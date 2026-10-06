@@ -1,0 +1,58 @@
+{
+  "personal": {
+    "full_name": "Casey Example",
+    "preferred_name": "Casey",
+    "email": "casey.example@example.com",
+    "phone": "555-010-0199",
+    "address": "100 Example Avenue",
+    "city": "Example City",
+    "province_state": "EX",
+    "country": "Exampleland",
+    "postal_code": "00000",
+    "linkedin_url": "https://www.linkedin.com/in/casey-example",
+    "github_url": "https://github.com/casey-example",
+    "portfolio_url": "https://example.com/casey",
+    "website_url": "https://example.com"
+  },
+  "work_authorization": {
+    "legally_authorized_to_work": "Yes",
+    "require_sponsorship": "No",
+    "work_permit_type": ""
+  },
+  "availability": {
+    "earliest_start_date": "Immediately",
+    "available_for_full_time": "Yes",
+    "available_for_contract": "No"
+  },
+  "compensation": {
+    "salary_expectation": "85000",
+    "salary_currency": "USD",
+    "salary_range_min": "80000",
+    "salary_range_max": "100000",
+    "currency_conversion_note": ""
+  },
+  "experience": {
+    "years_of_experience_total": "3",
+    "education_level": "Bachelor's Degree",
+    "current_job_title": "Example Engineer",
+    "current_company": "Example Labs",
+    "target_role": "software engineer"
+  },
+  "skills": ["Python", "SQL"],
+  "screening": {
+    "age_18_or_older": "Yes",
+    "willing_background_check": "Yes",
+    "felony_conviction": "No",
+    "previously_employed_here": "No",
+    "how_heard": "Online job board"
+  },
+  "eeo_voluntary": {
+    "gender": "Decline to self-identify",
+    "race_ethnicity": "Decline to self-identify",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not wish to answer"
+  },
+  "documents": {
+    "cover_letter_text": "Casey Example is a fictional candidate. This sentence exists so a cover-letter box can be filled in tests."
+  }
+}

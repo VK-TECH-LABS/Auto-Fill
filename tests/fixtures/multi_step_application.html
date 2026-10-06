@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fictional application</title>
+</head>
+<body>
+  <form id="application" onsubmit="window.__submitCount += 1; return false;">
+    <section id="step-login">
+      <h1>Sign in</h1>
+      <label for="login-email">Email</label>
+      <input id="login-email" name="login_email" type="email" autocomplete="username">
+      <label for="login-password">Password</label>
+      <input id="login-password" name="login_password" type="password" autocomplete="current-password">
+      <p id="login-error" class="login-error" role="alert" hidden>Invalid credentials</p>
+      <button type="button" id="sign-in">Sign in</button>
+    </section>
+
+    <section id="step-personal" hidden>
+      <h1>Personal information</h1>
+      <label for="first">First name</label>
+      <input id="first" name="first_name" autocomplete="given-name" value="Do Not Overwrite">
+      <label for="last">Last name</label>
+      <input id="last" name="last_name" autocomplete="family-name">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" autocomplete="email">
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel" autocomplete="tel">
+      <label for="city">City</label>
+      <input id="city" name="city" autocomplete="address-level2">
+      <span id="city-mirror"></span>
+      <button type="button" id="personal-next">Next</button>
+    </section>
+
+    <section id="step-address" hidden>
+      <h1>Address</h1>
+      <label for="street">Street address</label>
+      <input id="street" name="street">
+      <label for="state">State</label>
+      <select id="state" name="state">
+        <option value="">Select...</option>
+        <option value="CA">California</option>
+        <option value="NY">New York</option>
+      </select>
+      <label for="postal">Postal code</label>
+      <input id="postal" name="postal" autocomplete="postal-code">
+      <label for="country">Country</label>
+      <select id="country" name="country">
+        <option value="">Select...</option>
+        <option>Canada</option>
+        <option>United States</option>
+      </select>
+      <button type="button" id="address-next">Next</button>
+    </section>
+
+    <section id="step-employment" hidden>
+      <h1>Experience</h1>
+      <label for="employer-0">Employer</label>
+      <input id="employer-0" name="employer_0">
+      <label for="title-0">Job title</label>
+      <input id="title-0" name="title_0">
+      <label for="start-0">Start date</label>
+      <input id="start-0" name="start_0" placeholder="MM/DD/YYYY">
+      <label for="employer-1">Employer</label>
+      <input id="employer-1" name="employer_1">
+      <label for="title-1">Job title</label>
+      <input id="title-1" name="title_1">
+      <label for="project-name">Project name</label>
+      <input id="project-name" name="project_name">
+      <label for="intern-org">Internship company</label>
+      <input id="intern-org" name="intern_org">
+      <button type="button" id="experience-next">Next</button>
+    </section>
+
+    <section id="step-education" hidden>
+      <h1>Education</h1>
+      <label for="school">School</label>
+      <input id="school" name="school">
+      <label for="degree">Degree</label>
+      <input id="degree" name="degree">
+      <label for="major">Field of study</label>
+      <input id="major" name="major">
+      <button type="button" id="education-next">Next</button>
+    </section>
+
+    <section id="step-questions" hidden>
+      <h1>Questions</h1>
+      <label for="auth">Are you legally authorized to work?</label>
+      <select id="auth" name="auth">
+        <option value="">Select...</option>
+        <option>Yes</option>
+        <option>No</option>
+      </select>
+      <fieldset>
+        <legend>Will you require sponsorship?</legend>
+        <label><input type="radio" name="sponsor" id="sponsor-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="sponsor" id="sponsor-no" value="No"> No</label>
+      </fieldset>
+      <label for="hear">How did you hear about this role?</label>
+      <input id="hear" name="hear">
+      <label for="salary">Desired salary</label>
+      <input id="salary" name="salary">
+      <label for="animal">Favorite animal?</label>
+      <input id="animal" name="animal">
+      <label for="heard-combo">Referral source</label>
+      <input id="heard-combo" role="combobox" aria-controls="heard-list" aria-label="Referral source">
+      <ul id="heard-list" role="listbox">
+        <li id="opt-board" role="option">Online job board</li>
+        <li id="opt-friend" role="option">Friend</li>
+      </ul>
+      <button type="button" id="questions-next">Next</button>
+    </section>
+
+    <section id="step-resume" hidden>
+      <h1>Resume</h1>
+      <label for="resume">Resume</label>
+      <input id="resume" name="resume" type="file">
+      <button type="button" id="resume-next">Next</button>
+    </section>
+
+    <section id="step-review" hidden>
+      <h1>Review your application</h1>
+      <label><input type="checkbox" id="terms"> I agree to the terms of service</label>
+      <button type="submit" id="final-submit">Submit application</button>
+    </section>
+  </form>
+  <script>
+    window.__submitCount = 0;
+    window.__loginClicks = 0;
+    const EXPECTED = "fake-password-candidate-a";
+    const order = ["step-login", "step-personal", "step-address", "step-employment", "step-education", "step-questions", "step-resume", "step-review"];
+    function show(id) {
+      for (const step of order) document.getElementById(step).hidden = step !== id;
+    }
+    document.getElementById("sign-in").addEventListener("click", () => {
+      window.__loginClicks += 1;
+      const password = document.getElementById("login-password").value;
+      if (password !== EXPECTED) {
+        document.getElementById("login-error").hidden = false;
+        return;
+      }
+      show("step-personal");
+    });
+    document.getElementById("personal-next").addEventListener("click", () => show("step-address"));
+    document.getElementById("address-next").addEventListener("click", () => show("step-employment"));
+    document.getElementById("experience-next").addEventListener("click", () => show("step-education"));
+    document.getElementById("education-next").addEventListener("click", () => show("step-questions"));
+    document.getElementById("questions-next").addEventListener("click", () => show("step-resume"));
+    document.getElementById("resume-next").addEventListener("click", () => show("step-review"));
+    document.getElementById("final-submit").addEventListener("click", () => { window.__submitCount += 1; });
+    document.getElementById("city").addEventListener("input", (event) => {
+      document.getElementById("city-mirror").textContent = event.target.value;
+    });
+  </script>
+</body>
+</html>

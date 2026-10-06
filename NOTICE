@@ -1,0 +1,67 @@
+Auto-Fill
+Copyright (C) 2026 VK-TECH-LABS
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. The full license is in the LICENSE file.
+
+Auto-Fill adapts job-application form autofill behavior from ApplyPilot:
+
+  Project: ApplyPilot
+  Source:  https://github.com/Pickle-Pixel/ApplyPilot
+  Author:  Pickle-Pixel (package metadata; repository commits also name Henry Muhiar)
+  License: GNU Affero General Public License v3.0 only
+  Inspected revision: 4a8d521f67 (2026-03-08), tag/version 0.3.0 metadata
+
+ApplyPilot's license was verified from its GitHub license metadata
+(AGPL-3.0), the LICENSE file in that repository (the GNU AGPL v3 text),
+and pyproject.toml (`license = "AGPL-3.0-only"`). This repository stays
+on AGPL-3.0-only because it adapts that work.
+
+What was adapted, as a clean-room reimplementation of the behavior rather
+than a copy of ApplyPilot's agent prompt:
+
+  - Candidate profile sections (personal, work_authorization, availability,
+    compensation, experience, eeo_voluntary) from profile.example.json.
+  - Which form labels those sections answer, including preferred-name versus
+    legal-name, phone digits when a country prefix is present, voluntary EEO
+    decline defaults, and the screening topics the prompt filled (age 18+,
+    background check, conviction, prior employment at the company, how you
+    heard about the role). In Auto-Fill those screening answers are explicit
+    profile fields and are left blank when the candidate did not supply them.
+  - Form-control notes from src/applypilot/apply/prompt.py: selects that must
+    be chosen from their options, checkboxes, resume and cover-letter file
+    uploads, hidden honeypot fields left blank, multi-page Next/Continue
+    navigation for Workday, Taleo, and iCIMS, and the resume-upload step on
+    Workday and Lever.
+  - The salary decision order from that prompt (never below the profile floor,
+    midpoint of a posted range, a range around that midpoint, hourly = annual
+    / 2080). ApplyPilot hardcoded a senior-title floor of $110,000. That
+    figure is not reused. The floor is the profile's salary_expectation.
+  - Host lists from src/applypilot/config/sites.yaml: the manual-only ATS
+    domain ibegin.tcsapps.com, and the blocked SSO domains (accounts.google.com,
+    login.microsoftonline.com, okta.com, auth0.com, sso.cisco.com).
+
+What was intentionally left out:
+
+  - Job discovery, scraping, enrichment, scoring, resume tailoring, cover-letter
+    generation, the pipeline database, dashboards, and the Claude Code launcher.
+  - Automatic final submission. ApplyPilot's apply prompt clicks Submit.
+    Auto-Fill has no such path. A central guard raises HumanSubmissionRequired
+    if any adapter tries. See src/autofill/safeguards.py.
+  - CAPTCHA solving. ApplyPilot's prompt includes a CapSolver createTask /
+    poll / token-injection flow. None of that code, service, or procedure is
+    included. If a CAPTCHA or challenge widget is present, Auto-Fill stops
+    with CAPTCHA_REQUIRED. It does not solve, bypass, or inject a token.
+  - Stored site passwords and account creation. A host may pass a
+    CredentialProvider at call time so an existing account can sign in
+    (including email-first login). The profile schema still has no password
+    field. Sign-up, inbox verification codes, and identity-provider SSO stay
+    out. Resume files are not selected; the person uploads the resume.
+  - Optimistic screening answers. ApplyPilot instructed its agent to answer
+    "yes" to tool questions in the same domain. Auto-Fill answers a skill
+    question only when that skill is listed on the profile.
+
+The fictional profile in examples/profile.example.json is not a copy of a
+real ApplyPilot user's data. ApplyPilot's own example uses placeholders.

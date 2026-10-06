@@ -1,0 +1,53 @@
+[project]
+name = "auto-fill"
+version = "0.2.0"
+description = "Job-application form autofill that can sign in, fills fields, and stops before submit."
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.11"
+authors = [{ name = "VK-TECH-LABS" }]
+keywords = ["job-application", "autofill", "playwright", "ats"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+]
+dependencies = ["playwright>=1.40"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.8", "mypy>=1.13"]
+
+[project.scripts]
+autofill = "autofill.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/VK-TECH-LABS/Auto-Fill"
+Repository = "https://github.com/VK-TECH-LABS/Auto-Fill"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["autofill"]
+ignore_missing_imports = true
+warn_unused_ignores = true

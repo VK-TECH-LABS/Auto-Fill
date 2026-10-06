@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Example Corp application</title>
+</head>
+<body>
+  <form id="application" action="/submit" method="post" onsubmit="window.__submitted = true; return false;">
+    <h1>Example Corp application</h1>
+    <p>Fictional form used to test autofill. Nothing here is a real employer.</p>
+
+    <label for="first">First name</label>
+    <input id="first" name="first_name" autocomplete="given-name">
+
+    <label for="last">Last name</label>
+    <input id="last" name="last_name" autocomplete="family-name">
+
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" autocomplete="email">
+
+    <label for="phone">Phone</label>
+    <input id="phone" name="phone" type="tel" autocomplete="tel">
+
+    <label for="city">City</label>
+    <input id="city" name="city" autocomplete="address-level2">
+
+    <label for="auth">Are you legally authorized to work?</label>
+    <select id="auth" name="work_auth">
+      <option value="">Select...</option>
+      <option>Yes</option>
+      <option>No</option>
+    </select>
+
+    <fieldset>
+      <legend>Will you require sponsorship?</legend>
+      <label><input type="radio" name="sponsor" id="sponsor-yes" value="Yes"> Yes</label>
+      <label><input type="radio" name="sponsor" id="sponsor-no" value="No"> No</label>
+    </fieldset>
+
+    <label><input type="checkbox" id="background" name="background"> Willing to undergo a background check</label>
+
+    <label for="gender">Gender</label>
+    <select id="gender" name="gender">
+      <option value="">Select...</option>
+      <option>Female</option>
+      <option>Male</option>
+      <option>Non-binary</option>
+      <option>Decline to self-identify</option>
+    </select>
+
+    <label for="cover">Cover letter</label>
+    <textarea id="cover" name="cover_letter"></textarea>
+
+    <label for="resume">Resume</label>
+    <input id="resume" name="resume" type="file" accept=".pdf">
+
+    <label for="pronouns">Pronouns</label>
+    <input id="pronouns" name="pronouns">
+
+    <div style="display:none" aria-hidden="true">
+      <label for="company-website">Company website</label>
+      <input id="company-website" name="company_website" tabindex="-1" autocomplete="off">
+    </div>
+
+    <div id="github-host"></div>
+
+    <button type="button" id="continue">Save and continue</button>
+    <button type="submit" id="submit">Submit application</button>
+    <button type="submit">Send application</button>
+  </form>
+
+  <div id="page2" hidden>
+    <label for="hear">How did you hear about this role?</label>
+    <input id="hear" name="hear">
+    <button type="button" id="apply-now">Apply now</button>
+  </div>
+
+  <script>
+    window.__submitted = false;
+    window.__continued = false;
+    window.__applied = false;
+    document.getElementById("continue").addEventListener("click", () => {
+      window.__continued = true;
+      document.getElementById("page2").hidden = false;
+    });
+    document.getElementById("apply-now").addEventListener("click", () => {
+      window.__applied = true;
+      window.__submitted = true;
+    });
+    const host = document.getElementById("github-host");
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = '<label for="github">GitHub</label><input id="github" name="github" type="url">';
+  </script>
+</body>
+</html>
