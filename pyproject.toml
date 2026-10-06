@@ -1,0 +1,38 @@
+[project]
+name = "auto-fill"
+version = "0.1.0"
+description = "Job-application form autofill that fills fields and stops before submit."
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.11"
+authors = [{ name = "VK-TECH-LABS" }]
+keywords = ["job-application", "autofill", "playwright", "ats"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+]
+dependencies = ["playwright>=1.40"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+autofill = "autofill.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/VK-TECH-LABS/Auto-Fill"
+Repository = "https://github.com/VK-TECH-LABS/Auto-Fill"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

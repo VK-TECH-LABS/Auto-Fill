@@ -1,0 +1,254 @@
+"""Read form controls out of a Playwright page, including open shadow roots.
+
+Workday and several other ATS sites place inputs inside open shadow trees.
+``querySelector`` on the document does not see those nodes, so the extractor
+walks every open shadow root. Playwright locators still pierce open shadow
+roots, which is why an ``#id`` selector remains usable after extraction.
+"""
+
+from __future__ import annotations
+
+from autofill.models import ButtonControl, Control, Option, PageSnapshot
+
+EXTRACT_JS = r"""
+() => {
+  function isHidden(el) {
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden") return true;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden) return true;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return true;
+      if (node.getAttribute("aria-hidden") === "true") return true;
+    }
+    return false;
+  }
+
+  function textOf(node) {
+    if (!node) return "";
+    return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function byId(root, id) {
+    if (!id) return null;
+    if (typeof root.getElementById === "function") return root.getElementById(id);
+    return root.querySelector("#" + CSS.escape(id));
+  }
+
+  function labelFor(root, el) {
+    const bits = [];
+    if (el.id) {
+      const explicit = root.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (explicit) bits.push(textOf(explicit));
+    }
+    const wrapping = el.closest("label");
+    if (wrapping) bits.push(textOf(wrapping));
+    const labelledby = el.getAttribute("aria-labelledby");
+    if (labelledby) {
+      for (const id of labelledby.split(/\s+/)) {
+        const node = byId(root, id);
+        if (node) bits.push(textOf(node));
+      }
+    }
+    const aria = el.getAttribute("aria-label");
+    if (aria) bits.push(aria.trim());
+    const fieldset = el.closest("fieldset");
+    if (fieldset) {
+      const legend = fieldset.querySelector("legend");
+      if (legend) bits.push(textOf(legend));
+    }
+    return bits.join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  function selectorFor(el) {
+    if (el.id) return "#" + CSS.escape(el.id);
+    const name = el.getAttribute("name");
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (name && type === "radio") {
+      return tag + "[type='radio'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value) + "']";
+    }
+    if (name) return tag + "[name='" + CSS.escape(name) + "']";
+    const automation = el.getAttribute("data-automation-id");
+    if (automation) return "[data-automation-id='" + CSS.escape(automation) + "']";
+    // Unnamed submit buttons still need a selector so they can be reported
+    // and so the fill routine can refuse them. The attribute is not a secret.
+    if (!el.getAttribute("data-autofill-target")) {
+      el.setAttribute("data-autofill-target", Math.random().toString(36).slice(2));
+    }
+    return "[data-autofill-target='" + el.getAttribute("data-autofill-target") + "']";
+  }
+
+  function eachRoot(root, visit) {
+    visit(root);
+    for (const el of root.querySelectorAll("*")) {
+      if (el.shadowRoot) eachRoot(el.shadowRoot, visit);
+    }
+  }
+
+  const controls = [];
+  const seenRadios = new Set();
+  const buttons = [];
+  const seenButtons = new Set();
+
+  eachRoot(document, (root) => {
+    const rootKey = root.host ? (root.host.id || "shadow") : "document";
+    for (const el of root.querySelectorAll("input, select, textarea")) {
+      const tag = el.tagName.toLowerCase();
+      const inputType = tag === "textarea"
+        ? "textarea"
+        : tag === "select"
+          ? "select"
+          : (el.getAttribute("type") || "text").toLowerCase();
+      if (["submit", "button", "reset", "image"].includes(inputType)) continue;
+
+      if (inputType === "radio") {
+        const name = el.getAttribute("name") || "";
+        const groupKey = rootKey + "::" + name;
+        if (!name || seenRadios.has(groupKey)) continue;
+        seenRadios.add(groupKey);
+        const group = Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
+        const fieldset = el.closest("fieldset");
+        const legend = fieldset ? fieldset.querySelector("legend") : null;
+        const options = group.map((radio) => ({
+          value: radio.value || "",
+          label: textOf(radio.closest("label")) || radio.value || "",
+          selector: selectorFor(radio),
+        })).filter((option) => option.selector);
+        if (!options.length) continue;
+        controls.push({
+          kind: "radio",
+          name,
+          elementId: el.id || "",
+          label: textOf(legend) || labelFor(root, el),
+          placeholder: "",
+          ariaLabel: el.getAttribute("aria-label") || "",
+          autocomplete: "",
+          required: group.some((radio) => radio.required),
+          hidden: group.every((radio) => isHidden(radio)),
+          disabled: group.every((radio) => radio.disabled),
+          readOnly: false,
+          options,
+          selector: options[0].selector,
+          inputMode: "",
+          inputType: "radio",
+        });
+        continue;
+      }
+
+      const selector = selectorFor(el);
+      if (!selector) continue;
+      let kind = "text";
+      if (inputType === "checkbox") kind = "checkbox";
+      else if (inputType === "file") kind = "file";
+      else if (inputType === "password") kind = "password";
+      else if (tag === "select") kind = "select";
+      else if (tag === "textarea") kind = "textarea";
+
+      let options = [];
+      if (tag === "select") {
+        options = Array.from(el.options).map((option) => ({
+          value: option.value,
+          label: (option.textContent || "").replace(/\s+/g, " ").trim(),
+          selector: "",
+        })).filter((option) => option.label || option.value);
+      }
+
+      controls.push({
+        kind,
+        name: el.getAttribute("name") || "",
+        elementId: el.id || "",
+        label: labelFor(root, el),
+        placeholder: el.getAttribute("placeholder") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        autocomplete: el.getAttribute("autocomplete") || "",
+        required: !!el.required,
+        hidden: isHidden(el),
+        disabled: !!el.disabled,
+        readOnly: !!el.readOnly,
+        options,
+        selector,
+        inputMode: el.getAttribute("inputmode") || "",
+        inputType,
+      });
+    }
+
+    for (const el of root.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")) {
+      if (isHidden(el)) continue;
+      const name = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      const selector = selectorFor(el);
+      if (!name || !selector || seenButtons.has(selector)) continue;
+      seenButtons.add(selector);
+      buttons.push({
+        name,
+        selector,
+        controlType: (el.getAttribute("type") || "").toLowerCase(),
+      });
+    }
+  });
+
+  let captcha = false;
+  eachRoot(document, (root) => {
+    if (root.querySelector(".h-captcha, .g-recaptcha, .cf-turnstile, iframe[src*='hcaptcha.com'], iframe[src*='recaptcha'], iframe[src*='challenges.cloudflare.com'], iframe[src*='arkoselabs']")) {
+      captcha = true;
+    }
+  });
+  const password = controls.some((control) => control.kind === "password" && !control.hidden);
+  return { controls, buttons, captcha, password };
+}
+"""
+
+
+def _option(raw: dict) -> Option:
+    return Option(
+        value=str(raw.get("value", "")),
+        label=str(raw.get("label", "")),
+        selector=str(raw.get("selector", "")),
+    )
+
+
+def parse_snapshot(data: dict) -> PageSnapshot:
+    """Turn the JSON returned by ``EXTRACT_JS`` into dataclasses."""
+    controls: list[Control] = []
+    for raw in data.get("controls", []):
+        controls.append(
+            Control(
+                kind=str(raw.get("kind", "text")),
+                name=str(raw.get("name", "")),
+                element_id=str(raw.get("elementId", "")),
+                label=str(raw.get("label", "")),
+                placeholder=str(raw.get("placeholder", "")),
+                aria_label=str(raw.get("ariaLabel", "")),
+                autocomplete=str(raw.get("autocomplete", "")),
+                required=bool(raw.get("required", False)),
+                hidden=bool(raw.get("hidden", False)),
+                disabled=bool(raw.get("disabled", False)),
+                read_only=bool(raw.get("readOnly", False)),
+                options=[_option(option) for option in raw.get("options", [])],
+                selector=str(raw.get("selector", "")),
+                input_mode=str(raw.get("inputMode", "")),
+                input_type=str(raw.get("inputType", "")),
+            )
+        )
+    buttons = [
+        ButtonControl(
+            name=str(raw.get("name", "")),
+            selector=str(raw.get("selector", "")),
+            control_type=str(raw.get("controlType", "")),
+        )
+        for raw in data.get("buttons", [])
+    ]
+    return PageSnapshot(
+        controls=controls,
+        buttons=buttons,
+        captcha_present=bool(data.get("captcha", False)),
+        password_present=bool(data.get("password", False)),
+    )
+
+
+def extract_page(page) -> PageSnapshot:
+    """Evaluate the extractor in ``page`` and return a snapshot."""
+    # Call the arrow function as an expression. Playwright also accepts a bare
+    # function string, but invoking it keeps the contract obvious.
+    data = page.evaluate("(" + EXTRACT_JS + ")()")
+    return parse_snapshot(data)
