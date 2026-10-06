@@ -78,13 +78,13 @@ def test_sample_form_is_filled_and_not_submitted(browser, tmp_path):
             advance_pages=True,
         )
         assert result.stopped_before_submit is True
-        assert result.status == "filled"
-        assert result.pages_filled == 2
+        assert result.status == "resume_required"
+        assert result.resume_required is True
+        assert result.pages_filled == 1
         assert result.captcha_present is False
         assert "Submit application" in result.submit_controls
         assert "Send application" in result.submit_controls
-        assert "Apply now" in result.submit_controls
-        assert result.continued_controls == ["Save and continue"]
+        assert result.continued_controls == []
 
         assert page.locator("#first").input_value() == "Casey"
         assert page.locator("#last").input_value() == "Example"
@@ -100,13 +100,13 @@ def test_sample_form_is_filled_and_not_submitted(browser, tmp_path):
         assert page.locator("#pronouns").input_value() == ""
         assert page.locator("#company-website").input_value() == ""
         assert page.locator("#github").input_value() == "https://github.com/casey-example"
-        assert page.locator("#hear").input_value() == "Online job board"
-        uploaded = page.evaluate("() => document.querySelector('#resume').files[0].name")
-        assert uploaded == "resume.pdf"
+        uploaded = page.evaluate("() => document.querySelector('#resume').files.length")
+        assert uploaded == 0
+        assert page.locator("#hear").input_value() == ""
 
         assert page.evaluate("() => window.__submitted") is False
         assert page.evaluate("() => window.__applied") is False
-        assert page.evaluate("() => window.__continued") is True
+        assert page.evaluate("() => window.__continued") is False
     finally:
         page.close()
 
@@ -136,10 +136,12 @@ def test_captcha_stops_the_run_without_a_solver(browser, tmp_path):
     try:
         page.goto(html.as_uri())
         result = fill_application(CandidateProfile.load(EXAMPLE), page=page, advance_pages=True)
+        assert result.status == "captcha_required"
         assert result.captcha_present is True
         assert result.stopped_before_submit is True
         assert result.continued_controls == []
-        assert page.locator("#email").input_value() == "casey.example@example.com"
+        assert result.pages_filled == 0
+        assert page.locator("#email").input_value() == ""
         assert page.evaluate("() => window.__continued") is False
         assert page.evaluate("() => window.__submitted") is False
     finally:

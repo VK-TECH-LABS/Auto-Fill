@@ -33,6 +33,8 @@ class Control:
     selector: str = ""
     input_mode: str = ""
     input_type: str = ""
+    role: str = ""
+    nearby: str = ""
 
 
 @dataclass
@@ -52,6 +54,8 @@ class PageSnapshot:
     buttons: list[ButtonControl]
     captcha_present: bool = False
     password_present: bool = False
+    heading: str = ""
+    banner: str = ""
 
 
 @dataclass
@@ -65,6 +69,8 @@ class MappedField:
     option_value: str = ""
     option_selector: str = ""
     reason: str = ""
+    field_class: str = ""
+    confidence: str = "high"
 
 
 @dataclass
@@ -91,6 +97,7 @@ class FieldOutcome:
     key: str | None
     action: str
     detail: str = ""
+    field_class: str = ""
 
 
 @dataclass
@@ -111,6 +118,8 @@ class FillResult:
     submit_controls: list[str] = field(default_factory=list)
     continued_controls: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    resume_required: bool = False
+    manual_actions: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -134,10 +143,13 @@ class FillResult:
                     "key": item.key,
                     "action": item.action,
                     "detail": item.detail,
+                    "field_class": item.field_class,
                 }
                 for item in self.fields
             ],
             "submit_controls": list(self.submit_controls),
             "continued_controls": list(self.continued_controls),
             "messages": list(self.messages),
+            "resume_required": self.resume_required,
+            "manual_actions": list(self.manual_actions),
         }

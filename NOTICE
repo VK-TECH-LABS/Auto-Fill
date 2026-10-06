@@ -48,12 +48,17 @@ What was intentionally left out:
   - Job discovery, scraping, enrichment, scoring, resume tailoring, cover-letter
     generation, the pipeline database, dashboards, and the Claude Code launcher.
   - Automatic final submission. ApplyPilot's apply prompt clicks Submit.
-    Auto-Fill has no such path. See src/autofill/safeguards.py.
+    Auto-Fill has no such path. A central guard raises HumanSubmissionRequired
+    if any adapter tries. See src/autofill/safeguards.py.
   - CAPTCHA solving. ApplyPilot's prompt includes a CapSolver createTask /
-    poll / token-injection flow. None of that code or procedure is included.
-    If a CAPTCHA widget is present, Auto-Fill stops and says so.
-  - Stored site passwords, account creation, email-inbox verification codes,
-    and signing in through SSO.
+    poll / token-injection flow. None of that code, service, or procedure is
+    included. If a CAPTCHA or challenge widget is present, Auto-Fill stops
+    with CAPTCHA_REQUIRED. It does not solve, bypass, or inject a token.
+  - Stored site passwords and account creation. A host may pass a
+    CredentialProvider at call time so an existing account can sign in
+    (including email-first login). The profile schema still has no password
+    field. Sign-up, inbox verification codes, and identity-provider SSO stay
+    out. Resume files are not selected; the person uploads the resume.
   - Optimistic screening answers. ApplyPilot instructed its agent to answer
     "yes" to tool questions in the same domain. Auto-Fill answers a skill
     question only when that skill is listed on the profile.

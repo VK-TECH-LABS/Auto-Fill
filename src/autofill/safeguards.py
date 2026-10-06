@@ -1,10 +1,13 @@
 """Human-submit safeguard.
 
-Auto-Fill fills controls and may click Next, Continue, Save and continue,
-Proceed, or Review to reach later pages of a multi-page application. It never activates a final Submit
-or Apply control, and it never activates login, sign-up, or account-creation
-controls. There is no flag, environment variable, or dry-run switch that
-turns submission on.
+Final job-application Submit / Apply is always human-controlled. There is no
+flag that turns it on. Adapters call :func:`perform_click`, which raises
+:class:`HumanSubmissionRequired` when the action is a final submission.
+
+Login is a different action class. :func:`activate_login` may click
+Log in / Sign in on a detected login form. It still refuses final application
+submit, sign-up, and account creation. Page turns (Next, Continue, Save and
+continue, Proceed, Review, Add another) go through :func:`activate`.
 """
 
 from __future__ import annotations
@@ -32,10 +35,32 @@ _CONTINUE_RE = re.compile(
     r"\b(next|continue|save\s*(and|&)\s*continue|proceed|review)\b",
     re.IGNORECASE,
 )
+_ADD_RE = re.compile(
+    r"\badd (another|experience|employment|education|position|job)\b",
+    re.IGNORECASE,
+)
+_SIGNUP_RE = re.compile(r"\b(sign\s*up|create\s+account|register)\b", re.IGNORECASE)
+_LOGIN_OK_RE = re.compile(r"\b(log\s*in|sign\s*in)\b", re.IGNORECASE)
+
+
+class ActionClass:
+    """Separate login submission from the final application submission."""
+
+    LOGIN_SUBMIT_ALLOWED = "login_submit_allowed"
+    FINAL_APPLICATION_SUBMIT_FORBIDDEN = "final_application_submit_forbidden"
+    NAVIGATION = "navigation"
+    OTHER = "other"
 
 
 class SubmitBlockedError(RuntimeError):
-    """Raised when code tries to activate a control a person must click."""
+    """Raised when code tries to activate a control it is not allowed to use."""
+
+
+class HumanSubmissionRequired(SubmitBlockedError):
+    """A final application Submit or Apply was attempted.
+
+    The central guard raises this. ATS adapters cannot bypass it.
+    """
 
 
 def classify_control(name: str, *, control_type: str = "") -> str:
@@ -51,11 +76,42 @@ def classify_control(name: str, *, control_type: str = "") -> str:
         return "submit"
     if _AUTH_RE.search(label):
         return "auth"
-    if _CONTINUE_RE.search(label):
+    if _CONTINUE_RE.search(label) or _ADD_RE.search(label):
         return "continue"
     if control_type.lower() == "submit":
         return "submit"
     return "other"
+
+
+def is_add_row(name: str) -> bool:
+    """True for Add-experience style controls, which are navigation, not submit."""
+    return bool(_ADD_RE.search(" ".join(name.split())))
+
+
+def field_class_for_button(name: str, *, control_type: str = "") -> str:
+    """Field class for a button. Final submit and navigation stay distinct from login."""
+    klass = action_class(name, control_type=control_type)
+    if klass == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        return "FINAL_SUBMIT"
+    if klass == ActionClass.LOGIN_SUBMIT_ALLOWED:
+        return "LOGIN_FIELD"
+    if klass == ActionClass.NAVIGATION:
+        return "NAVIGATION_CONTROL"
+    return "UNKNOWN_FIELD"
+
+
+def action_class(name: str, *, control_type: str = "") -> str:
+    """Map a control label onto an action class."""
+    kind = classify_control(name, control_type=control_type)
+    if kind == "submit":
+        return ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN
+    if kind == "auth":
+        if _LOGIN_OK_RE.search(name) and not _SIGNUP_RE.search(name):
+            return ActionClass.LOGIN_SUBMIT_ALLOWED
+        return ActionClass.OTHER
+    if kind == "continue":
+        return ActionClass.NAVIGATION
+    return ActionClass.OTHER
 
 
 def assert_safe_to_activate(name: str, *, control_type: str = "") -> str:
@@ -69,12 +125,12 @@ def assert_safe_to_activate(name: str, *, control_type: str = "") -> str:
         raise SubmitBlockedError("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
     kind = classify_control(name, control_type=control_type)
     if kind == "submit":
-        raise SubmitBlockedError(
+        raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. Auto-Fill never clicks the final Submit or Apply control."
         )
     if kind == "auth":
         raise SubmitBlockedError(
-            f"Refusing to activate {name!r}. Auto-Fill does not log in, sign up, or create accounts."
+            f"Refusing to activate {name!r}. Page turns do not include Log in, Sign in, or account creation."
         )
     if kind != "continue":
         raise SubmitBlockedError(
@@ -89,5 +145,56 @@ def activate(page, selector: str, name: str, *, control_type: str = "") -> None:
     ``page`` is a Playwright ``Page``. The click lives in this module so the
     rest of the package cannot press a button without the check.
     """
-    assert_safe_to_activate(name, control_type=control_type)
-    page.locator(selector).click()
+    perform_click(page, selector, name, control_type=control_type, purpose="navigation")
+
+
+def activate_login(page, selector: str, name: str, *, control_type: str = "") -> None:
+    """Click Log in or Sign in. Final application submit stays forbidden."""
+    perform_click(page, selector, name, control_type=control_type, purpose="login")
+
+
+def choose_option(page, opener_selector: str, option_selector: str, option_name: str) -> None:
+    """Open a listbox and choose one option. This sets a field value.
+
+    Option labels that read as a final Submit or Apply are refused, so a
+    combobox cannot be used as a side path around the submit guard.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if action_class(option_name) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        raise HumanSubmissionRequired(
+            f"Refusing to choose {option_name!r}. That label is a final Submit or Apply."
+        )
+    page.locator(opener_selector).click()
+    page.locator(option_selector).click()
+
+
+def perform_click(page, selector: str, name: str, *, control_type: str = "", purpose: str) -> None:
+    """Central click guard. ``purpose`` is ``navigation`` or ``login``.
+
+    If the control is a final application submission, this raises
+    :class:`HumanSubmissionRequired` before any click. That is true for both
+    purposes, so an adapter cannot reach Submit by asking for a login click.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    klass = action_class(name, control_type=control_type)
+    if klass == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        raise HumanSubmissionRequired(
+            f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
+        )
+    if purpose == "login":
+        if klass != ActionClass.LOGIN_SUBMIT_ALLOWED:
+            raise SubmitBlockedError(
+                f"Refusing to activate {name!r}. Only an existing-account Log in or Sign in is allowed."
+            )
+        page.locator(selector).click()
+        return
+    if purpose == "navigation":
+        if klass != ActionClass.NAVIGATION:
+            raise SubmitBlockedError(
+                f"Refusing to activate {name!r}. Only Next, Continue, Review, or Add-row navigation is automatic."
+            )
+        page.locator(selector).click()
+        return
+    raise SubmitBlockedError(f"Unknown click purpose {purpose!r}.")

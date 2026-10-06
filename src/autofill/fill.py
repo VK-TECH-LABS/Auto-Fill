@@ -1,8 +1,10 @@
 """Fill an application form and stop.
 
 The final Submit / Apply control is never clicked. Multi-page applications
-may advance with Next, Continue, or Review when the caller opts in. Login,
-sign-up, and CAPTCHA challenges are reported and left for a person.
+may advance with Next, Continue, or Review when the caller opts in.
+``fill_application`` does not type passwords. Authorized login lives in
+``autofill_application``. A visible CAPTCHA widget stops the run before
+any field is written. Resume file inputs are reported and never selected.
 """
 
 from __future__ import annotations
@@ -11,10 +13,10 @@ from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
 from autofill.extract import extract_page
-from autofill.mapping import map_field
+from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
 from autofill.profile import CandidateProfile
-from autofill.safeguards import activate, classify_control
+from autofill.safeguards import activate, choose_option, classify_control, is_add_row
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -28,27 +30,64 @@ def _path_text(path: str | Path | None) -> str | None:
     return str(path)
 
 
-def _outcome(control: Control, mapped: MappedField, *, action: str | None = None, detail: str | None = None) -> FieldOutcome:
+def _outcome(
+    control: Control,
+    mapped: MappedField,
+    *,
+    action: str | None = None,
+    detail: str | None = None,
+) -> FieldOutcome:
     return FieldOutcome(
         selector=control.selector,
         label=control.label,
         key=mapped.key,
         action=action or mapped.action,
         detail=detail if detail is not None else mapped.reason,
+        field_class=mapped.field_class,
     )
 
 
+_SET_NATIVE = """
+(el, value) => {
+  const proto = el instanceof HTMLTextAreaElement
+    ? window.HTMLTextAreaElement.prototype
+    : window.HTMLInputElement.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, "value");
+  if (desc && desc.set) desc.set.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  el.dispatchEvent(new Event("blur", { bubbles: true }));
+}
+"""
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField) -> FieldOutcome:
-    if mapped.action in {"skip", "unanswered"}:
+    if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
     try:
         locator = page.locator(control.selector)
         if mapped.action == "fill":
-            locator.fill(mapped.text)
+            current = locator.input_value()
+            if current.strip() and current.strip() != mapped.text:
+                return _outcome(
+                    control,
+                    mapped,
+                    action="skip",
+                    detail="Left an existing value in place.",
+                )
+            if current.strip() == mapped.text:
+                return _outcome(control, mapped, detail="already set")
+            if control.kind in {"text", "textarea", "combobox"}:
+                locator.evaluate(_SET_NATIVE, mapped.text)
+            else:
+                locator.fill(mapped.text)
             return _outcome(control, mapped, detail="filled")
         if mapped.action == "select":
             if control.kind == "radio":
                 page.locator(mapped.option_selector).check()
+            elif control.kind == "combobox" and mapped.option_selector:
+                choose_option(page, control.selector, mapped.option_selector, mapped.option_label)
             elif mapped.option_value:
                 locator.select_option(value=mapped.option_value)
             else:
@@ -68,6 +107,74 @@ def _apply_mapped(page, control: Control, mapped: MappedField) -> FieldOutcome:
     return _outcome(control, mapped, action="unanswered", detail=f"Unsupported action {mapped.action}.")
 
 
+def _note_manual(control: Control, mapped: MappedField, manual: list[str]) -> None:
+    if mapped.field_class in {"MANUAL_REVIEW_FIELD", "LEGAL_FIELD"} or mapped.action == "resume_required":
+        label = control.label or control.selector or control.name
+        manual.append(f"{label}: {mapped.reason}")
+
+
+def fill_one_page(
+    page,
+    profile: CandidateProfile,
+    *,
+    cover_letter_path: str | None,
+    cover_letter_text: str | None,
+    job: JobContext | None,
+    resume_uploaded: bool,
+) -> tuple[list[FieldOutcome], PageSnapshot, bool, list[str]]:
+    """Fill the current page. Does not click Next or Submit.
+
+    Repeated employment rows are added only via an Add control, then filled.
+    A resume file is never chosen by this function.
+    """
+    fields: list[FieldOutcome] = []
+    manual: list[str] = []
+    resume_blocked = False
+    snapshot = extract_page(page)
+    for _ in range(4):
+        fields = []
+        manual = []
+        resume_blocked = False
+        snapshot = extract_page(page)
+        cursor = MapCursor(page_heading=snapshot.heading)
+        for control in snapshot.controls:
+            mapped = map_field(
+                control,
+                profile,
+                cover_letter_path=cover_letter_path,
+                cover_letter_text=cover_letter_text,
+                job=job,
+                cursor=cursor,
+            )
+            if mapped.action == "resume_required" and resume_uploaded:
+                fields.append(
+                    _outcome(
+                        control,
+                        mapped,
+                        action="skip",
+                        detail="Resume left for the person who uploaded it.",
+                    )
+                )
+                continue
+            if mapped.action == "resume_required":
+                resume_blocked = True
+            _note_manual(control, mapped, manual)
+            fields.append(_apply_mapped(page, control, mapped))
+        if resume_blocked:
+            break
+        employer_slots = [
+            control
+            for control in snapshot.controls
+            if not control.hidden and control.kind in {"text", "combobox"} and "employ" in control.label.casefold()
+        ]
+        add = next((button for button in snapshot.buttons if is_add_row(button.name)), None)
+        if add and len(profile.employment) > len(employer_slots):
+            activate(page, add.selector, add.name, control_type=add.control_type)
+            continue
+        break
+    return fields, snapshot, resume_blocked, manual
+
+
 def _remember_blocked(snapshot: PageSnapshot, submit_controls: list[str]) -> None:
     for button in snapshot.buttons:
         kind = classify_control(button.name, control_type=button.control_type)
@@ -81,26 +188,31 @@ def _fill_pages(
     *,
     resume_path: str | None,
     cover_letter_path: str | None,
+    cover_letter_text: str | None,
     job: JobContext | None,
     advance_pages: bool,
     max_pages: int,
     ats_name: str | None,
+    resume_uploaded: bool,
 ) -> FillResult:
+    del resume_path  # Resume files are a human checkpoint, never auto-selected.
     fields: list[FieldOutcome] = []
     submit_controls: list[str] = []
     continued: list[str] = []
+    manual: list[str] = []
     messages = [_HUMAN_MESSAGE]
     seen_pages: set[tuple[str, ...]] = set()
     captcha_present = False
     login_wall = False
+    resume_blocked = False
     pages_filled = 0
     clicked: set[str] = set()
 
     info = detect_ats(page.url)
     if info and info.notes:
         messages.append(info.notes)
-    if info and info.resume_first and not resume_path:
-        messages.append(f"{info.name} often requires a resume upload before the other fields.")
+    if info and info.resume_first:
+        messages.append(f"{info.name} reaches a resume step a person completes. Auto-Fill does not choose the file.")
 
     for _ in range(max_pages):
         snapshot = extract_page(page)
@@ -111,26 +223,35 @@ def _fill_pages(
             break
         seen_pages.add(visible_key)
 
+        if snapshot.captcha_present:
+            messages.append("CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs.")
+            break
+
         if snapshot.password_present:
             login_wall = True
             messages.append(
-                "Password field detected. Auto-Fill does not enter passwords, log in, or create accounts."
+                "Password field detected. fill_application does not submit credentials; use autofill_application."
             )
             break
 
         pages_filled += 1
-        for control in snapshot.controls:
-            mapped = map_field(
-                control,
-                profile,
-                resume_path=resume_path,
-                cover_letter_path=cover_letter_path,
-                job=job,
-            )
-            fields.append(_apply_mapped(page, control, mapped))
-
-        if snapshot.captcha_present:
-            messages.append("A CAPTCHA is on the page. Auto-Fill does not solve CAPTCHAs.")
+        page_fields, snapshot, page_resume, page_manual = fill_one_page(
+            page,
+            profile,
+            cover_letter_path=cover_letter_path,
+            cover_letter_text=cover_letter_text,
+            job=job,
+            resume_uploaded=resume_uploaded,
+        )
+        fields.extend(page_fields)
+        manual.extend(page_manual)
+        _remember_blocked(snapshot, submit_controls)
+        if page_resume:
+            resume_blocked = True
+            messages.append("Stopped at resume upload. A person must upload the resume.")
+            break
+        if "review" in snapshot.heading.casefold():
+            messages.append("Stopped on the review page. A person must click Submit.")
             break
         if not advance_pages:
             break
@@ -140,6 +261,7 @@ def _fill_pages(
                 button
                 for button in snapshot.buttons
                 if button.selector not in clicked
+                and not is_add_row(button.name)
                 and classify_control(button.name, control_type=button.control_type) == "continue"
             ),
             None,
@@ -159,8 +281,12 @@ def _fill_pages(
         )
 
     status = "filled"
-    if login_wall and pages_filled == 0:
+    if captcha_present and pages_filled == 0:
+        status = "captcha_required"
+    elif login_wall and pages_filled == 0:
         status = "skipped_login"
+    elif resume_blocked:
+        status = "resume_required"
     return FillResult(
         status=status,
         stopped_before_submit=True,
@@ -172,6 +298,8 @@ def _fill_pages(
         submit_controls=submit_controls,
         continued_controls=continued,
         messages=messages,
+        resume_required=resume_blocked,
+        manual_actions=manual,
     )
 
 
@@ -191,10 +319,12 @@ def fill_application(
     page=None,
     resume_path: str | Path | None = None,
     cover_letter_path: str | Path | None = None,
+    cover_letter_text: str | None = None,
     job: JobContext | None = None,
     advance_pages: bool = False,
     max_pages: int = 5,
     headless: bool = True,
+    resume_uploaded: bool = False,
 ) -> FillResult:
     """Fill ``page`` or ``url`` from ``profile`` and stop before submit.
 
@@ -211,8 +341,9 @@ def fill_application(
         url: Application form URL. Ignored for navigation when ``page`` is
             already on a real document.
         page: Existing Playwright page. It is left open for a person to review.
-        resume_path: PDF or other file to place in a resume upload control.
-        cover_letter_path: File to place in a cover-letter upload control.
+        resume_path: Ignored. Resume upload is a human checkpoint.
+        cover_letter_path: File to place in a cover-letter upload control when explicitly passed.
+        cover_letter_text: Paste this text only when the caller supplies it.
         job: Optional posted salary range. Auto-Fill does not fetch the job.
         advance_pages: Follow Next / Continue / Review, never Submit / Apply.
         max_pages: Cap on how many pages to fill when advancing.
@@ -251,10 +382,12 @@ def fill_application(
             profile,
             resume_path=resume,
             cover_letter_path=cover,
+            cover_letter_text=cover_letter_text,
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
             ats_name=ats.name if ats else None,
+            resume_uploaded=resume_uploaded,
         )
 
     from playwright.sync_api import sync_playwright
@@ -262,6 +395,8 @@ def fill_application(
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=headless)
     try:
+        if not url:
+            raise ValueError("Provide a url or an open Playwright page.")
         opened = browser.new_page()
         opened.goto(url)
         return _fill_pages(
@@ -269,10 +404,12 @@ def fill_application(
             profile,
             resume_path=resume,
             cover_letter_path=cover,
+            cover_letter_text=cover_letter_text,
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
             ats_name=ats.name if ats else None,
+            resume_uploaded=resume_uploaded,
         )
     finally:
         browser.close()

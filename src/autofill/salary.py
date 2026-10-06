@@ -45,11 +45,12 @@ def resolve_salary(
     floor = _as_int(compensation.salary_expectation, 0)
     range_min = _as_int(compensation.salary_range_min, floor)
     range_max = _as_int(compensation.salary_range_max, floor)
-    has_posting = posted_min is not None and posted_max is not None
+    posting = (posted_min, posted_max) if posted_min is not None and posted_max is not None else None
 
     if as_range:
-        if has_posting:
-            midpoint = (int(posted_min) + int(posted_max)) // 2
+        if posting is not None:
+            low_post, high_post = posting
+            midpoint = (low_post + high_post) // 2
             low = max(floor, int(midpoint * 0.9))
             high = max(low, int(midpoint * 1.1))
         else:
@@ -59,8 +60,9 @@ def resolve_salary(
             return f"{low // HOURS_PER_YEAR}-{high // HOURS_PER_YEAR}"
         return f"{low}-{high}"
 
-    if has_posting:
-        annual = max(floor, (int(posted_min) + int(posted_max)) // 2)
+    if posting is not None:
+        low_post, high_post = posting
+        annual = max(floor, (low_post + high_post) // 2)
     else:
         annual = floor
     if hourly:

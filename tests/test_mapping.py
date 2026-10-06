@@ -128,10 +128,11 @@ def test_hidden_and_honeypot_fields_are_skipped():
 def test_resume_and_cover_letter_files():
     filled = profile()
     missing = map_field(control("Resume", kind="file"), filled)
-    assert missing.action == "unanswered"
-    uploaded = map_field(control("Resume", kind="file"), filled, resume_path="/tmp/resume.pdf")
-    assert uploaded.action == "upload"
-    assert uploaded.text == "/tmp/resume.pdf"
+    assert missing.action == "resume_required"
+    assert missing.field_class == "RESUME_FIELD"
+    still_human = map_field(control("Resume", kind="file"), filled, resume_path="/tmp/resume.pdf")
+    assert still_human.action == "resume_required"
+    assert still_human.text == ""
     letter = map_field(control("Cover letter", kind="textarea"), filled)
     assert letter.action == "fill"
     assert "fictional" in letter.text

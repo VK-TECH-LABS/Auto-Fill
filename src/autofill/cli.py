@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resume",
-        help="Resume file to upload. Defaults to AUTOFILL_RESUME. Omit if the form has no upload.",
+        help="Accepted for compatibility and ignored. A person uploads the resume.",
     )
     parser.add_argument("--cover-letter", help="Cover letter file to upload when the form asks for one.")
     parser.add_argument(

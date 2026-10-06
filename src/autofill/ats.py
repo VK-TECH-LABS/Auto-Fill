@@ -86,6 +86,22 @@ _ATS: tuple[tuple[str, AtsInfo], ...] = (
     ("jobvite.com", AtsInfo("jobvite", notes="Generic field fill. Do not submit.")),
     ("bamboohr.com", AtsInfo("bamboohr", notes="Generic field fill. Do not submit.")),
     ("workable.com", AtsInfo("workable", notes="Generic field fill. Do not submit.")),
+    (
+        "successfactors.com",
+        AtsInfo("successfactors", multipage=True, notes="Multi-page. Shared field matcher. Do not submit."),
+    ),
+    (
+        "sapsf.com",
+        AtsInfo("successfactors", multipage=True, notes="Multi-page. Shared field matcher. Do not submit."),
+    ),
+    (
+        "dayforcehcm.com",
+        AtsInfo("dayforce", multipage=True, notes="Multi-page. Shared field matcher. Do not submit."),
+    ),
+    (
+        "dayforce.com",
+        AtsInfo("dayforce", multipage=True, notes="Multi-page. Shared field matcher. Do not submit."),
+    ),
 )
 
 # Substring match, matching ApplyPilot's manual_ats check.
@@ -108,11 +124,26 @@ def _host(url: str) -> str:
     return (parsed.hostname or "").lower()
 
 
+def site_domain(url: str | None) -> str:
+    """Hostname used to scope credentials. Empty when the URL has none."""
+    return _host(url or "")
+
+
 def detect_ats(url: str | None) -> AtsInfo | None:
     """Return ATS metadata when ``url`` is on a known application host."""
-    host = _host(url or "")
+    raw = url or ""
+    host = _host(raw)
     if not host:
         return None
+    path = (urlparse(raw if "://" in raw else f"https://{raw}").path or "").lower()
+    if (host == "oraclecloud.com" or host.endswith(".oraclecloud.com")) and (
+        "candidateexperience" in path or "hcmui" in path
+    ):
+        return AtsInfo(
+            "oracle",
+            multipage=True,
+            notes="Oracle Candidate Experience. Login, then multi-step Next/Continue. Do not submit.",
+        )
     for pattern, info in _ATS:
         if host == pattern or host.endswith("." + pattern):
             return info

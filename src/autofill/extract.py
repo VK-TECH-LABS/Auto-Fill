@@ -138,12 +138,14 @@ EXTRACT_JS = r"""
 
       const selector = selectorFor(el);
       if (!selector) continue;
+      const role = (el.getAttribute("role") || "").toLowerCase();
       let kind = "text";
       if (inputType === "checkbox") kind = "checkbox";
       else if (inputType === "file") kind = "file";
       else if (inputType === "password") kind = "password";
       else if (tag === "select") kind = "select";
       else if (tag === "textarea") kind = "textarea";
+      else if (role === "combobox") kind = "combobox";
 
       let options = [];
       if (tag === "select") {
@@ -152,7 +154,19 @@ EXTRACT_JS = r"""
           label: (option.textContent || "").replace(/\s+/g, " ").trim(),
           selector: "",
         })).filter((option) => option.label || option.value);
+      } else if (role === "combobox") {
+        const listId = el.getAttribute("aria-controls");
+        const list = listId ? byId(root, listId) : root.querySelector("[role='listbox']");
+        if (list) {
+          options = Array.from(list.querySelectorAll("[role='option']")).map((option) => ({
+            value: option.getAttribute("data-value") || textOf(option),
+            label: textOf(option),
+            selector: selectorFor(option),
+          })).filter((option) => option.label && option.selector);
+        }
       }
+      const block = el.closest("section, fieldset") || el.parentElement;
+      const headingNode = block ? block.querySelector("h1, h2, h3, legend") : null;
 
       controls.push({
         kind,
@@ -170,6 +184,8 @@ EXTRACT_JS = r"""
         selector,
         inputMode: el.getAttribute("inputmode") || "",
         inputType,
+        role,
+        nearby: textOf(headingNode).slice(0, 160),
       });
     }
 
@@ -189,12 +205,33 @@ EXTRACT_JS = r"""
 
   let captcha = false;
   eachRoot(document, (root) => {
-    if (root.querySelector(".h-captcha, .g-recaptcha, .cf-turnstile, iframe[src*='hcaptcha.com'], iframe[src*='recaptcha'], iframe[src*='challenges.cloudflare.com'], iframe[src*='arkoselabs']")) {
+    const captchaSelector = [
+      ".h-captcha",
+      ".g-recaptcha",
+      ".cf-turnstile",
+      "iframe[src*='hcaptcha.com']",
+      "iframe[src*='recaptcha']",
+      "iframe[src*='challenges.cloudflare.com']",
+      "iframe[src*='arkoselabs']",
+    ].join(", ");
+    if (root.querySelector(captchaSelector)) {
       captcha = true;
     }
   });
   const password = controls.some((control) => control.kind === "password" && !control.hidden);
-  return { controls, buttons, captcha, password };
+  let heading = "";
+  for (const node of document.querySelectorAll("h1, h2")) {
+    if (!isHidden(node)) {
+      heading = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+      break;
+    }
+  }
+  let banner = "";
+  const alertNode = document.querySelector("[role='alert'], #login-error, .login-error");
+  if (alertNode && !isHidden(alertNode)) {
+    banner = (alertNode.innerText || alertNode.textContent || "").replace(/\s+/g, " ").trim();
+  }
+  return { controls, buttons, captcha, password, heading, banner };
 }
 """
 
@@ -228,6 +265,8 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 selector=str(raw.get("selector", "")),
                 input_mode=str(raw.get("inputMode", "")),
                 input_type=str(raw.get("inputType", "")),
+                role=str(raw.get("role", "")),
+                nearby=str(raw.get("nearby", "")),
             )
         )
     buttons = [
@@ -243,6 +282,8 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         buttons=buttons,
         captcha_present=bool(data.get("captcha", False)),
         password_present=bool(data.get("password", False)),
+        heading=str(data.get("heading", "")),
+        banner=str(data.get("banner", "")),
     )
 
 

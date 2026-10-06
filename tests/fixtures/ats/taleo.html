@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Synthetic taleo application</title></head>
+<body>
+  <form onsubmit="window.__submitCount += 1; return false;">
+    <h1>My Information</h1>
+    <p>Synthetic taleo page. No live account.</p>
+    <label for="last">Last name</label>
+    <input id="last" name="last_name" autocomplete="family-name">
+    <button type="submit" id="final-submit">Submit application</button>
+  </form>
+  <script>
+    window.__submitCount = 0;
+    document.getElementById("final-submit").addEventListener("click", () => { window.__submitCount += 1; });
+  </script>
+</body>
+</html>

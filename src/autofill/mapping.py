@@ -14,13 +14,39 @@ skill is listed on the profile, and otherwise leaves the control unanswered.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from autofill.answers import match_answer
+from autofill.dates import format_for_control
 from autofill.models import Control, JobContext, MappedField, Option
 from autofill.profile import CandidateProfile
 from autofill.salary import resolve_salary
 
 _DECLINE_HINTS = ("decline", "prefer not", "do not wish", "not to say", "not to answer")
+_LEGAL_RE = re.compile(
+    r"\b(i agree|i certify|i acknowledge|terms of (service|use)|privacy policy|attest|e-?sign|legal attestation)\b"
+)
+_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"united states", "united states of america", "usa", "us"}),
+    frozenset({"canada", "ca"}),
+    frozenset({"california", "ca"}),
+    frozenset({"new york", "ny"}),
+    frozenset({"texas", "tx"}),
+    frozenset({"washington", "wa"}),
+)
+
+
+@dataclass
+class MapCursor:
+    """Per-page counters so repeated employer/school fields use the next row."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    page_heading: str = ""
+
+    def take(self, kind: str) -> int:
+        index = self.counts.get(kind, 0)
+        self.counts[kind] = index + 1
+        return index
 
 
 @dataclass(frozen=True)
@@ -50,6 +76,11 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("linkedin_url", _compile((r"\blinkedin\b",))),
     _Rule("github_url", _compile((r"\bgithub\b",))),
     _Rule("portfolio_url", _compile((r"\bportfolio\b",))),
+    _Rule("school", _compile((r"\bschool\b", r"\buniversity\b", r"\bcollege\b"))),
+    _Rule("field_of_study", _compile((r"\bfield of study\b", r"\bmajor\b"))),
+    _Rule("internship_company", _compile((r"\binternship (company|employer|organization)\b",))),
+    _Rule("project_name", _compile((r"\bproject name\b",))),
+    _Rule("project_description", _compile((r"\bproject description\b",)), frozenset({"textarea", "text"})),
     _Rule("city", _compile((r"\bcity\b", r"\btown\b"))),
     _Rule("state", _compile((r"\bprovince\b", r"\bstate\b"))),
     _Rule("postal_code", _compile((r"\bpostal\b", r"\bpost code\b", r"\bpostcode\b", r"\bzip\b"))),
@@ -181,7 +212,6 @@ _AUTOCOMPLETE = {
 _SKILL_RE = re.compile(
     r"(?:experience with|proficient in|knowledge of|familiar with|worked with|do you know)\s+(.+)$"
 )
-_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _SPECIFIC_EXPERIENCE_RE = re.compile(r"\b(with|using)\b")
 
 
@@ -220,7 +250,8 @@ def is_honeypot(control: Control) -> bool:
     compact = blob.replace(" ", "")
     if "companywebsite" in compact or "company website" in blob:
         return True
-    if any(token in blob for token in ("honeypot", "leave blank", "leave this field blank", "do not fill", "bot field")):
+    honeypot_tokens = ("honeypot", "leave blank", "leave this field blank", "do not fill", "bot field")
+    if any(token in blob for token in honeypot_tokens):
         return True
     if control.hidden and control.kind in {"text", "textarea"}:
         return True
@@ -251,7 +282,19 @@ def match_option(desired: str, options: list[Option]) -> Option | None:
             label = normalize(option.label)
             if any(hint in label for hint in _DECLINE_HINTS):
                 return option
+    aliases = _alias_set(target)
+    if aliases:
+        for option in options:
+            if normalize(option.label) in aliases or normalize(option.value) in aliases:
+                return option
     return None
+
+
+def _alias_set(token: str) -> set[str]:
+    matched = [group for group in _ALIAS_GROUPS if token in group]
+    if not matched:
+        return set()
+    return set().union(*matched)
 
 
 def _wants_national_digits(control: Control) -> bool:
@@ -261,7 +304,22 @@ def _wants_national_digits(control: Control) -> bool:
     return "digits" in blob or "country code" in blob or "country prefix" in blob
 
 
-def _profile_text(profile: CandidateProfile, key: str, control: Control, job: JobContext | None) -> str:
+def _row(items: list, cursor: MapCursor | None, kind: str):
+    if not items:
+        return None
+    index = 0 if cursor is None else cursor.take(kind)
+    if index >= len(items):
+        return None
+    return items[index]
+
+
+def _profile_text(
+    profile: CandidateProfile,
+    key: str,
+    control: Control,
+    job: JobContext | None,
+    cursor: MapCursor | None,
+) -> str:
     personal = profile.personal
     if key == "full_name":
         return personal.public_name
@@ -325,11 +383,41 @@ def _profile_text(profile: CandidateProfile, key: str, control: Control, job: Jo
     if key == "years_of_experience_total":
         return profile.experience.years_of_experience_total
     if key == "education_level":
+        row = _row(profile.education_history, cursor, "degree")
+        if profile.education_history:
+            return row.degree if row else ""
         return profile.experience.education_level
+    if key == "school":
+        row = _row(profile.education_history, cursor, "school")
+        return row.school if row else ""
+    if key == "field_of_study":
+        row = _row(profile.education_history, cursor, "field")
+        return row.field_of_study if row else ""
     if key == "current_job_title":
+        row = _row(profile.employment, cursor, "title")
+        if profile.employment:
+            return row.title if row else ""
         return profile.experience.current_job_title
     if key == "current_company":
+        row = _row(profile.employment, cursor, "employer")
+        if profile.employment:
+            return row.company if row else ""
         return profile.experience.current_company
+    if key == "employment_start":
+        row = _row(profile.employment, cursor, "employment_start")
+        return row.start_date if row else ""
+    if key == "education_start":
+        row = _row(profile.education_history, cursor, "education_start")
+        return row.start_date if row else ""
+    if key == "internship_company":
+        row = _row(profile.internships, cursor, "internship")
+        return row.company if row else ""
+    if key == "project_name":
+        row = _row(profile.projects, cursor, "project")
+        return row.name if row else ""
+    if key == "project_description":
+        row = _row(profile.projects, cursor, "project_description")
+        return row.description if row else ""
     if key == "gender":
         return profile.eeo_voluntary.gender
     if key == "race_ethnicity":
@@ -356,6 +444,14 @@ def _profile_text(profile: CandidateProfile, key: str, control: Control, job: Jo
 def _specific_years_question(blob: str) -> bool:
     """Years-with-a-tool questions are not the profile's total years."""
     return bool(_SPECIFIC_EXPERIENCE_RE.search(blob))
+
+
+def _nearby_key(control: Control) -> str | None:
+    """A match that exists only in surrounding heading or legend text."""
+    if not control.nearby.strip():
+        return None
+    probe = Control(kind=control.kind, label=control.nearby, options=control.options, input_type=control.input_type)
+    return _match_rule(probe)
 
 
 def _match_rule(control: Control) -> str | None:
@@ -399,7 +495,7 @@ def _skill_answer(control: Control, profile: CandidateProfile) -> MappedField | 
 def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> MappedField:
     if not text:
         return MappedField(key=key, action="unanswered", reason="Profile has no value for this field.")
-    if control.kind in {"select", "radio"}:
+    if control.kind in {"select", "radio"} or (control.kind == "combobox" and control.options):
         option = match_option(text, control.options)
         if option is None:
             return MappedField(
@@ -423,13 +519,31 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
         if answer == "no":
             return MappedField(key=key, action="uncheck", text=text, reason=reason)
         return MappedField(key=key, action="unanswered", reason="Checkbox needs a yes or no profile value.")
-    if control.input_type == "date" and not _ISO_DATE_RE.fullmatch(text):
-        return MappedField(
-            key=key,
-            action="unanswered",
-            reason=f"Date input needs YYYY-MM-DD; profile value is {text!r}.",
+    if _is_date_key(key) or control.input_type in {"date", "month"} or _date_hint(control):
+        formatted = format_for_control(
+            text,
+            input_type=control.input_type,
+            placeholder=control.placeholder,
+            label=control.label,
         )
-    return MappedField(key=key, action="fill", text=text, reason=reason)
+        if formatted is None:
+            return MappedField(
+                key=key,
+                action="unanswered",
+                field_class="PROFILE_FIELD",
+                reason=f"Date input needs a calendar date; profile value is {text!r}.",
+            )
+        text = formatted
+    return MappedField(key=key, action="fill", text=text, reason=reason, field_class="PROFILE_FIELD")
+
+
+def _is_date_key(key: str) -> bool:
+    return key in {"earliest_start_date", "employment_start", "education_start"}
+
+
+def _date_hint(control: Control) -> bool:
+    hint = normalize(f"{control.placeholder} {control.label}")
+    return "mm/dd/yyyy" in hint or "dd/mm/yyyy" in hint or "yyyy-mm-dd" in hint
 
 
 def map_field(
@@ -438,42 +552,139 @@ def map_field(
     *,
     resume_path: str | None = None,
     cover_letter_path: str | None = None,
+    cover_letter_text: str | None = None,
     job: JobContext | None = None,
+    cursor: MapCursor | None = None,
 ) -> MappedField:
-    """Decide how to fill one control. Does not touch the page."""
+    """Decide how to fill one control. Does not touch the page.
+
+    ``resume_path`` is ignored for uploading. A resume file control is always
+    ``resume_required`` so a person uploads the file TileArc already downloaded.
+    ``cover_letter_text`` is used only when the caller passes it explicitly.
+    """
+    del resume_path  # kept for callers; resumes are a human checkpoint
     if control.kind == "password" or control.input_type == "password":
-        return MappedField(key=None, action="skip", reason="Password fields are never filled.")
+        return MappedField(
+            key=None,
+            action="skip",
+            field_class="LOGIN_FIELD",
+            reason="Password fields are filled only by the login flow.",
+        )
     if control.disabled:
         return MappedField(key=None, action="skip", reason="Control is disabled.")
     if control.read_only and control.kind in {"text", "textarea"}:
         return MappedField(key=None, action="skip", reason="Control is read-only.")
-    if control.hidden and control.kind != "file":
+    if control.hidden:
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    if control.kind in {"checkbox", "radio"} and _LEGAL_RE.search(haystack(control)):
+        return MappedField(
+            key=None,
+            action="skip",
+            field_class="LEGAL_FIELD",
+            reason="Legal attestation left for a person.",
+        )
 
-    key = _match_rule(control)
+    own = Control(
+        kind=control.kind,
+        name=control.name,
+        element_id=control.element_id,
+        label=control.label,
+        placeholder=control.placeholder,
+        aria_label=control.aria_label,
+        autocomplete=control.autocomplete,
+        options=control.options,
+        input_type=control.input_type,
+        input_mode=control.input_mode,
+        role=control.role,
+    )
+    key = _match_rule(own)
+    if key is None and _nearby_key(control):
+        return MappedField(
+            key=None,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            confidence="low",
+            reason="Low-confidence nearby text was not used.",
+        )
     if key is not None and control.kind == "file" and key not in {"resume", "cover_letter"}:
         return MappedField(key=key, action="unanswered", reason="File input did not match a resume or cover letter.")
     if key is None:
+        answered = _explicit_answer(control, profile)
+        if answered is not None:
+            return answered
         skill = _skill_answer(control, profile)
         if skill is not None:
+            skill.field_class = "APPROVED_QUESTION" if skill.action != "unanswered" else "UNKNOWN_FIELD"
             return skill
-        return MappedField(key=None, action="unanswered", reason="No profile field matched this control.")
+        return MappedField(
+            key=None,
+            action="unanswered",
+            field_class="UNKNOWN_FIELD",
+            reason="No profile field matched this control.",
+        )
 
+    key = _retarget_date(key, cursor)
     if key == "resume":
-        if not resume_path:
-            return MappedField(key=key, action="unanswered", reason="No resume file was provided.")
-        return MappedField(key=key, action="upload", text=resume_path)
+        return MappedField(
+            key=key,
+            action="resume_required",
+            field_class="RESUME_FIELD",
+            reason="A person uploads the resume. Auto-Fill does not choose a file.",
+        )
     if key == "cover_letter" and control.kind == "file":
         if not cover_letter_path:
-            return MappedField(key=key, action="unanswered", reason="No cover letter file was provided.")
-        return MappedField(key=key, action="upload", text=cover_letter_path)
+            return MappedField(
+                key=key,
+                action="unanswered",
+                field_class="MANUAL_REVIEW_FIELD",
+                reason="No cover letter file was passed to the API.",
+            )
+        return MappedField(key=key, action="upload", text=cover_letter_path, field_class="PROFILE_FIELD")
 
     if key in {"salary", "salary_range"} and not profile.compensation.salary_expectation:
-        return MappedField(key=key, action="unanswered", reason="Profile has no salary expectation.")
+        return MappedField(
+            key=key,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Profile has no salary expectation.",
+        )
     try:
-        text = _profile_text(profile, key, control, job)
+        text = _profile_text(profile, key, control, job, cursor)
     except ValueError as exc:
         return MappedField(key=key, action="unanswered", reason=str(exc))
-    return _from_text(control, key, text)
+    if not text:
+        answered = _explicit_answer(control, profile)
+        if answered is not None and answered.action != "unanswered":
+            return answered
+    if key == "cover_letter" and cover_letter_text is not None:
+        text = cover_letter_text
+    mapped = _from_text(control, key, text)
+    if mapped.field_class == "":
+        mapped.field_class = "PROFILE_FIELD" if mapped.action != "unanswered" else "UNKNOWN_FIELD"
+    if key in {"legally_authorized_to_work", "require_sponsorship", "salary", "salary_range"}:
+        mapped.field_class = "PROFILE_FIELD" if text else "MANUAL_REVIEW_FIELD"
+    return mapped
+
+
+def _retarget_date(key: str, cursor: MapCursor | None) -> str:
+    if key != "earliest_start_date" or cursor is None:
+        return key
+    heading = normalize(cursor.page_heading)
+    if "education" in heading:
+        return "education_start"
+    if "experience" in heading or "employment" in heading:
+        return "employment_start"
+    return key
+
+
+def _explicit_answer(control: Control, profile: CandidateProfile) -> MappedField | None:
+    if not profile.application_answers:
+        return None
+    text = match_answer(haystack(control), profile.application_answers, normalize=normalize)
+    if text is None:
+        return None
+    mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")
+    mapped.field_class = "APPROVED_QUESTION" if mapped.action != "unanswered" else "UNKNOWN_FIELD"
+    return mapped
