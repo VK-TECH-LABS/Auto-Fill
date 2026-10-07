@@ -1,6 +1,8 @@
 # TileArc integration contract
 
-Auto-Fill is a standalone library. TileArc can call it later. This repository does not import TileArc, does not open TileArc's database, and does not read candidate rows, resumes, or credentials from anywhere except the arguments of one call.
+Auto-Fill is a standalone program. A host can call the authenticated HTTP API in [HTTP_SERVICE.md](HTTP_SERVICE.md). That service is this public Auto-Fill implementation. Callers are separate applications. This repository does not import a host application, does not open a host database, and does not read candidate rows, resumes, or credentials from anywhere except the arguments of one call or one HTTP request.
+
+The sections below describe the in-process library call. They are not a private API.
 
 ## What TileArc already does
 

@@ -66,6 +66,10 @@ class MemoryCredentialProvider:
     def put(self, candidate_id: str, domain: str, credentials: Credentials) -> None:
         self._records[(candidate_id, domain.lower())] = credentials
 
+    def clear(self) -> None:
+        """Drop every record. Callers use this when a session ends."""
+        self._records.clear()
+
     def get_credentials(
         self,
         site_context: SiteContext,
