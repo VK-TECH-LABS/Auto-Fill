@@ -4,7 +4,7 @@ from pathlib import Path
 
 from autofill.mapping import map_field
 from autofill.models import Control, JobContext, Option
-from autofill.profile import CandidateProfile
+from autofill.profile import ApplicationAnswer, CandidateProfile
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "profile.example.json"
 
@@ -97,6 +97,40 @@ def test_blank_screening_answer_is_not_invented():
     mapped = map_field(control("Have you been convicted of a felony?"), person)
     assert mapped.action == "unanswered"
     assert mapped.text == ""
+
+
+def test_approved_answer_overrides_screening_for_the_same_question():
+    """Session approved Q&A wins over screening.* when both match. Other questions stay put."""
+    person = profile()
+    assert person.screening.how_heard == "Online job board"
+    assert person.screening.age_18_or_older == "Yes"
+    assert person.screening.felony_conviction == "No"
+    person.application_answers = [
+        ApplicationAnswer(question="Where did you hear about this role?", answer="Employee referral"),
+        ApplicationAnswer(question="Are you age 18 or older?", answer="No"),
+    ]
+    heard = map_field(control("How did you hear about this role?"), person)
+    assert heard.action == "fill"
+    assert heard.text == "Employee referral"
+    assert heard.field_class == "APPROVED_QUESTION"
+    age = map_field(
+        control(
+            "Are you age 18 or older?",
+            kind="select",
+            options=[Option("Yes", "Yes"), Option("No", "No")],
+        ),
+        person,
+    )
+    assert age.action == "select"
+    assert age.option_label == "No"
+    assert age.field_class == "APPROVED_QUESTION"
+    felony = map_field(control("Have you been convicted of a felony?", kind="checkbox"), person)
+    assert felony.action == "uncheck"
+    assert felony.text == "No"
+    unknown = map_field(control("What is your favorite color?"), person)
+    assert unknown.action == "unanswered"
+    assert unknown.text == ""
+    assert unknown.field_class == "UNKNOWN_FIELD"
 
 
 def test_eeo_decline_matches_a_similar_option():
