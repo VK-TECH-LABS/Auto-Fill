@@ -2,7 +2,7 @@
 
 Standalone library that opens a job application, signs in when the host supplies credentials, fills the form, and **stops**. A person uploads the resume and clicks the final Submit or Apply.
 
-It is meant to be embedded in another product (TileArc is the intended host). It does not search for jobs, score them, rewrite resumes, generate cover letters, or send the application. CAPTCHA and anti-bot challenges are detected and the run stops. They are not solved.
+It runs in-process or as an authenticated HTTP service. Callers are separate applications. This repository is the public Auto-Fill implementation and does not include those applications. It does not search for jobs, score them, rewrite resumes, generate cover letters, or send the application. CAPTCHA and anti-bot challenges are detected and the run stops. They are not solved.
 
 ## License and attribution
 
@@ -30,6 +30,20 @@ python -m playwright install chromium
 ```
 
 The Playwright browser is only needed to fill pages. Mapping and profile tests do not launch it. CI installs Chromium with system dependencies (see `.github/workflows/ci.yml`).
+
+## HTTP service
+
+The network API is [docs/HTTP_SERVICE.md](docs/HTTP_SERVICE.md). It is this same program behind bearer auth. `AUTOFILL_SERVICE_TOKEN` is required and is read from the environment. The default listen port is `PORT` (`8080`). `AUTOFILL_RUN_BROWSER=1` (the default) launches Chromium. `AUTOFILL_RUN_BROWSER=0` keeps the API up and will not launch a browser.
+
+```bash
+export AUTOFILL_SERVICE_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export PORT=8080
+python -m autofill.service
+```
+
+`GET /health` is unauthenticated. Every `/v1/` route needs `Authorization: Bearer <AUTOFILL_SERVICE_TOKEN>`. Do not put that token in a URL or in client-side JavaScript. The OpenAPI document is `/openapi.json`. A separate image is built from the [Dockerfile](Dockerfile). It does not bake in a token.
+
+Sessions stay in memory. The service does not take a `DATABASE_URL`. Resume bytes are not part of the API, and there is no route that clicks the final Submit or Apply.
 
 ## Two different buttons
 

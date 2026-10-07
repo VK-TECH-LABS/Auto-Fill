@@ -20,7 +20,7 @@ from autofill.credentials import CredentialProvider, SiteContext
 from autofill.extract import extract_page
 from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
-from autofill.models import FillResult
+from autofill.models import FillResult, JobContext
 from autofill.profile import CandidateProfile
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, activate, field_class_for_button, is_add_row
 from autofill.session import SessionStore
@@ -54,6 +54,7 @@ class AutofillOptions:
     resume_uploaded: bool = False
     headless: bool = True
     page: Any = None
+    job: JobContext | None = None
 
 
 @dataclass
@@ -313,7 +314,7 @@ def autofill_application(
                     candidate_profile,
                     cover_letter_path=opts.cover_letter_path,
                     cover_letter_text=opts.cover_letter_text,
-                    job=None,
+                    job=opts.job,
                     resume_uploaded=opts.resume_uploaded,
                 )
                 fields.extend(page_fields)
@@ -339,7 +340,7 @@ def autofill_application(
                 candidate_profile,
                 cover_letter_path=opts.cover_letter_path,
                 cover_letter_text=opts.cover_letter_text,
-                job=None,
+                job=opts.job,
                 resume_uploaded=opts.resume_uploaded,
             )
             fields.extend(page_fields)
