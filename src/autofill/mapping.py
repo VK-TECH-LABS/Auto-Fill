@@ -213,6 +213,15 @@ _SKILL_RE = re.compile(
     r"(?:experience with|proficient in|knowledge of|familiar with|worked with|do you know)\s+(.+)$"
 )
 _SPECIFIC_EXPERIENCE_RE = re.compile(r"\b(with|using)\b")
+_SCREENING_KEYS = frozenset(
+    {
+        "age_18_or_older",
+        "willing_background_check",
+        "felony_conviction",
+        "previously_employed_here",
+        "how_heard",
+    }
+)
 
 
 def normalize(text: str) -> str:
@@ -650,6 +659,12 @@ def map_field(
             field_class="MANUAL_REVIEW_FIELD",
             reason="Profile has no salary expectation.",
         )
+    # An explicit approved answer beats a screening.* value for the same question.
+    # Other profile fields stay as mapped. A question with no approved answer is unchanged.
+    if key in _SCREENING_KEYS:
+        approved = _explicit_answer(control, profile)
+        if approved is not None and approved.action != "unanswered":
+            return approved
     try:
         text = _profile_text(profile, key, control, job, cursor)
     except ValueError as exc:
