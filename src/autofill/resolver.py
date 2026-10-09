@@ -20,6 +20,11 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger("autofill.resolver")
 
 _RETRYABLE_HTTP = frozenset({408, 429, 500, 502, 503, 504})
+MAX_FIELDS_PER_CALL = 40
+MAX_QUESTIONS_PER_CALL = 20
+MAX_QUESTION_TEXT = 300
+MAX_OPTION_LABEL = 80
+MAX_OPTIONS = 30
 _TOKEN_QUERY_KEYS = frozenset({"token", "access_token", "authorization", "auth"})
 
 
@@ -105,6 +110,32 @@ def assert_token_not_in_url(url: str, token: str) -> None:
             raise ResolverCallError("invalid")
 
 
+def limit_question(question: dict[str, Any]) -> dict[str, Any]:
+    """Fit one question to the resolver size limits.
+
+    More than 30 options are omitted. The caller still has the full list and
+    can match a returned value locally.
+    """
+    text = question.get("text")
+    text = text[:MAX_QUESTION_TEXT] if isinstance(text, str) else ""
+    options = question.get("options")
+    limited: list[str] = []
+    if isinstance(options, list) and len(options) <= MAX_OPTIONS:
+        for option in options:
+            if isinstance(option, str) and option:
+                limited.append(option[:MAX_OPTION_LABEL])
+    bounded = dict(question)
+    bounded["text"] = text
+    bounded["options"] = limited
+    return bounded
+
+
+def _batches(items: list[Any], size: int) -> list[list[Any]]:
+    if not items:
+        return []
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
 def resolve_step(
     binding: ResolverBinding,
     *,
@@ -113,12 +144,45 @@ def resolve_step(
     fields: list[str],
     questions: list[dict[str, Any]],
 ) -> ResolverResponse:
-    """POST one step. Retries are bounded and never include 401, 409, or 410."""
+    """POST one step in bounded chunks. A 413 marks that chunk unresolved."""
     assert_token_not_in_url(binding.url, binding.token)
     if binding.expired():
         raise ResolverCallError("expired", 410)
     if not binding.token:
         raise ResolverCallError("unauthorized", 401)
+    limited = [limit_question(item) for item in questions if isinstance(item, dict)]
+    field_batches = _batches(list(fields), MAX_FIELDS_PER_CALL)
+    question_batches = _batches(limited, MAX_QUESTIONS_PER_CALL)
+    count = max(len(field_batches), len(question_batches), 1)
+    merged = ResolverResponse()
+    for index in range(count):
+        field_batch = field_batches[index] if index < len(field_batches) else []
+        question_batch = question_batches[index] if index < len(question_batches) else []
+        part = _resolve_once(
+            binding,
+            session_id=session_id,
+            step=step,
+            fields=field_batch,
+            questions=question_batch,
+        )
+        merged.fields.update(part.fields)
+        merged.answers.extend(part.answers)
+        merged.unresolved.extend(part.unresolved)
+        merged.latency_ms += part.latency_ms
+        if part.result_code != "ok":
+            merged.result_code = part.result_code
+    return merged
+
+
+def _resolve_once(
+    binding: ResolverBinding,
+    *,
+    session_id: str,
+    step: str,
+    fields: list[str],
+    questions: list[dict[str, Any]],
+) -> ResolverResponse:
+    """POST one chunk. Retries are bounded and never include 401, 409, or 410."""
     payload = {
         "sessionId": session_id,
         "candidateRef": binding.candidate_ref,
@@ -129,7 +193,10 @@ def resolve_step(
     }
     raw = json.dumps(payload).encode("utf-8")
     if len(raw) > binding.max_bytes:
-        raise ResolverCallError("too_large")
+        return ResolverResponse(
+            unresolved=_requested_names(fields, questions),
+            result_code="unprocessable",
+        )
     requested_fields = set(fields)
     requested_intents = {item.get("intent") for item in questions}
     started = time.perf_counter()
@@ -213,8 +280,8 @@ def _post(binding: ResolverBinding, raw: bytes) -> tuple[bytes, int]:
             raise ResolverCallError("mismatch", code) from None
         if code == 410:
             raise ResolverCallError("expired", code) from None
-        if code == 422:
-            # A step the resolver will not answer. The body is not read or logged.
+        if code in {413, 422}:
+            # Too many fields, or a step the resolver will not answer. The body is not logged.
             raise ResolverCallError("unprocessable", code) from None
         if code in _RETRYABLE_HTTP:
             raise ResolverCallError("retryable", code) from None

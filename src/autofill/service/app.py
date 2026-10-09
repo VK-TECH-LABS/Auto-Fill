@@ -29,7 +29,15 @@ from autofill.service.context import (
     require_login_name,
     validate_application_url,
 )
-from autofill.service.runner import BrowserDisabled, FillRequest, FillRunner, PlaywrightRunner, elapsed_ms
+from autofill.service.runner import (
+    DEFAULT_LAUNCH_ARGS,
+    BrowserDisabled,
+    FillRequest,
+    FillRunner,
+    PageUnavailable,
+    PlaywrightRunner,
+    elapsed_ms,
+)
 from autofill.service.schemas import (
     CandidateCheckIn,
     ContinueIn,
@@ -165,6 +173,34 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     return _status_out(session)
 
 
+def _mark_browser_crash(session: ServiceSession) -> None:
+    """A dead tab is a retryable crash, not the status the run had before it died."""
+    session.status = Status.FAILED_RETRYABLE
+    if session.result is None:
+        session.result = ApplicationResult(
+            status=Status.FAILED_RETRYABLE,
+            ats=None,
+            current_step=Status.FAILED_RETRYABLE,
+            login_status="NOT_REQUIRED",
+            session_id=session.session_id,
+            candidate_id=session.candidate_id,
+            job_id=session.job_id,
+            messages=["browser_crash"],
+        )
+    else:
+        session.result.status = Status.FAILED_RETRYABLE
+        session.result.current_step = Status.FAILED_RETRYABLE
+        session.result.messages = ["browser_crash"]
+    logger.info("session=%s status=%s result=browser_crash", session.session_id, session.status)
+
+
+def _allow_browser_restart(session: ServiceSession) -> None:
+    """A crashed session can be started again from its URL, a bounded number of times."""
+    if session.browser_restarts >= 2:
+        raise HTTPException(status_code=409, detail="Browser crash retry limit reached.")
+    session.browser_restarts += 1
+
+
 def _failed(session: ServiceSession, exc: BaseException) -> RunStatusOut:
     logger.info("session=%s status=FAILED error_type=%s", session.session_id, type(exc).__name__)
     result = ApplicationResult(
@@ -291,13 +327,13 @@ def create_app(
     resolver_timeout_seconds: float = 5,
     resolver_retries: int = 2,
     resolver_max_bytes: int = 65536,
-    browser_workers: int = 4,
+    browser_workers: int = 2,
 ) -> FastAPI:
     """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
     expected = require_configured_token(token)
     install_redaction()
     store = ServiceSessionStore(max_sessions=max_sessions)
-    launch_args = ["--disable-dev-shm-usage"]
+    launch_args = list(DEFAULT_LAUNCH_ARGS)
     if browser_no_sandbox:
         launch_args.append("--no-sandbox")
     active_runner = (
@@ -434,6 +470,8 @@ def create_app(
             _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if session.status not in _STARTABLE:
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
+        if session.status == Status.FAILED_RETRYABLE:
+            _allow_browser_restart(session)
         return _run(session, store, active_runner, limits, resume_uploaded=False)
 
     @router.get("/sessions/{session_id}/status", response_model=RunStatusOut, tags=["sessions"])
@@ -445,11 +483,17 @@ def create_app(
         session = _session_or_404(session_id)
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if body.human_resolved:
+            if session.status == Status.FAILED_RETRYABLE:
+                _allow_browser_restart(session)
+                return _run(session, store, active_runner, limits, resume_uploaded=False)
             if session.status not in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}:
                 raise HTTPException(
                     status_code=409,
                     detail="humanResolved continues only after login, a challenge, or a missing form.",
                 )
+            return _run(session, store, active_runner, limits, resume_uploaded=False)
+        if session.status == Status.FAILED_RETRYABLE:
+            _allow_browser_restart(session)
             return _run(session, store, active_runner, limits, resume_uploaded=False)
         if session.status == Status.READY_FOR_HUMAN_SUBMIT:
             raise HTTPException(
@@ -508,7 +552,15 @@ def create_app(
     def session_screenshot(session_id: str) -> Response:
         session = _session_or_404(session_id)
         shot = getattr(active_runner, "screenshot", None)
-        image = shot(session_id) if shot is not None else None
+        try:
+            image = shot(session_id) if shot is not None else None
+        except PageUnavailable as exc:
+            _mark_browser_crash(session)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail="The page crashed.",
+                headers={"X-Autofill-Status": session.status},
+            ) from None
         if not image:
             raise HTTPException(status_code=409, detail="No page is open for this session.")
         payload, host = image
@@ -532,7 +584,15 @@ def create_app(
         _limit_interact(session)
         action = {"action": body.action, "x": body.x, "y": body.y, "text": body.text, "key": body.key, "dy": body.dy}
         apply = getattr(active_runner, "interact", None)
-        moved = apply(session_id, action) if apply is not None else False
+        try:
+            moved = apply(session_id, action) if apply is not None else False
+        except PageUnavailable as exc:
+            _mark_browser_crash(session)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail="The page crashed.",
+                headers={"X-Autofill-Status": session.status},
+            ) from None
         if not moved:
             raise HTTPException(status_code=409, detail="No page is open for this session.")
         session.screenshot_version += 1

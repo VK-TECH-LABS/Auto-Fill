@@ -592,7 +592,7 @@ _RESOLVER_STATUS = {
     "expired": Status.EXPIRED,
     "retryable": Status.FAILED_RETRYABLE,
     "invalid": Status.FAILED_FINAL,
-    "too_large": Status.FAILED_FINAL,
+        "too_large": Status.FAILED_RETRYABLE,
 }
 
 _VALIDATION = ("invalid phone", "valid date", "select one", "required")
@@ -618,6 +618,8 @@ def is_browser_crash(exc: BaseException) -> bool:
         "target page, context or browser has been closed",
         "connection closed",
         "has been closed",
+        "target crashed",
+        "page crashed",
     )
     return any(needle in text for needle in needles)
 

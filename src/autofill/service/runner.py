@@ -9,11 +9,13 @@ touched only on their worker thread. Passwords are not logged.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 from autofill.ats import is_blocked_sso, is_manual_ats
@@ -31,6 +33,89 @@ from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 
 _T = TypeVar("_T")
+
+DEFAULT_LAUNCH_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",
+]
+_MEMORY_LIMIT_BYTES = 768 * 1024 * 1024
+_BLOCKED_HOSTS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "segment.io",
+    "segment.com",
+    "hotjar.com",
+    "mixpanel.com",
+)
+
+
+class PageUnavailable(RuntimeError):
+    """The session page is missing or the tab crashed. ``status_code`` is 409 or 410."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__("page unavailable")
+        self.status_code = status_code
+
+
+def _rss_bytes() -> int:
+    """Resident memory of this process and its children. Zero when /proc is absent."""
+    root = Path("/proc")
+    if not root.is_dir():
+        return 0
+    seen: set[int] = set()
+    pending = [os.getpid()]
+    total = 0
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            status = (root / str(pid) / "status").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    total += int(parts[1]) * 1024
+                break
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            child = int(entry.name)
+            if child in seen:
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            end = stat.rfind(")")
+            fields = stat[end + 2 :].split() if end >= 0 else []
+            if len(fields) >= 2 and fields[1] == str(pid):
+                pending.append(child)
+    return total
+
+
+def _block_heavy(page) -> None:
+    """Drop video, fonts, and analytics. Documents, scripts, and form calls stay."""
+
+    def handle(route) -> None:
+        request = route.request
+        url = request.url.casefold()
+        if request.resource_type in {"media", "font"} or any(host in url for host in _BLOCKED_HOSTS):
+            route.abort()
+            return
+        route.continue_()
+
+    page.route("**/*", handle)
 
 
 def elapsed_ms(started: float) -> int:
@@ -139,6 +224,7 @@ class _SessionContext:
         self.context_ready_ms = elapsed_ms(started)
         try:
             page = context.new_page()
+            _block_heavy(page)
             page.goto(url)
         except BaseException:
             context.close()
@@ -244,13 +330,13 @@ class PlaywrightRunner:
         enabled: bool = True,
         headless: bool = True,
         launch_args: list[str] | None = None,
-        workers: int = 4,
+        workers: int = 2,
     ) -> None:
         if workers < 1:
             raise ValueError("workers must be at least 1.")
         self.enabled = enabled
         self.headless = headless
-        self.launch_args = list(launch_args or [])
+        self.launch_args = list(DEFAULT_LAUNCH_ARGS if launch_args is None else launch_args)
         self.workers = workers
         self._assign = threading.Lock()
         self._loads = [0 for _ in range(workers)]
@@ -373,6 +459,8 @@ class PlaywrightRunner:
             try:
                 slot = worker.sessions.get(request.session_id)
                 if slot is None or slot.page is None:
+                    if _rss_bytes() > _MEMORY_LIMIT_BYTES:
+                        return self._retryable(request, category="browser_crash")
                     slot = _SessionContext()
                     slot.open(worker.driver, request.application_url)
                     worker.sessions[request.session_id] = slot
@@ -383,7 +471,7 @@ class PlaywrightRunner:
                 if not is_browser_crash(exc) or attempts >= 1:
                     if is_browser_crash(exc):
                         worker._recover_driver()
-                        return self._retryable(request, category="browser_closed")
+                        return self._retryable(request, category="browser_crash")
                     raise
                 attempts += 1
                 worker._recover_driver()
@@ -419,8 +507,17 @@ class PlaywrightRunner:
                 return None
             from urllib.parse import urlparse
 
-            host = urlparse(slot.page.url).hostname or ""
-            image = slot.page.screenshot(type="jpeg", quality=60)
+            try:
+                host = urlparse(slot.page.url).hostname or ""
+                image = slot.page.screenshot(type="jpeg", quality=60)
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(session_id)
+                except Exception:
+                    worker.sessions.pop(session_id, None)
+                raise PageUnavailable(410) from None
             return image, host
 
         return worker.submit(take)
@@ -436,18 +533,27 @@ class PlaywrightRunner:
             if slot is None or slot.page is None:
                 return False
             page = slot.page
-            kind = action.get("action")
-            if kind == "click":
-                page.mouse.click(float(action["x"]), float(action["y"]))
-            elif kind == "type":
-                page.keyboard.type(str(action.get("text") or ""))
-            elif kind == "key":
-                key = str(action.get("key") or "")
-                page.keyboard.press(" " if key == "Space" else key)
-            elif kind == "scroll":
-                page.mouse.wheel(0, float(action.get("dy") or 0))
-            else:
-                return False
+            try:
+                kind = action.get("action")
+                if kind == "click":
+                    page.mouse.click(float(action["x"]), float(action["y"]))
+                elif kind == "type":
+                    page.keyboard.type(str(action.get("text") or ""))
+                elif kind == "key":
+                    key = str(action.get("key") or "")
+                    page.keyboard.press(" " if key == "Space" else key)
+                elif kind == "scroll":
+                    page.mouse.wheel(0, float(action.get("dy") or 0))
+                else:
+                    return False
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(session_id)
+                except Exception:
+                    worker.sessions.pop(session_id, None)
+                raise PageUnavailable(410) from None
             return True
 
         return worker.submit(apply)

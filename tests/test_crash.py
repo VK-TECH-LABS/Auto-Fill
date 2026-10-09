@@ -8,7 +8,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 from tests.helpers import empty_credentials, job_context
 
-from autofill.engine import ApplicationResult, Status
+from autofill.engine import ApplicationResult, Status, is_browser_crash
 from autofill.profile import CandidateProfile
 from autofill.service.runner import PlaywrightRunner
 
@@ -46,6 +46,11 @@ def _chromium_or_skip() -> None:
         pytest.skip(f"Chromium is not installed: {exc}")
 
 
+def test_target_crashed_is_a_browser_crash():
+    assert is_browser_crash(RuntimeError("Page.screenshot: Target crashed"))
+    assert is_browser_crash(RuntimeError("Target page, context or browser has been closed"))
+
+
 def test_closed_browser_relaunches_for_the_same_session(tmp_path):
     _chromium_or_skip()
     page = tmp_path / "one.html"
@@ -81,6 +86,7 @@ def test_repeated_browser_fault_keeps_one_session(monkeypatch):
         result = runner.run(_request("about:blank", session_id="sess-retry"))
         assert isinstance(result, ApplicationResult)
         assert result.status == Status.FAILED_RETRYABLE
+        assert result.messages == ["browser_crash"]
         assert result.session_id == "sess-retry"
         assert calls == ["sess-retry", "sess-retry"]
         assert len(runner._sessions) <= 1

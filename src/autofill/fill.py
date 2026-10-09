@@ -16,7 +16,7 @@ from autofill.extract import extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
 from autofill.profile import CandidateProfile
-from autofill.safeguards import activate, choose_option, classify_control, is_add_row
+from autofill.safeguards import activate, classify_control, is_add_row
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -95,8 +95,17 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
         if mapped.action == "select":
             if control.kind == "radio":
                 page.locator(mapped.option_selector).check()
-            elif control.kind == "combobox" and mapped.option_selector:
-                choose_option(page, control.selector, mapped.option_selector, mapped.option_label)
+            elif control.kind == "combobox":
+                from autofill.combobox import select_combobox
+
+                chosen = select_combobox(page, control.selector, mapped.option_label or mapped.text)
+                if chosen is None:
+                    return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
+                return _outcome(control, mapped, detail=chosen.label)
+            elif control.kind == "buttons" and mapped.option_selector:
+                from autofill.safeguards import click_choice
+
+                click_choice(page, mapped.option_selector, mapped.option_label)
             elif mapped.option_value:
                 locator.select_option(value=mapped.option_value)
             else:

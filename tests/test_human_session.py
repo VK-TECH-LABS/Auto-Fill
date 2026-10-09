@@ -278,3 +278,56 @@ def test_live_screenshot_and_human_click_can_reach_submit(tmp_path):
     finally:
         server.shutdown()
         runner.shutdown()
+
+
+def test_crashed_page_is_retryable_and_can_restart(tmp_path):
+    _chromium_or_skip()
+    handler = partial(SimpleHTTPRequestHandler, directory=str(FIXTURES))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    origin = f"http://{host}:{port}"
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    app = create_app(token=TOKEN, runner=runner, run_browser=True)
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/v1/sessions",
+                headers=AUTH,
+                json=_profile_body(f"{origin}/job_description_apply.html"),
+            )
+            session_id = created.json()["sessionId"]
+            started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+            assert started.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+
+            def crash_shot() -> None:
+                page = runner._sessions[session_id].page
+
+                def boom(*_args, **_kwargs):
+                    raise RuntimeError("Page.screenshot: Target crashed")
+
+                page.screenshot = boom
+
+            runner._submit(crash_shot, session_id)
+            shot = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
+            assert shot.status_code in {409, 410}
+            assert shot.status_code != 500
+            assert shot.headers["x-autofill-status"] == Status.FAILED_RETRYABLE
+            status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+            assert status.json()["status"] == Status.FAILED_RETRYABLE
+            assert "browser_crash" in status.json()["messages"]
+            restarted = client.post(
+                f"/v1/sessions/{session_id}/continue",
+                headers=AUTH,
+                json={"candidateId": "ref-a", "humanResolved": True},
+            )
+            assert restarted.status_code == 200, restarted.text
+            assert restarted.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+            runner._submit(lambda: runner._sessions[session_id].page.close(), session_id)
+            closed = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
+            assert closed.status_code == 410
+            assert closed.headers["x-autofill-status"] == Status.FAILED_RETRYABLE
+    finally:
+        server.shutdown()
+        runner.shutdown()

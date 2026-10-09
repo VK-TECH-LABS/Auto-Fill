@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Questions</title></head>
+<body>
+  <h1>Questions</h1>
+  <label for="phone">Phone country</label>
+  <input id="phone" role="combobox" aria-controls="phone-list" aria-label="Phone country">
+  <ul id="phone-list" role="listbox">
+    <li id="country-us" role="option">United States</li>
+    <li id="country-ca" role="option">Canada</li>
+  </ul>
+  <label for="relocate">Are you willing to relocate?</label>
+  <div class="select" id="relocate-box">
+    <div class="select__control">
+      <input id="relocate" class="select__input" role="combobox" required aria-label="Are you willing to relocate?">
+    </div>
+  </div>
+  <label for="desk">Preferred desk?</label>
+  <div class="select" id="desk-box">
+    <div class="select__control">
+      <input id="desk" class="select__input" role="combobox" required aria-label="Preferred desk?">
+    </div>
+  </div>
+  <script>
+    window.__picked = [];
+    function menu(input, options) {
+      input.addEventListener("click", () => {
+        const existing = document.getElementById(input.id + "-list");
+        if (existing) existing.remove();
+        const list = document.createElement("ul");
+        list.id = input.id + "-list";
+        list.setAttribute("role", "listbox");
+        input.setAttribute("aria-controls", list.id);
+        for (const [id, label] of options) {
+          const item = document.createElement("li");
+          item.id = id;
+          item.setAttribute("role", "option");
+          item.textContent = label;
+          item.addEventListener("click", () => {
+            window.__picked.push(id);
+            list.remove();
+          });
+          list.appendChild(item);
+        }
+        input.closest(".select").appendChild(list);
+      });
+    }
+    menu(document.getElementById("relocate"), [["relocate-yes", "Yes"], ["relocate-no", "No"]]);
+    menu(document.getElementById("desk"), [["desk-window", "Window"], ["desk-aisle", "Aisle"]]);
+  </script>
+</body>
+</html>
