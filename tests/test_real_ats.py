@@ -14,6 +14,7 @@ from playwright.sync_api import sync_playwright
 from autofill import AutofillOptions, Status, autofill_application
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
+from autofill.service.context import placeholder_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
 EMAIL = "river.example@example.com"
@@ -44,11 +45,11 @@ def browser():
         pytest.skip(f"Chromium is not installed: {exc}")
 
 
-def _run(page, url: str, **options):
+def _run(page, url: str, *, profile: CandidateProfile | None = None, **options):
     timings: dict[str, int] = {}
     result = autofill_application(
         url,
-        _profile(),
+        profile or _profile(),
         None,
         AutofillOptions(page=page, session_id="sess-ats", candidate_id="ref-a", timings=timings, **options),
     )
@@ -201,14 +202,15 @@ def resolver():
             server.calls.append(body)
             custom_fields = getattr(server, "custom_fields", None)
             if server.mode == "resume":
-                fields = {
-                    "resume.file": {
-                        "url": server.resume_url,  # type: ignore[attr-defined]
-                        "filename": "Granted_Resume.pdf",
-                        "contentType": "application/pdf",
-                        "expiresAt": _future(),
-                    }
+                grant_name = getattr(server, "resume_filename", "Granted_Resume.pdf")
+                descriptor = {
+                    "url": server.resume_url,  # type: ignore[attr-defined]
+                    "contentType": "application/pdf",
+                    "expiresAt": _future(),
                 }
+                if isinstance(grant_name, str):
+                    descriptor["filename"] = grant_name
+                fields = {"resume.file": descriptor}
             elif server.mode == "file":
                 fields = {"resume.file": {"url": "file:///tmp/resume.pdf", "filename": "resume.pdf"}}
             elif isinstance(custom_fields, dict):
@@ -933,5 +935,87 @@ def test_upload_error_still_blocks_when_success_is_shown(browser, resolver, file
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert "failed to upload" in page.locator("#toast").inner_text().lower()
+    finally:
+        page.close()
+
+
+def _uploaded_bytes(page) -> bytes:
+    values = page.locator("#resume").evaluate(
+        """async (el) => {
+          const file = el.files && el.files[0];
+          if (!file) return [];
+          const buf = await file.arrayBuffer();
+          return Array.from(new Uint8Array(buf));
+        }"""
+    )
+    return bytes(values)
+
+
+def _placeholder_application() -> str:
+    return (
+        "<h1>Application</h1>"
+        "<label for='name'>Full name</label><input id='name' name='name'>"
+        "<label for='email'>Email</label><input id='email' type='email' name='email'>"
+        "<div id='resume-field'><label for='resume'>Resume</label>"
+        "<input id='resume' type='file' name='resume'>"
+        "<div id='resume-name'></div></div>"
+        "<script>document.getElementById('resume').addEventListener('change', () => {"
+        "const file = document.getElementById('resume').files[0];"
+        "document.getElementById('resume-name').textContent = file ? file.name : '';"
+        "});</script>"
+    )
+
+
+def _assert_placeholder_stayed_off_the_page(page, result) -> None:
+    assert page.locator("#name").input_value() == ""
+    assert page.locator("#email").input_value() == ""
+    published = json.dumps(result.to_dict())
+    assert "Synthetic Candidate" not in published
+    assert "synthetic@example.com" not in published
+    visible = page.locator("body").inner_text()
+    assert "Synthetic Candidate" not in visible
+    assert "synthetic@example.com" not in visible
+
+
+def test_resolver_upload_uses_the_grant_not_the_placeholder_profile(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    server.resume_filename = "First_Last_Resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_placeholder_application())
+        result, _timings = _run(
+            page,
+            "https://jobs.ashbyhq.com/example/role",
+            profile=placeholder_profile("ref-a"),
+            resolver=_binding(url),
+        )
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "First_Last_Resume.pdf"
+        assert _uploaded_bytes(page) == PDF
+        _assert_placeholder_stayed_off_the_page(page, result)
+    finally:
+        page.close()
+
+
+def test_missing_grant_filename_uses_resume_pdf_not_the_placeholder(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    server.resume_filename = ""  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_placeholder_application())
+        result, _timings = _run(
+            page,
+            "https://jobs.ashbyhq.com/example/role",
+            profile=placeholder_profile("ref-a"),
+            resolver=_binding(url),
+        )
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Resume.pdf"
+        assert _uploaded_bytes(page) == PDF
+        _assert_placeholder_stayed_off_the_page(page, result)
     finally:
         page.close()

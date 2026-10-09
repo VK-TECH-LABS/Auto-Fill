@@ -18,6 +18,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024
+NEUTRAL_RESUME_NAME = "Resume.pdf"
+_RESUME_SUFFIXES = (".pdf", ".doc", ".docx")
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -30,22 +32,27 @@ class ResumeFetchError(RuntimeError):
 
 
 def sanitized_resume_name(filename: str) -> str:
-    """The grant's basename, with characters a file input cannot safely carry removed.
+    """Basename only, and only when it ends in ``.pdf``, ``.doc``, or ``.docx``.
 
-    An empty result means Vinayaka did not provide a usable name. Callers must
-    not replace that with a generated name.
+    An empty result means the grant did not include a usable name. It is not a
+    name built from a profile.
     """
     base = Path(str(filename or "")).name
     cleaned = _NAME_RE.sub("-", base).strip(".-")
-    if not cleaned:
+    if not cleaned or not cleaned.lower().endswith(_RESUME_SUFFIXES):
         return ""
     if len(cleaned) <= 80:
         return cleaned
     suffix = Path(cleaned).suffix[:8]
     stem = cleaned[: 80 - len(suffix)].strip(".-")
-    if not stem:
+    if not stem or not f"{stem}{suffix}".lower().endswith(_RESUME_SUFFIXES):
         return ""
-    return f"{stem}{suffix}" if suffix else stem[:80]
+    return f"{stem}{suffix}"
+
+
+def resume_filename(filename: str) -> str:
+    """The grant filename, or ``Resume.pdf`` when the grant did not name a document."""
+    return sanitized_resume_name(filename) or NEUTRAL_RESUME_NAME
 
 
 @dataclass(frozen=True)
@@ -85,9 +92,7 @@ def _download(descriptor: dict, *, timeout: float) -> tuple[bytes, str, str]:
     url = descriptor.get("url") if isinstance(descriptor, dict) else None
     if not isinstance(url, str):
         raise ResumeFetchError("invalid")
-    filename = sanitized_resume_name(str(descriptor.get("filename") or ""))
-    if not filename:
-        raise ResumeFetchError("invalid")
+    filename = resume_filename(str(descriptor.get("filename") or ""))
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ResumeFetchError("invalid")

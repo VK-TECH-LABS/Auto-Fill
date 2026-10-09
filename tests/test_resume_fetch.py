@@ -6,30 +6,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from autofill.models import Control, Option, PageSnapshot
 from autofill.resolver import _resume_descriptor
-from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload, sanitized_resume_name
+from autofill.resume_fetch import fetch_resume_payload, resume_filename, sanitized_resume_name
 from autofill.stepfill import _clusters, _compose_location, _describe, _question_text, choose_location_label
 
 _PDF = b"%PDF-1.1\ngrant-bytes\n%%EOF\n"
 
 
-def test_grant_filename_is_sanitized_and_not_replaced():
-    assert sanitized_resume_name("Granted_Resume.pdf") == "Granted_Resume.pdf"
-    assert sanitized_resume_name("../../Granted_Resume.pdf") == "Granted_Resume.pdf"
-    assert sanitized_resume_name("My Resume.pdf") == "My-Resume.pdf"
+def test_grant_filename_is_sanitized_and_not_taken_from_a_profile():
+    assert sanitized_resume_name("First_Last_Resume.pdf") == "First_Last_Resume.pdf"
+    assert sanitized_resume_name("../../First_Last_Resume.pdf") == "First_Last_Resume.pdf"
+    assert sanitized_resume_name("My Resume.docx") == "My-Resume.docx"
+    assert sanitized_resume_name("letter.DOC") == "letter.DOC"
     assert sanitized_resume_name("") == ""
-    assert sanitized_resume_name("Synthetic Candidate") == "Synthetic-Candidate"
-    assert sanitized_resume_name("Synthetic Candidate") != "Synthetic_Candidate_Resume.pdf"
-    assert _resume_descriptor({"url": "https://files.example/resume", "filename": ""}) is None
-    assert _resume_descriptor({"url": "https://files.example/resume"}) is None
+    assert sanitized_resume_name("Synthetic Candidate") == ""
+    assert sanitized_resume_name("notes.txt") == ""
+    assert resume_filename("") == "Resume.pdf"
+    assert resume_filename("Synthetic Candidate") == "Resume.pdf"
+    assert resume_filename("Synthetic_Candidate_Resume.pdf") == "Synthetic_Candidate_Resume.pdf"
+    unnamed = _resume_descriptor({"url": "https://files.example/resume", "filename": ""})
+    assert unnamed is not None and unnamed["filename"] == "Resume.pdf"
+    missing = _resume_descriptor({"url": "https://files.example/resume"})
+    assert missing is not None and missing["filename"] == "Resume.pdf"
     kept = _resume_descriptor(
         {
             "url": "https://files.example/resume",
-            "filename": "Granted_Resume.pdf",
+            "filename": "First_Last_Resume.pdf",
             "contentType": "application/pdf",
         }
     )
     assert kept is not None
-    assert kept["filename"] == "Granted_Resume.pdf"
+    assert kept["filename"] == "First_Last_Resume.pdf"
 
 
 def test_payload_is_the_grant_bytes_under_the_grant_name():
@@ -48,29 +54,31 @@ def test_payload_is_the_grant_bytes_under_the_grant_name():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
+    expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     try:
         payload = fetch_resume_payload(
             {
                 "url": f"http://{host}:{port}/granted",
                 "filename": "Granted_Resume.pdf",
                 "contentType": "application/pdf",
-                "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "expiresAt": expires,
+            }
+        )
+        neutral = fetch_resume_payload(
+            {
+                "url": f"http://{host}:{port}/granted",
+                "filename": "",
+                "contentType": "application/pdf",
+                "expiresAt": expires,
             }
         )
     finally:
         server.shutdown()
     assert payload.data == _PDF
     assert payload.name == "Granted_Resume.pdf"
-    assert "Synthetic" not in payload.name
-
-
-def test_missing_filename_is_not_replaced_with_a_document():
-    try:
-        fetch_resume_payload({"url": "https://files.example/granted", "filename": ""})
-    except ResumeFetchError as exc:
-        assert exc.code == "invalid"
-    else:
-        raise AssertionError("a missing filename must not invent a resume")
+    assert neutral.data == _PDF
+    assert neutral.name == "Resume.pdf"
+    assert "Synthetic" not in neutral.name
 
 
 def test_fieldset_and_shared_name_checkboxes_are_one_question():

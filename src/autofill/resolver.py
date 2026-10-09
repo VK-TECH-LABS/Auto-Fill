@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from autofill.resume_fetch import sanitized_resume_name
+from autofill.resume_fetch import resume_filename
 
 logger = logging.getLogger("autofill.resolver")
 
@@ -397,12 +397,8 @@ def _resume_descriptor(value: Any) -> dict[str, str] | None:
     url = value.get("url")
     if not isinstance(url, str) or len(url) > 2048 or not url.startswith(("http://", "https://")):
         return None
-    filename = value.get("filename")
-    if not isinstance(filename, str):
-        return None
-    safe_name = sanitized_resume_name(filename)
-    if not safe_name:
-        return None
+    raw_name = value.get("filename")
+    safe_name = resume_filename(raw_name if isinstance(raw_name, str) else "")
     content_type = value.get("contentType")
     expires = value.get("expiresAt")
     return {
