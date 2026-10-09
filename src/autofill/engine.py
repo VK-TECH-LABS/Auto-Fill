@@ -18,7 +18,7 @@ from typing import Any
 from autofill.adapters import adapter_for, page_step
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats, site_domain
 from autofill.credentials import CredentialProvider, SiteContext
-from autofill.extract import extract_page
+from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
 from autofill.models import FillResult, JobContext
@@ -245,7 +245,7 @@ def autofill_application(
                 status=Status.CAPTCHA_REQUIRED,
                 ats=ats_name,
                 login_status="NOT_REQUIRED",
-                messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                messages=[challenge_message(snapshot)],
             )
         snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
         if snapshot.captcha_present:
@@ -255,7 +255,7 @@ def autofill_application(
                 status=Status.CAPTCHA_REQUIRED,
                 ats=ats_name,
                 login_status="NOT_REQUIRED",
-                messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                messages=[challenge_message(snapshot)],
             )
         if not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
@@ -367,7 +367,7 @@ def autofill_application(
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                    messages=[challenge_message(snapshot)],
                     submit_controls=submit_controls,
                 )
             snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
@@ -383,7 +383,7 @@ def autofill_application(
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                    messages=[challenge_message(snapshot)],
                     submit_controls=submit_controls,
                 )
             if not visible_fields(snapshot) and not is_review(snapshot):
@@ -736,14 +736,14 @@ def _run_resolver_pages(
             session.mark("FAILED")
             return finish(
                 Status.CAPTCHA_REQUIRED,
-                ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                [challenge_message(snapshot)],
             )
         snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
         if snapshot.captcha_present:
             session.mark("FAILED")
             return finish(
                 Status.CAPTCHA_REQUIRED,
-                ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                [challenge_message(snapshot)],
             )
         if not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
@@ -836,7 +836,7 @@ def _run_resolver_pages(
                 session.mark("FAILED")
                 return finish(
                     Status.CAPTCHA_REQUIRED,
-                    ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                    [challenge_message(snapshot)],
                 )
             if not _validation_hit(snapshot):
                 break

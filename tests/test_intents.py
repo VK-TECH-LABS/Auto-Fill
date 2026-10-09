@@ -10,6 +10,7 @@ from autofill.intents import (
     classify_question,
     combine_authorized_without,
     combine_yes_if_either,
+    dedupe_label,
     match_all_options,
     may_fill,
     options_equivalent,
@@ -50,6 +51,33 @@ _MATRIX = [
     ("Employment type", "EMPLOYMENT_TYPE", "short"),
     ("When is your earliest start date?", "START_DATE", "exact"),
     ("Have you previously been employed here?", "PREVIOUSLY_EMPLOYED", "exact"),
+    (
+        "Will you now or in the future require sponsorship for a visa to remain in your country?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "greenhouse-country",
+    ),
+    (
+        "Will you now or in the future require sponsorship for employment visa status?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "lever-visa-status",
+    ),
+    (
+        "Will you now or in the future require visa sponsorship?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "visa-sponsorship",
+    ),
+    (
+        "Do you now or will you in the future require sponsorship to work in the United States?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "ashby-united-states",
+    ),
+    (
+        "Will you require sponsorship for a visa to remain in the United States?",
+        "SPONSORSHIP_NOW",
+        "remain-us",
+    ),
+    ("Will you require a visa to remain in the US?", "SPONSORSHIP_NOW", "visa-remain-us"),
+    ("Do you need sponsorship for a visa?", "SPONSORSHIP_NOW", "sponsorship-for-a-visa"),
 ]
 
 
@@ -238,3 +266,15 @@ def test_option_mapping_is_exact_or_equivalent():
     assert match_all_options(["Day", "Graveyard"], [Option("Day", "Day"), Option("Night", "Night")]) is None
     assert match_all_options(["49%"], options) is None
     assert match_all_options(["50%"], options) is not None
+
+
+def test_repeated_labels_keep_one_copy_and_drop_a_trailing_star():
+    assert dedupe_label("Gender Gender") == "Gender"
+    assert dedupe_label("Question?* Question?") == "Question?"
+    assert dedupe_label("Gender*") == "Gender"
+    assert dedupe_label("What is your favorite prime number?") == "What is your favorite prime number?"
+    citizen = classify_question("Are you a Singapore citizen?", ["Yes", "No"])
+    assert citizen.intent is None
+    without = classify_question("Are you authorized to work without sponsorship?", ["Yes", "No"])
+    assert without.intent == "AUTHORIZED_WITHOUT_SPONSORSHIP"
+    assert without.confidence == "HIGH"

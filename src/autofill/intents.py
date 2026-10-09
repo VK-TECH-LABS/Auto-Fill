@@ -8,6 +8,7 @@ option labels, and the intent catalogue, and it may return an intent only.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -250,6 +251,17 @@ class IntentMatch:
 
 _NOW_RE = re.compile(r"\b(?:now|currently)\b")
 _FUTURE_RE = re.compile(r"\bfuture\b")
+_VISA_SPONSOR_RE = re.compile(
+    r"\bvisa sponsorship\b"
+    r"|\bsponsorship for (?:a |an )?(?:employment )?visa\b"
+    r"|\bemployment visa status\b"
+)
+_REMAIN_RE = re.compile(
+    r"\b(?:visa|sponsorship|sponsor)\b(?:\s+\w+){0,10}\s+"
+    r"remain in (?:your country|the (?:us|united states)|this country)\b"
+    r"|\bremain in (?:your country|the (?:us|united states)|this country)\b"
+    r"(?:\s+\w+){0,10}\s+(?:visa|sponsorship|sponsor)\b"
+)
 _WITHOUT_SPONSOR_RE = re.compile(
     r"\bwithout\b(?:\s+\w+){0,6}\s+sponsorship\b"
     r"|\bno\s+(?:visa\s+)?sponsorship\b"
@@ -272,6 +284,38 @@ def normalize_question(text: str) -> str:
     return re.sub(r"\s+", " ", folded).strip()
 
 
+def question_hash(text: str) -> str:
+    """Stable id for an unknown question: sha256 of its normalized text."""
+    normalized = normalize_question(sanitize_question(text))
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def dedupe_label(text: str) -> str:
+    """Keep one copy when a label repeats its accessible name, and drop a trailing star."""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    words = cleaned.split(" ") if cleaned else []
+    for count in range(1, len(words)):
+        left = _strip_star(" ".join(words[:count]))
+        right = _strip_star(" ".join(words[count:]))
+        left_folded = left.casefold()
+        right_folded = right.casefold()
+        if not left_folded or not right_folded:
+            continue
+        if left_folded == right_folded:
+            return left
+        if len(right_folded) >= 3 and right_folded in left_folded:
+            return left
+        if len(left_folded) >= 3 and left_folded in right_folded:
+            return right
+    return _strip_star(cleaned)
+
+
+def _strip_star(text: str) -> str:
+    return re.sub(r"[\s*✱＊]+$", "", text).strip()
+
+
 def sanitize_question(text: str, *, limit: int = 300) -> str:
     """Question text safe to send onward: no emails, no phone numbers, bounded."""
     cleaned = _EMAIL_RE.sub(" ", text)
@@ -287,23 +331,32 @@ def _tokens(text: str) -> set[str]:
     return {token for token in normalize_question(text).split() if token not in _STOP and len(token) > 1}
 
 
+def _sponsorship_signal(folded: str) -> bool:
+    if "sponsorship" in folded or re.search(r"\bsponsor\b", folded):
+        return True
+    return _VISA_SPONSOR_RE.search(folded) is not None or _REMAIN_RE.search(folded) is not None
+
+
 def _compound_intent(folded: str) -> str | None:
     """Compound legal questions before a shorter phrase can claim them.
 
     "Now or in the future" is not the same fact as sponsorship now. "Authorized
-    to work without sponsorship" is not work authorization alone.
+    to work without sponsorship" is not work authorization alone. "Sponsorship
+    for a visa" and "remain in your country" are sponsorship, not a missing intent.
     """
-    if "sponsorship" not in folded:
+    if not _sponsorship_signal(folded):
         return None
     if _WITHOUT_SPONSOR_RE.search(folded):
         return "AUTHORIZED_WITHOUT_SPONSORSHIP"
-    now = _NOW_RE.search(folded) is not None
-    future = _FUTURE_RE.search(folded) is not None
+    now = _NOW_RE.search(folded) is not None or "now or in the future" in folded
+    future = _FUTURE_RE.search(folded) is not None or "now or in the future" in folded
     if now and future:
         return "SPONSORSHIP_NOW_OR_FUTURE"
     if future:
         return "SPONSORSHIP_FUTURE"
     if now:
+        return "SPONSORSHIP_NOW"
+    if _VISA_SPONSOR_RE.search(folded) or _REMAIN_RE.search(folded):
         return "SPONSORSHIP_NOW"
     return None
 

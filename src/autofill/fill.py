@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
-from autofill.extract import extract_page
+from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
 from autofill.profile import CandidateProfile
@@ -260,7 +260,7 @@ def _fill_pages(
         seen_pages.add(visible_key)
 
         if snapshot.captcha_present:
-            messages.append("CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs.")
+            messages.append(challenge_message(snapshot))
             break
 
         if snapshot.password_present:

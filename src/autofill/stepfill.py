@@ -22,10 +22,12 @@ from autofill.intents import (
     classify_question,
     combine_authorized_without,
     combine_yes_if_either,
+    dedupe_label,
     match_all_options,
     match_option_exact,
     may_fill,
     normalize_question,
+    question_hash,
     sanitize_question,
 )
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
@@ -743,7 +745,7 @@ def _apply(
     outcome: ResolvedPage,
     heading: str,
 ) -> None:
-    by_intent, unnamed, by_text = _index_answers(response)
+    by_intent, unnamed, by_key = _index_answers(response)
     employment_rows = _rows(response.fields.get("employment[]"))
     education_rows = _rows(response.fields.get("education[]"))
     project_rows = _rows(response.fields.get("projects[]"))
@@ -760,7 +762,7 @@ def _apply(
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-            answer = _take_answer(match, by_intent, unnamed, by_text)
+            answer = _take_answer(match, by_intent, unnamed, by_key)
             _apply_question(page, ask, answer, outcome)
             continue
         if not ask.field_key:
@@ -1289,37 +1291,63 @@ def _drop_emitted_options(outcome: ResolvedPage) -> None:
     ]
 
 
+def _lookup_keys(text: str, question_id: str = "") -> list[str]:
+    """Normalized text, the question hash, and an echoed id all name one question."""
+    keys: list[str] = []
+    normalized = normalize_question(text)
+    if normalized:
+        keys.append(normalized)
+    digest = question_hash(text) if text else ""
+    if digest:
+        keys.append(digest)
+    token = text.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", token):
+        keys.append(token)
+    qid = question_id.strip().lower()
+    if qid:
+        keys.append(qid)
+    unique: list[str] = []
+    for key in keys:
+        if key not in unique:
+            unique.append(key)
+    return unique
+
+
 def _index_answers(
     response: ResolverResponse,
 ) -> tuple[dict[str, ResolverAnswer], list[ResolverAnswer], dict[str, ResolverAnswer]]:
-    """Known intents by name. Unknown answers pair by question text, then order."""
+    """Known intents by name. Unknown answers pair by text, id, or hash."""
     by_intent: dict[str, ResolverAnswer] = {}
     unnamed: list[ResolverAnswer] = []
-    by_text: dict[str, ResolverAnswer] = {}
+    by_key: dict[str, ResolverAnswer] = {}
     for item in response.answers:
         if item.intent:
             by_intent.setdefault(item.intent, item)
             continue
         unnamed.append(item)
-        if item.text:
-            by_text.setdefault(normalize_question(item.text), item)
-    return by_intent, unnamed, by_text
+        for key in _lookup_keys(item.text, item.question_id):
+            by_key.setdefault(key, item)
+    return by_intent, unnamed, by_key
 
 
 def _take_answer(
     match: IntentMatch,
     by_intent: dict[str, ResolverAnswer],
     unnamed: list[ResolverAnswer],
-    by_text: dict[str, ResolverAnswer],
+    by_key: dict[str, ResolverAnswer],
 ) -> ResolverAnswer | None:
     if match.intent:
         return by_intent.get(match.intent)
-    found = by_text.get(normalize_question(match.text))
-    if found is not None and found in unnamed:
+    for key in _lookup_keys(match.text):
+        found = by_key.get(key)
+        if found is not None and found in unnamed:
+            unnamed.remove(found)
+            return found
+    loose = [item for item in unnamed if not _lookup_keys(item.text, item.question_id)]
+    if loose:
+        found = loose[0]
         unnamed.remove(found)
         return found
-    if unnamed:
-        return unnamed.pop(0)
     return None
 
 
@@ -1473,7 +1501,7 @@ def _matches_option(text: str, controls: list[Control]) -> bool:
 
 
 def _usable_question(text: str, controls: list[Control]) -> str:
-    cleaned = _clean_prompt(text)
+    cleaned = dedupe_label(_clean_prompt(text))
     if not cleaned or _matches_option(cleaned, controls) or _is_section_heading(cleaned):
         return ""
     return cleaned

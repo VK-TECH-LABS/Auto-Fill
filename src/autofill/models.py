@@ -55,6 +55,7 @@ class PageSnapshot:
     controls: list[Control]
     buttons: list[ButtonControl]
     captcha_present: bool = False
+    bot_wall: bool = False
     password_present: bool = False
     heading: str = ""
     banner: str = ""

@@ -125,6 +125,51 @@ EXTRACT_JS = r"""
     return "";
   }
 
+  function stripStar(text) {
+    return cleanPrompt(text).replace(/[\s*✱＊]+$/g, "").trim();
+  }
+
+  function dedupeBits(bits) {
+    const kept = [];
+    for (const bit of bits) {
+      const text = cleanPrompt(bit);
+      const folded = stripStar(text).toLowerCase();
+      if (!folded) continue;
+      let skip = false;
+      for (let index = 0; index < kept.length; index += 1) {
+        const other = stripStar(kept[index]).toLowerCase();
+        if (!other) continue;
+        if (other === folded || (folded.length >= 3 && other.indexOf(folded) !== -1)) {
+          skip = true;
+          break;
+        }
+        if (other.length >= 3 && folded.indexOf(other) !== -1) {
+          kept[index] = stripStar(text);
+          skip = true;
+          break;
+        }
+      }
+      if (!skip) kept.push(stripStar(text));
+    }
+    return collapseRepeated(kept.join(" "));
+  }
+
+  function collapseRepeated(text) {
+    const cleaned = (text || "").replace(/\s+/g, " ").trim();
+    const words = cleaned ? cleaned.split(" ") : [];
+    for (let count = 1; count < words.length; count += 1) {
+      const left = stripStar(words.slice(0, count).join(" "));
+      const right = stripStar(words.slice(count).join(" "));
+      const leftFolded = left.toLowerCase();
+      const rightFolded = right.toLowerCase();
+      if (!leftFolded || !rightFolded) continue;
+      if (leftFolded === rightFolded) return left;
+      if (rightFolded.length >= 3 && leftFolded.indexOf(rightFolded) !== -1) return left;
+      if (leftFolded.length >= 3 && rightFolded.indexOf(leftFolded) !== -1) return right;
+    }
+    return stripStar(cleaned);
+  }
+
   function labelFor(root, el) {
     const bits = [];
     if (el.id) {
@@ -181,7 +226,7 @@ EXTRACT_JS = r"""
         }
       }
     }
-    return bits.join(" ").replace(/\s+/g, " ").trim();
+    return dedupeBits(bits);
   }
 
   function selectorFor(el) {
@@ -568,17 +613,21 @@ EXTRACT_JS = r"""
   }
 
   let captcha = false;
+  let botWall = false;
   const wallText = (document.body ? document.body.innerText : "").slice(0, 5000).toLowerCase();
-  if (
-    wallText.indexOf("datadome") !== -1 ||
-    wallText.indexOf("captcha-delivery") !== -1 ||
-    wallText.indexOf("checking your browser") !== -1 ||
-    wallText.indexOf("just a moment") !== -1 ||
-    wallText.indexOf("perimeterx") !== -1 ||
-    wallText.indexOf("px-captcha") !== -1
-  ) {
-    captcha = true;
+  const wallPhrases = [
+    "access is temporarily restricted",
+    "datadome",
+    "captcha-delivery",
+    "checking your browser",
+    "just a moment",
+    "perimeterx",
+    "px-captcha",
+  ];
+  for (const phrase of wallPhrases) {
+    if (wallText.indexOf(phrase) !== -1) botWall = true;
   }
+  if (botWall) captcha = true;
   const challengeSelector = [
     ".h-captcha",
     ".g-recaptcha",
@@ -619,7 +668,7 @@ EXTRACT_JS = r"""
       }
     }
   });
-  return { controls, buttons, captcha, password, heading, banner, alerts };
+  return { controls, buttons, captcha, botWall, password, heading, banner, alerts };
 }
 """
 
@@ -671,11 +720,19 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         controls=controls,
         buttons=buttons,
         captcha_present=bool(data.get("captcha", False)),
+        bot_wall=bool(data.get("botWall", False)),
         password_present=bool(data.get("password", False)),
         heading=str(data.get("heading", "")),
         banner=str(data.get("banner", "")),
         alerts=[str(item) for item in data.get("alerts", []) if str(item).strip()],
     )
+
+
+def challenge_message(snapshot: PageSnapshot) -> str:
+    """A bot wall names the block. A visible widget keeps the CAPTCHA message."""
+    if snapshot.bot_wall:
+        return "site blocked automated access"
+    return "CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."
 
 
 def extract_page(page) -> PageSnapshot:

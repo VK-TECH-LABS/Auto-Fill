@@ -8,7 +8,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from autofill.resolver import ResolverBinding, ResolverCallError, resolve_step
+from autofill.intents import IntentMatch, question_hash
+from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverCallError, ResolverResponse, resolve_step
+from autofill.stepfill import _index_answers, _take_answer
 
 TOKEN = "synthetic-resolver-token-0123456789abcdef"
 
@@ -250,3 +252,43 @@ def test_question_text_and_options_are_bounded(resolver_url):
     question = server.calls[0]["body"]["questions"][0]
     assert len(question["text"]) == 300
     assert question["options"] == []
+    assert question["id"] == question_hash(question["text"])
+
+
+def test_unknown_answer_keyed_by_hash_is_kept(resolver_url):
+    server, url = resolver_url
+    text = "Are you a Singapore citizen?"
+    digest = question_hash(text)
+    server.payload = {
+        "fields": {},
+        "answers": [
+            {
+                "intent": digest,
+                "value": "No",
+                "confidence": "HIGH",
+                "source": "saved_answer",
+            },
+            {"intent": "NOT_A_REQUEST", "value": "Yes", "confidence": "HIGH", "source": "saved_answer"},
+        ],
+        "unresolved": [],
+    }
+    result = resolve_step(
+        _binding(url),
+        session_id="sess",
+        step="questions",
+        fields=[],
+        questions=[{"intent": None, "text": text, "options": ["Yes", "No"], "control": "radio"}],
+    )
+    assert len(result.answers) == 1
+    answer = result.answers[0]
+    assert answer.intent is None
+    assert answer.question_id == digest
+    assert answer.value == "No"
+    by_intent, unnamed, by_key = _index_answers(result)
+    taken = _take_answer(IntentMatch(None, "unknown", "none", text), by_intent, unnamed, by_key)
+    assert taken is not None and taken.value == "No"
+    normalized = ResolverAnswer(intent=None, value="No", confidence="HIGH", source="saved_answer", text=text.casefold())
+    response = ResolverResponse(answers=[normalized])
+    by_intent, unnamed, by_key = _index_answers(response)
+    taken = _take_answer(IntentMatch(None, "unknown", "none", text), by_intent, unnamed, by_key)
+    assert taken is normalized
