@@ -50,6 +50,11 @@ EXTRACT_JS = r"""
     return (text || "").replace(/[^A-Za-z]/g, "");
   }
 
+  function isPlaceholderPrompt(text) {
+    const folded = cleanPrompt(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+    return folded === "select" || folded === "please select" || folded === "choose" || folded === "choose one";
+  }
+
   function isSectionHeading(node, text) {
     // "ADDITIONAL INFORMATION" is a section title, not a question.
     const cleaned = cleanPrompt(text);
@@ -201,25 +206,41 @@ EXTRACT_JS = r"""
     }
     if (!bits.length) {
       let node = el;
-      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+      const stop = el.closest ? el.closest("form") : null;
+      for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+        if (stop && node === stop) break;
         const prev = node.previousElementSibling;
         if (!prev || !prev.tagName) continue;
         const tag = prev.tagName.toLowerCase();
         if (tag === "label" || tag === "legend") {
           const text = textOf(prev);
-          if (text && !isSectionHeading(prev, text)) {
+          if (text && !isSectionHeading(prev, text) && !isPlaceholderPrompt(text)) {
             bits.push(text);
             break;
           }
         }
-        if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
+        if (prev.querySelector && prev.querySelector("input, select, textarea, button, [role='combobox']")) continue;
+        const inner = prev.querySelector && prev.querySelector("label, legend");
+        if (inner) {
+          const text = textOf(inner);
+          if (text && !isSectionHeading(inner, text) && !isPlaceholderPrompt(text)) {
+            bits.push(text);
+            break;
+          }
+        }
         const cls = (prev.getAttribute("class") || "").toLowerCase();
         const text = cleanPrompt(textOf(prev));
         if (
           text &&
           text.length <= 200 &&
           !isSectionHeading(prev, text) &&
-          (cls.indexOf("question") !== -1 || cls.indexOf("application-label") !== -1 || text.indexOf("?") !== -1)
+          !isPlaceholderPrompt(text) &&
+          (
+            cls.indexOf("question") !== -1 ||
+            cls.indexOf("application-label") !== -1 ||
+            cls.indexOf("label") !== -1 ||
+            text.indexOf("?") !== -1
+          )
         ) {
           bits.push(text);
           break;
@@ -379,6 +400,45 @@ EXTRACT_JS = r"""
         name,
         selector,
         controlType: (el.getAttribute("type") || "").toLowerCase(),
+      });
+    }
+  });
+
+  // A closed react-select keeps the real <input> or <select> aria-hidden and
+  // shows .select__control. The question is the label beside that control.
+  eachRoot(document, (root) => {
+    for (const el of root.querySelectorAll(".select__control, [role='combobox']")) {
+      if (isHidden(el)) continue;
+      const inner = el.matches("input, select, textarea")
+        ? el
+        : (el.querySelector ? el.querySelector("input, select, textarea") : null);
+      if (inner && !isHidden(inner)) continue;
+      const question = labelFor(root, el);
+      if (!question || isPlaceholderPrompt(question)) continue;
+      const selector = selectorFor(el);
+      if (!selector || controls.some((control) => control.selector === selector)) continue;
+      controls.push({
+        kind: "combobox",
+        name: el.getAttribute("name") || "",
+        elementId: el.id || "",
+        label: question,
+        placeholder: "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        autocomplete: "",
+        required:
+          el.getAttribute("aria-required") === "true" ||
+          !!(inner && (inner.required || inner.getAttribute("aria-required") === "true")),
+        hidden: false,
+        disabled: !!(el.disabled || (inner && inner.disabled)),
+        readOnly: false,
+        options: [],
+        selector,
+        inputMode: "",
+        inputType: "text",
+        role: "combobox",
+        nearby: "",
+        group: "",
+        prompt: "",
       });
     }
   });

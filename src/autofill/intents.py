@@ -147,6 +147,9 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("PREVIOUSLY_EMPLOYED", "worked for this company"),
     ("GENDER", "gender"),
     ("RACE_ETHNICITY", "race ethnicity"),
+    ("RACE_ETHNICITY", "hispanic"),
+    ("RACE_ETHNICITY", "latino"),
+    ("RACE_ETHNICITY", "latina"),
     ("RACE_ETHNICITY", "ethnicity"),
     ("VETERAN_STATUS", "veteran status"),
     ("VETERAN_STATUS", "protected veteran"),
@@ -258,8 +261,8 @@ _VISA_SPONSOR_RE = re.compile(
 )
 _REMAIN_RE = re.compile(
     r"\b(?:visa|sponsorship|sponsor)\b(?:\s+\w+){0,10}\s+"
-    r"remain in (?:your country|the (?:us|united states)|this country)\b"
-    r"|\bremain in (?:your country|the (?:us|united states)|this country)\b"
+    r"remain in (?:your country|your current location|the (?:us|united states)|this country)\b"
+    r"|\bremain in (?:your country|your current location|the (?:us|united states)|this country)\b"
     r"(?:\s+\w+){0,10}\s+(?:visa|sponsorship|sponsor)\b"
 )
 _WITHOUT_SPONSOR_RE = re.compile(

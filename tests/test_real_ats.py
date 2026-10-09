@@ -120,6 +120,78 @@ def test_unknown_radio_answer_matches_by_question_hash(browser, resolver):
         page.close()
 
 
+def test_keyless_saved_answer_is_not_applied_to_the_first_open_question(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [  # type: ignore[attr-defined]
+        {"intent": None, "value": "No", "confidence": "HIGH", "source": "saved_answer"},
+    ]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='color'>What is your favorite color?</label>"
+            "<input id='color'>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<ul>"
+            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
+            "</ul></div></form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("input[value='No']").is_checked() is False
+        assert page.locator("#color").input_value() == ""
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Are you a Singapore citizen?" in texts
+        assert "What is your favorite color?" in texts
+    finally:
+        page.close()
+
+
+def test_echoed_question_hash_fills_the_matching_unknown_question(browser, resolver):
+    server, url = resolver
+
+    def dynamic(body: dict) -> dict:
+        answers = []
+        for question in body.get("questions", []):
+            text = str(question.get("text") or "")
+            if "Singapore" not in text:
+                continue
+            answers.append(
+                {
+                    "intent": None,
+                    "questionHash": question.get("id"),
+                    "value": "No",
+                    "confidence": "HIGH",
+                    "source": "saved_answer",
+                }
+            )
+        return {"fields": {}, "answers": answers, "unresolved": []}
+
+    server.dynamic = dynamic  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='color'>What is your favorite color?</label>"
+            "<input id='color'>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<ul>"
+            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
+            "</ul></div></form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("input[value='No']").is_checked()
+        assert page.locator("#color").input_value() == ""
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Are you a Singapore citizen?" not in texts
+        assert "What is your favorite color?" in texts
+    finally:
+        page.close()
+
+
 def test_greenhouse_labels_are_not_doubled_and_visa_sponsorship_is_classified(browser, resolver):
     server, url = resolver
     server.custom_answers = [  # type: ignore[attr-defined]
@@ -422,6 +494,63 @@ def test_greenhouse_react_select_fills_and_eeo_stays_manual(browser, resolver):
         page.close()
 
 
+def test_closed_greenhouse_selects_are_sent_to_the_resolver(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='prime'>What is your favorite prime number?</label><input id='prime'>"
+            "<label for='color'>What is your favorite color?</label><input id='color'>"
+            "<label for='team'>Which team do you prefer?</label><input id='team'>"
+            "<label for='notes'>Any notes for the hiring team?</label><input id='notes'>"
+            "<div class='field'>"
+            "<div class='label'><label>"
+            "Will you now or in the future require sponsorship for a visa to remain in your current location?"
+            "</label></div>"
+            "<div class='select'><div class='css-container'><div class='select__control'>"
+            "<div class='select__value-container'>"
+            "<div class='select__placeholder'>Select...</div>"
+            "<div class='select__input-container'>"
+            "<input id='sponsor' class='select__input' autocomplete='off' aria-autocomplete='list'>"
+            "</div></div></div></div></div></div>"
+            "<div class='field'>"
+            "<div class='label'><label>Are you Hispanic/Latino?</label></div>"
+            "<div class='select'><div class='css-container'>"
+            "<div class='select__control' id='hisp-box' role='combobox'>"
+            "<div class='select__value-container'>"
+            "<div class='select__placeholder'>Select...</div>"
+            "<input id='hispanic' class='select__input' aria-hidden='true' tabindex='-1'>"
+            "</div></div></div></div></div>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        questions = list(server.calls[0].get("questions", []))
+        texts = [str(item.get("text") or "") for item in questions]
+        sponsor = "Will you now or in the future require sponsorship for a visa to remain in your current location?"
+        assert sponsor in texts
+        assert "Are you Hispanic/Latino?" in texts
+        assert "Select..." not in texts
+        assert texts.count(sponsor) == 1
+        assert texts.count("Are you Hispanic/Latino?") == 1
+        assert len(questions) >= 6
+        by_text = {str(item.get("text")): item for item in questions}
+        assert by_text[sponsor].get("intent") == "SPONSORSHIP_NOW_OR_FUTURE"
+        assert by_text[sponsor].get("control") == "select"
+        assert by_text["Are you Hispanic/Latino?"].get("intent") == "RACE_ETHNICITY"
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "address.city" not in requested
+        assert page.locator("#sponsor").input_value() == ""
+        assert page.locator("#hispanic").input_value() == ""
+        manual = [item.get("text") for item in result.manual_questions]
+        assert "Are you Hispanic/Latino?" in manual
+        assert sponsor in manual
+    finally:
+        page.close()
+
+
 @pytest.fixture
 def files():
     class Handler(BaseHTTPRequestHandler):
@@ -699,8 +828,9 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
         page.close()
 
 
-def test_lever_location_without_a_match_stays_manual(browser, resolver):
+def test_lever_location_without_a_match_stays_manual(browser, resolver, caplog):
     server, url = resolver
+    caplog.set_level("INFO")
     server.custom_fields = {  # type: ignore[attr-defined]
         "address.city": "Example City",
         "address.region": "CA",
@@ -718,14 +848,21 @@ def test_lever_location_without_a_match_stays_manual(browser, resolver):
             "<script>"
             "const input = document.getElementById('current-location');"
             "const list = document.getElementById('loc-list');"
+            "const labels = ["
+            "'Far Town, Texas, United States',"
+            "'123 Secret Road, Austin, TX',"
+            "'person@example.com, Austin, TX'"
+            "];"
             "input.addEventListener('input', () => {"
             "list.innerHTML = '';"
             "if (!input.value.trim()) { list.hidden = true; return; }"
+            "labels.forEach((label, index) => {"
             "const li = document.createElement('li');"
             "li.setAttribute('role', 'option');"
-            "li.id = 'loc-far';"
-            "li.textContent = 'Far Town, Texas, United States';"
+            "li.id = 'loc-' + index;"
+            "li.textContent = label;"
             "list.appendChild(li);"
+            "});"
             "list.hidden = false;"
             "});"
             "</script>"
@@ -735,6 +872,9 @@ def test_lever_location_without_a_match_stays_manual(browser, resolver):
         assert page.locator("#current-location").input_value() == ""
         assert "Current location" in [item.get("text") for item in result.manual_questions]
         assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert "Far Town, Texas, United States" in caplog.text
+        assert "123 Secret Road" not in caplog.text
+        assert "person@example.com" not in caplog.text
     finally:
         page.close()
 
@@ -789,6 +929,57 @@ def test_lever_dropdown_location_uses_address_state(browser, resolver):
         assert page.locator("#current-location").input_value() == picked
         assert page.locator("#selected-location").input_value() == picked
         assert [item.get("text") for item in result.manual_questions] == []
+    finally:
+        page.close()
+
+
+def test_lever_location_retries_a_late_list_and_ignores_city_case(browser, resolver, caplog):
+    server, url = resolver
+    caplog.set_level("INFO")
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Austin",
+        "address.state": "TX",
+        "address.country": "US",
+    }
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='current-location'>Current location</label>"
+            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "<div id='location-results' hidden>"
+            "<div class='dropdown-location' id='location-0'>austin, tx, usa</div>"
+            "<div class='dropdown-location' id='location-1'>austin, mn, usa</div>"
+            "<div class='dropdown-location' id='location-2'>austin, in, usa</div>"
+            "<div class='dropdown-location' id='location-3'>austin, ar, usa</div>"
+            "</div></form>"
+            "<script>"
+            "const input = document.getElementById('current-location');"
+            "const dropdown = document.getElementById('location-results');"
+            "const hidden = document.getElementById('selected-location');"
+            "input.addEventListener('input', () => {"
+            "hidden.value = '';"
+            "dropdown.hidden = true;"
+            "setTimeout(() => { if (input.value.trim()) dropdown.hidden = false; }, 1900);"
+            "});"
+            "dropdown.querySelectorAll('.dropdown-location').forEach((item) => {"
+            "item.addEventListener('mousedown', (event) => {"
+            "event.preventDefault();"
+            "input.value = item.textContent;"
+            "hidden.value = item.textContent;"
+            "dropdown.hidden = true;"
+            "});"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        picked = "austin, tx, usa"
+        assert page.locator("#current-location").input_value() == picked
+        assert page.locator("#selected-location").input_value() == picked
+        assert [item.get("text") for item in result.manual_questions] == []
+        assert "location left manual" not in caplog.text
     finally:
         page.close()
 

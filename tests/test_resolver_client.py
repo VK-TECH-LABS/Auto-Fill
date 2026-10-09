@@ -292,3 +292,54 @@ def test_unknown_answer_keyed_by_hash_is_kept(resolver_url):
     by_intent, unnamed, by_key = _index_answers(response)
     taken = _take_answer(IntentMatch(None, "unknown", "none", text), by_intent, unnamed, by_key)
     assert taken is normalized
+
+
+def test_echoed_question_hash_is_kept(resolver_url):
+    server, url = resolver_url
+    text = "Are you a Singapore citizen?"
+    digest = question_hash(text)
+    server.payload = {
+        "fields": {},
+        "answers": [
+            {
+                "intent": None,
+                "text": text,
+                "questionId": digest,
+                "questionHash": digest,
+                "value": "No",
+                "confidence": "HIGH",
+                "source": "saved_answer",
+            }
+        ],
+        "unresolved": [],
+    }
+    result = resolve_step(
+        _binding(url),
+        session_id="sess",
+        step="questions",
+        fields=[],
+        questions=[{"intent": None, "text": text, "options": ["Yes", "No"], "control": "radio"}],
+    )
+    assert len(result.answers) == 1
+    answer = result.answers[0]
+    assert answer.question_id == digest
+    assert answer.text == text
+    by_intent, unnamed, by_key = _index_answers(result)
+    taken = _take_answer(IntentMatch(None, "unknown", "none", text), by_intent, unnamed, by_key, unclassified=2)
+    assert taken is not None and taken.value == "No"
+
+
+def test_keyless_answer_is_not_assigned_across_unclassified_questions():
+    text = "Are you a Singapore citizen?"
+    other = "What is your favorite color?"
+    loose = ResolverAnswer(intent=None, value="No", confidence="HIGH", source="saved_answer")
+    response = ResolverResponse(answers=[loose])
+    by_intent, unnamed, by_key = _index_answers(response)
+    first = IntentMatch(None, "unknown", "none", text)
+    second = IntentMatch(None, "unknown", "none", other)
+    assert _take_answer(first, by_intent, unnamed, by_key, unclassified=2) is None
+    assert _take_answer(second, by_intent, unnamed, by_key, unclassified=2) is None
+    assert loose in unnamed
+    by_intent, unnamed, by_key = _index_answers(response)
+    taken = _take_answer(first, by_intent, unnamed, by_key, unclassified=1)
+    assert taken is loose

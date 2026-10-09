@@ -78,6 +78,17 @@ _MATRIX = [
     ),
     ("Will you require a visa to remain in the US?", "SPONSORSHIP_NOW", "visa-remain-us"),
     ("Do you need sponsorship for a visa?", "SPONSORSHIP_NOW", "sponsorship-for-a-visa"),
+    (
+        "Will you now or in the future require sponsorship for a visa to remain in your current location?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "greenhouse-current-location",
+    ),
+    (
+        "Will you require a visa to remain in your current location?",
+        "SPONSORSHIP_NOW",
+        "visa-remain-current-location",
+    ),
+    ("Are you Hispanic/Latino?", "RACE_ETHNICITY", "hispanic-latino"),
 ]
 
 
