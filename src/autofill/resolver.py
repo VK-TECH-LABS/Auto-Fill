@@ -388,7 +388,7 @@ def _parse_body(
             intent = None
         keys = question_keys or set()
         question_id = ""
-        for raw_key in (item.get("id"), item.get("questionId"), item.get("hash")):
+        for raw_key in (item.get("id"), item.get("questionId"), item.get("questionHash"), item.get("hash")):
             if isinstance(raw_key, str) and raw_key.strip():
                 question_id = raw_key.strip()
                 break

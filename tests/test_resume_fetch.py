@@ -13,6 +13,8 @@ from autofill.stepfill import (
     _clusters,
     _compose_location,
     _describe,
+    _is_current_location,
+    _location_suggestion_log,
     _manual,
     _note_unfilled_required,
     _question_text,
@@ -186,6 +188,21 @@ def test_location_state_alias_picks_austin_tx():
     assert choose_location_label(labels, city="Austin", region="TX", country="US") == "Austin, TX, USA"
     assert choose_location_label(labels, city="Austin", region="Texas", country="USA") == "Austin, TX, USA"
     assert choose_location_label(labels, city="Austin", region="", country="US") is None
+    assert choose_location_label(labels, city="austin", region="tx", country="us") == "Austin, TX, USA"
+    assert choose_location_label(["AUSTIN, TX, USA"], city="Austin", region="TX", country="US") == "AUSTIN, TX, USA"
+    sponsor = Control(
+        kind="combobox",
+        label="Will you now or in the future require sponsorship for a visa to remain in your current location?",
+    )
+    assert _is_current_location(sponsor) is False
+    assert _is_current_location(Control(kind="text", label="Current location")) is True
+    logged = _location_suggestion_log(
+        ["Austin, TX, USA", "123 Main Street, Austin, TX", "river.example@example.com, Austin, TX"]
+    )
+    assert "Austin, TX, USA" in logged
+    assert "123" not in logged
+    assert "Main Street" not in logged
+    assert "@" not in logged
     assert _compose_location({"address.city": "Austin", "address.state": "TX"}) == "Austin, TX"
     assert (
         _compose_location({"address.city": "Austin", "address.region": "TX", "address.state": "MN"}) == "Austin, TX"

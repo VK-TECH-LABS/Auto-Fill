@@ -413,15 +413,22 @@ def _is_application_resume(control: Control) -> bool:
 
 
 def _is_current_location(control: Control) -> bool:
-    """A single location box, not a relocation question and not a city field."""
+    """A single location box, not a relocation question and not a longer question.
+
+    "Current location" is the Lever autocomplete. A sponsorship question that
+    merely mentions "your current location" is still a question.
+    """
     if control.kind not in {"text", "textarea", "combobox"}:
         return False
-    blob = normalize(" ".join(part for part in (control.label, control.aria_label, control.placeholder) if part))
-    if not blob or "relocat" in blob:
+    raw = " ".join(part for part in (control.label, control.aria_label, control.placeholder) if part)
+    if not raw or "relocat" in raw.casefold() or "?" in raw:
         return False
-    if "current location" in blob:
+    blob = normalize(raw)
+    if blob in {"location", "your location", "current location", "your current location"}:
         return True
-    return blob in {"location", "your location"}
+    if "current location" in blob and len(blob) <= 32 and "sponsor" not in blob and "visa" not in blob:
+        return True
+    return False
 
 
 def _requested_field_keys(requests: list[_Ask]) -> list[str]:
@@ -625,12 +632,23 @@ def _alias_in(folded: str, value: str, table: dict[str, str]) -> bool:
     return False
 
 
+def _same_city(label: str, city: str) -> bool:
+    """True when the suggestion's city equals ``city``, ignoring case."""
+    wanted = normalize(city)
+    if not wanted:
+        return False
+    head = normalize(label.split(",")[0])
+    if head == wanted:
+        return True
+    return _phrase_in(normalize(label), city)
+
+
 def choose_location_label(labels: list[str], *, city: str, region: str, country: str) -> str | None:
     """One suggestion that matches the city and, when present, the region and country."""
     winners: list[tuple[int, str]] = []
     for label in labels:
         folded = normalize(label)
-        if not city or not _phrase_in(folded, city):
+        if not _same_city(label, city):
             continue
         score = 4
         if region:
@@ -679,6 +697,50 @@ def _manual_location(outcome: ResolvedPage, control: Control) -> None:
     _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
 
 
+def _pause(page, millis: int) -> None:
+    pause = getattr(page, "wait_for_timeout", None)
+    if pause is None:
+        time.sleep(millis / 1000)
+    else:
+        pause(millis)
+
+
+def _location_suggestion_log(labels: list[str]) -> str:
+    """City and region text only. Street numbers and emails stay out of the log."""
+    kept: list[str] = []
+    for label in labels:
+        if "@" in label:
+            continue
+        parts: list[str] = []
+        for part in label.split(","):
+            piece = part.strip()
+            if not piece or "@" in piece or re.search(r"\d", piece):
+                continue
+            parts.append(piece)
+        if parts:
+            kept.append(", ".join(parts))
+    return " | ".join(kept[:12])
+
+
+def _poll_location_options(page, selector: str, attempts: int, delay_ms: int) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for _ in range(attempts):
+        options = _location_options(page, selector)
+        if options:
+            return options
+        _pause(page, delay_ms)
+    return options
+
+
+def _match_location(
+    options: list[tuple[str, str]], *, city: str, region: str, country: str
+) -> tuple[str, str] | None:
+    label = choose_location_label([item[0] for item in options], city=city, region=region, country=country)
+    if not label:
+        return None
+    return next((item for item in options if item[0] == label), None)
+
+
 def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
@@ -692,19 +754,15 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
     except Exception:
         _manual_location(outcome, control)
         return
-    options: list[tuple[str, str]] = []
-    for _ in range(15):
-        options = _location_options(page, control.selector)
-        if options:
-            break
-        pause = getattr(page, "wait_for_timeout", None)
-        if pause is None:
-            time.sleep(0.1)
-        else:
-            pause(100)
-    label = choose_location_label([item[0] for item in options], city=city, region=region, country=country)
-    match = next((item for item in options if item[0] == label), None) if label else None
+    options = _poll_location_options(page, control.selector, 15, 100)
+    match = _match_location(options, city=city, region=region, country=country)
     if match is None:
+        # One more wait. Lever's list sometimes arrives after the first second.
+        _pause(page, 1000)
+        options = _location_options(page, control.selector) or options
+        match = _match_location(options, city=city, region=region, country=country)
+    if match is None:
+        logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
         try:
             field.fill("")
         except Exception:
@@ -723,6 +781,7 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
         else:
             pause(50)
     if not selected or not _phrase_in(normalize(selected), city):
+        logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
         _manual_location(outcome, control)
         return
     outcome.fields.append(
@@ -746,6 +805,7 @@ def _apply(
     heading: str,
 ) -> None:
     by_intent, unnamed, by_key = _index_answers(response)
+    unclassified = _unclassified_count(requests)
     employment_rows = _rows(response.fields.get("employment[]"))
     education_rows = _rows(response.fields.get("education[]"))
     project_rows = _rows(response.fields.get("projects[]"))
@@ -762,7 +822,7 @@ def _apply(
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-            answer = _take_answer(match, by_intent, unnamed, by_key)
+            answer = _take_answer(match, by_intent, unnamed, by_key, unclassified=unclassified)
             _apply_question(page, ask, answer, outcome)
             continue
         if not ask.field_key:
@@ -1330,11 +1390,24 @@ def _index_answers(
     return by_intent, unnamed, by_key
 
 
+def _unclassified_count(requests: list[_Ask]) -> int:
+    """Questions sent with no recognised intent."""
+    count = 0
+    for ask in requests:
+        if not ask.include_question:
+            continue
+        if ask.match is None or ask.match.intent is None:
+            count += 1
+    return count
+
+
 def _take_answer(
     match: IntentMatch,
     by_intent: dict[str, ResolverAnswer],
     unnamed: list[ResolverAnswer],
     by_key: dict[str, ResolverAnswer],
+    *,
+    unclassified: int = 1,
 ) -> ResolverAnswer | None:
     if match.intent:
         return by_intent.get(match.intent)
@@ -1343,6 +1416,10 @@ def _take_answer(
         if found is not None and found in unnamed:
             unnamed.remove(found)
             return found
+    # A keyless answer can only be the one open question. With two or more
+    # unclassified questions it would land in the wrong field.
+    if unclassified > 1:
+        return None
     loose = [item for item in unnamed if not _lookup_keys(item.text, item.question_id)]
     if loose:
         found = loose[0]
