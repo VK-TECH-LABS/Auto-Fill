@@ -115,6 +115,13 @@ EXTRACT_JS = r"""
             break;
           }
         }
+        if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
+        const cls = (prev.getAttribute("class") || "").toLowerCase();
+        const text = cleanPrompt(textOf(prev));
+        if (text && text.length <= 200 && (cls.indexOf("question") !== -1 || text.indexOf("?") !== -1)) {
+          bits.push(text);
+          break;
+        }
       }
     }
     return bits.join(" ").replace(/\s+/g, " ").trim();
@@ -185,7 +192,7 @@ EXTRACT_JS = r"""
           placeholder: "",
           ariaLabel: el.getAttribute("aria-label") || "",
           autocomplete: "",
-          required: group.some((radio) => radio.required),
+          required: group.some((radio) => radio.required || radio.getAttribute("aria-required") === "true"),
           hidden: group.every((radio) => isHidden(radio)),
           disabled: group.every((radio) => radio.disabled),
           readOnly: false,
@@ -245,7 +252,7 @@ EXTRACT_JS = r"""
         placeholder: el.getAttribute("placeholder") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: el.getAttribute("autocomplete") || "",
-        required: !!el.required,
+          required: !!el.required || el.getAttribute("aria-required") === "true",
         hidden: isHidden(el),
         disabled: !!el.disabled,
         readOnly: !!el.readOnly,
@@ -326,6 +333,108 @@ EXTRACT_JS = r"""
         nearby: "",
         group: question,
         prompt: "",
+      });
+    }
+  });
+  function pickerQuestion(el) {
+    const labelled = el.getAttribute("aria-labelledby") || "";
+    if (labelled) {
+      const bits = [];
+      for (const id of labelled.split(/\s+/)) {
+        const node = document.getElementById(id);
+        if (!node || node === el || el.contains(node)) continue;
+        const text = cleanPrompt(textOf(node));
+        if (text) bits.push(text);
+      }
+      if (bits.length) return bits.join(" ");
+    }
+    if (el.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (explicit && !el.contains(explicit)) {
+        const text = cleanPrompt(textOf(explicit));
+        if (text) return text;
+      }
+    }
+    let node = el;
+    for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+      const prev = node.previousElementSibling;
+      if (!prev || !prev.tagName) continue;
+      if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
+      const tag = prev.tagName.toLowerCase();
+      const cls = (prev.getAttribute("class") || "").toLowerCase();
+      const text = cleanPrompt(textOf(prev));
+      if (!text || text.length > 200) continue;
+      if (
+        tag === "label" ||
+        tag === "legend" ||
+        /^h[1-6]$/.test(tag) ||
+        cls.indexOf("question") !== -1 ||
+        text.indexOf("?") !== -1
+      ) {
+        return text;
+      }
+    }
+    const fieldset = el.closest("fieldset");
+    if (fieldset) {
+      const legend = fieldset.querySelector("legend");
+      if (legend && !legend.contains(el)) {
+        const text = cleanPrompt(textOf(legend));
+        if (text) return text;
+      }
+    }
+    return "";
+  }
+
+  const navNames = {
+    yes: true,
+    no: true,
+    submit: true,
+    "submit application": true,
+    apply: true,
+    "apply now": true,
+    next: true,
+    continue: true,
+    back: true,
+    save: true,
+    "save and continue": true,
+    cancel: true,
+    review: true,
+    proceed: true,
+  };
+  eachRoot(document, (root) => {
+    for (const el of root.querySelectorAll("button, [role='button']")) {
+      if (isHidden(el)) continue;
+      const selector = selectorFor(el);
+      if (!selector || consumed.has(selector)) continue;
+      const popup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
+      const ariaRequired = el.getAttribute("aria-required") === "true";
+      if (popup !== "listbox" && !ariaRequired) continue;
+      if ((el.getAttribute("type") || "").toLowerCase() === "submit") continue;
+      const own = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (!own || navNames[own.toLowerCase()]) continue;
+      const question = pickerQuestion(el);
+      if (!question || question.toLowerCase() === own.toLowerCase()) continue;
+      consumed.add(selector);
+      controls.push({
+        kind: "buttons",
+        name: "",
+        elementId: el.id || "",
+        label: question,
+        placeholder: "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        autocomplete: "",
+        required: ariaRequired,
+        hidden: false,
+        disabled: !!el.disabled,
+        readOnly: false,
+        options: [],
+        selector,
+        inputMode: "",
+        inputType: "button",
+        role: "listbox",
+        nearby: "",
+        group: question,
+        prompt: question,
       });
     }
   });
