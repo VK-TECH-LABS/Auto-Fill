@@ -229,12 +229,29 @@ class _Ask:
         }
 
 
+def _is_section_heading(text: str) -> bool:
+    """True for a standalone title such as ``ADDITIONAL INFORMATION``."""
+    cleaned = _clean_prompt(text)
+    if not cleaned or "?" in cleaned:
+        return False
+    letters = [char for char in cleaned if char.isalpha()]
+    return len(letters) >= 3 and all(char.isupper() for char in letters)
+
+
 def _checkbox_key(control: Control) -> str:
-    """One bucket per fieldset legend, or per shared name when there is no legend."""
+    """One bucket per fieldset, group question, or shared name.
+
+    Options that share any of those stay one question. A section heading is
+    not a group question.
+    """
     if control.kind != "checkbox":
         return ""
-    if control.group:
-        return "fieldset:" + control.group
+    if control.group and not _is_section_heading(control.group):
+        return "fieldset:" + normalize(control.group)
+    prompt = _clean_prompt(control.prompt)
+    option = normalize(_checkbox_label(control))
+    if prompt and not _is_section_heading(prompt) and normalize(prompt) != option:
+        return "prompt:" + normalize(prompt)
     if control.name:
         return "name:" + control.name
     return ""
@@ -298,11 +315,17 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     if match.intent is not None:
         return _Ask(controls=controls, match=match, include_question=True)
     if kind == "multi":
+        if not text or _is_section_heading(text):
+            return None
         return _Ask(controls=controls, unknown=True, include_question=True)
     key = _protocol_key(internal or "", heading, control)
     if key:
         return _Ask(controls=controls, field_key=key, subfield=_subfield(control, heading))
+    if control.kind in {"checkbox", "textarea"} and (not text or _is_section_heading(text)):
+        return None
     if control.kind in {"radio", "select", "combobox", "checkbox", "textarea"} or "?" in control.label:
+        if _is_section_heading(text):
+            return None
         return _Ask(controls=controls, unknown=True, include_question=True)
     if _required_question(control) and _question_text(controls):
         return _Ask(controls=controls, unknown=True, include_question=True)
@@ -1155,7 +1178,7 @@ def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str)
 
 def _manual(outcome: ResolvedPage, match: IntentMatch, *, blocking: bool) -> None:
     text = sanitize_question(match.text or "")
-    if not text:
+    if not text or _is_section_heading(text):
         return
     entry = {"intent": match.intent, "text": text, "blocking": blocking}
     if not any(item.get("intent") == entry["intent"] and item.get("text") == text for item in outcome.manual_questions):
@@ -1184,8 +1207,21 @@ def _group_filled(control: Control, controls: list[Control], filled: set[str]) -
     return False
 
 
+def _checkbox_buckets(controls: list[Control]) -> dict[str, list[Control]]:
+    buckets: dict[str, list[Control]] = {}
+    for control in controls:
+        key = _checkbox_key(control)
+        if key:
+            buckets.setdefault(key, []).append(control)
+    return buckets
+
+
 def _note_unfilled_required(outcome: ResolvedPage) -> None:
-    """Every required visible control that is still empty is a manual question."""
+    """Every required visible control that is still empty is a manual question.
+
+    Options of a checkbox group stay on that one question. A section heading
+    is not a question.
+    """
     snapshot = outcome.snapshot
     if snapshot is None:
         return
@@ -1196,7 +1232,26 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
             continue
         if _control_filled(control, filled) or _group_filled(control, snapshot.controls, filled):
             continue
+        if control.kind == "checkbox":
+            key_name = _checkbox_key(control)
+            siblings = [
+                item
+                for item in snapshot.controls
+                if item.kind == "checkbox" and key_name and _checkbox_key(item) == key_name
+            ]
+            if len(siblings) > 1:
+                text = sanitize_question(_question_text(siblings))
+                if not text or _matches_option(text, siblings) or _is_section_heading(text):
+                    continue
+                folded = normalize_question(text)
+                if folded in seen:
+                    continue
+                seen.add(folded)
+                _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+                continue
         text = sanitize_question(_manual_label(control))
+        if _is_section_heading(text):
+            continue
         if not text:
             continue
         key = normalize_question(text)
@@ -1204,6 +1259,34 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
             continue
         seen.add(key)
         _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+    _drop_emitted_options(outcome)
+
+
+def _drop_emitted_options(outcome: ResolvedPage) -> None:
+    """Remove option labels once their group question is already listed."""
+    snapshot = outcome.snapshot
+    if snapshot is None or not outcome.manual_questions:
+        return
+    listed = {normalize_question(str(item.get("text") or "")) for item in outcome.manual_questions}
+    option_keys: set[str] = set()
+    for items in _checkbox_buckets(snapshot.controls).values():
+        if len(items) < 2:
+            continue
+        title = normalize_question(sanitize_question(_question_text(items)))
+        if not title or title not in listed:
+            continue
+        for item in items:
+            for raw in (item.label, item.aria_label, _checkbox_label(item)):
+                folded = normalize_question(sanitize_question(raw))
+                if folded and folded != title:
+                    option_keys.add(folded)
+    if not option_keys:
+        return
+    outcome.manual_questions = [
+        item
+        for item in outcome.manual_questions
+        if normalize_question(str(item.get("text") or "")) not in option_keys
+    ]
 
 
 def _index_answers(
@@ -1389,22 +1472,29 @@ def _matches_option(text: str, controls: list[Control]) -> bool:
     return False
 
 
+def _usable_question(text: str, controls: list[Control]) -> str:
+    cleaned = _clean_prompt(text)
+    if not cleaned or _matches_option(cleaned, controls) or _is_section_heading(cleaned):
+        return ""
+    return cleaned
+
+
 def _question_text(controls: list[Control]) -> str:
     control = controls[0]
-    grouped = len(controls) > 1 or control.kind == "radio"
-    if grouped:
-        for raw in (control.group, control.prompt, control.label, control.aria_label):
-            text = _clean_prompt(raw)
-            if text and not _matches_option(text, controls):
+    if len(controls) > 1 or control.kind == "radio" or control.kind == "checkbox":
+        for raw in (control.group, control.prompt):
+            text = _usable_question(raw, controls)
+            if text:
                 return text
-        return ""
-    if control.group and control.kind == "checkbox":
-        cleaned = _clean_prompt(control.group)
-        if cleaned and not _matches_option(cleaned, [control]):
-            return cleaned
+        if len(controls) > 1 or control.kind == "radio":
+            for raw in (control.label, control.aria_label):
+                text = _usable_question(raw, controls)
+                if text:
+                    return text
+            return ""
     for raw in (control.label, control.aria_label, control.placeholder, control.prompt):
-        text = _clean_prompt(raw)
-        if text and not _matches_option(text, controls):
+        text = _usable_question(raw, controls)
+        if text:
             return text
     return ""
 
