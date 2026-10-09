@@ -204,7 +204,7 @@ def resolver():
                 fields = {
                     "resume.file": {
                         "url": server.resume_url,  # type: ignore[attr-defined]
-                        "filename": "example-resume.pdf",
+                        "filename": "Granted_Resume.pdf",
                         "contentType": "application/pdf",
                         "expiresAt": _future(),
                     }
@@ -345,7 +345,7 @@ def test_resume_file_is_attached_from_a_remote_descriptor(browser, resolver, fil
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
-        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
+        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
         assert any("resume.file" in call.get("fields", []) for call in server.calls)
     finally:
         page.close()
@@ -484,7 +484,7 @@ def test_ashby_resume_uses_the_application_field_and_a_real_name(browser, resolv
         assert page.locator("#toast").inner_text() == ""
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
         shown = page.locator("#resume-name").inner_text()
-        assert shown == "River_Example_Resume.pdf"
+        assert shown == "Granted_Resume.pdf"
         assert not shown.startswith("autofill-resume")
     finally:
         page.close()
@@ -676,7 +676,7 @@ def test_resume_bytes_survive_a_later_read(browser, resolver, files):
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#toast").inner_text() == ""
-        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
+        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
     finally:
         page.close()
 
@@ -858,7 +858,7 @@ def test_lever_resume_accepts_an_uppercased_filename(browser, resolver, files):
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume-name").inner_text() == "RIVER_EXAMPLE_RESUME.PDF"
+        assert page.locator("#resume-name").inner_text() == "GRANTED_RESUME.PDF"
     finally:
         page.close()
 
@@ -881,7 +881,7 @@ def test_lever_resume_accepts_the_success_indicator(browser, resolver, files):
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#done").inner_text() == "Success!"
-        assert "RIVER" not in page.locator("#resume-field").inner_text()
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Granted_Resume.pdf"
     finally:
         page.close()
 
@@ -905,7 +905,7 @@ def test_ashby_resume_accepts_a_spaced_uppercased_name(browser, resolver, files)
         )
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume-name").inner_text() == "RIVER EXAMPLE RESUME.PDF"
+        assert page.locator("#resume-name").inner_text() == "GRANTED RESUME.PDF"
     finally:
         page.close()
 

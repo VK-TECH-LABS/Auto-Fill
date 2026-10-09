@@ -1,13 +1,76 @@
-"""The file a site receives is named for the candidate."""
+"""The attached resume is the grant, under the grant's filename."""
+
+import threading
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from autofill.models import Control, Option, PageSnapshot
-from autofill.resume_fetch import candidate_resume_name
+from autofill.resolver import _resume_descriptor
+from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload, sanitized_resume_name
 from autofill.stepfill import _clusters, _compose_location, _describe, _question_text, choose_location_label
 
+_PDF = b"%PDF-1.1\ngrant-bytes\n%%EOF\n"
 
-def test_resume_name_uses_first_and_last():
-    assert candidate_resume_name("River", "Example") == "River_Example_Resume.pdf"
-    assert not candidate_resume_name("River", "Example").startswith("autofill-resume")
+
+def test_grant_filename_is_sanitized_and_not_replaced():
+    assert sanitized_resume_name("Granted_Resume.pdf") == "Granted_Resume.pdf"
+    assert sanitized_resume_name("../../Granted_Resume.pdf") == "Granted_Resume.pdf"
+    assert sanitized_resume_name("My Resume.pdf") == "My-Resume.pdf"
+    assert sanitized_resume_name("") == ""
+    assert sanitized_resume_name("Synthetic Candidate") == "Synthetic-Candidate"
+    assert sanitized_resume_name("Synthetic Candidate") != "Synthetic_Candidate_Resume.pdf"
+    assert _resume_descriptor({"url": "https://files.example/resume", "filename": ""}) is None
+    assert _resume_descriptor({"url": "https://files.example/resume"}) is None
+    kept = _resume_descriptor(
+        {
+            "url": "https://files.example/resume",
+            "filename": "Granted_Resume.pdf",
+            "contentType": "application/pdf",
+        }
+    )
+    assert kept is not None
+    assert kept["filename"] == "Granted_Resume.pdf"
+
+
+def test_payload_is_the_grant_bytes_under_the_grant_name():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(_PDF)))
+            self.end_headers()
+            self.wfile.write(_PDF)
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        payload = fetch_resume_payload(
+            {
+                "url": f"http://{host}:{port}/granted",
+                "filename": "Granted_Resume.pdf",
+                "contentType": "application/pdf",
+                "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            }
+        )
+    finally:
+        server.shutdown()
+    assert payload.data == _PDF
+    assert payload.name == "Granted_Resume.pdf"
+    assert "Synthetic" not in payload.name
+
+
+def test_missing_filename_is_not_replaced_with_a_document():
+    try:
+        fetch_resume_payload({"url": "https://files.example/granted", "filename": ""})
+    except ResumeFetchError as exc:
+        assert exc.code == "invalid"
+    else:
+        raise AssertionError("a missing filename must not invent a resume")
 
 
 def test_fieldset_and_shared_name_checkboxes_are_one_question():

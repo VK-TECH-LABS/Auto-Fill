@@ -31,7 +31,7 @@ from autofill.intents import (
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
-from autofill.resume_fetch import ResumeFetchError, candidate_resume_name, fetch_resume_payload
+from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice
 
 logger = logging.getLogger("autofill.stepfill")
@@ -88,7 +88,6 @@ _PROTOCOL = {
     "years_of_experience_total": "yearsExperience",
 }
 _LOCATION_KEYS = ("address.city", "address.region", "address.country", "location")
-_RESUME_SUFFIXES = {".pdf", ".doc", ".docx", ".rtf", ".txt"}
 _ALIASES = (
     frozenset({"california", "ca"}),
     frozenset({"new york", "ny"}),
@@ -145,7 +144,6 @@ def fill_resolved_page(
     step: str,
     flags: FillFlags | None = None,
     hook=None,
-    resume_name: str = "",
 ) -> ResolvedPage:
     """Inspect this step, ask the resolver only for it, fill, and wipe the values."""
     active = flags or FillFlags()
@@ -180,7 +178,7 @@ def fill_resolved_page(
             questions=questions,
         )
         response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
-        _apply(page, requests, response, active, outcome, snapshot.heading, resume_name)
+        _apply(page, requests, response, active, outcome, snapshot.heading)
         adapter = adapter_for(ats_name)
         resume_code = "none"
         if "resume.file" in field_keys:
@@ -671,16 +669,6 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
     )
 
 
-def _visible_resume_name(resume_name: str, descriptor: dict) -> str:
-    filename = str(descriptor.get("filename") or "")
-    raw_suffix = filename[filename.rfind(".") :].lower()[:8] if "." in filename else ""
-    suffix = raw_suffix if raw_suffix in _RESUME_SUFFIXES else ".pdf"
-    base = resume_name.strip() or candidate_resume_name("", "", suffix)
-    dot = base.rfind(".")
-    stem = base[:dot] if dot > 0 else base
-    return f"{stem}{suffix}"
-
-
 def _apply(
     page,
     requests: list[_Ask],
@@ -688,7 +676,6 @@ def _apply(
     flags: FillFlags,
     outcome: ResolvedPage,
     heading: str,
-    resume_name: str = "",
 ) -> None:
     by_intent, unnamed, by_text = _index_answers(response)
     employment_rows = _rows(response.fields.get("employment[]"))
@@ -697,7 +684,7 @@ def _apply(
     employment_index = -1
     for ask in requests:
         if ask.field_key == "resume.file":
-            _apply_resume(page, ask, response, outcome, resume_name)
+            _apply_resume(page, ask, response, outcome)
             continue
         if ask.compose_location:
             _apply_location(page, ask.controls[0], response.fields, outcome)
@@ -837,9 +824,8 @@ def _apply_resume(
     ask: _Ask,
     response: ResolverResponse,
     outcome: ResolvedPage,
-    resume_name: str = "",
 ) -> None:
-    """Attach ``resume.file`` from bytes the browser keeps, or leave the input for a person."""
+    """Attach the resume grant, or leave the input when none was granted."""
     control = ask.controls[0]
     descriptor = response.fields.get("resume.file")
     if not isinstance(descriptor, dict):
@@ -847,7 +833,7 @@ def _apply_resume(
         _skip(control, outcome, "resume.file", "Resolver did not return a resume file.")
         return
     try:
-        payload = fetch_resume_payload(descriptor, display_name=_visible_resume_name(resume_name, descriptor))
+        payload = fetch_resume_payload(descriptor)
         result = attach_resume(
             page,
             control,
