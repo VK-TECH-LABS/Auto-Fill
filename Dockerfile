@@ -2,7 +2,7 @@
 # This image does not contain a service token, a database URL, or caller source.
 # Pass AUTOFILL_SERVICE_TOKEN at runtime.
 
-FROM python:3.12-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
