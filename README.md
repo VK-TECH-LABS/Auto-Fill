@@ -61,7 +61,7 @@ Sign up, Register, and Create account are not clicked. `HUMAN_SUBMIT_ONLY` in `s
 
 ### CAPTCHA
 
-CAPTCHA is **not** automated. If the page contains hCaptcha, reCAPTCHA, Cloudflare Turnstile, or a known challenge iframe, the status is `CAPTCHA_REQUIRED` and nothing is solved, bypassed, or injected. ApplyPilot's CapSolver path is not in this package.
+CAPTCHA is **not** automated. A visible hCaptcha, reCAPTCHA, Cloudflare Turnstile, or full-page bot wall sets `CAPTCHA_REQUIRED`. Invisible widgets are ignored. Nothing is solved, bypassed, or injected. ApplyPilot's CapSolver path is not in this package.
 
 ### Resume checkpoint
 

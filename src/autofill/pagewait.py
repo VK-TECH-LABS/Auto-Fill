@@ -1,7 +1,7 @@
 """Wait for a real ATS page to render before the first inspection.
 
 A delayed form and a bot wall both look empty at the first paint. The wait
-is bounded. An invisible reCAPTCHA badge is not a form and is not a wall.
+is bounded. An invisible reCAPTCHA or hCaptcha widget is not a wall.
 """
 
 from __future__ import annotations

@@ -218,6 +218,36 @@ EXTRACT_JS = r"""
     }
   });
 
+  function invisibleChallenge(el) {
+    if (el.closest(".grecaptcha-badge")) return true;
+    if (el.closest("[data-size='invisible']")) return true;
+    const src = (el.getAttribute("src") || "").toLowerCase();
+    return src.indexOf("size=invisible") !== -1;
+  }
+
+  function challengeShown(el) {
+    // A widget counts only when a person could interact with it. Invisible
+    // reCAPTCHA and hCaptcha, and nodes with no real box, do not.
+    if (invisibleChallenge(el)) return false;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden) return false;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      if (parseFloat(style.opacity) === 0) return false;
+      if (style.display !== "contents") {
+        const box = node.getBoundingClientRect();
+        if (box.width < 1 || box.height < 1) return false;
+      }
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 30 || rect.height < 30) return false;
+    const viewW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewH = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (rect.bottom <= 0 || rect.right <= 0) return false;
+    if (rect.top >= viewH || rect.left >= viewW) return false;
+    return true;
+  }
+
   let captcha = false;
   const wallText = (document.body ? document.body.innerText : "").slice(0, 5000).toLowerCase();
   if (
@@ -230,24 +260,22 @@ EXTRACT_JS = r"""
   ) {
     captcha = true;
   }
+  const challengeSelector = [
+    ".h-captcha",
+    ".g-recaptcha",
+    ".cf-turnstile",
+    "#px-captcha",
+    ".px-captcha",
+    "iframe[src*='hcaptcha.com']",
+    "iframe[src*='challenges.cloudflare.com']",
+    "iframe[src*='arkoselabs']",
+    "iframe[src*='datadome']",
+    "iframe[src*='captcha-delivery']",
+    "iframe[src*='recaptcha']",
+  ].join(", ");
   eachRoot(document, (root) => {
-    const captchaSelector = [
-      ".h-captcha",
-      ".g-recaptcha",
-      ".cf-turnstile",
-      "#px-captcha",
-      ".px-captcha",
-      "iframe[src*='hcaptcha.com']",
-      "iframe[src*='challenges.cloudflare.com']",
-      "iframe[src*='arkoselabs']",
-      "iframe[src*='datadome']",
-      "iframe[src*='captcha-delivery']",
-    ].join(", ");
-    if (root.querySelector(captchaSelector)) {
-      captcha = true;
-    }
-    for (const frame of root.querySelectorAll("iframe[src*='recaptcha']")) {
-      if (!frame.closest(".grecaptcha-badge")) captcha = true;
+    for (const el of root.querySelectorAll(challengeSelector)) {
+      if (challengeShown(el)) captcha = true;
     }
   });
   const password = controls.some((control) => control.kind === "password" && !control.hidden);

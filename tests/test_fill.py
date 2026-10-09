@@ -29,7 +29,9 @@ CAPTCHA_HTML = """<!DOCTYPE html>
 <form onsubmit="window.__submitted = true; return false;">
   <label for="email">Email address</label>
   <input id="email" name="email" type="email" autocomplete="email">
-  <div class="g-recaptcha" data-sitekey="not-a-real-sitekey"></div>
+  <div class="g-recaptcha" data-sitekey="not-a-real-sitekey">
+    <iframe title="recaptcha" src="/recaptcha/api2/anchor" style="width:304px;height:78px;border:0"></iframe>
+  </div>
   <button type="button" id="next">Next</button>
   <button type="submit" id="submit">Submit application</button>
 </form>
