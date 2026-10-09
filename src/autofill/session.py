@@ -20,6 +20,7 @@ class Session:
     profile: CandidateProfile
     current_step: str = "OPEN_URL"
     steps: list[str] = field(default_factory=list)
+    timings: dict[str, int] = field(default_factory=dict)
 
     def mark(self, step: str) -> None:
         self.current_step = step

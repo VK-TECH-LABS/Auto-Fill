@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from autofill.engine import ApplicationResult, Status
-from autofill.redact import install_redaction, redaction_filter
+from autofill.redact import configure_stdout_logging, install_redaction, redaction_filter
 from autofill.service.app import create_app
 
 TOKEN = "synthetic-service-token-0123456789"
@@ -97,6 +99,7 @@ def test_resolver_create_does_not_echo_the_token(client):
     assert body["stopped_before_submit"] is True
     assert body["protocolVersion"] == "0.4.0"
     assert "timings" in body
+    assert body["timings"]["sessionCreatedMs"] >= 1
     assert RESOLVER_TOKEN not in created.text
     assert "synthetic@example.com" not in created.text
     assert "Synthetic Candidate" not in created.text
@@ -209,6 +212,53 @@ def test_log_redaction_keeps_keys_and_drops_values(caplog: pytest.LogCaptureFixt
     assert "555-010-0199" not in text
     assert RESOLVER_TOKEN not in text
     redaction_filter().discard(RESOLVER_TOKEN)
+
+
+def test_stdout_logs_are_structured_and_redacted(capsys: pytest.CaptureFixture[str]):
+    logger = logging.getLogger("autofill")
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    previous_handlers = list(logger.handlers)
+    secret = "synthetic-stdout-secret-0123456789"
+    filt = redaction_filter()
+    filt.add(secret)
+    try:
+        configure_stdout_logging()
+        for handler in logger.handlers:
+            handler.setStream(sys.stdout)
+        logging.getLogger("autofill.stepfill").info(
+            "session=%s step=%s field_keys=%s intents=%s result=%s latency_ms=%s %s",
+            "sess-log",
+            "questions",
+            "email",
+            "US_WORK_AUTHORIZATION",
+            "ok",
+            9,
+            "river.example@example.com",
+        )
+        logging.getLogger("autofill.resolver").info("bearer %s", f"Bearer {secret}")
+        for handler in logger.handlers:
+            handler.flush()
+        captured = capsys.readouterr().out
+    finally:
+        filt.discard(secret)
+        logger.handlers.clear()
+        for handler in previous_handlers:
+            logger.addHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+    lines = [line for line in captured.splitlines() if line.startswith("{")]
+    assert len(lines) >= 2
+    payloads = [json.loads(line) for line in lines]
+    assert payloads[0]["level"] == "INFO"
+    assert payloads[0]["logger"] == "autofill.stepfill"
+    assert "sess-log" in payloads[0]["message"]
+    assert "questions" in payloads[0]["message"]
+    assert "US_WORK_AUTHORIZATION" in payloads[0]["message"]
+    assert "latency_ms=9" in payloads[0]["message"]
+    assert "river.example@example.com" not in captured
+    assert secret not in captured
+    assert "Bearer [redacted]" in captured
 
 
 def test_image_still_installs_chromium():

@@ -29,7 +29,7 @@ from autofill.service.context import (
     require_login_name,
     validate_application_url,
 )
-from autofill.service.runner import BrowserDisabled, FillRequest, FillRunner, PlaywrightRunner
+from autofill.service.runner import BrowserDisabled, FillRequest, FillRunner, PlaywrightRunner, elapsed_ms
 from autofill.service.schemas import (
     CandidateCheckIn,
     ContinueIn,
@@ -77,8 +77,10 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
         raw.update(session.result.timings)
     return TimingsOut(
         sessionCreatedMs=int(raw.get("sessionCreatedMs", 0)),
-        browserReadyMs=int(raw.get("browserReadyMs", 0)),
+        browserReadyMs=int(raw.get("browserReadyMs", raw.get("contextReadyMs", 0))),
         firstFormInspectedMs=int(raw.get("firstFormInspectedMs", 0)),
+        contextReadyMs=int(raw.get("contextReadyMs", 0)),
+        browserPrewarmMs=int(raw.get("browserPrewarmMs", 0)),
     )
 
 
@@ -123,7 +125,10 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     session.status = result.status
     session.manual_questions = [dict(item) for item in result.manual_questions]
     if result.timings:
-        session.timings.update(result.timings)
+        for key, value in result.timings.items():
+            if key == "sessionCreatedMs" and not value and session.timings.get(key):
+                continue
+            session.timings[key] = value
     logger.info(
         "session=%s status=%s ats=%s step=%s",
         session.session_id,
@@ -260,6 +265,7 @@ def create_app(
     resolver_timeout_seconds: float = 5,
     resolver_retries: int = 2,
     resolver_max_bytes: int = 65536,
+    browser_workers: int = 4,
 ) -> FastAPI:
     """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
     expected = require_configured_token(token)
@@ -268,7 +274,11 @@ def create_app(
     launch_args = ["--disable-dev-shm-usage"]
     if browser_no_sandbox:
         launch_args.append("--no-sandbox")
-    active_runner = runner if runner is not None else PlaywrightRunner(enabled=run_browser, launch_args=launch_args)
+    active_runner = (
+        runner
+        if runner is not None
+        else PlaywrightRunner(enabled=run_browser, launch_args=launch_args, workers=browser_workers)
+    )
     limits: dict[str, float | int] = {
         "timeout": resolver_timeout_seconds,
         "retries": resolver_retries,
@@ -382,7 +392,7 @@ def create_app(
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         session.expires_at = time.monotonic() + session_ttl_seconds
-        session.timings["sessionCreatedMs"] = int((time.perf_counter() - started) * 1000)
+        session.timings["sessionCreatedMs"] = elapsed_ms(started)
         try:
             store.create(session)
         except RuntimeError as exc:

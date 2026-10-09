@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import logging.config
 import re
 import threading
 
@@ -77,3 +79,67 @@ def install_redaction() -> RedactionFilter:
         if _FILTER not in logger.filters:
             logger.addFilter(_FILTER)
     return _FILTER
+
+
+class StructuredFormatter(logging.Formatter):
+    """One JSON object per line. The message is already redacted."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        return json.dumps(payload, ensure_ascii=True)
+
+
+def uvicorn_log_config() -> dict:
+    """Uvicorn config that also emits Auto-Fill INFO logs on stdout."""
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "()": "uvicorn.logging.DefaultFormatter",
+                "fmt": "%(levelprefix)s %(message)s",
+                "use_colors": None,
+            },
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            },
+            "autofill": {"()": "autofill.redact.StructuredFormatter"},
+        },
+        "filters": {"redact": {"()": "autofill.redact.redaction_filter"}},
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            },
+            "autofill": {
+                "formatter": "autofill",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+                "filters": ["redact"],
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"level": "INFO"},
+            "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+            "autofill": {"handlers": ["autofill"], "level": "INFO", "propagate": False},
+        },
+    }
+
+
+def configure_stdout_logging() -> None:
+    """Send Auto-Fill INFO records to stdout as redacted JSON lines."""
+    install_redaction()
+    logging.config.dictConfig(uvicorn_log_config())
+    logging.getLogger("autofill").setLevel(logging.INFO)

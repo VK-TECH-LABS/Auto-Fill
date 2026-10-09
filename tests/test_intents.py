@@ -69,6 +69,12 @@ def test_control_kind_does_not_change_the_intent(kind: str, options: list[str]):
     assert match.confidence == "HIGH"
 
 
+@pytest.mark.parametrize("intent", ["GENDER", "RACE_ETHNICITY", "VETERAN_STATUS", "DISABILITY_STATUS"])
+def test_demographic_intents_are_never_filled(intent: str):
+    match = IntentMatch(intent, "HIGH", "level1", intent)
+    assert may_fill(local=match, resolver_confidence="HIGH") is False
+
+
 def test_unknown_question_stays_unknown():
     match = classify_question("What is your favorite prime number?")
     assert match.intent is None

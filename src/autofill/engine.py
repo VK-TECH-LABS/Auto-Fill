@@ -132,6 +132,8 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         status,
         session.current_step,
     )
+    if "timings" not in kwargs:
+        kwargs["timings"] = {key: int(value) for key, value in session.timings.items()}
     return ApplicationResult(
         status=status,
         ats=ats,
@@ -178,6 +180,8 @@ def autofill_application(
         candidate_id=opts.candidate_id,
         session_id=opts.session_id,
     )
+    if opts.timings is not None:
+        session.timings = opts.timings
     session.mark("OPEN_URL")
     session.mark("DETECT_SITE")
     domain = site_domain(application_url)
@@ -451,6 +455,22 @@ def autofill_application(
     except Exception as exc:
         if is_browser_crash(exc):
             raise
+        if is_ats_timeout(exc):
+            session.mark(Status.FAILED_RETRYABLE)
+            logger.info(
+                "session=%s status=%s result=%s",
+                session.session_id,
+                Status.FAILED_RETRYABLE,
+                "ats_timeout",
+            )
+            return _result(
+                session,
+                status=Status.FAILED_RETRYABLE,
+                ats=ats_name,
+                login_status="NOT_REQUIRED",
+                messages=["ats_timeout"],
+                timings=_timings(opts),
+            )
         session.mark("FAILED")
         logger.info("session=%s status=FAILED error_type=%s", session.session_id, type(exc).__name__)
         return _result(
@@ -480,6 +500,16 @@ _RESOLVER_STATUS = {
 _VALIDATION = ("invalid phone", "valid date", "select one", "required")
 
 
+def is_ats_timeout(exc: BaseException) -> bool:
+    """True for a navigation or page timeout. The category is ``ats_timeout``."""
+    if is_browser_crash(exc):
+        return False
+    if "timeout" in type(exc).__name__.casefold():
+        return True
+    text = str(exc).casefold()
+    return "timeout" in text and "exceeded" in text
+
+
 def is_browser_crash(exc: BaseException) -> bool:
     """True when Chromium or its driver has gone away and a relaunch can help."""
     text = f"{type(exc).__name__} {exc}".casefold()
@@ -502,12 +532,22 @@ def _timings(opts: AutofillOptions) -> dict[str, int]:
 
 def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
     snapshot = extract_page(page)
-    if not state.get("seen") and opts.timings is not None:
+    if not state.get("seen"):
         state["seen"] = True
-        opts.timings["firstFormInspectedMs"] = max(0, int((time.perf_counter() - started) * 1000))
-    elif not state.get("seen"):
-        state["seen"] = True
+        if opts.timings is not None:
+            elapsed = (time.perf_counter() - started) * 1000
+            opts.timings["firstFormInspectedMs"] = 0 if elapsed <= 0 else max(1, int(elapsed))
     return snapshot
+
+
+def _public_questions(items: list[dict]) -> list[dict]:
+    """Intent and question text only. Blocking is an internal flag."""
+    published: list[dict] = []
+    for item in items:
+        entry = {"intent": item.get("intent"), "text": item.get("text") or ""}
+        if entry not in published:
+            published.append(entry)
+    return published
 
 
 def _validation_hit(snapshot) -> bool:
@@ -542,9 +582,11 @@ def _run_resolver_pages(
     manual: list[str] = []
     submit_controls: list[str] = []
     seen: set[tuple[str, ...]] = set()
+    carried: list[dict] = []
 
     def finish(status: str, messages: list[str], *, questions: list[dict] | None = None) -> ApplicationResult:
         detected, filled, skipped = _counts(fields)
+        published = _public_questions(list(questions or []) + carried)
         return _result(
             session,
             status=status,
@@ -556,7 +598,7 @@ def _run_resolver_pages(
             manual_actions=manual,
             messages=messages,
             submit_controls=submit_controls,
-            manual_questions=list(questions or []),
+            manual_questions=published,
             timings=_timings(opts),
         )
 
@@ -592,23 +634,43 @@ def _run_resolver_pages(
             if outcome.snapshot is not None:
                 snapshot = outcome.snapshot
                 _remember_submit(snapshot, submit_controls)
+            blocking = [item for item in outcome.manual_questions if item.get("blocking", True)]
+            optional = [item for item in outcome.manual_questions if not item.get("blocking", True)]
             if outcome.resume_blocked and not opts.resume_uploaded:
+                if blocking:
+                    session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                    return finish(
+                        Status.MANUAL_ANSWER_REQUIRED,
+                        ["A saved answer is required. Nothing below HIGH confidence was written."],
+                        questions=blocking,
+                    )
+                carried.extend(optional)
                 session.mark(Status.RESUME_UPLOAD_REQUIRED)
                 return finish(
                     Status.RESUME_UPLOAD_REQUIRED,
                     ["Upload the resume that was already downloaded, then continue with resumeUploaded."],
                 )
             if on_review:
+                if blocking or (outcome.manual_questions and not opts.answers_updated):
+                    session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                    return finish(
+                        Status.MANUAL_ANSWER_REQUIRED,
+                        ["A saved answer is required. Nothing below HIGH confidence was written."],
+                        questions=blocking or outcome.manual_questions,
+                    )
+                carried.extend(optional)
                 session.mark("REVIEW_PAGE")
                 session.mark(Status.READY_FOR_HUMAN_SUBMIT)
                 return finish(Status.READY_FOR_HUMAN_SUBMIT, ["Review page reached. A person clicks Submit."])
-            if outcome.manual_questions and not opts.answers_updated:
+            if blocking or (outcome.manual_questions and not opts.answers_updated):
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                pending = blocking if opts.answers_updated else outcome.manual_questions
                 return finish(
                     Status.MANUAL_ANSWER_REQUIRED,
                     ["A saved answer is required. Nothing below HIGH confidence was written."],
-                    questions=outcome.manual_questions,
+                    questions=pending,
                 )
+            carried.extend(optional)
             nxt = next(
                 (
                     button

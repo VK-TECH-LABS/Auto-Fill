@@ -7,6 +7,7 @@ import sys
 
 import uvicorn
 
+from autofill.redact import configure_stdout_logging, uvicorn_log_config
 from autofill.service.app import create_app
 from autofill.service.auth import AuthConfigurationError
 
@@ -35,10 +36,12 @@ def main() -> None:
             resolver_timeout_seconds=float(os.environ.get("AUTOFILL_RESOLVER_TIMEOUT_SECONDS", "5")),
             resolver_retries=int(os.environ.get("AUTOFILL_RESOLVER_RETRIES", "2")),
             resolver_max_bytes=int(os.environ.get("AUTOFILL_RESOLVER_MAX_BYTES", "65536")),
+            browser_workers=int(os.environ.get("AUTOFILL_BROWSER_WORKERS", "4")),
         )
     except (AuthConfigurationError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from exc
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    configure_stdout_logging()
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=uvicorn_log_config())

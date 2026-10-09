@@ -15,11 +15,13 @@ from autofill.dates import format_for_control
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped
 from autofill.intents import (
+    DEMOGRAPHIC_INTENTS,
     IntentMatch,
     classify_question,
     match_all_options,
     match_option_exact,
     may_fill,
+    normalize_question,
     sanitize_question,
 )
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
@@ -106,7 +108,7 @@ class ResolvedPage:
     snapshot: PageSnapshot | None = None
     resume_blocked: bool = False
     manual_actions: list[str] = field(default_factory=list)
-    manual_questions: list[dict[str, str | None]] = field(default_factory=list)
+    manual_questions: list[dict[str, str | bool | None]] = field(default_factory=list)
     requested_fields: list[str] = field(default_factory=list)
     requested_intents: list[str | None] = field(default_factory=list)
 
@@ -345,14 +347,16 @@ def _apply(
     outcome: ResolvedPage,
     heading: str,
 ) -> None:
-    answers = {item.intent: item for item in response.answers}
+    by_intent, unnamed, by_text = _index_answers(response)
     employment_rows = _rows(response.fields.get("employment[]"))
     education_rows = _rows(response.fields.get("education[]"))
     project_rows = _rows(response.fields.get("projects[]"))
     employment_index = -1
     for ask in requests:
         if ask.include_question:
-            _apply_question(page, ask, answers.get(ask.match.intent if ask.match else None), outcome)
+            match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
+            answer = _take_answer(match, by_intent, unnamed, by_text)
+            _apply_question(page, ask, answer, outcome)
             continue
         if not ask.field_key:
             continue
@@ -392,6 +396,18 @@ def _apply(
         _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
 
 
+def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
+    """TileArc already matched this exact question text to a saved answer."""
+    return match.intent is None and answer.confidence == "HIGH" and answer.source == "saved_answer"
+
+
+def _question_blocks(controls: list[Control], answer: ResolverAnswer | None) -> bool:
+    """Required questions and unusable saved values stop a later continue."""
+    if answer is not None:
+        return True
+    return any(item.required for item in controls)
+
+
 def _apply_question(
     page,
     ask: _Ask,
@@ -399,9 +415,13 @@ def _apply_question(
     outcome: ResolvedPage,
 ) -> None:
     match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-    confidence = answer.confidence if answer is not None else "LOW"
-    if answer is None or not may_fill(local=match, resolver_confidence=confidence):
-        _manual(outcome, match)
+    if match.intent in DEMOGRAPHIC_INTENTS:
+        _manual(outcome, match, blocking=any(item.required for item in ask.controls))
+        return
+    if answer is None or not (
+        may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)
+    ):
+        _manual(outcome, match, blocking=_question_blocks(ask.controls, answer))
         return
     control = ask.controls[0]
     if len(ask.controls) > 1 or (control.kind == "checkbox" and control.group and len(ask.controls) > 1):
@@ -411,7 +431,7 @@ def _apply_question(
         ]
         chosen = match_all_options(saved, options)
         if chosen is None:
-            _manual(outcome, match)
+            _manual(outcome, match, blocking=True)
             return
         chosen_selectors = {item.selector for item in chosen}
         for item in ask.controls:
@@ -428,7 +448,7 @@ def _apply_question(
         desired = answer.value or (answer.values[0] if answer.values else "")
         option = match_option_exact(desired, control.options)
         if option is None:
-            _manual(outcome, match)
+            _manual(outcome, match, blocking=True)
             return
         mapped = MappedField(
             key=match.intent,
@@ -451,12 +471,12 @@ def _apply_question(
             mapped = MappedField(key=match.intent, action="uncheck", field_class="APPROVED_QUESTION", confidence="high")
             outcome.fields.append(apply_mapped(page, control, mapped))
             return
-        _manual(outcome, match)
+        _manual(outcome, match, blocking=True)
         return
     if not answer.value:
-        _manual(outcome, match)
+        _manual(outcome, match, blocking=True)
         return
-    _write_text(page, control, answer.value, outcome, key=match.intent)
+    _write_text(page, control, answer.value, outcome, key=match.intent or "saved_answer")
 
 
 def options_yes(value: str) -> bool:
@@ -583,13 +603,47 @@ def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str)
     )
 
 
-def _manual(outcome: ResolvedPage, match: IntentMatch) -> None:
+def _manual(outcome: ResolvedPage, match: IntentMatch, *, blocking: bool) -> None:
     text = sanitize_question(match.text or "")
-    entry = {"intent": match.intent, "text": text}
-    if entry not in outcome.manual_questions:
+    entry = {"intent": match.intent, "text": text, "blocking": blocking}
+    if not any(item.get("intent") == entry["intent"] and item.get("text") == text for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
     outcome.manual_actions.append(f"{label}: manual answer required")
+
+
+def _index_answers(
+    response: ResolverResponse,
+) -> tuple[dict[str, ResolverAnswer], list[ResolverAnswer], dict[str, ResolverAnswer]]:
+    """Known intents by name. Unknown answers pair by question text, then order."""
+    by_intent: dict[str, ResolverAnswer] = {}
+    unnamed: list[ResolverAnswer] = []
+    by_text: dict[str, ResolverAnswer] = {}
+    for item in response.answers:
+        if item.intent:
+            by_intent.setdefault(item.intent, item)
+            continue
+        unnamed.append(item)
+        if item.text:
+            by_text.setdefault(normalize_question(item.text), item)
+    return by_intent, unnamed, by_text
+
+
+def _take_answer(
+    match: IntentMatch,
+    by_intent: dict[str, ResolverAnswer],
+    unnamed: list[ResolverAnswer],
+    by_text: dict[str, ResolverAnswer],
+) -> ResolverAnswer | None:
+    if match.intent:
+        return by_intent.get(match.intent)
+    found = by_text.get(normalize_question(match.text))
+    if found is not None and found in unnamed:
+        unnamed.remove(found)
+        return found
+    if unnamed:
+        return unnamed.pop(0)
+    return None
 
 
 def _rows(value: object) -> list[dict[str, str]]:
