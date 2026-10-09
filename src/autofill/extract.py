@@ -42,16 +42,38 @@ EXTRACT_JS = r"""
     return legend ? textOf(legend) : "";
   }
 
-  function checkboxPrompt(el) {
+  function cleanPrompt(text) {
+    return (text || "").replace(/[✱*＊]+$/, "").replace(/\s+/g, " ").trim();
+  }
+
+  function groupQuestion(el) {
+    // The question is the fieldset, the application-question text, or
+    // aria-labelledby. An option label such as "Yes" is not the question.
     const legend = legendText(el);
-    if (legend) return legend.replace(/[✱*＊]+$/, "").trim();
+    if (legend) return cleanPrompt(legend);
     const stop = el.closest("form") || document.body;
-    let node = el.parentElement;
+    let node = el;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const labelled = node.getAttribute && node.getAttribute("aria-labelledby");
+      if (labelled) {
+        const bits = [];
+        for (const id of labelled.split(/\s+/)) {
+          const target = document.getElementById(id);
+          if (!target || target.contains(el)) continue;
+          const text = textOf(target);
+          if (text) bits.push(text);
+        }
+        const joined = cleanPrompt(bits.join(" "));
+        if (joined) return joined;
+      }
+      if (node === stop) break;
+    }
+    node = el.parentElement;
     for (let depth = 0; node && node !== stop && depth < 5; depth += 1, node = node.parentElement) {
       for (const child of Array.from(node.children)) {
         if (child.contains(el)) break;
         if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
-        const text = textOf(child).replace(/[✱*＊]+$/, "").trim();
+        const text = cleanPrompt(textOf(child));
         if (text && text.length <= 200) return text;
       }
     }
@@ -148,6 +170,7 @@ EXTRACT_JS = r"""
         const group = Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
         const fieldset = el.closest("fieldset");
         const legend = fieldset ? fieldset.querySelector("legend") : null;
+        const question = groupQuestion(el);
         const options = group.map((radio) => ({
           value: radio.value || "",
           label: textOf(radio.closest("label")) || radio.value || "",
@@ -158,7 +181,7 @@ EXTRACT_JS = r"""
           kind: "radio",
           name,
           elementId: el.id || "",
-          label: textOf(legend) || labelFor(root, el),
+          label: question,
           placeholder: "",
           ariaLabel: el.getAttribute("aria-label") || "",
           autocomplete: "",
@@ -172,8 +195,8 @@ EXTRACT_JS = r"""
           inputType: "radio",
           role: "radio",
           nearby: "",
-          group: textOf(legend),
-          prompt: "",
+          group: textOf(legend) || question,
+          prompt: question,
         });
         continue;
       }
@@ -233,7 +256,7 @@ EXTRACT_JS = r"""
         role,
         nearby: textOf(headingNode).slice(0, 160),
         group: legendText(el),
-        prompt: inputType === "checkbox" ? checkboxPrompt(el) : "",
+        prompt: inputType === "checkbox" ? groupQuestion(el) : "",
       });
     }
 
