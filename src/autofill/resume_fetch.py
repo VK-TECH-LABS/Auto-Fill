@@ -27,8 +27,22 @@ class ResumeFetchError(RuntimeError):
         self.code = code
 
 
-def fetch_resume(descriptor: dict, *, timeout: float = 15.0) -> Path:
-    """Save the remote file under a temp name. The caller must delete it."""
+def candidate_resume_name(first: str, last: str, suffix: str = ".pdf") -> str:
+    """A person-shaped file name such as ``River_Example_Resume.pdf``."""
+    first_token = _token(first)
+    last_token = _token(last)
+    if first_token and last_token:
+        stem = f"{first_token}_{last_token}"
+    else:
+        stem = first_token or last_token or "Candidate"
+    ext = suffix if suffix.startswith(".") else f".{suffix}"
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,7}", ext):
+        ext = ".pdf"
+    return f"{stem}_Resume{ext}"
+
+
+def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str | None = None) -> Path:
+    """Save the remote file under ``display_name``. The caller must delete it."""
     url = descriptor.get("url") if isinstance(descriptor, dict) else None
     if not isinstance(url, str):
         raise ResumeFetchError("invalid")
@@ -65,13 +79,34 @@ def fetch_resume(descriptor: dict, *, timeout: float = 15.0) -> Path:
     payload = b"".join(chunks)
     if not payload or payload.lstrip().startswith(b"<"):
         raise ResumeFetchError("invalid")
+    chosen = display_name or _safe_name(str(descriptor.get("filename") or "")) or "Candidate_Resume.pdf"
+    filename = _visible_filename(chosen)
+    if not Path(filename).suffix:
+        filename = f"{filename}{suffix}"
     directory = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    handle, name = tempfile.mkstemp(prefix="autofill-resume-", suffix=suffix, dir=directory)
+    folder = tempfile.mkdtemp(prefix="autofill-upload-", dir=directory)
+    path = Path(folder) / filename
     try:
-        os.write(handle, payload)
-    finally:
-        os.close(handle)
-    return Path(name)
+        path.write_bytes(payload)
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        os.rmdir(folder)
+        raise ResumeFetchError("unavailable") from exc
+    return path
+
+
+def _token(value: str) -> str:
+    return _NAME_RE.sub("_", value).strip("._")[:40]
+
+
+def _visible_filename(value: str) -> str:
+    """The basename the site sees. Never the internal ``autofill-resume-`` prefix."""
+    cleaned = _safe_name(Path(value).name)
+    if not cleaned or cleaned.lower().startswith("autofill-resume"):
+        cleaned = "Candidate_Resume.pdf"
+    if not Path(cleaned).suffix:
+        cleaned = f"{cleaned}.pdf"
+    return cleaned[:80]
 
 
 def _safe_name(value: str) -> str:

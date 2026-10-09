@@ -199,6 +199,7 @@ def resolver():
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             server: _Resolver = self.server  # type: ignore[assignment]
             server.calls.append(body)
+            custom_fields = getattr(server, "custom_fields", None)
             if server.mode == "resume":
                 fields = {
                     "resume.file": {
@@ -210,6 +211,8 @@ def resolver():
                 }
             elif server.mode == "file":
                 fields = {"resume.file": {"url": "file:///tmp/resume.pdf", "filename": "resume.pdf"}}
+            elif isinstance(custom_fields, dict):
+                fields = custom_fields
             else:
                 fields = {}
             custom = getattr(server, "custom_answers", None)
@@ -337,6 +340,7 @@ def test_resume_file_is_attached_from_a_remote_descriptor(browser, resolver, fil
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
+        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
         assert any("resume.file" in call.get("fields", []) for call in server.calls)
     finally:
         page.close()
@@ -438,5 +442,92 @@ def test_captcha_below_the_fold_stops_before_ready(browser):
         assert result.status == Status.CAPTCHA_REQUIRED, result.messages
         assert result.status != Status.READY_FOR_HUMAN_SUBMIT
         assert page.locator("#email").input_value() == ""
+    finally:
+        page.close()
+
+
+def test_ashby_resume_uses_the_application_field_and_a_real_name(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<div id='autofill-zone'>"
+            "<label for='autofill-resume'>Autofill from resume</label>"
+            "<input id='autofill-resume' type='file' name='autofill'>"
+            "<div id='toast' role='alert'></div></div>"
+            "<div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name'></div></div>"
+            "<script>"
+            "document.getElementById('autofill-resume').addEventListener('change', () => {"
+            "const file = document.getElementById('autofill-resume').files[0];"
+            "document.getElementById('toast').textContent = (file ? file.name : 'file') + ' failed to upload';"
+            "});"
+            "document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name : '';"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#autofill-resume").evaluate("el => el.files.length") == 0
+        assert page.locator("#toast").inner_text() == ""
+        assert page.locator("#resume").evaluate("el => el.files.length") == 1
+        shown = page.locator("#resume-name").inner_text()
+        assert shown == "River_Example_Resume.pdf"
+        assert not shown.startswith("autofill-resume")
+    finally:
+        page.close()
+
+
+def test_lever_checkbox_group_and_current_location(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Example City",
+        "address.region": "EX",
+        "address.country": "Exampleland",
+    }
+    server.custom_answers = [  # type: ignore[attr-defined]
+        {
+            "intent": None,
+            "text": "Which languages do you speak?",
+            "values": ["English", "Spanish"],
+            "confidence": "HIGH",
+            "source": "saved_answer",
+        }
+    ]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='current-location'>Current location</label>"
+            "<input id='current-location' name='current_location' type='text'>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Which languages do you speak?</div>"
+            "<ul>"
+            "<li><label><input type='checkbox' name='languages' value='English'> English</label></li>"
+            "<li><label><input type='checkbox' name='languages' value='Spanish'> Spanish</label></li>"
+            "<li><label><input type='checkbox' name='languages' value='French'> French</label></li>"
+            "</ul></div></form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        questions = [item for call in server.calls for item in call.get("questions", [])]
+        assert len(questions) == 1, questions
+        assert questions[0].get("text") == "Which languages do you speak?"
+        assert questions[0].get("options") == ["English", "Spanish", "French"]
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "address.city" in requested
+        assert "address.region" in requested
+        assert "address.country" in requested
+        assert page.locator("#current-location").input_value() == "Example City, EX, Exampleland"
+        assert page.locator("input[value='English']").is_checked()
+        assert page.locator("input[value='Spanish']").is_checked()
+        assert page.locator("input[value='French']").is_checked() is False
+        assert [item.get("text") for item in result.manual_questions] == []
     finally:
         page.close()

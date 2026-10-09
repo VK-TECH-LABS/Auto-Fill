@@ -36,6 +36,7 @@ class Control:
     role: str = ""
     nearby: str = ""
     group: str = ""
+    prompt: str = ""
 
 
 @dataclass
