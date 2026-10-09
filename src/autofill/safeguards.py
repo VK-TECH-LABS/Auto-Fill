@@ -235,6 +235,29 @@ def activate_entry(page, selector: str, name: str, *, control_type: str = "") ->
     page.locator(selector).click()
 
 
+def open_combobox(page, selector: str) -> None:
+    """Open one combobox. The click is not a form submit."""
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    page.locator(selector).click()
+
+
+def click_choice(page, selector: str, name: str) -> None:
+    """Choose a list option or a Yes/No button. Submit labels are refused."""
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if action_class(name) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        raise HumanSubmissionRequired(
+            f"Refusing to choose {name!r}. That label is a final Submit or Apply."
+        )
+    page.locator(selector).click()
+
+
+def dismiss_combobox(page) -> None:
+    """Close an open list without choosing. Escape is not a submit."""
+    page.keyboard.press("Escape")
+
+
 def choose_option(page, opener_selector: str, option_selector: str, option_name: str) -> None:
     """Open a listbox and choose one option. This sets a field value.
 

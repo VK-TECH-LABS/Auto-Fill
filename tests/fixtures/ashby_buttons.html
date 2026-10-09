@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <h1>Application</h1>
+  <div id="auth-q">Are you authorized to work in the United States?</div>
+  <div role="group" aria-labelledby="auth-q">
+    <button type="button" id="auth-yes">Yes</button>
+    <button type="button" id="auth-no">No</button>
+  </div>
+  <label for="loc">Where are you located?</label>
+  <input id="loc" placeholder="Start typing...">
+  <script>
+    window.__picked = [];
+    for (const id of ["auth-yes", "auth-no"]) {
+      document.getElementById(id).addEventListener("click", () => window.__picked.push(id));
+    }
+  </script>
+</body>
+</html>

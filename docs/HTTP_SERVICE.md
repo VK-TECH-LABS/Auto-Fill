@@ -10,7 +10,8 @@ The in-process Python API still exists. This service calls `autofill_application
 
 - It will not click Submit or Submit Application on a form. There is no submit route. `stopped_before_submit` is always true. A refused automation click raises `HumanSubmissionRequired` inside the process and the HTTP call returns 409. `Apply`, `Apply now`, `Apply for this job`, `I'm interested`, and `Apply Manually` may be clicked only when the page has no application form yet.
 - It will not accept resume bytes in the JSON body. A resolver `resume.file` descriptor (`url`, `filename`, `contentType`, `expiresAt`) is downloaded into memory with a size cap and attached to the file input, then deleted. Any other resume input stops at `RESUME_UPLOAD_REQUIRED` until `resumeUploaded: true`.
-- It will not solve, bypass, or inject a token for CAPTCHA, DataDome, Cloudflare, or PerimeterX. A visible interactive challenge, or a full-page bot wall, sets `CAPTCHA_REQUIRED`. Invisible reCAPTCHA (including Enterprise outside the badge) and invisible hCaptcha do not stop the run, so a visible form is filled. A challenge that becomes visible later, including after Next, stops the run. `continue` with `humanResolved: true` resumes after a person has cleared a challenge.
+- It will not solve, bypass, or inject a token for CAPTCHA, DataDome, Cloudflare, or PerimeterX. A visible interactive challenge, including one below the fold, or a full-page bot wall, sets `CAPTCHA_REQUIRED`. Invisible reCAPTCHA (including Enterprise outside the badge) and invisible hCaptcha do not stop the run, so a visible form is filled. A challenge that becomes visible later, including after Next, stops the run. `continue` with `humanResolved: true` resumes after a person has cleared a challenge.
+- Resolver calls stay within 40 fields and 20 questions. Question text is at most 300 characters and option labels at most 80. A question with more than 30 options is asked without its list, then matched locally. A `413` is treated like a `422`: those keys stay unresolved and the session is not `FAILED_FINAL`.
 - It will not open a caller database. `DATABASE_URL` is ignored. Do not send database URLs, API tokens, or resume files in the JSON body.
 - It will not fill demographic or voluntary self-identification questions, including Greenhouse-style react-select EEO controls.
 - It will not log raw profile values, passwords, typed interaction text, screenshot bytes, or the service token. Logs contain the session id, status, ATS name, and step. Screenshots stay in memory for the response only.
@@ -43,7 +44,7 @@ python -m autofill.service
 | `AUTOFILL_RESOLVER_TIMEOUT_SECONDS` | no | Resolver HTTP timeout. Default `5`. |
 | `AUTOFILL_RESOLVER_RETRIES` | no | Extra attempts after a retryable resolver failure. Default `2`. |
 | `AUTOFILL_RESOLVER_MAX_BYTES` | no | Maximum resolver response body. Default `65536`. |
-| `AUTOFILL_BROWSER_WORKERS` | no | Browser worker threads. Each has its own Chromium. Default `4`. |
+| `AUTOFILL_BROWSER_WORKERS` | no | Browser worker threads. Each has its own Chromium. Default `2`. |
 
 Interactive API docs are served at `/docs`. The schema is `/openapi.json`. Neither document contains a real token.
 
@@ -196,7 +197,7 @@ Status includes `protocolVersion`, `manualQuestions` (`[{intent, text}]` only, a
 
 Before each inspection the engine waits for the page to render (network idle, then a poll of up to 12 seconds for form controls or known markers). A non-review step with no fields ends as `NO_FORM_FOUND`, not `READY_FOR_HUMAN_SUBMIT`.
 
-The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 4). A session is pinned to one worker. Each session gets a new browser context that is never reused. A browser crash relaunches that worker's Chromium, retries the session once, and otherwise records `FAILED_RETRYABLE` on the same session id. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
+The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 2). Chromium is launched with a shared-memory workaround, GPU disabled, a renderer cap, and a JavaScript heap cap. Video, fonts, and analytics requests are not loaded. A session is pinned to one worker. Each session gets a new browser context that is never reused. A browser or tab crash closes that context, records `FAILED_RETRYABLE` with category `browser_crash`, and `continue` or `humanResolved` can start again from the application URL up to two more times. A screenshot or interaction on a crashed page returns 410 and the status becomes `FAILED_RETRYABLE`. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
 
 A background reaper closes an expired session's context and wipes the resolver token, site credentials, and held values, then sets `EXPIRED`. Shutdown does the same wipe. Logs for resolver steps record the session id, step, adapter, field keys, intents, counts, result codes, and latency. They do not record values, emails, phones, or tokens.
 

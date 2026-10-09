@@ -52,6 +52,25 @@ def resolver_url():
                 self.send_response(503)
                 self.end_headers()
                 return
+            if mode == "413":
+                self.send_response(413)
+                self.end_headers()
+                return
+            if mode == "echo":
+                requested = server.calls[-1]["body"]
+                encoded = json.dumps(
+                    {
+                        "fields": {key: "ok" for key in requested.get("fields", [])},
+                        "answers": [],
+                        "unresolved": [],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             if mode in {"401", "409", "410", "422"}:
                 self.send_response(int(mode))
                 if mode == "422":
@@ -190,3 +209,44 @@ def test_response_size_is_limited(resolver_url):
             questions=[],
         )
     assert raised.value.code == "too_large"
+
+
+def test_large_steps_are_chunked(resolver_url):
+    server, url = resolver_url
+    server.mode = "echo"
+    fields = [f"field.{index}" for index in range(51)]
+    result = resolve_step(_binding(url), session_id="sess", step="questions", fields=fields, questions=[])
+    assert [len(call["body"]["fields"]) for call in server.calls] == [40, 11]
+    assert len(result.fields) == 51
+    assert result.result_code == "ok"
+
+
+def test_413_marks_the_chunk_unresolved(resolver_url):
+    server, url = resolver_url
+    server.mode = "413"
+    result = resolve_step(
+        _binding(url, retries=2),
+        session_id="sess",
+        step="questions",
+        fields=["email"],
+        questions=[{"intent": "RELOCATE", "text": "Relocate?", "options": ["Yes"], "control": "radio"}],
+    )
+    assert result.result_code == "unprocessable"
+    assert result.unresolved == ["email", "RELOCATE"]
+    assert result.fields == {}
+    assert len(server.calls) == 1
+
+
+def test_question_text_and_options_are_bounded(resolver_url):
+    server, url = resolver_url
+    options = [f"option-{index:02d}-" + ("x" * 90) for index in range(31)]
+    resolve_step(
+        _binding(url),
+        session_id="sess",
+        step="questions",
+        fields=[],
+        questions=[{"intent": None, "text": "Q" * 500, "options": options, "control": "select"}],
+    )
+    question = server.calls[0]["body"]["questions"][0]
+    assert len(question["text"]) == 300
+    assert question["options"] == []

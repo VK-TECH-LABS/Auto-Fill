@@ -212,7 +212,8 @@ def resolver():
                 fields = {"resume.file": {"url": "file:///tmp/resume.pdf", "filename": "resume.pdf"}}
             else:
                 fields = {}
-            answers = [
+            custom = getattr(server, "custom_answers", None)
+            answers = custom if isinstance(custom, list) else [
                 {
                     "intent": "RELOCATE",
                     "value": "Yes",
@@ -324,8 +325,14 @@ def test_resume_file_is_attached_from_a_remote_descriptor(browser, resolver, fil
     page = browser.new_page()
     try:
         page.set_content(
-            "<h1>Resume</h1><label for='resume'>Resume</label>"
+            "<h1>Resume</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
             "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name'></div></div>"
+            "<script>document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name : '';"
+            "});</script>"
         )
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
@@ -348,5 +355,88 @@ def test_resume_file_failure_stops_for_a_person(browser, resolver, files):
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#resume").evaluate("el => el.files.length") == 0
+    finally:
+        page.close()
+
+
+def test_resume_error_near_the_input_stops(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Resume</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div role='alert'>Upload failed</div></div>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+    finally:
+        page.close()
+
+
+def test_scoped_react_select_ignores_the_phone_list(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [  # type: ignore[attr-defined]
+        {"intent": "RELOCATE", "value": "Yes", "confidence": "HIGH", "source": "saved_answer"},
+    ]
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "greenhouse_scoped_select.html").as_uri())
+        result, _timings = _run(
+            page,
+            "https://boards.greenhouse.io/example/jobs/1",
+            resolver=_binding(url),
+        )
+        picked = page.evaluate("() => window.__picked")
+        assert picked == ["relocate-yes"], picked
+        assert "country-us" not in picked
+        assert any("Preferred desk" in (item.get("text") or "") for item in result.manual_questions)
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_yes_no_buttons_and_label_before_placeholder(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [  # type: ignore[attr-defined]
+        {
+            "intent": "US_WORK_AUTHORIZATION",
+            "value": "Yes",
+            "confidence": "HIGH",
+            "source": "saved_answer",
+        },
+        {
+            "intent": None,
+            "text": "Where are you located?",
+            "value": "Example City",
+            "confidence": "HIGH",
+            "source": "saved_answer",
+        },
+    ]
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_buttons.html").as_uri())
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert page.evaluate("() => window.__picked") == ["auth-yes"]
+        assert page.locator("#loc").input_value() == "Example City"
+        asked = [item.get("text") for call in server.calls for item in call.get("questions", [])]
+        assert "Where are you located?" in asked
+        assert "Start typing..." not in asked
+        assert result.status != Status.FAILED
+    finally:
+        page.close()
+
+
+def test_captcha_below_the_fold_stops_before_ready(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "captcha_below_fold.html").as_uri())
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role")
+        assert result.status == Status.CAPTCHA_REQUIRED, result.messages
+        assert result.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert page.locator("#email").input_value() == ""
     finally:
         page.close()

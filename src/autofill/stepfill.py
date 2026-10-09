@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from autofill.adapters import adapter_for
+from autofill.combobox import select_combobox
 from autofill.dates import format_for_control
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped
@@ -28,6 +29,7 @@ from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume
+from autofill.safeguards import click_choice
 
 logger = logging.getLogger("autofill.stepfill")
 
@@ -244,6 +246,11 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
     control = controls[0]
+    if control.kind == "buttons":
+        text = _question_text(controls)
+        options = _option_labels(controls)
+        match = classify_question(text, options, hook=hook)
+        return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "password" or control.input_type == "password":
         return None
     if is_honeypot(control):
@@ -416,6 +423,29 @@ def _eeo(text: str) -> bool:
     return bool(_EEO_RE.search(text or ""))
 
 
+_RESUME_SHOWN_JS = """
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el || !el.files || !el.files.length) return false;
+  const box = el.closest("div, section, fieldset, li") || el.parentElement;
+  if (!box) return false;
+  const alert = box.querySelector("[role='alert'], .field-error, .error");
+  if (alert && !alert.hidden && (alert.innerText || alert.textContent || "").trim()) return false;
+  const name = el.files[0].name || "";
+  if (!name) return false;
+  return (box.innerText || box.textContent || "").indexOf(name) !== -1;
+}
+"""
+
+
+def _resume_shown(page, selector: str) -> bool:
+    """True when the page shows the file name and no error next to the input."""
+    try:
+        return bool(page.evaluate(_RESUME_SHOWN_JS, selector))
+    except Exception:
+        return False
+
+
 def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: ResolvedPage) -> None:
     """Attach ``resume.file`` from a remote descriptor, or leave the input for a person."""
     control = ask.controls[0]
@@ -436,7 +466,7 @@ def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: Resolved
         )
         result = apply_mapped(page, control, mapped)
         outcome.fields.append(result)
-        if result.action == "error":
+        if result.action == "error" or not _resume_shown(page, control.selector):
             outcome.resume_blocked = True
     except ResumeFetchError:
         outcome.resume_blocked = True
@@ -494,7 +524,42 @@ def _apply_question(
                 )
                 outcome.fields.append(apply_mapped(page, item, mapped))
         return
-    if control.kind in {"radio", "select", "combobox"}:
+    if control.kind == "buttons":
+        desired = answer.value or (answer.values[0] if answer.values else "")
+        option = match_option_exact(desired, control.options)
+        if option is None or not option.selector:
+            _manual(outcome, match, blocking=True)
+            return
+        click_choice(page, option.selector, option.label)
+        outcome.fields.append(
+            FieldOutcome(
+                selector=option.selector,
+                label=control.label,
+                key=match.intent,
+                action="select",
+                detail=option.label,
+                field_class="APPROVED_QUESTION",
+            )
+        )
+        return
+    if control.kind == "combobox":
+        desired = answer.value or (answer.values[0] if answer.values else "")
+        picked = select_combobox(page, control.selector, desired)
+        if picked is None:
+            _manual(outcome, match, blocking=True)
+            return
+        outcome.fields.append(
+            FieldOutcome(
+                selector=control.selector,
+                label=control.label,
+                key=match.intent,
+                action="select",
+                detail=picked.label,
+                field_class="APPROVED_QUESTION",
+            )
+        )
+        return
+    if control.kind in {"radio", "select"}:
         desired = answer.value or (answer.values[0] if answer.values else "")
         option = match_option_exact(desired, control.options)
         if option is None:
@@ -725,7 +790,7 @@ def _option_labels(controls: list[Control]) -> list[str]:
         label = option.label or option.value
         if label and label not in labels:
             labels.append(sanitize_question(label, limit=80))
-    return labels[:20]
+    return labels
 
 
 def _checkbox_label(control: Control) -> str:
@@ -747,7 +812,7 @@ def _control_name(controls: list[Control], control: Control) -> str:
         return "multiselect"
     if control.kind == "radio":
         return "radio"
-    if control.kind in {"select", "combobox"}:
+    if control.kind in {"select", "combobox", "buttons"}:
         return "select"
     if control.kind == "checkbox":
         return "checkbox"

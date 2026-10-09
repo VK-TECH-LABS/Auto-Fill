@@ -64,6 +64,21 @@ EXTRACT_JS = r"""
       const legend = fieldset.querySelector("legend");
       if (legend) bits.push(textOf(legend));
     }
+    if (!bits.length) {
+      let node = el;
+      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+        const prev = node.previousElementSibling;
+        if (!prev || !prev.tagName) continue;
+        const tag = prev.tagName.toLowerCase();
+        if (tag === "label" || tag === "legend" || /^h[1-6]$/.test(tag)) {
+          const text = textOf(prev);
+          if (text) {
+            bits.push(text);
+            break;
+          }
+        }
+      }
+    }
     return bits.join(" ").replace(/\s+/g, " ").trim();
   }
 
@@ -169,9 +184,9 @@ EXTRACT_JS = r"""
           selector: "",
         })).filter((option) => option.label || option.value);
       } else if (kind === "combobox") {
-        const listId = el.getAttribute("aria-controls");
-        const list = listId ? byId(root, listId) : root.querySelector("[role='listbox']");
-        if (list) {
+        const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
+        const list = listId ? byId(root, listId) : null;
+        if (list && (list.getAttribute("role") || "") === "listbox") {
           options = Array.from(list.querySelectorAll("[role='option']")).map((option) => ({
             value: option.getAttribute("data-value") || textOf(option),
             label: textOf(option),
@@ -218,6 +233,64 @@ EXTRACT_JS = r"""
     }
   });
 
+  const consumed = new Set();
+  eachRoot(document, (root) => {
+    const seenParents = new Set();
+    for (const el of root.querySelectorAll("button, [role='button']")) {
+      if (isHidden(el) || !el.parentElement || seenParents.has(el.parentElement)) continue;
+      const parent = el.parentElement;
+      const kids = Array.from(parent.children).filter((node) => {
+        const tag = node.tagName ? node.tagName.toLowerCase() : "";
+        return (tag === "button" || node.getAttribute("role") === "button") && !isHidden(node);
+      });
+      const names = kids.map((node) => (node.innerText || "").replace(/\s+/g, " ").trim().toLowerCase());
+      if (names.length !== 2 || names.indexOf("yes") === -1 || names.indexOf("no") === -1) continue;
+      seenParents.add(parent);
+      let question = "";
+      const labelled = parent.getAttribute("aria-labelledby") || "";
+      if (labelled) {
+        const node = document.getElementById(labelled.split(/\s+/)[0]);
+        if (node) question = textOf(node);
+      }
+      if (!question) question = (parent.getAttribute("aria-label") || "").trim();
+      if (!question && parent.querySelector("legend")) question = textOf(parent.querySelector("legend"));
+      if (!question && parent.previousElementSibling) question = textOf(parent.previousElementSibling);
+      if (!question) continue;
+      const options = [];
+      for (const kid of kids) {
+        const optionSelector = selectorFor(kid);
+        if (!optionSelector) continue;
+        const optionLabel = (kid.innerText || "").replace(/\s+/g, " ").trim();
+        options.push({ value: optionLabel, label: optionLabel, selector: optionSelector });
+      }
+      if (options.length !== 2) continue;
+      for (const option of options) consumed.add(option.selector);
+      controls.push({
+        kind: "buttons",
+        name: "",
+        elementId: parent.id || "",
+        label: question,
+        placeholder: "",
+        ariaLabel: parent.getAttribute("aria-label") || "",
+        autocomplete: "",
+        required: parent.getAttribute("aria-required") === "true",
+        hidden: false,
+        disabled: false,
+        readOnly: false,
+        options,
+        selector: options[0].selector,
+        inputMode: "",
+        inputType: "button",
+        role: "group",
+        nearby: "",
+        group: question,
+      });
+    }
+  });
+  for (let index = buttons.length - 1; index >= 0; index -= 1) {
+    if (consumed.has(buttons[index].selector)) buttons.splice(index, 1);
+  }
+
   function invisibleChallenge(el) {
     if (el.closest(".grecaptcha-badge")) return true;
     if (el.closest("[data-size='invisible']")) return true;
@@ -241,10 +314,9 @@ EXTRACT_JS = r"""
     }
     const rect = el.getBoundingClientRect();
     if (rect.width < 30 || rect.height < 30) return false;
-    const viewW = window.innerWidth || document.documentElement.clientWidth || 0;
-    const viewH = window.innerHeight || document.documentElement.clientHeight || 0;
+    // A box parked above or left of the page is hidden. A widget below the
+    // fold still has a real box, so it still stops the run.
     if (rect.bottom <= 0 || rect.right <= 0) return false;
-    if (rect.top >= viewH || rect.left >= viewW) return false;
     return true;
   }
 

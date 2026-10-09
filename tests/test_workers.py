@@ -131,3 +131,18 @@ def test_navigation_timeout_from_the_page_is_retryable(caplog):
     assert result.messages == ["ats_timeout"]
     assert "ats_timeout" in caplog.text
     assert "secret.example" not in caplog.text
+
+
+def test_default_browser_pool_is_two_workers():
+    import inspect
+
+    from autofill.service.app import create_app
+    from autofill.service.runner import DEFAULT_LAUNCH_ARGS
+
+    assert inspect.signature(create_app).parameters["browser_workers"].default == 2
+    assert inspect.signature(PlaywrightRunner.__init__).parameters["workers"].default == 2
+    joined = " ".join(DEFAULT_LAUNCH_ARGS)
+    assert "--disable-dev-shm-usage" in joined
+    assert "--disable-gpu" in joined
+    assert "--renderer-process-limit=2" in joined
+    assert "--max-old-space-size=" in joined
