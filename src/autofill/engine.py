@@ -25,7 +25,6 @@ from autofill.models import FillResult, JobContext
 from autofill.pagewait import choose_entry, is_login_wall, is_review, visible_fields, wait_for_render
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding, ResolverCallError
-from autofill.resume_fetch import candidate_resume_name
 from autofill.safeguards import (
     HUMAN_SUBMIT_ONLY,
     activate,
@@ -776,10 +775,6 @@ def _run_resolver_pages(
                 step=step_name,
                 flags=flags,
                 hook=opts.intent_hook,
-                resume_name=candidate_resume_name(
-                    session.profile.personal.first_token,
-                    session.profile.personal.last_name,
-                ),
             )
             fields.extend(outcome.fields)
             manual.extend(outcome.manual_actions)

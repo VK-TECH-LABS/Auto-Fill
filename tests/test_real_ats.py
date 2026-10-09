@@ -14,6 +14,7 @@ from playwright.sync_api import sync_playwright
 from autofill import AutofillOptions, Status, autofill_application
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
+from autofill.service.context import placeholder_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
 EMAIL = "river.example@example.com"
@@ -44,11 +45,11 @@ def browser():
         pytest.skip(f"Chromium is not installed: {exc}")
 
 
-def _run(page, url: str, **options):
+def _run(page, url: str, *, profile: CandidateProfile | None = None, **options):
     timings: dict[str, int] = {}
     result = autofill_application(
         url,
-        _profile(),
+        profile or _profile(),
         None,
         AutofillOptions(page=page, session_id="sess-ats", candidate_id="ref-a", timings=timings, **options),
     )
@@ -201,14 +202,15 @@ def resolver():
             server.calls.append(body)
             custom_fields = getattr(server, "custom_fields", None)
             if server.mode == "resume":
-                fields = {
-                    "resume.file": {
-                        "url": server.resume_url,  # type: ignore[attr-defined]
-                        "filename": "example-resume.pdf",
-                        "contentType": "application/pdf",
-                        "expiresAt": _future(),
-                    }
+                grant_name = getattr(server, "resume_filename", "Granted_Resume.pdf")
+                descriptor = {
+                    "url": server.resume_url,  # type: ignore[attr-defined]
+                    "contentType": "application/pdf",
+                    "expiresAt": _future(),
                 }
+                if isinstance(grant_name, str):
+                    descriptor["filename"] = grant_name
+                fields = {"resume.file": descriptor}
             elif server.mode == "file":
                 fields = {"resume.file": {"url": "file:///tmp/resume.pdf", "filename": "resume.pdf"}}
             elif isinstance(custom_fields, dict):
@@ -237,7 +239,12 @@ def resolver():
                     "source": "saved_answer",
                 },
             ]
-            encoded = json.dumps({"fields": fields, "answers": answers, "unresolved": []}).encode("utf-8")
+            dynamic = getattr(server, "dynamic", None)
+            if callable(dynamic):
+                payload = dynamic(body)
+            else:
+                payload = {"fields": fields, "answers": answers, "unresolved": []}
+            encoded = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -340,7 +347,7 @@ def test_resume_file_is_attached_from_a_remote_descriptor(browser, resolver, fil
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
-        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
+        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
         assert any("resume.file" in call.get("fields", []) for call in server.calls)
     finally:
         page.close()
@@ -479,7 +486,7 @@ def test_ashby_resume_uses_the_application_field_and_a_real_name(browser, resolv
         assert page.locator("#toast").inner_text() == ""
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
         shown = page.locator("#resume-name").inner_text()
-        assert shown == "River_Example_Resume.pdf"
+        assert shown == "Granted_Resume.pdf"
         assert not shown.startswith("autofill-resume")
     finally:
         page.close()
@@ -671,7 +678,7 @@ def test_resume_bytes_survive_a_later_read(browser, resolver, files):
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#toast").inner_text() == ""
-        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
+        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
     finally:
         page.close()
 
@@ -701,5 +708,314 @@ def test_late_upload_toast_rejects_the_resume(browser, resolver, files):
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert "failed to upload" in page.locator("#toast").inner_text()
+    finally:
+        page.close()
+
+
+def _yes_no_question(legend: str) -> str:
+    return (
+        "<h1>Application</h1><form><fieldset>"
+        f"<legend>{legend}</legend>"
+        "<label><input type='radio' name='answer' value='Yes' required> Yes</label>"
+        "<label><input type='radio' name='answer' value='No'> No</label>"
+        "</fieldset></form>"
+    )
+
+
+def _saved(intent: str, value: str, confidence: str = "HIGH") -> dict:
+    return {"intent": intent, "value": value, "confidence": confidence, "source": "saved_answer"}
+
+
+def test_lever_now_or_future_sponsorship_follows_either_yes(browser, resolver):
+    server, url = resolver
+
+    def respond(body: dict) -> dict:
+        intents = [item.get("intent") for item in body.get("questions") or []]
+        if "SPONSORSHIP_NOW" in intents or "SPONSORSHIP_FUTURE" in intents:
+            return {
+                "fields": {},
+                "answers": [_saved("SPONSORSHIP_NOW", "No"), _saved("SPONSORSHIP_FUTURE", "Yes")],
+                "unresolved": [],
+            }
+        return {"fields": {}, "answers": [], "unresolved": ["SPONSORSHIP_NOW_OR_FUTURE"]}
+
+    server.dynamic = respond  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            _yes_no_question("Will you now or in the future require sponsorship for employment visa status?")
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        first = [item.get("intent") for item in server.calls[0].get("questions", [])]
+        second = [item.get("intent") for item in server.calls[1].get("questions", [])]
+        assert first == ["SPONSORSHIP_NOW_OR_FUTURE"]
+        assert set(second) == {"SPONSORSHIP_NOW", "SPONSORSHIP_FUTURE"}
+        assert page.locator("input[value='Yes']").is_checked()
+        assert page.locator("input[value='No']").is_checked() is False
+        assert result.status != Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_known_compound_sponsorship_does_not_ask_again(browser, resolver):
+    server, url = resolver
+
+    def respond(body: dict) -> dict:
+        return {"fields": {}, "answers": [_saved("SPONSORSHIP_NOW_OR_FUTURE", "No")], "unresolved": []}
+
+    server.dynamic = respond  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_yes_no_question("Will you now or will you in the future require sponsorship?"))
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert len(server.calls) == 1
+        assert page.locator("input[value='No']").is_checked()
+        assert result.status != Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_sponsorship_below_high_stays_manual(browser, resolver):
+    server, url = resolver
+
+    def respond(body: dict) -> dict:
+        intents = [item.get("intent") for item in body.get("questions") or []]
+        if "SPONSORSHIP_NOW" in intents or "SPONSORSHIP_FUTURE" in intents:
+            return {
+                "fields": {},
+                "answers": [
+                    _saved("SPONSORSHIP_NOW", "No", "MEDIUM"),
+                    _saved("SPONSORSHIP_FUTURE", "No", "HIGH"),
+                ],
+                "unresolved": [],
+            }
+        return {
+            "fields": {},
+            "answers": [_saved("SPONSORSHIP_NOW_OR_FUTURE", "No", "MEDIUM")],
+            "unresolved": ["SPONSORSHIP_NOW_OR_FUTURE"],
+        }
+
+    server.dynamic = respond  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_yes_no_question("Will you now or in the future require sponsorship?"))
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("input[value='Yes']").is_checked() is False
+        assert page.locator("input[value='No']").is_checked() is False
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_authorized_without_sponsorship_does_not_use_work_auth_alone(browser, resolver):
+    server, url = resolver
+    legend = (
+        "Are you legally authorized to work in the United States without the need for "
+        "sponsorship now or in the future?"
+    )
+
+    def respond(body: dict) -> dict:
+        intents = [item.get("intent") for item in body.get("questions") or []]
+        if "US_WORK_AUTHORIZATION" in intents:
+            return {
+                "fields": {},
+                "answers": [
+                    _saved("US_WORK_AUTHORIZATION", "Yes"),
+                    _saved("SPONSORSHIP_NOW", "No"),
+                    _saved("SPONSORSHIP_FUTURE", "Yes"),
+                ],
+                "unresolved": [],
+            }
+        return {"fields": {}, "answers": [], "unresolved": ["AUTHORIZED_WITHOUT_SPONSORSHIP"]}
+
+    server.dynamic = respond  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_yes_no_question(legend))
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        asked = [item.get("intent") for item in server.calls[0].get("questions", [])]
+        assert asked == ["AUTHORIZED_WITHOUT_SPONSORSHIP"]
+        assert page.locator("input[value='No']").is_checked()
+        assert page.locator("input[value='Yes']").is_checked() is False
+        assert result.status != Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_lever_resume_accepts_an_uppercased_filename(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name' style='text-transform: uppercase'></div></div>"
+            "<script>document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name.toUpperCase() : '';"
+            "});</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume-name").inner_text() == "GRANTED_RESUME.PDF"
+    finally:
+        page.close()
+
+
+def test_lever_resume_accepts_the_success_indicator(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'></div>"
+            "<div id='done' class='upload-success' role='status'></div>"
+            "<script>document.getElementById('resume').addEventListener('change', () => {"
+            "document.getElementById('done').textContent = 'Success!';"
+            "});</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#done").inner_text() == "Success!"
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Granted_Resume.pdf"
+    finally:
+        page.close()
+
+
+def test_ashby_resume_accepts_a_spaced_uppercased_name(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name'></div></div>"
+            "<script>document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "const shown = file ? file.name.replaceAll('_', ' ').toUpperCase() : '';"
+            "document.getElementById('resume-name').textContent = shown;"
+            "});</script>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume-name").inner_text() == "GRANTED RESUME.PDF"
+    finally:
+        page.close()
+
+
+def test_upload_error_still_blocks_when_success_is_shown(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name'></div>"
+            "<div id='done' class='upload-success'>Success!</div></div>"
+            "<div id='toast' role='alert'></div>"
+            "<script>document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name.toUpperCase() : '';"
+            "document.getElementById('toast').textContent = "
+            "(file ? file.name.toUpperCase() : 'FILE') + ' failed to upload';"
+            "});</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert "failed to upload" in page.locator("#toast").inner_text().lower()
+    finally:
+        page.close()
+
+
+def _uploaded_bytes(page) -> bytes:
+    values = page.locator("#resume").evaluate(
+        """async (el) => {
+          const file = el.files && el.files[0];
+          if (!file) return [];
+          const buf = await file.arrayBuffer();
+          return Array.from(new Uint8Array(buf));
+        }"""
+    )
+    return bytes(values)
+
+
+def _placeholder_application() -> str:
+    return (
+        "<h1>Application</h1>"
+        "<label for='name'>Full name</label><input id='name' name='name'>"
+        "<label for='email'>Email</label><input id='email' type='email' name='email'>"
+        "<div id='resume-field'><label for='resume'>Resume</label>"
+        "<input id='resume' type='file' name='resume'>"
+        "<div id='resume-name'></div></div>"
+        "<script>document.getElementById('resume').addEventListener('change', () => {"
+        "const file = document.getElementById('resume').files[0];"
+        "document.getElementById('resume-name').textContent = file ? file.name : '';"
+        "});</script>"
+    )
+
+
+def _assert_placeholder_stayed_off_the_page(page, result) -> None:
+    assert page.locator("#name").input_value() == ""
+    assert page.locator("#email").input_value() == ""
+    published = json.dumps(result.to_dict())
+    assert "Synthetic Candidate" not in published
+    assert "synthetic@example.com" not in published
+    visible = page.locator("body").inner_text()
+    assert "Synthetic Candidate" not in visible
+    assert "synthetic@example.com" not in visible
+
+
+def test_resolver_upload_uses_the_grant_not_the_placeholder_profile(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    server.resume_filename = "First_Last_Resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_placeholder_application())
+        result, _timings = _run(
+            page,
+            "https://jobs.ashbyhq.com/example/role",
+            profile=placeholder_profile("ref-a"),
+            resolver=_binding(url),
+        )
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "First_Last_Resume.pdf"
+        assert _uploaded_bytes(page) == PDF
+        _assert_placeholder_stayed_off_the_page(page, result)
+    finally:
+        page.close()
+
+
+def test_missing_grant_filename_uses_resume_pdf_not_the_placeholder(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    server.resume_filename = ""  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_placeholder_application())
+        result, _timings = _run(
+            page,
+            "https://jobs.ashbyhq.com/example/role",
+            profile=placeholder_profile("ref-a"),
+            resolver=_binding(url),
+        )
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Resume.pdf"
+        assert _uploaded_bytes(page) == PDF
+        _assert_placeholder_stayed_off_the_page(page, result)
     finally:
         page.close()

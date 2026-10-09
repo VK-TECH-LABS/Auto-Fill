@@ -105,7 +105,12 @@ def credential_domain(application_url: str, site: str) -> str:
 
 
 def placeholder_profile(candidate_ref: str) -> CandidateProfile:
-    """A non-PII stand-in so the engine can run. Resolver mode never fills it."""
+    """A non-PII stand-in so the engine can run. Resolver mode never fills it.
+
+    This is not a resume and its name and email are never typed. The only
+    resume Auto-Fill can attach is the ``resume.file`` grant, under that
+    grant's filename, or ``Resume.pdf`` when the grant does not name one.
+    """
     return CandidateProfile.from_dict(
         {
             "candidateId": candidate_ref,

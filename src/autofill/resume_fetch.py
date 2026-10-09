@@ -1,8 +1,9 @@
-"""Download one resume descriptor into a temp file, then the caller deletes it.
+"""Download the resume grant and keep those bytes.
 
-The descriptor is a URL returned for the field key ``resume.file``. This
-module does not send the resolver token and does not read a caller-chosen
-local path.
+The descriptor is a URL returned for the field key ``resume.file``. The file
+name is the sanitized name from that grant. This module does not invent a
+document, a sample resume, or a replacement name, and it does not send the
+resolver token or read a caller-chosen local path.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 MAX_RESUME_BYTES = 10 * 1024 * 1024
+NEUTRAL_RESUME_NAME = "Resume.pdf"
+_RESUME_SUFFIXES = (".pdf", ".doc", ".docx")
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -28,18 +31,28 @@ class ResumeFetchError(RuntimeError):
         self.code = code
 
 
-def candidate_resume_name(first: str, last: str, suffix: str = ".pdf") -> str:
-    """A person-shaped file name such as ``River_Example_Resume.pdf``."""
-    first_token = _token(first)
-    last_token = _token(last)
-    if first_token and last_token:
-        stem = f"{first_token}_{last_token}"
-    else:
-        stem = first_token or last_token or "Candidate"
-    ext = suffix if suffix.startswith(".") else f".{suffix}"
-    if not re.fullmatch(r"\.[A-Za-z0-9]{1,7}", ext):
-        ext = ".pdf"
-    return f"{stem}_Resume{ext}"
+def sanitized_resume_name(filename: str) -> str:
+    """Basename only, and only when it ends in ``.pdf``, ``.doc``, or ``.docx``.
+
+    An empty result means the grant did not include a usable name. It is not a
+    name built from a profile.
+    """
+    base = Path(str(filename or "")).name
+    cleaned = _NAME_RE.sub("-", base).strip(".-")
+    if not cleaned or not cleaned.lower().endswith(_RESUME_SUFFIXES):
+        return ""
+    if len(cleaned) <= 80:
+        return cleaned
+    suffix = Path(cleaned).suffix[:8]
+    stem = cleaned[: 80 - len(suffix)].strip(".-")
+    if not stem or not f"{stem}{suffix}".lower().endswith(_RESUME_SUFFIXES):
+        return ""
+    return f"{stem}{suffix}"
+
+
+def resume_filename(filename: str) -> str:
+    """The grant filename, or ``Resume.pdf`` when the grant did not name a document."""
+    return sanitized_resume_name(filename) or NEUTRAL_RESUME_NAME
 
 
 @dataclass(frozen=True)
@@ -51,15 +64,15 @@ class ResumePayload:
     data: bytes
 
 
-def fetch_resume_payload(descriptor: dict, *, timeout: float = 15.0, display_name: str | None = None) -> ResumePayload:
-    """Download the resume and keep the bytes. The site reads this buffer, not a path."""
-    data, filename, mime_type = _download(descriptor, timeout=timeout, display_name=display_name)
+def fetch_resume_payload(descriptor: dict, *, timeout: float = 15.0) -> ResumePayload:
+    """Download the grant and keep those bytes. The site reads this buffer, not a path."""
+    data, filename, mime_type = _download(descriptor, timeout=timeout)
     return ResumePayload(name=filename, mime_type=mime_type, data=data)
 
 
-def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str | None = None) -> Path:
-    """Save the remote file under ``display_name``. The caller must delete it."""
-    data, filename, _mime = _download(descriptor, timeout=timeout, display_name=display_name)
+def fetch_resume(descriptor: dict, *, timeout: float = 15.0) -> Path:
+    """Save the grant under its sanitized filename. The caller must delete it."""
+    data, filename, _mime = _download(descriptor, timeout=timeout)
     directory = "/dev/shm" if os.path.isdir("/dev/shm") else None
     folder = tempfile.mkdtemp(prefix="autofill-upload-", dir=directory)
     path = Path(folder) / filename
@@ -75,10 +88,11 @@ def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str |
     return path
 
 
-def _download(descriptor: dict, *, timeout: float, display_name: str | None) -> tuple[bytes, str, str]:
+def _download(descriptor: dict, *, timeout: float) -> tuple[bytes, str, str]:
     url = descriptor.get("url") if isinstance(descriptor, dict) else None
     if not isinstance(url, str):
         raise ResumeFetchError("invalid")
+    filename = resume_filename(str(descriptor.get("filename") or ""))
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ResumeFetchError("invalid")
@@ -87,8 +101,6 @@ def _download(descriptor: dict, *, timeout: float, display_name: str | None) -> 
     if _expired(str(descriptor.get("expiresAt") or "")):
         raise ResumeFetchError("expired")
     content_type = str(descriptor.get("contentType") or "")
-    filename = _safe_name(str(descriptor.get("filename") or "resume.bin"))
-    suffix = Path(filename).suffix[:8] or ".bin"
     header = content_type
     request = urllib.request.Request(url, method="GET")
     try:
@@ -113,10 +125,6 @@ def _download(descriptor: dict, *, timeout: float, display_name: str | None) -> 
     payload = b"".join(chunks)
     if not payload or payload.lstrip().startswith(b"<"):
         raise ResumeFetchError("invalid")
-    chosen = display_name or _safe_name(str(descriptor.get("filename") or "")) or "Candidate_Resume.pdf"
-    filename = _visible_filename(chosen)
-    if not Path(filename).suffix:
-        filename = f"{filename}{suffix}"
     mime = _mime_type(str(header), filename, content_type)
     return payload, filename, mime
 
@@ -129,25 +137,6 @@ def _mime_type(header: str, filename: str, declared: str) -> str:
     if filename.lower().endswith(".pdf"):
         return "application/pdf"
     return "application/octet-stream"
-
-
-def _token(value: str) -> str:
-    return _NAME_RE.sub("_", value).strip("._")[:40]
-
-
-def _visible_filename(value: str) -> str:
-    """The basename the site sees. Never the internal ``autofill-resume-`` prefix."""
-    cleaned = _safe_name(Path(value).name)
-    if not cleaned or cleaned.lower().startswith("autofill-resume"):
-        cleaned = "Candidate_Resume.pdf"
-    if not Path(cleaned).suffix:
-        cleaned = f"{cleaned}.pdf"
-    return cleaned[:80]
-
-
-def _safe_name(value: str) -> str:
-    cleaned = _NAME_RE.sub("-", value).strip(".-")
-    return (cleaned or "resume.bin")[:80]
 
 
 def _expired(value: str) -> bool:

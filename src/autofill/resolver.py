@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from autofill.resume_fetch import resume_filename
+
 logger = logging.getLogger("autofill.resolver")
 
 _RETRYABLE_HTTP = frozenset({408, 429, 500, 502, 503, 504})
@@ -395,12 +397,13 @@ def _resume_descriptor(value: Any) -> dict[str, str] | None:
     url = value.get("url")
     if not isinstance(url, str) or len(url) > 2048 or not url.startswith(("http://", "https://")):
         return None
-    filename = value.get("filename")
+    raw_name = value.get("filename")
+    safe_name = resume_filename(raw_name if isinstance(raw_name, str) else "")
     content_type = value.get("contentType")
     expires = value.get("expiresAt")
     return {
         "url": url,
-        "filename": filename[:200] if isinstance(filename, str) else "resume.bin",
+        "filename": safe_name,
         "contentType": content_type[:120] if isinstance(content_type, str) else "",
         "expiresAt": expires[:40] if isinstance(expires, str) else "",
     }
