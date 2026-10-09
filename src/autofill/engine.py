@@ -785,18 +785,18 @@ def _run_resolver_pages(
             blocking = [item for item in outcome.manual_questions if item.get("blocking", True)]
             optional = [item for item in outcome.manual_questions if not item.get("blocking", True)]
             if outcome.resume_blocked and not opts.resume_uploaded:
-                if blocking:
-                    session.mark(Status.MANUAL_ANSWER_REQUIRED)
-                    return finish(
-                        Status.MANUAL_ANSWER_REQUIRED,
-                        ["A saved answer is required. Nothing below HIGH confidence was written."],
-                        questions=blocking,
-                    )
+                # The resume stop is reported with every question this step already
+                # asked. HIGH answers were written above; unanswered ones stay listed.
+                pending = blocking if opts.answers_updated else list(outcome.manual_questions)
                 carried.extend(optional)
+                messages = ["Upload the resume that was already downloaded, then continue with resumeUploaded."]
+                if pending:
+                    messages.append("A saved answer is required. Nothing below HIGH confidence was written.")
                 session.mark(Status.RESUME_UPLOAD_REQUIRED)
                 return finish(
                     Status.RESUME_UPLOAD_REQUIRED,
-                    ["Upload the resume that was already downloaded, then continue with resumeUploaded."],
+                    messages,
+                    questions=pending,
                 )
             if on_review:
                 if blocking or (outcome.manual_questions and not opts.answers_updated):

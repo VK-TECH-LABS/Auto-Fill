@@ -725,7 +725,10 @@ def _apply(
     education_rows = _rows(response.fields.get("education[]"))
     project_rows = _rows(response.fields.get("projects[]"))
     employment_index = -1
-    for ask in requests:
+    # A missing resume is recorded after the other controls. It must not skip them.
+    ordered = [ask for ask in requests if ask.field_key != "resume.file"]
+    ordered.extend(ask for ask in requests if ask.field_key == "resume.file")
+    for ask in ordered:
         if ask.field_key == "resume.file":
             _apply_resume(page, ask, response, outcome)
             continue
