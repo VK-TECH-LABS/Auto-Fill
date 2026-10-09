@@ -719,6 +719,63 @@ def test_ashby_required_questions_stay_in_manual(browser, resolver):
         page.close()
 
 
+def test_missing_resume_still_fills_and_lists_questions(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {"fullName": "River Example", "email": EMAIL}  # type: ignore[attr-defined]
+    server.custom_answers = [_saved("US_WORK_AUTHORIZATION", "Yes")]  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='name'>Full name</label>"
+            "<input id='name' name='name' autocomplete='name'>"
+            "<label for='email'>Email</label>"
+            "<input id='email' type='email' autocomplete='email'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' required>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<label class='ashby-application-form-question-title'>"
+            "Are you authorized to work in the United States?<span>*</span></label>"
+            "<div><div><button type='button' id='auth-yes'>Yes</button></div>"
+            "<div><button type='button' id='auth-no'>No</button></div></div></div>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<label class='ashby-application-form-question-title'>"
+            "Will you now or in the future require sponsorship for employment visa status?<span>*</span></label>"
+            "<div><div><button type='button' id='sponsor-yes'>Yes</button></div>"
+            "<div><button type='button' id='sponsor-no'>No</button></div></div></div>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<label class='ashby-application-form-question-title'>"
+            "Are you willing to relocate?<span>*</span></label>"
+            "<div><div><button type='button' id='move-yes'>Yes</button></div>"
+            "<div><button type='button' id='move-no'>No</button></div></div></div>"
+            "</form><script>window.__picked = [];"
+            "for (const id of ['auth-yes','auth-no','sponsor-yes','sponsor-no','move-yes','move-no']) {"
+            "document.getElementById(id).addEventListener('click', () => window.__picked.push(id));"
+            "}</script>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        intents = [item.get("intent") for call in server.calls for item in call.get("questions", [])]
+        fields = [key for call in server.calls for key in call.get("fields", [])]
+        assert "resume.file" in fields
+        assert "fullName" in fields
+        assert "email" in fields
+        assert "US_WORK_AUTHORIZATION" in intents
+        assert "SPONSORSHIP_NOW_OR_FUTURE" in intents
+        assert "RELOCATE" in intents
+        assert page.locator("#name").input_value() == "River Example"
+        assert page.locator("#email").input_value() == EMAIL
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
+        assert page.evaluate("() => window.__picked") == ["auth-yes"]
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Will you now or in the future require sponsorship for employment visa status?" in texts
+        assert "Are you willing to relocate?" in texts
+        assert "Are you authorized to work in the United States?" not in texts
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED
+        assert any("resume" in message.lower() for message in result.messages)
+    finally:
+        page.close()
+
+
 def test_radio_and_checkbox_questions_use_the_group_label(browser, resolver):
     server, url = resolver
     server.custom_answers = []  # type: ignore[attr-defined]

@@ -281,59 +281,98 @@ EXTRACT_JS = r"""
     }
   });
 
+  function buttonText(node) {
+    return (node.innerText || node.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+  }
+
+  function visibleButtons(container) {
+    return Array.from(container.querySelectorAll("button, [role='button']")).filter((node) => !isHidden(node));
+  }
+
+  function questionFor(container) {
+    const labelled = container.getAttribute("aria-labelledby") || "";
+    if (labelled) {
+      const node = document.getElementById(labelled.split(/\s+/)[0]);
+      if (node && !container.contains(node)) {
+        const text = textOf(node);
+        if (text) return text;
+      }
+    }
+    const aria = (container.getAttribute("aria-label") || "").trim();
+    if (aria) return aria;
+    const inside = container.querySelector("label, legend, .ashby-application-form-question-title");
+    if (inside && !inside.querySelector("button, [role='button']")) {
+      const text = textOf(inside);
+      if (text) return text;
+    }
+    let node = container;
+    for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+      const prev = node.previousElementSibling;
+      if (!prev || !prev.tagName) continue;
+      if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
+      const text = textOf(prev);
+      if (text && text.length <= 200) return text;
+    }
+    return "";
+  }
+
+  function groupRequired(container, raw) {
+    if (/[*✱＊]/.test(raw || "")) return true;
+    let node = container;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      if (node.getAttribute && node.getAttribute("aria-required") === "true") return true;
+    }
+    return false;
+  }
+
   const consumed = new Set();
   eachRoot(document, (root) => {
-    const seenParents = new Set();
+    const seenGroups = new Set();
     for (const el of root.querySelectorAll("button, [role='button']")) {
-      if (isHidden(el) || !el.parentElement || seenParents.has(el.parentElement)) continue;
-      const parent = el.parentElement;
-      const kids = Array.from(parent.children).filter((node) => {
-        const tag = node.tagName ? node.tagName.toLowerCase() : "";
-        return (tag === "button" || node.getAttribute("role") === "button") && !isHidden(node);
-      });
-      const names = kids.map((node) => (node.innerText || "").replace(/\s+/g, " ").trim().toLowerCase());
-      if (names.length !== 2 || names.indexOf("yes") === -1 || names.indexOf("no") === -1) continue;
-      seenParents.add(parent);
-      let question = "";
-      const labelled = parent.getAttribute("aria-labelledby") || "";
-      if (labelled) {
-        const node = document.getElementById(labelled.split(/\s+/)[0]);
-        if (node) question = textOf(node);
+      if (isHidden(el)) continue;
+      let container = el.parentElement;
+      for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+        if (seenGroups.has(container)) break;
+        const kids = visibleButtons(container);
+        if (kids.length !== 2) continue;
+        const names = kids.map((node) => buttonText(node).toLowerCase());
+        if (names.indexOf("yes") === -1 || names.indexOf("no") === -1) continue;
+        seenGroups.add(container);
+        const rawQuestion = questionFor(container);
+        const question = cleanPrompt(rawQuestion);
+        if (!question) break;
+        const options = [];
+        for (const kid of kids) {
+          const optionSelector = selectorFor(kid);
+          if (!optionSelector) continue;
+          const optionLabel = buttonText(kid);
+          options.push({ value: optionLabel, label: optionLabel, selector: optionSelector });
+        }
+        if (options.length !== 2) break;
+        for (const option of options) consumed.add(option.selector);
+        controls.push({
+          kind: "buttons",
+          name: "",
+          elementId: container.id || "",
+          label: question,
+          placeholder: "",
+          ariaLabel: container.getAttribute("aria-label") || "",
+          autocomplete: "",
+          required: groupRequired(container, rawQuestion),
+          hidden: false,
+          disabled: false,
+          readOnly: false,
+          options,
+          selector: options[0].selector,
+          inputMode: "",
+          inputType: "button",
+          role: "group",
+          nearby: "",
+          group: question,
+          prompt: "",
+        });
+        break;
       }
-      if (!question) question = (parent.getAttribute("aria-label") || "").trim();
-      if (!question && parent.querySelector("legend")) question = textOf(parent.querySelector("legend"));
-      if (!question && parent.previousElementSibling) question = textOf(parent.previousElementSibling);
-      if (!question) continue;
-      const options = [];
-      for (const kid of kids) {
-        const optionSelector = selectorFor(kid);
-        if (!optionSelector) continue;
-        const optionLabel = (kid.innerText || "").replace(/\s+/g, " ").trim();
-        options.push({ value: optionLabel, label: optionLabel, selector: optionSelector });
-      }
-      if (options.length !== 2) continue;
-      for (const option of options) consumed.add(option.selector);
-      controls.push({
-        kind: "buttons",
-        name: "",
-        elementId: parent.id || "",
-        label: question,
-        placeholder: "",
-        ariaLabel: parent.getAttribute("aria-label") || "",
-        autocomplete: "",
-        required: parent.getAttribute("aria-required") === "true",
-        hidden: false,
-        disabled: false,
-        readOnly: false,
-        options,
-        selector: options[0].selector,
-        inputMode: "",
-        inputType: "button",
-        role: "group",
-        nearby: "",
-        group: question,
-        prompt: "",
-      });
     }
   });
   function pickerQuestion(el) {
