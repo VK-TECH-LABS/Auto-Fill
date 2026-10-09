@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -41,8 +42,40 @@ def candidate_resume_name(first: str, last: str, suffix: str = ".pdf") -> str:
     return f"{stem}_Resume{ext}"
 
 
+@dataclass(frozen=True)
+class ResumePayload:
+    """Resume bytes held in memory. Nothing is written to disk."""
+
+    name: str
+    mime_type: str
+    data: bytes
+
+
+def fetch_resume_payload(descriptor: dict, *, timeout: float = 15.0, display_name: str | None = None) -> ResumePayload:
+    """Download the resume and keep the bytes. The site reads this buffer, not a path."""
+    data, filename, mime_type = _download(descriptor, timeout=timeout, display_name=display_name)
+    return ResumePayload(name=filename, mime_type=mime_type, data=data)
+
+
 def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str | None = None) -> Path:
     """Save the remote file under ``display_name``. The caller must delete it."""
+    data, filename, _mime = _download(descriptor, timeout=timeout, display_name=display_name)
+    directory = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    folder = tempfile.mkdtemp(prefix="autofill-upload-", dir=directory)
+    path = Path(folder) / filename
+    try:
+        path.write_bytes(data)
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+        raise ResumeFetchError("unavailable") from exc
+    return path
+
+
+def _download(descriptor: dict, *, timeout: float, display_name: str | None) -> tuple[bytes, str, str]:
     url = descriptor.get("url") if isinstance(descriptor, dict) else None
     if not isinstance(url, str):
         raise ResumeFetchError("invalid")
@@ -56,10 +89,11 @@ def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str |
     content_type = str(descriptor.get("contentType") or "")
     filename = _safe_name(str(descriptor.get("filename") or "resume.bin"))
     suffix = Path(filename).suffix[:8] or ".bin"
+    header = content_type
     request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            header = response.headers.get("Content-Type", content_type)
+            header = str(response.headers.get("Content-Type", content_type) or content_type)
             if "text/html" in header.casefold():
                 raise ResumeFetchError("invalid")
             chunks: list[bytes] = []
@@ -83,16 +117,18 @@ def fetch_resume(descriptor: dict, *, timeout: float = 15.0, display_name: str |
     filename = _visible_filename(chosen)
     if not Path(filename).suffix:
         filename = f"{filename}{suffix}"
-    directory = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    folder = tempfile.mkdtemp(prefix="autofill-upload-", dir=directory)
-    path = Path(folder) / filename
-    try:
-        path.write_bytes(payload)
-    except OSError as exc:
-        path.unlink(missing_ok=True)
-        os.rmdir(folder)
-        raise ResumeFetchError("unavailable") from exc
-    return path
+    mime = _mime_type(str(header), filename, content_type)
+    return payload, filename, mime
+
+
+def _mime_type(header: str, filename: str, declared: str) -> str:
+    for candidate in (header, declared):
+        token = candidate.split(";", 1)[0].strip().lower()
+        if token and token != "application/octet-stream" and "/" in token:
+            return token
+    if filename.lower().endswith(".pdf"):
+        return "application/pdf"
+    return "application/octet-stream"
 
 
 def _token(value: str) -> str:

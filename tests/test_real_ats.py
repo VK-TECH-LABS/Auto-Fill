@@ -489,8 +489,8 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
     server, url = resolver
     server.custom_fields = {  # type: ignore[attr-defined]
         "address.city": "Example City",
-        "address.region": "EX",
-        "address.country": "Exampleland",
+        "address.region": "CA",
+        "address.country": "US",
     }
     server.custom_answers = [  # type: ignore[attr-defined]
         {
@@ -506,7 +506,9 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='current-location'>Current location</label>"
-            "<input id='current-location' name='current_location' type='text'>"
+            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "<ul id='loc-list' role='listbox' hidden></ul>"
             "<div class='application-question'>"
             "<div class='application-label'>Which languages do you speak?</div>"
             "<ul>"
@@ -514,6 +516,40 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
             "<li><label><input type='checkbox' name='languages' value='Spanish'> Spanish</label></li>"
             "<li><label><input type='checkbox' name='languages' value='French'> French</label></li>"
             "</ul></div></form>"
+            "<script>"
+            "const input = document.getElementById('current-location');"
+            "const list = document.getElementById('loc-list');"
+            "const hidden = document.getElementById('selected-location');"
+            "const places = ["
+            "'Example City, California, United States',"
+            "'Example City, Texas, United States',"
+            "'Other Town, California, United States'"
+            "];"
+            "input.addEventListener('input', () => {"
+            "hidden.value = '';"
+            "list.innerHTML = '';"
+            "const q = input.value.trim().toLowerCase();"
+            "if (!q) { list.hidden = true; return; }"
+            "places.forEach((place, index) => {"
+            "if (place.toLowerCase().indexOf(q) === -1) return;"
+            "const li = document.createElement('li');"
+            "li.setAttribute('role', 'option');"
+            "li.id = 'loc-opt-' + index;"
+            "li.textContent = place;"
+            "li.addEventListener('mousedown', (event) => {"
+            "event.preventDefault();"
+            "input.value = place;"
+            "hidden.value = place;"
+            "list.hidden = true;"
+            "});"
+            "list.appendChild(li);"
+            "});"
+            "list.hidden = list.children.length === 0;"
+            "});"
+            "input.addEventListener('blur', () => {"
+            "setTimeout(() => { if (!hidden.value) input.value = ''; }, 30);"
+            "});"
+            "</script>"
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         questions = [item for call in server.calls for item in call.get("questions", [])]
@@ -524,10 +560,146 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
         assert "address.city" in requested
         assert "address.region" in requested
         assert "address.country" in requested
-        assert page.locator("#current-location").input_value() == "Example City, EX, Exampleland"
+        picked = "Example City, California, United States"
+        assert page.locator("#current-location").input_value() == picked
+        assert page.locator("#selected-location").input_value() == picked
         assert page.locator("input[value='English']").is_checked()
         assert page.locator("input[value='Spanish']").is_checked()
         assert page.locator("input[value='French']").is_checked() is False
         assert [item.get("text") for item in result.manual_questions] == []
+    finally:
+        page.close()
+
+
+def test_lever_location_without_a_match_stays_manual(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Example City",
+        "address.region": "CA",
+        "address.country": "US",
+    }
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='current-location'>Current location</label>"
+            "<input id='current-location' type='text'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "<ul id='loc-list' role='listbox' hidden></ul></form>"
+            "<script>"
+            "const input = document.getElementById('current-location');"
+            "const list = document.getElementById('loc-list');"
+            "input.addEventListener('input', () => {"
+            "list.innerHTML = '';"
+            "if (!input.value.trim()) { list.hidden = true; return; }"
+            "const li = document.createElement('li');"
+            "li.setAttribute('role', 'option');"
+            "li.id = 'loc-far';"
+            "li.textContent = 'Far Town, Texas, United States';"
+            "list.appendChild(li);"
+            "list.hidden = false;"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("#selected-location").input_value() == ""
+        assert page.locator("#current-location").input_value() == ""
+        assert "Current location" in [item.get("text") for item in result.manual_questions]
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
+def test_radio_and_checkbox_questions_use_the_group_label(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<div class='application-question'>"
+            "<div class='application-label' id='consent-q'>Do you consent to a background check?</div>"
+            "<ul aria-labelledby='consent-q'>"
+            "<li><label><input type='radio' name='consent' value='yes'> Yes, I consent</label></li>"
+            "<li><label><input type='radio' name='consent' value='no'> No</label></li>"
+            "</ul></div>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Which languages do you speak?</div>"
+            "<ul>"
+            "<li><label><input type='checkbox' name='languages' value='English'> English</label></li>"
+            "<li><label><input type='checkbox' name='languages' value='Spanish'> Spanish</label></li>"
+            "</ul></div></form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Do you consent to a background check?" in texts
+        assert "Which languages do you speak?" in texts
+        assert "Yes, I consent" not in texts
+        assert "Yes" not in texts
+        assert "English" not in texts
+    finally:
+        page.close()
+
+
+def test_resume_bytes_survive_a_later_read(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file' name='resume'>"
+            "<div id='resume-name'></div>"
+            "<div id='toast' role='alert'></div></div>"
+            "<script>"
+            "document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name : '';"
+            "setTimeout(() => {"
+            "file.arrayBuffer().then((buf) => {"
+            "if (!buf || !buf.byteLength) throw new Error('empty');"
+            "}).catch(() => {"
+            "document.getElementById('toast').textContent = file.name + ' failed to upload';"
+            "});"
+            "}, 300);"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#toast").inner_text() == ""
+        assert page.locator("#resume-name").inner_text() == "River_Example_Resume.pdf"
+    finally:
+        page.close()
+
+
+def test_late_upload_toast_rejects_the_resume(browser, resolver, files):
+    server, url = resolver
+    server.mode = "resume"
+    server.resume_url = f"{files}/example-resume.pdf"  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='resume-field'>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' type='file'>"
+            "<div id='resume-name'></div></div>"
+            "<div id='toast' role='alert'></div>"
+            "<script>"
+            "document.getElementById('resume').addEventListener('change', () => {"
+            "const file = document.getElementById('resume').files[0];"
+            "document.getElementById('resume-name').textContent = file ? file.name : '';"
+            "setTimeout(() => {"
+            "document.getElementById('toast').textContent = file.name + ' failed to upload';"
+            "}, 400);"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert "failed to upload" in page.locator("#toast").inner_text()
     finally:
         page.close()

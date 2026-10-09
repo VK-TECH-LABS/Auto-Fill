@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 
 from autofill.adapters import adapter_for
 from autofill.combobox import select_combobox
 from autofill.dates import format_for_control
 from autofill.extract import extract_page
-from autofill.fill import apply_mapped
+from autofill.fill import apply_mapped, attach_resume
 from autofill.intents import (
     DEMOGRAPHIC_INTENTS,
     IntentMatch,
@@ -28,7 +29,7 @@ from autofill.intents import (
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
-from autofill.resume_fetch import ResumeFetchError, candidate_resume_name, fetch_resume
+from autofill.resume_fetch import ResumeFetchError, candidate_resume_name, fetch_resume_payload
 from autofill.safeguards import click_choice
 
 logger = logging.getLogger("autofill.stepfill")
@@ -407,18 +408,264 @@ def _requested_field_keys(requests: list[_Ask]) -> list[str]:
 
 def _compose_location(fields: dict) -> str:
     """A location string, or city, region, and country joined when that is what came back."""
+    city, region, country = _location_parts(fields)
+    parts = [part for part in (city, region, country) if part]
+    return ", ".join(parts)
+
+
+_STATES = {
+    "al": "alabama",
+    "ak": "alaska",
+    "az": "arizona",
+    "ar": "arkansas",
+    "ca": "california",
+    "co": "colorado",
+    "ct": "connecticut",
+    "de": "delaware",
+    "dc": "district of columbia",
+    "fl": "florida",
+    "ga": "georgia",
+    "hi": "hawaii",
+    "id": "idaho",
+    "il": "illinois",
+    "in": "indiana",
+    "ia": "iowa",
+    "ks": "kansas",
+    "ky": "kentucky",
+    "la": "louisiana",
+    "me": "maine",
+    "md": "maryland",
+    "ma": "massachusetts",
+    "mi": "michigan",
+    "mn": "minnesota",
+    "ms": "mississippi",
+    "mo": "missouri",
+    "mt": "montana",
+    "ne": "nebraska",
+    "nv": "nevada",
+    "nh": "new hampshire",
+    "nj": "new jersey",
+    "nm": "new mexico",
+    "ny": "new york",
+    "nc": "north carolina",
+    "nd": "north dakota",
+    "oh": "ohio",
+    "ok": "oklahoma",
+    "or": "oregon",
+    "pa": "pennsylvania",
+    "ri": "rhode island",
+    "sc": "south carolina",
+    "sd": "south dakota",
+    "tn": "tennessee",
+    "tx": "texas",
+    "ut": "utah",
+    "vt": "vermont",
+    "va": "virginia",
+    "wa": "washington",
+    "wv": "west virginia",
+    "wi": "wisconsin",
+    "wy": "wyoming",
+}
+_COUNTRIES = {
+    "us": "united states",
+    "usa": "united states",
+    "united states of america": "united states",
+    "uk": "united kingdom",
+    "gb": "united kingdom",
+    "great britain": "united kingdom",
+}
+_LOCATION_OPTIONS_JS = r"""
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return [];
+  function visible(node) {
+    for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
+      if (current.hidden) return false;
+      const style = window.getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    }
+    return !!node;
+  }
+  function textOf(node) {
+    return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+  let root = el.parentElement;
+  for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
+    const found = [];
+    for (const option of root.querySelectorAll("[role='option']")) {
+      if (!visible(option)) continue;
+      const label = textOf(option);
+      if (!label) continue;
+      if (!option.id) option.setAttribute("data-autofill-option", String(found.length));
+      const itemSelector = option.id
+        ? "#" + CSS.escape(option.id)
+        : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
+      found.push({ label, selector: itemSelector });
+    }
+    if (found.length) return found;
+  }
+  return [];
+}
+"""
+_SELECTED_LOCATION_JS = """
+() => {
+  const named = document.querySelector("input[name='selectedLocation'], input[name='selected_location']");
+  if (named && (named.value || "").trim()) return named.value;
+  for (const node of document.querySelectorAll("input[type='hidden']")) {
+    const key = ((node.name || "") + " " + (node.id || "")).toLowerCase();
+    if (key.indexOf("location") !== -1 && (node.value || "").trim()) return node.value;
+  }
+  return "";
+}
+"""
+
+
+def _location_parts(fields: dict) -> tuple[str, str, str]:
+    city = str(fields.get("address.city") or "").strip()
+    region = str(fields.get("address.region") or "").strip()
+    country = str(fields.get("address.country") or "").strip()
     raw = fields.get("location")
     if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    parts: list[str] = []
-    for key in ("address.city", "address.region", "address.country"):
-        value = fields.get(key)
-        if value is None:
+        pieces = [part.strip() for part in raw.split(",") if part.strip()]
+        if not city and pieces:
+            city = pieces[0]
+        if not region and len(pieces) > 1:
+            region = pieces[1]
+        if not country and len(pieces) > 2:
+            country = pieces[2]
+    return city, region, country
+
+
+def _phrase_in(folded: str, phrase: str) -> bool:
+    token = normalize(phrase)
+    if not token:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", folded) is not None
+
+
+def _alias_in(folded: str, value: str, table: dict[str, str]) -> bool:
+    token = normalize(value)
+    if _phrase_in(folded, token):
+        return True
+    full = table.get(token)
+    if full and _phrase_in(folded, full):
+        return True
+    for short, name in table.items():
+        if token == name and _phrase_in(folded, short):
+            return True
+    return False
+
+
+def choose_location_label(labels: list[str], *, city: str, region: str, country: str) -> str | None:
+    """One suggestion that matches the city and, when present, the region and country."""
+    winners: list[tuple[int, str]] = []
+    for label in labels:
+        folded = normalize(label)
+        if not city or not _phrase_in(folded, city):
             continue
-        text = str(value).strip()
-        if text and text not in parts:
-            parts.append(text)
-    return ", ".join(parts)
+        score = 4
+        if region:
+            if not _alias_in(folded, region, _STATES):
+                continue
+            score += 2
+        if country:
+            if not _alias_in(folded, country, _COUNTRIES):
+                continue
+            score += 1
+        winners.append((score, label))
+    if not winners:
+        return None
+    best = max(score for score, _label in winners)
+    chosen = [label for score, label in winners if score == best]
+    if len(chosen) != 1:
+        return None
+    return chosen[0]
+
+
+def _location_options(page, selector: str) -> list[tuple[str, str]]:
+    try:
+        raw = page.evaluate(_LOCATION_OPTIONS_JS, selector) or []
+    except Exception:
+        return []
+    found: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        item_selector = str(item.get("selector") or "").strip()
+        if label and item_selector:
+            found.append((label, item_selector))
+    return found
+
+
+def _selected_location(page) -> str:
+    try:
+        return str(page.evaluate(_SELECTED_LOCATION_JS) or "").strip()
+    except Exception:
+        return ""
+
+
+def _manual_location(outcome: ResolvedPage, control: Control) -> None:
+    text = sanitize_question(control.label or control.aria_label or "Current location")
+    _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+
+
+def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
+    """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
+    city, region, country = _location_parts(fields)
+    if not city:
+        _manual_location(outcome, control)
+        return
+    field = page.locator(control.selector)
+    try:
+        field.fill("")
+        field.press_sequentially(city, delay=10)
+    except Exception:
+        _manual_location(outcome, control)
+        return
+    options: list[tuple[str, str]] = []
+    for _ in range(15):
+        options = _location_options(page, control.selector)
+        if options:
+            break
+        pause = getattr(page, "wait_for_timeout", None)
+        if pause is None:
+            time.sleep(0.1)
+        else:
+            pause(100)
+    label = choose_location_label([item[0] for item in options], city=city, region=region, country=country)
+    match = next((item for item in options if item[0] == label), None) if label else None
+    if match is None:
+        try:
+            field.fill("")
+        except Exception:
+            pass
+        _manual_location(outcome, control)
+        return
+    click_choice(page, match[1], match[0])
+    selected = ""
+    for _ in range(10):
+        selected = _selected_location(page)
+        if selected and _phrase_in(normalize(selected), city):
+            break
+        pause = getattr(page, "wait_for_timeout", None)
+        if pause is None:
+            time.sleep(0.05)
+        else:
+            pause(50)
+    if not selected or not _phrase_in(normalize(selected), city):
+        _manual_location(outcome, control)
+        return
+    outcome.fields.append(
+        FieldOutcome(
+            selector=control.selector,
+            label=control.label,
+            key="location",
+            action="select",
+            detail=selected,
+            field_class="PROFILE_FIELD",
+        )
+    )
 
 
 def _visible_resume_name(resume_name: str, descriptor: dict) -> str:
@@ -450,13 +697,7 @@ def _apply(
             _apply_resume(page, ask, response, outcome, resume_name)
             continue
         if ask.compose_location:
-            _write_text(
-                page,
-                ask.controls[0],
-                _compose_location(response.fields),
-                outcome,
-                key="location",
-            )
+            _apply_location(page, ask.controls[0], response.fields, outcome)
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
@@ -512,27 +753,59 @@ def _eeo(text: str) -> bool:
     return bool(_EEO_RE.search(text or ""))
 
 
-_RESUME_SHOWN_JS = """
-(selector) => {
+_RESUME_VERIFY_SECONDS = 4.0
+_RESUME_STATUS_JS = """
+({ selector, name }) => {
+  function shown(node) {
+    if (!node || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    return true;
+  }
+  function message(node) {
+    return ((node.innerText || node.textContent || "").replace(/\\s+/g, " ")).trim();
+  }
+  const expected = name || "";
+  const foldedName = expected.toLowerCase();
+  const alerts = document.querySelectorAll("[role='alert'], .field-error, .error, [class*='toast'], [class*='Toast']");
+  for (const alert of alerts) {
+    if (!shown(alert)) continue;
+    const text = message(alert);
+    if (!text) continue;
+    const folded = text.toLowerCase();
+    if (folded.indexOf("failed to upload") !== -1) return "error";
+    const mentionsFile = foldedName && folded.indexOf(foldedName) !== -1;
+    const mentionsFailure = folded.indexOf("fail") !== -1 || folded.indexOf("error") !== -1;
+    if (mentionsFile && mentionsFailure) return "error";
+  }
   const el = document.querySelector(selector);
-  if (!el || !el.files || !el.files.length) return false;
+  if (!el || !el.files || !el.files.length) return "missing";
+  const fileName = el.files[0].name || "";
   const box = el.closest("div, section, fieldset, li") || el.parentElement;
-  if (!box) return false;
-  const alert = box.querySelector("[role='alert'], .field-error, .error");
-  if (alert && !alert.hidden && (alert.innerText || alert.textContent || "").trim()) return false;
-  const name = el.files[0].name || "";
-  if (!name) return false;
-  return (box.innerText || box.textContent || "").indexOf(name) !== -1;
+  if (!box) return "missing";
+  const local = box.querySelector("[role='alert'], .field-error, .error");
+  if (local && shown(local) && message(local)) return "error";
+  const body = box.innerText || box.textContent || "";
+  if ((fileName && body.indexOf(fileName) !== -1) || (expected && body.indexOf(expected) !== -1)) return "shown";
+  return "missing";
 }
 """
 
 
-def _resume_shown(page, selector: str) -> bool:
-    """True when the page shows the file name and no error next to the input."""
-    try:
-        return bool(page.evaluate(_RESUME_SHOWN_JS, selector))
-    except Exception:
-        return False
+def _resume_accepted(page, selector: str, name: str) -> bool:
+    """Wait a few seconds. An upload-error toast fails the attach; otherwise the name must show."""
+    deadline = time.monotonic() + _RESUME_VERIFY_SECONDS
+    status = "missing"
+    while True:
+        try:
+            status = str(page.evaluate(_RESUME_STATUS_JS, {"selector": selector, "name": name}) or "missing")
+        except Exception:
+            return False
+        if status == "error":
+            return False
+        if time.monotonic() >= deadline:
+            return status == "shown"
+        time.sleep(0.25)
 
 
 def _apply_resume(
@@ -542,38 +815,28 @@ def _apply_resume(
     outcome: ResolvedPage,
     resume_name: str = "",
 ) -> None:
-    """Attach ``resume.file`` from a remote descriptor, or leave the input for a person."""
+    """Attach ``resume.file`` from bytes the browser keeps, or leave the input for a person."""
     control = ask.controls[0]
     descriptor = response.fields.get("resume.file")
     if not isinstance(descriptor, dict):
         outcome.resume_blocked = True
         _skip(control, outcome, "resume.file", "Resolver did not return a resume file.")
         return
-    path = None
     try:
-        path = fetch_resume(descriptor, display_name=_visible_resume_name(resume_name, descriptor))
-        mapped = MappedField(
-            key="resume.file",
-            action="upload",
-            text=str(path),
-            field_class="RESUME_FIELD",
-            confidence="high",
+        payload = fetch_resume_payload(descriptor, display_name=_visible_resume_name(resume_name, descriptor))
+        result = attach_resume(
+            page,
+            control,
+            name=payload.name,
+            mime_type=payload.mime_type,
+            data=payload.data,
         )
-        result = apply_mapped(page, control, mapped)
         outcome.fields.append(result)
-        if result.action == "error" or not _resume_shown(page, control.selector):
+        if result.action == "error" or not _resume_accepted(page, control.selector, payload.name):
             outcome.resume_blocked = True
     except ResumeFetchError:
         outcome.resume_blocked = True
         _skip(control, outcome, "resume.file", "Resume file was not attached.")
-    finally:
-        if path is not None:
-            parent = path.parent
-            path.unlink(missing_ok=True)
-            try:
-                parent.rmdir()
-            except OSError:
-                pass
 
 
 def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
@@ -877,17 +1140,35 @@ def _clean_prompt(text: str) -> str:
     return re.sub(r"[\s*✱＊]+$", "", text).strip()
 
 
-def _question_text(controls: list[Control]) -> str:
+def _matches_option(text: str, controls: list[Control]) -> bool:
+    """True when ``text`` is an option label, not the question."""
+    folded = normalize(text)
+    if not folded:
+        return True
     if len(controls) > 1:
-        group = controls[0].group.strip()
-        if group:
-            return _clean_prompt(group)
-        prompt = controls[0].prompt.strip()
-        if prompt:
-            return _clean_prompt(prompt)
+        for control in controls:
+            if folded in {normalize(_checkbox_label(control)), normalize(control.label)}:
+                return True
+        return False
+    for option in controls[0].options:
+        if folded in {normalize(option.label), normalize(option.value)}:
+            return True
+    return False
+
+
+def _question_text(controls: list[Control]) -> str:
     control = controls[0]
+    grouped = len(controls) > 1 or control.kind == "radio"
+    if grouped:
+        for raw in (control.group, control.prompt, control.label, control.aria_label):
+            text = _clean_prompt(raw)
+            if text and not _matches_option(text, controls):
+                return text
+        return ""
     if control.group and control.kind == "checkbox":
-        return _clean_prompt(control.group)
+        cleaned = _clean_prompt(control.group)
+        if cleaned and not _matches_option(cleaned, [control]):
+            return cleaned
     return control.label or control.aria_label or control.placeholder
 
 

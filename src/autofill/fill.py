@@ -62,6 +62,24 @@ _SET_NATIVE = """
 """
 
 
+def attach_resume(page, control: Control, *, name: str, mime_type: str, data: bytes) -> FieldOutcome:
+    """Put resume bytes on the file input. The browser keeps the buffer after this returns."""
+    mapped = MappedField(
+        key="resume.file",
+        action="upload",
+        text=name,
+        field_class="RESUME_FIELD",
+        confidence="high",
+    )
+    try:
+        page.locator(control.selector).set_input_files(
+            [{"name": name, "mimeType": mime_type or "application/octet-stream", "buffer": data}]
+        )
+    except Exception as exc:
+        return _outcome(control, mapped, action="error", detail=str(exc))
+    return _outcome(control, mapped, detail=name)
+
+
 def apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     """Write one mapped value. Clicks still go through the submit guard.
 
