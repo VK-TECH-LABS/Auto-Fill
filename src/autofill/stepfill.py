@@ -28,7 +28,7 @@ from autofill.intents import (
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
-from autofill.resume_fetch import ResumeFetchError, fetch_resume
+from autofill.resume_fetch import ResumeFetchError, candidate_resume_name, fetch_resume
 from autofill.safeguards import click_choice
 
 logger = logging.getLogger("autofill.stepfill")
@@ -84,6 +84,8 @@ _PROTOCOL = {
     "website_url": "links.website",
     "years_of_experience_total": "yearsExperience",
 }
+_LOCATION_KEYS = ("address.city", "address.region", "address.country", "location")
+_RESUME_SUFFIXES = {".pdf", ".doc", ".docx", ".rtf", ".txt"}
 _ALIASES = (
     frozenset({"california", "ca"}),
     frozenset({"new york", "ny"}),
@@ -140,6 +142,7 @@ def fill_resolved_page(
     step: str,
     flags: FillFlags | None = None,
     hook=None,
+    resume_name: str = "",
 ) -> ResolvedPage:
     """Inspect this step, ask the resolver only for it, fill, and wipe the values."""
     active = flags or FillFlags()
@@ -156,7 +159,7 @@ def fill_resolved_page(
             continue
         requests.append(ask)
 
-    field_keys = _unique([ask.field_key for ask in requests if ask.field_key and not ask.include_question])
+    field_keys = _requested_field_keys(requests)
     questions = [ask.question_body() for ask in requests if ask.include_question]
     outcome.requested_fields = field_keys
     outcome.requested_intents = [ask.match.intent if ask.match else None for ask in requests if ask.include_question]
@@ -173,7 +176,7 @@ def fill_resolved_page(
             fields=field_keys,
             questions=questions,
         )
-        _apply(page, requests, response, active, outcome, snapshot.heading)
+        _apply(page, requests, response, active, outcome, snapshot.heading, resume_name)
         adapter = adapter_for(ats_name)
         resume_code = "none"
         if "resume.file" in field_keys:
@@ -207,6 +210,7 @@ class _Ask:
     include_question: bool = False
     resume: bool = False
     subfield: str = ""
+    compose_location: bool = False
 
     def question_body(self) -> dict:
         control = self.controls[0]
@@ -221,6 +225,17 @@ class _Ask:
         }
 
 
+def _checkbox_key(control: Control) -> str:
+    """One bucket per fieldset legend, or per shared name when there is no legend."""
+    if control.kind != "checkbox":
+        return ""
+    if control.group:
+        return "fieldset:" + control.group
+    if control.name:
+        return "name:" + control.name
+    return ""
+
+
 def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
     grouped: dict[str, list[Control]] = {}
     ordered: list[tuple[str, list[Control]]] = []
@@ -228,19 +243,23 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
     for control in snapshot.controls:
         if control.hidden or control.disabled:
             continue
-        if control.kind == "checkbox" and control.group:
-            grouped.setdefault(control.group, []).append(control)
+        key = _checkbox_key(control)
+        if key:
+            grouped.setdefault(key, []).append(control)
             continue
         ordered.append(("one", [control]))
     for control in snapshot.controls:
-        if control.kind == "checkbox" and control.group and control.group not in seen_groups:
-            items = grouped.get(control.group, [])
-            if len(items) >= 2:
-                ordered.append(("multi", items))
-                seen_groups.add(control.group)
-            elif len(items) == 1:
-                ordered.append(("one", items))
-                seen_groups.add(control.group)
+        if control.hidden or control.disabled:
+            continue
+        key = _checkbox_key(control)
+        if not key or key in seen_groups:
+            continue
+        seen_groups.add(key)
+        items = grouped.get(key, [])
+        if len(items) >= 2:
+            ordered.append(("multi", items))
+        elif len(items) == 1:
+            ordered.append(("one", items))
     return ordered
 
 
@@ -259,9 +278,11 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     if _LEGAL_RE.search(blob):
         return None
     if control.kind == "file" or any(item.kind == "file" for item in controls):
-        if "resume" in blob or "cv" in blob or "curriculum vitae" in blob:
+        if _is_application_resume(control):
             return _Ask(controls=controls, field_key="resume.file")
         return None
+    if kind != "multi" and _is_current_location(control):
+        return _Ask(controls=controls, field_key="location", compose_location=True)
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
     match = classify_question(text, options, hook=hook)
@@ -352,6 +373,64 @@ def _subfield(control: Control, heading: str) -> str:
     return ""
 
 
+def _is_application_resume(control: Control) -> bool:
+    """The application Resume/CV input. The Autofill-from-resume widget is not it."""
+    blob = haystack(control)
+    if "autofill" in blob:
+        return False
+    return bool(re.search(r"\b(?:resume|cv|curriculum vitae)\b", blob))
+
+
+def _is_current_location(control: Control) -> bool:
+    """A single location box, not a relocation question and not a city field."""
+    if control.kind not in {"text", "textarea", "combobox"}:
+        return False
+    blob = normalize(" ".join(part for part in (control.label, control.aria_label, control.placeholder) if part))
+    if not blob or "relocat" in blob:
+        return False
+    if "current location" in blob:
+        return True
+    return blob in {"location", "your location"}
+
+
+def _requested_field_keys(requests: list[_Ask]) -> list[str]:
+    keys: list[str] = []
+    for ask in requests:
+        if not ask.field_key or ask.include_question:
+            continue
+        if ask.compose_location:
+            keys.extend(_LOCATION_KEYS)
+        else:
+            keys.append(ask.field_key)
+    return _unique(keys)
+
+
+def _compose_location(fields: dict) -> str:
+    """A location string, or city, region, and country joined when that is what came back."""
+    raw = fields.get("location")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    parts: list[str] = []
+    for key in ("address.city", "address.region", "address.country"):
+        value = fields.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text not in parts:
+            parts.append(text)
+    return ", ".join(parts)
+
+
+def _visible_resume_name(resume_name: str, descriptor: dict) -> str:
+    filename = str(descriptor.get("filename") or "")
+    raw_suffix = filename[filename.rfind(".") :].lower()[:8] if "." in filename else ""
+    suffix = raw_suffix if raw_suffix in _RESUME_SUFFIXES else ".pdf"
+    base = resume_name.strip() or candidate_resume_name("", "", suffix)
+    dot = base.rfind(".")
+    stem = base[:dot] if dot > 0 else base
+    return f"{stem}{suffix}"
+
+
 def _apply(
     page,
     requests: list[_Ask],
@@ -359,6 +438,7 @@ def _apply(
     flags: FillFlags,
     outcome: ResolvedPage,
     heading: str,
+    resume_name: str = "",
 ) -> None:
     by_intent, unnamed, by_text = _index_answers(response)
     employment_rows = _rows(response.fields.get("employment[]"))
@@ -367,7 +447,16 @@ def _apply(
     employment_index = -1
     for ask in requests:
         if ask.field_key == "resume.file":
-            _apply_resume(page, ask, response, outcome)
+            _apply_resume(page, ask, response, outcome, resume_name)
+            continue
+        if ask.compose_location:
+            _write_text(
+                page,
+                ask.controls[0],
+                _compose_location(response.fields),
+                outcome,
+                key="location",
+            )
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
@@ -446,7 +535,13 @@ def _resume_shown(page, selector: str) -> bool:
         return False
 
 
-def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: ResolvedPage) -> None:
+def _apply_resume(
+    page,
+    ask: _Ask,
+    response: ResolverResponse,
+    outcome: ResolvedPage,
+    resume_name: str = "",
+) -> None:
     """Attach ``resume.file`` from a remote descriptor, or leave the input for a person."""
     control = ask.controls[0]
     descriptor = response.fields.get("resume.file")
@@ -456,7 +551,7 @@ def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: Resolved
         return
     path = None
     try:
-        path = fetch_resume(descriptor)
+        path = fetch_resume(descriptor, display_name=_visible_resume_name(resume_name, descriptor))
         mapped = MappedField(
             key="resume.file",
             action="upload",
@@ -473,7 +568,12 @@ def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: Resolved
         _skip(control, outcome, "resume.file", "Resume file was not attached.")
     finally:
         if path is not None:
+            parent = path.parent
             path.unlink(missing_ok=True)
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
 
 def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
@@ -773,12 +873,21 @@ def _rows(value: object) -> list[dict[str, str]]:
     return rows
 
 
+def _clean_prompt(text: str) -> str:
+    return re.sub(r"[\s*✱＊]+$", "", text).strip()
+
+
 def _question_text(controls: list[Control]) -> str:
-    if len(controls) > 1 and controls[0].group:
-        return controls[0].group
+    if len(controls) > 1:
+        group = controls[0].group.strip()
+        if group:
+            return _clean_prompt(group)
+        prompt = controls[0].prompt.strip()
+        if prompt:
+            return _clean_prompt(prompt)
     control = controls[0]
     if control.group and control.kind == "checkbox":
-        return control.group
+        return _clean_prompt(control.group)
     return control.label or control.aria_label or control.placeholder
 
 
@@ -793,17 +902,23 @@ def _option_labels(controls: list[Control]) -> list[str]:
     return labels
 
 
+def _strip_affix(label: str, affix: str) -> str:
+    if not affix:
+        return label
+    folded = label.casefold()
+    affix_folded = affix.casefold()
+    if folded.startswith(affix_folded):
+        return label[len(affix) :].strip(" :-")
+    if folded.endswith(affix_folded):
+        return label[: -len(affix)].strip(" :-")
+    return label
+
+
 def _checkbox_label(control: Control) -> str:
-    """Option text with the fieldset legend removed from either end."""
+    """Option text with the fieldset legend or question prompt removed from either end."""
     label = control.label.strip()
-    group = control.group.strip()
-    if group:
-        folded = label.casefold()
-        group_folded = group.casefold()
-        if folded.startswith(group_folded):
-            label = label[len(group) :].strip(" :-")
-        elif folded.endswith(group_folded):
-            label = label[: -len(group)].strip(" :-")
+    for affix in (control.group.strip(), control.prompt.strip()):
+        label = _strip_affix(label, affix)
     return sanitize_question(label or control.aria_label or control.name, limit=80)
 
 

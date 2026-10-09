@@ -33,6 +33,15 @@ def test_identity_contact_and_address_labels():
     assert digits.text == "5550100199"
 
 
+def test_current_location_uses_city_state_and_country():
+    filled = profile()
+    mapped = map_field(control("Current location"), filled)
+    assert mapped.key == "location"
+    assert mapped.text == "Example City, EX, Exampleland"
+    assert map_field(control("Where are you located?"), filled).key != "location"
+    assert map_field(control("Are you willing to relocate?"), filled).key != "location"
+
+
 def test_preferred_name_versus_legal_name():
     person = CandidateProfile.from_dict(
         {

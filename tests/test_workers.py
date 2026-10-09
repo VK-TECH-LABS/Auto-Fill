@@ -133,6 +133,35 @@ def test_navigation_timeout_from_the_page_is_retryable(caplog):
     assert "secret.example" not in caplog.text
 
 
+def test_two_idle_workers_do_not_refuse_a_session(tmp_path):
+    _chromium_or_skip()
+    page_path = tmp_path / "apply.html"
+    page_path.write_text(
+        "<form><label for='email'>Email</label><input id='email' type='email'></form>",
+        encoding="utf-8",
+    )
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=2)
+    try:
+        runner.prewarm()
+        result = runner.run(_request(page_path.as_uri(), "idle-two-workers"))
+    finally:
+        runner.shutdown()
+    assert result.status != Status.FAILED_RETRYABLE
+    assert "capacity_busy" not in result.messages
+    assert "browser_crash" not in result.messages
+
+
+def test_capacity_refusal_is_not_a_browser_crash(monkeypatch):
+    monkeypatch.setattr("autofill.service.runner.memory_allows_session", lambda: False)
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    try:
+        result = runner.run(_request("https://example.test/jobs/1", "sess-capacity"))
+    finally:
+        runner.shutdown()
+    assert result.status == Status.FAILED_RETRYABLE
+    assert result.messages == ["capacity_busy"]
+
+
 def test_default_browser_pool_is_two_workers():
     import inspect
 

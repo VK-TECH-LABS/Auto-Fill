@@ -356,6 +356,9 @@ def _profile_text(
         return personal.province_state
     if key == "country":
         return personal.country
+    if key == "location":
+        parts = [personal.city, personal.province_state, personal.country]
+        return ", ".join(part.strip() for part in parts if part and part.strip())
     if key == "postal_code":
         return personal.postal_code
     if key == "linkedin_url":
@@ -489,6 +492,9 @@ def _match_rule(control: Control) -> str | None:
     blob = haystack(control)
     if "country code" in blob:
         return None
+    label = normalize(control.label or control.aria_label or control.placeholder)
+    if label in {"current location", "location", "your location"} and "relocat" not in label:
+        return "location"
     for rule in _RULES:
         if rule.kinds is not None and control.kind not in rule.kinds:
             continue

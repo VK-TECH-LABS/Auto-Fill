@@ -40,7 +40,12 @@ DEFAULT_LAUNCH_ARGS = [
     "--renderer-process-limit=2",
     "--js-flags=--max-old-space-size=256",
 ]
-_MEMORY_LIMIT_BYTES = 768 * 1024 * 1024
+_DEFAULT_MEMORY_LIMIT_BYTES = 1536 * 1024 * 1024
+_MEMORY_HEADROOM_NUMERATOR = 85
+_MEMORY_HEADROOM_DENOMINATOR = 100
+_UNLIMITED_CGROUP_BYTES = 1 << 60
+_CAPACITY_ATTEMPTS = 3
+_CAPACITY_PAUSE_SECONDS = 0.25
 _BLOCKED_HOSTS = (
     "google-analytics.com",
     "googletagmanager.com",
@@ -60,48 +65,266 @@ class PageUnavailable(RuntimeError):
         self.status_code = status_code
 
 
-def _rss_bytes() -> int:
-    """Resident memory of this process and its children. Zero when /proc is absent."""
-    root = Path("/proc")
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _parse_bytes(text: str) -> int | None:
+    token = text.strip()
+    if not token.isdigit():
+        return None
+    return int(token)
+
+
+def _stat_bytes(text: str, key: str) -> int | None:
+    prefix = key + " "
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return _parse_bytes(line[len(prefix) :])
+    return None
+
+
+def _finite_limit(text: str) -> int | None:
+    """A cgroup maximum in bytes. ``None`` means the controller reported no cap."""
+    token = text.strip()
+    if token == "max" or not token:
+        return None
+    value = _parse_bytes(token)
+    if value is None or value <= 0 or value >= _UNLIMITED_CGROUP_BYTES:
+        return None
+    return value
+
+
+def _env_memory_limit() -> int | None:
+    raw = os.environ.get("AUTOFILL_MEMORY_LIMIT_MB", "").strip()
+    if not raw:
+        return None
+    try:
+        megabytes = float(raw)
+    except ValueError:
+        return None
+    if megabytes <= 0:
+        return None
+    return int(megabytes * 1024 * 1024)
+
+
+def _cgroup_relative() -> str | None:
+    text = _read_text(Path("/proc/self/cgroup"))
+    if text is None:
+        return None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            return parts[2].lstrip("/")
+    return None
+
+
+def _walk_for(start: Path, filename: str, stop: Path) -> Path | None:
+    node = start
+    while True:
+        if (node / filename).is_file():
+            return node
+        if node == stop or node.parent == node:
+            return None
+        node = node.parent
+
+
+def _discover_cgroup_v2() -> Path | None:
+    relative = _cgroup_relative()
+    root = Path("/sys/fs/cgroup")
+    if relative is not None:
+        found = _walk_for(root / relative, "memory.current", root)
+        if found is not None:
+            return found
+    if (root / "memory.current").is_file():
+        return root
+    return None
+
+
+def _discover_cgroup_v1() -> Path | None:
+    text = _read_text(Path("/proc/self/cgroup"))
+    root = Path("/sys/fs/cgroup")
+    if text is not None:
+        for line in text.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) != 3 or "memory" not in parts[1].split(","):
+                continue
+            relative = parts[2].lstrip("/")
+            for start in (root / "memory" / relative, root / relative):
+                found = _walk_for(start, "memory.usage_in_bytes", root)
+                if found is not None:
+                    return found
+    fallback = root / "memory"
+    if (fallback / "memory.usage_in_bytes").is_file():
+        return fallback
+    return None
+
+
+def _v2_usage(directory: Path) -> int | None:
+    current_text = _read_text(directory / "memory.current")
+    if current_text is None:
+        return None
+    current = _parse_bytes(current_text)
+    if current is None:
+        return None
+    stat = _read_text(directory / "memory.stat") or ""
+    inactive = _stat_bytes(stat, "inactive_file")
+    if inactive is None:
+        return current
+    return max(0, current - inactive)
+
+
+def _v1_usage(directory: Path) -> int | None:
+    usage_text = _read_text(directory / "memory.usage_in_bytes")
+    if usage_text is None:
+        return None
+    usage = _parse_bytes(usage_text)
+    if usage is None:
+        return None
+    stat = _read_text(directory / "memory.stat") or ""
+    inactive = _stat_bytes(stat, "total_inactive_file")
+    if inactive is None:
+        inactive = _stat_bytes(stat, "inactive_file")
+    if inactive is None:
+        return usage
+    return max(0, usage - inactive)
+
+
+def _directory_limit(directory: Path) -> int | None:
+    for name in ("memory.max", "memory.limit_in_bytes"):
+        text = _read_text(directory / name)
+        if text is None:
+            continue
+        return _finite_limit(text)
+    return None
+
+
+def _kb_field(line: str) -> int | None:
+    parts = line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1]) * 1024
+
+
+def _rollup_bytes(text: str) -> int | None:
+    """PSS when the kernel reports it, otherwise private clean plus private dirty."""
+    pss: int | None = None
+    private = 0
+    saw_private = False
+    for line in text.splitlines():
+        if line.startswith("Pss:"):
+            pss = _kb_field(line)
+        elif line.startswith("Private_Clean:") or line.startswith("Private_Dirty:"):
+            value = _kb_field(line)
+            if value is not None:
+                private += value
+                saw_private = True
+    if pss is not None:
+        return pss
+    if saw_private:
+        return private
+    return None
+
+
+def _ppid(stat_text: str) -> str | None:
+    end = stat_text.rfind(")")
+    fields = stat_text[end + 2 :].split() if end >= 0 else []
+    if len(fields) >= 2:
+        return fields[1]
+    return None
+
+
+def proportional_memory_bytes(proc_root: Path | None = None, start_pid: int | None = None) -> int:
+    """PSS or USS of one process and its descendants. Shared pages are not added per process."""
+    root = proc_root or Path("/proc")
     if not root.is_dir():
         return 0
+    pending = [start_pid if start_pid is not None else os.getpid()]
     seen: set[int] = set()
-    pending = [os.getpid()]
     total = 0
     while pending:
         pid = pending.pop()
         if pid in seen:
             continue
         seen.add(pid)
-        try:
-            status = (root / str(pid) / "status").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in status.splitlines():
-            if line.startswith("VmRSS:"):
-                parts = line.split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    total += int(parts[1]) * 1024
-                break
+        rollup = _read_text(root / str(pid) / "smaps_rollup")
+        if rollup is not None:
+            amount = _rollup_bytes(rollup)
+            if amount is not None:
+                total += amount
         try:
             entries = list(root.iterdir())
         except OSError:
             entries = []
         for entry in entries:
-            if not entry.name.isdigit():
+            if not entry.name.isdigit() or int(entry.name) in seen:
                 continue
-            child = int(entry.name)
-            if child in seen:
-                continue
-            try:
-                stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            end = stat.rfind(")")
-            fields = stat[end + 2 :].split() if end >= 0 else []
-            if len(fields) >= 2 and fields[1] == str(pid):
-                pending.append(child)
+            stat = _read_text(entry / "stat")
+            if stat is not None and _ppid(stat) == str(pid):
+                pending.append(int(entry.name))
     return total
+
+
+def container_memory_bytes(
+    *,
+    v2_dir: Path | None = None,
+    v1_dir: Path | None = None,
+    proc_root: Path | None = None,
+    start_pid: int | None = None,
+) -> int:
+    """Container usage: cgroup v2, then cgroup v1, then PSS/USS. Never a sum of RSS."""
+    if v2_dir is None and v1_dir is None and proc_root is None:
+        discovered = _discover_cgroup_v2()
+        if discovered is not None:
+            usage = _v2_usage(discovered)
+            if usage is not None:
+                return usage
+        discovered_v1 = _discover_cgroup_v1()
+        if discovered_v1 is not None:
+            usage = _v1_usage(discovered_v1)
+            if usage is not None:
+                return usage
+        return proportional_memory_bytes()
+    if v2_dir is not None:
+        usage = _v2_usage(v2_dir)
+        if usage is not None:
+            return usage
+    if v1_dir is not None:
+        usage = _v1_usage(v1_dir)
+        if usage is not None:
+            return usage
+    if proc_root is not None:
+        return proportional_memory_bytes(proc_root, start_pid)
+    return 0
+
+
+def memory_limit_bytes(cgroup_dir: Path | None = None) -> int:
+    """``AUTOFILL_MEMORY_LIMIT_MB``, else 85% of a finite cgroup max, else 1536 MB."""
+    override = _env_memory_limit()
+    if override is not None:
+        return override
+    directory = cgroup_dir
+    if directory is None:
+        directory = _discover_cgroup_v2() or _discover_cgroup_v1()
+    if directory is not None:
+        maximum = _directory_limit(directory)
+        if maximum is not None:
+            return maximum * _MEMORY_HEADROOM_NUMERATOR // _MEMORY_HEADROOM_DENOMINATOR
+    return _DEFAULT_MEMORY_LIMIT_BYTES
+
+
+def memory_allows_session() -> bool:
+    """True when usage is within the limit. Recheck briefly before refusing."""
+    limit = memory_limit_bytes()
+    for attempt in range(_CAPACITY_ATTEMPTS):
+        if container_memory_bytes() <= limit:
+            return True
+        if attempt + 1 < _CAPACITY_ATTEMPTS:
+            time.sleep(_CAPACITY_PAUSE_SECONDS)
+    return False
 
 
 def _block_heavy(page) -> None:
@@ -459,8 +682,8 @@ class PlaywrightRunner:
             try:
                 slot = worker.sessions.get(request.session_id)
                 if slot is None or slot.page is None:
-                    if _rss_bytes() > _MEMORY_LIMIT_BYTES:
-                        return self._retryable(request, category="browser_crash")
+                    if not memory_allows_session():
+                        return self._retryable(request, category="capacity_busy")
                     slot = _SessionContext()
                     slot.open(worker.driver, request.application_url)
                     worker.sessions[request.session_id] = slot

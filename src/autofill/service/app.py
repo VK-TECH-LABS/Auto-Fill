@@ -195,7 +195,13 @@ def _mark_browser_crash(session: ServiceSession) -> None:
 
 
 def _allow_browser_restart(session: ServiceSession) -> None:
-    """A crashed session can be started again from its URL, a bounded number of times."""
+    """A crashed session can be started again from its URL, a bounded number of times.
+
+    A capacity refusal is retryable on its own and does not spend this budget.
+    """
+    messages = session.result.messages if session.result is not None else []
+    if "capacity_busy" in messages:
+        return
     if session.browser_restarts >= 2:
         raise HTTPException(status_code=409, detail="Browser crash retry limit reached.")
     session.browser_restarts += 1

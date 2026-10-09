@@ -45,6 +45,7 @@ python -m autofill.service
 | `AUTOFILL_RESOLVER_RETRIES` | no | Extra attempts after a retryable resolver failure. Default `2`. |
 | `AUTOFILL_RESOLVER_MAX_BYTES` | no | Maximum resolver response body. Default `65536`. |
 | `AUTOFILL_BROWSER_WORKERS` | no | Browser worker threads. Each has its own Chromium. Default `2`. |
+| `AUTOFILL_MEMORY_LIMIT_MB` | no | Container memory limit for opening a new session. Unset uses 85% of the cgroup memory maximum when that maximum is finite, otherwise `1536`. |
 
 Interactive API docs are served at `/docs`. The schema is `/openapi.json`. Neither document contains a real token.
 
@@ -197,7 +198,7 @@ Status includes `protocolVersion`, `manualQuestions` (`[{intent, text}]` only, a
 
 Before each inspection the engine waits for the page to render (network idle, then a poll of up to 12 seconds for form controls or known markers). A non-review step with no fields ends as `NO_FORM_FOUND`, not `READY_FOR_HUMAN_SUBMIT`.
 
-The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 2). Chromium is launched with a shared-memory workaround, GPU disabled, a renderer cap, and a JavaScript heap cap. Video, fonts, and analytics requests are not loaded. A session is pinned to one worker. Each session gets a new browser context that is never reused. A browser or tab crash closes that context, records `FAILED_RETRYABLE` with category `browser_crash`, and `continue` or `humanResolved` can start again from the application URL up to two more times. A screenshot or interaction on a crashed page returns 410 and the status becomes `FAILED_RETRYABLE`. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
+The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 2). Chromium is launched with a shared-memory workaround, GPU disabled, a renderer cap, and a JavaScript heap cap. Video, fonts, and analytics requests are not loaded. A session is pinned to one worker. Each session gets a new browser context that is never reused. Before that context is opened, memory is read from the container cgroup (`memory.current` minus `inactive_file`, then the cgroup v1 equivalent, then PSS or USS from `smaps_rollup`). Shared pages are not added once per process. The limit is `AUTOFILL_MEMORY_LIMIT_MB`, or 85% of a finite cgroup maximum, or 1536 MB. The check is repeated briefly. A session that is still over the limit is `FAILED_RETRYABLE` with category `capacity_busy`, which is not a browser crash. A browser or tab crash closes that context, records `FAILED_RETRYABLE` with category `browser_crash`, and `continue` or `humanResolved` can start again from the application URL up to two more times. A screenshot or interaction on a crashed page returns 410 and the status becomes `FAILED_RETRYABLE`. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
 
 A background reaper closes an expired session's context and wipes the resolver token, site credentials, and held values, then sets `EXPIRED`. Shutdown does the same wipe. Logs for resolver steps record the session id, step, adapter, field keys, intents, counts, result codes, and latency. They do not record values, emails, phones, or tokens.
 

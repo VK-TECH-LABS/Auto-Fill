@@ -42,6 +42,22 @@ EXTRACT_JS = r"""
     return legend ? textOf(legend) : "";
   }
 
+  function checkboxPrompt(el) {
+    const legend = legendText(el);
+    if (legend) return legend.replace(/[✱*＊]+$/, "").trim();
+    const stop = el.closest("form") || document.body;
+    let node = el.parentElement;
+    for (let depth = 0; node && node !== stop && depth < 5; depth += 1, node = node.parentElement) {
+      for (const child of Array.from(node.children)) {
+        if (child.contains(el)) break;
+        if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
+        const text = textOf(child).replace(/[✱*＊]+$/, "").trim();
+        if (text && text.length <= 200) return text;
+      }
+    }
+    return "";
+  }
+
   function labelFor(root, el) {
     const bits = [];
     if (el.id) {
@@ -87,8 +103,8 @@ EXTRACT_JS = r"""
     const name = el.getAttribute("name");
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute("type") || "").toLowerCase();
-    if (name && type === "radio") {
-      return tag + "[type='radio'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value) + "']";
+    if (name && (type === "radio" || type === "checkbox")) {
+      return tag + "[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value || "") + "']";
     }
     if (name) return tag + "[name='" + CSS.escape(name) + "']";
     const automation = el.getAttribute("data-automation-id");
@@ -157,6 +173,7 @@ EXTRACT_JS = r"""
           role: "radio",
           nearby: "",
           group: textOf(legend),
+          prompt: "",
         });
         continue;
       }
@@ -216,6 +233,7 @@ EXTRACT_JS = r"""
         role,
         nearby: textOf(headingNode).slice(0, 160),
         group: legendText(el),
+        prompt: inputType === "checkbox" ? checkboxPrompt(el) : "",
       });
     }
 
@@ -284,6 +302,7 @@ EXTRACT_JS = r"""
         role: "group",
         nearby: "",
         group: question,
+        prompt: "",
       });
     }
   });
@@ -409,6 +428,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 role=str(raw.get("role", "")),
                 nearby=str(raw.get("nearby", "")),
                 group=str(raw.get("group", "")),
+                prompt=str(raw.get("prompt", "")),
             )
         )
     buttons = [
