@@ -11,6 +11,7 @@ The final Submit control is never clicked. CAPTCHA widgets stop the run.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,23 +23,33 @@ from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
 from autofill.models import FillResult, JobContext
 from autofill.profile import CandidateProfile
-from autofill.safeguards import HUMAN_SUBMIT_ONLY, activate, field_class_for_button, is_add_row
+from autofill.resolver import ResolverBinding, ResolverCallError
+from autofill.safeguards import HUMAN_SUBMIT_ONLY, activate, field_class_for_button, is_add_row, is_forward_navigation
 from autofill.session import SessionStore
+from autofill.stepfill import FillFlags, fill_resolved_page, flags_for_alerts, validation_blob
 
 logger = logging.getLogger("autofill.engine")
 
 
 class Status:
+    CREATED = "CREATED"
+    STARTED = "STARTED"
     FILLED = "FILLED"
     LOGIN_REQUIRED = "LOGIN_REQUIRED"
     LOGIN_FAILED = "LOGIN_FAILED"
     APPLICATION_READY = "APPLICATION_READY"
+    FORM_IN_PROGRESS = "FORM_IN_PROGRESS"
+    MANUAL_ANSWER_REQUIRED = "MANUAL_ANSWER_REQUIRED"
     RESUME_UPLOAD_REQUIRED = "RESUME_UPLOAD_REQUIRED"
     MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
     READY_FOR_HUMAN_SUBMIT = "READY_FOR_HUMAN_SUBMIT"
     UNSUPPORTED = "UNSUPPORTED"
     FAILED = "FAILED"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    FAILED_FINAL = "FAILED_FINAL"
     CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
 
 
 @dataclass
@@ -55,6 +66,10 @@ class AutofillOptions:
     headless: bool = True
     page: Any = None
     job: JobContext | None = None
+    resolver: ResolverBinding | None = None
+    answers_updated: bool = False
+    timings: dict[str, int] | None = None
+    intent_hook: Any = None
 
 
 @dataclass
@@ -76,6 +91,8 @@ class ApplicationResult:
     stopped_before_submit: bool = True
     messages: list[str] = field(default_factory=list)
     submit_controls: list[str] = field(default_factory=list)
+    manual_questions: list[dict[str, str | None]] = field(default_factory=list)
+    timings: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -100,6 +117,8 @@ class ApplicationResult:
             "stopped_before_submit": True,
             "messages": list(self.messages),
             "submitControls": list(self.submit_controls),
+            "manualQuestions": [dict(item) for item in self.manual_questions],
+            "timings": dict(self.timings),
         }
 
 
@@ -149,6 +168,8 @@ def autofill_application(
     opts = options or AutofillOptions()
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
+    run_started = time.perf_counter()
+    inspect_state = {"seen": False}
     store = SessionStore()
     session = store.open(
         profile=candidate_profile,
@@ -203,7 +224,7 @@ def autofill_application(
             page = browser.new_page()
             page.goto(application_url)
 
-        snapshot = extract_page(page)
+        snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if snapshot.captcha_present:
             session.mark("FAILED")
             return _result(
@@ -275,13 +296,24 @@ def autofill_application(
         if adapter:
             logger.info("adapter=%s", adapter.name)
 
+        if opts.resolver is not None:
+            return _run_resolver_pages(
+                page,
+                session,
+                opts,
+                ats_name=ats_name,
+                login_status=login_status,
+                run_started=run_started,
+                inspect_state=inspect_state,
+            )
+
         fields: list = []
         manual: list[str] = []
         submit_controls: list[str] = []
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
         for index in range(opts.max_pages):
-            snapshot = extract_page(page)
+            snapshot = _timed_extract(page, opts, run_started, inspect_state)
             if snapshot.captcha_present:
                 session.mark("FAILED")
                 detected, filled, skipped = _counts(fields)
@@ -385,7 +417,7 @@ def autofill_application(
 
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
-        snapshot = extract_page(page)
+        snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if "review" in (snapshot.heading or "").casefold():
             session.mark("REVIEW_PAGE")
         session.mark("READY_FOR_HUMAN_SUBMIT")
@@ -404,7 +436,21 @@ def autofill_application(
             messages=["Filled what it could. A person clicks Submit or Apply."],
             submit_controls=submit_controls,
         )
+    except ResolverCallError as exc:
+        session.mark("FAILED")
+        status = _RESOLVER_STATUS.get(exc.code, Status.FAILED_RETRYABLE)
+        logger.info("session=%s status=%s result=%s", session.session_id, status, exc.code)
+        return _result(
+            session,
+            status=status,
+            ats=ats_name,
+            login_status="NOT_REQUIRED",
+            messages=[f"Resolver result {exc.code}."],
+            timings=_timings(opts),
+        )
     except Exception as exc:
+        if is_browser_crash(exc):
+            raise
         session.mark("FAILED")
         logger.info("session=%s status=FAILED error_type=%s", session.session_id, type(exc).__name__)
         return _result(
@@ -413,12 +459,193 @@ def autofill_application(
             ats=ats_name,
             login_status="NOT_REQUIRED",
             messages=[f"Stopped because of {type(exc).__name__}."],
+            timings=_timings(opts),
         )
     finally:
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:
             playwright.stop()
+
+
+_RESOLVER_STATUS = {
+    "unauthorized": Status.FAILED_FINAL,
+    "mismatch": Status.FAILED_FINAL,
+    "expired": Status.EXPIRED,
+    "retryable": Status.FAILED_RETRYABLE,
+    "invalid": Status.FAILED_FINAL,
+    "too_large": Status.FAILED_FINAL,
+}
+
+_VALIDATION = ("invalid phone", "valid date", "select one", "required")
+
+
+def is_browser_crash(exc: BaseException) -> bool:
+    """True when Chromium or its driver has gone away and a relaunch can help."""
+    text = f"{type(exc).__name__} {exc}".casefold()
+    needles = (
+        "browser has been closed",
+        "browser closed",
+        "target closed",
+        "target page, context or browser has been closed",
+        "connection closed",
+        "has been closed",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _timings(opts: AutofillOptions) -> dict[str, int]:
+    if not opts.timings:
+        return {}
+    return {key: int(value) for key, value in opts.timings.items()}
+
+
+def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
+    snapshot = extract_page(page)
+    if not state.get("seen") and opts.timings is not None:
+        state["seen"] = True
+        opts.timings["firstFormInspectedMs"] = max(0, int((time.perf_counter() - started) * 1000))
+    elif not state.get("seen"):
+        state["seen"] = True
+    return snapshot
+
+
+def _validation_hit(snapshot) -> bool:
+    blob = validation_blob(snapshot)
+    return any(phrase in blob for phrase in _VALIDATION)
+
+
+def _remember_submit(snapshot, submit_controls: list[str]) -> None:
+    for button in snapshot.buttons:
+        if field_class_for_button(button.name, control_type=button.control_type) == "FINAL_SUBMIT":
+            if button.name not in submit_controls:
+                submit_controls.append(button.name)
+
+
+def _run_resolver_pages(
+    page,
+    session,
+    opts: AutofillOptions,
+    *,
+    ats_name: str | None,
+    login_status: str,
+    run_started: float,
+    inspect_state: dict,
+) -> ApplicationResult:
+    """Step through the form, asking the resolver only for the current step."""
+    binding = opts.resolver
+    if binding is None:
+        raise RuntimeError("Resolver mode was entered without a binding.")
+    session.mark(Status.STARTED)
+    session.mark(Status.FORM_IN_PROGRESS)
+    fields: list = []
+    manual: list[str] = []
+    submit_controls: list[str] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def finish(status: str, messages: list[str], *, questions: list[dict] | None = None) -> ApplicationResult:
+        detected, filled, skipped = _counts(fields)
+        return _result(
+            session,
+            status=status,
+            ats=ats_name,
+            login_status=login_status,
+            fields_detected=detected,
+            fields_filled=filled,
+            fields_skipped=skipped,
+            manual_actions=manual,
+            messages=messages,
+            submit_controls=submit_controls,
+            manual_questions=list(questions or []),
+            timings=_timings(opts),
+        )
+
+    for index in range(opts.max_pages):
+        snapshot = _timed_extract(page, opts, run_started, inspect_state)
+        if snapshot.captcha_present:
+            session.mark("FAILED")
+            return finish(
+                Status.CAPTCHA_REQUIRED,
+                ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+            )
+        visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
+        if visible in seen:
+            break
+        seen.add(visible)
+        _remember_submit(snapshot, submit_controls)
+        step_name = page_step(ats_name, snapshot.heading, session.application_url)
+        session.mark("FILL_PAGE" if index == 0 else "FILL_NEXT_PAGE")
+        on_review = step_name == "review" or "review" in snapshot.heading.casefold()
+        flags = FillFlags()
+        for attempt in range(3):
+            outcome = fill_resolved_page(
+                page,
+                binding,
+                session_id=session.session_id,
+                ats_name=ats_name,
+                step=step_name,
+                flags=flags,
+                hook=opts.intent_hook,
+            )
+            fields.extend(outcome.fields)
+            manual.extend(outcome.manual_actions)
+            if outcome.snapshot is not None:
+                snapshot = outcome.snapshot
+                _remember_submit(snapshot, submit_controls)
+            if outcome.resume_blocked and not opts.resume_uploaded:
+                session.mark(Status.RESUME_UPLOAD_REQUIRED)
+                return finish(
+                    Status.RESUME_UPLOAD_REQUIRED,
+                    ["Upload the resume that was already downloaded, then continue with resumeUploaded."],
+                )
+            if on_review:
+                session.mark("REVIEW_PAGE")
+                session.mark(Status.READY_FOR_HUMAN_SUBMIT)
+                return finish(Status.READY_FOR_HUMAN_SUBMIT, ["Review page reached. A person clicks Submit."])
+            if outcome.manual_questions and not opts.answers_updated:
+                session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                return finish(
+                    Status.MANUAL_ANSWER_REQUIRED,
+                    ["A saved answer is required. Nothing below HIGH confidence was written."],
+                    questions=outcome.manual_questions,
+                )
+            nxt = next(
+                (
+                    button
+                    for button in snapshot.buttons
+                    if is_forward_navigation(button.name, control_type=button.control_type)
+                ),
+                None,
+            )
+            if nxt is None:
+                break
+            session.mark("NEXT_PAGE")
+            activate(page, nxt.selector, nxt.name, control_type=nxt.control_type)
+            snapshot = _timed_extract(page, opts, run_started, inspect_state)
+            if snapshot.captcha_present:
+                session.mark("FAILED")
+                return finish(
+                    Status.CAPTCHA_REQUIRED,
+                    ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                )
+            if not _validation_hit(snapshot):
+                break
+            flags = flags_for_alerts(validation_blob(snapshot), flags)
+            if attempt == 2:
+                session.mark(Status.FAILED_RETRYABLE)
+                return finish(
+                    Status.FAILED_RETRYABLE,
+                    ["Validation could not be corrected within the attempt limit."],
+                )
+
+    snapshot = _timed_extract(page, opts, run_started, inspect_state)
+    _remember_submit(snapshot, submit_controls)
+    if "review" in (snapshot.heading or "").casefold():
+        session.mark("REVIEW_PAGE")
+    session.mark(Status.READY_FOR_HUMAN_SUBMIT)
+    on_review = "review" in (snapshot.heading or "").casefold()
+    terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
+    return finish(terminal, ["Filled what it could. A person clicks Submit or Apply."])
 
 
 def autofill_from_fill_result(result: FillResult) -> str:

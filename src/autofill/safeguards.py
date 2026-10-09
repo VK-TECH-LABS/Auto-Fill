@@ -35,6 +35,11 @@ _CONTINUE_RE = re.compile(
     r"\b(next|continue|save\s*(and|&)\s*continue|proceed|review)\b",
     re.IGNORECASE,
 )
+_FORBIDDEN_RE = re.compile(
+    r"\b(withdraw|delete|decline|cancel\s+application)\b",
+    re.IGNORECASE,
+)
+_FORWARD = frozenset({"next", "continue", "save_and_continue", "review"})
 _ADD_RE = re.compile(
     r"\badd (another|experience|employment|education|position|job)\b",
     re.IGNORECASE,
@@ -72,7 +77,7 @@ def classify_control(name: str, *, control_type: str = "") -> str:
     continue label is treated as a final submit.
     """
     label = " ".join(name.split())
-    if _SUBMIT_RE.search(label):
+    if _SUBMIT_RE.search(label) or _FORBIDDEN_RE.search(label):
         return "submit"
     if _AUTH_RE.search(label):
         return "auth"
@@ -81,6 +86,45 @@ def classify_control(name: str, *, control_type: str = "") -> str:
     if control_type.lower() == "submit":
         return "submit"
     return "other"
+
+
+def semantic_action(name: str, *, control_type: str = "") -> str:
+    """Classify a button without activating it.
+
+    Forward steps are Next, Continue, Save and Continue, and Review.
+    Back and Save are named so they are not treated as a final submit and
+    are not used to advance. Withdraw, Delete, Decline, and Cancel
+    Application stay forbidden.
+    """
+    label = " ".join(name.split())
+    if _SUBMIT_RE.search(label) or _FORBIDDEN_RE.search(label):
+        return "forbidden_submit"
+    if _SIGNUP_RE.search(label):
+        return "signup"
+    if _LOGIN_OK_RE.search(label):
+        return "login"
+    if re.search(r"\bback\b", label, re.IGNORECASE):
+        return "back"
+    if re.search(r"\bsave\s*(and|&)\s*continue\b", label, re.IGNORECASE):
+        return "save_and_continue"
+    if re.search(r"\bnext\b", label, re.IGNORECASE):
+        return "next"
+    if re.search(r"\b(continue|proceed)\b", label, re.IGNORECASE):
+        return "continue"
+    if re.search(r"\breview\b", label, re.IGNORECASE):
+        return "review"
+    if re.search(r"\bsave\b", label, re.IGNORECASE):
+        return "save"
+    if control_type.lower() == "submit":
+        return "forbidden_submit"
+    return "other"
+
+
+def is_forward_navigation(name: str, *, control_type: str = "") -> bool:
+    """True for a page-turn that is not Back, Save, or a final submit."""
+    if is_add_row(name):
+        return False
+    return semantic_action(name, control_type=control_type) in _FORWARD
 
 
 def is_add_row(name: str) -> bool:

@@ -104,4 +104,17 @@ def page_step(ats_name: str | None, heading: str, url: str = "") -> str:
         return "resume"
     if "sign in" in blob or "log in" in blob:
         return "login"
+    heading_only = normalize(heading)
+    for label in (
+        "questions",
+        "education",
+        "employment",
+        "experience",
+        "address",
+        "contact",
+        "identity",
+        "login",
+    ):
+        if label in heading_only:
+            return label
     return "application"

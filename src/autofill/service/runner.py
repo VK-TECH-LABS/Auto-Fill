@@ -11,15 +11,17 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
 from autofill.ats import is_blocked_sso, is_manual_ats
 from autofill.credentials import MemoryCredentialProvider
-from autofill.engine import ApplicationResult, AutofillOptions, autofill_application
+from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application, is_browser_crash
 from autofill.models import JobContext
 from autofill.profile import CandidateProfile
+from autofill.resolver import ResolverBinding
 
 _T = TypeVar("_T")
 
@@ -45,6 +47,12 @@ class FillRequest:
     credentials: MemoryCredentialProvider
     resume_uploaded: bool
     cover_letter_text: str | None
+    resolver: ResolverBinding | None = None
+    answers_updated: bool = False
+    timings: dict[str, int] | None = None
+    session_created_ms: int = 0
+    max_pages: int = 8
+    intent_hook: Any = None
 
 
 class FillRunner(Protocol):
@@ -109,6 +117,7 @@ class _SessionContext:
     def open(self, driver: _SharedDriver, url: str) -> Any:
         if self.page is not None:
             return self.page
+        # A fresh context every time. No user-data directory and no stored profile.
         context = driver.browser().new_context()
         try:
             page = context.new_page()
@@ -147,8 +156,19 @@ class PlaywrightRunner:
         self._queue: queue.Queue = queue.Queue()
         self._accept = threading.Lock()
         self._stopped = False
+        self.browser_ready_ms = 0
         self._thread = threading.Thread(target=self._loop, name="autofill-browser", daemon=True)
         self._thread.start()
+
+    def prewarm(self) -> int:
+        """Launch the shared Chromium once. Later sessions only open a context."""
+        if not self.enabled:
+            self.browser_ready_ms = 0
+            return 0
+        started = time.perf_counter()
+        self._submit(lambda: self._driver.browser())
+        self.browser_ready_ms = int((time.perf_counter() - started) * 1000)
+        return self.browser_ready_ms
 
     def _loop(self) -> None:
         while True:
@@ -183,7 +203,18 @@ class PlaywrightRunner:
             cover_letter_text=request.cover_letter_text,
             headless=self.headless,
             job=request.job,
+            resolver=request.resolver,
+            answers_updated=request.answers_updated,
+            timings=self._timings(request),
+            max_pages=request.max_pages,
+            intent_hook=request.intent_hook,
         )
+
+    def _timings(self, request: FillRequest) -> dict[str, int]:
+        timings = dict(request.timings or {})
+        timings.setdefault("sessionCreatedMs", request.session_created_ms)
+        timings.setdefault("browserReadyMs", self.browser_ready_ms)
+        return timings
 
     def _run_engine(self, request: FillRequest, page: object | None) -> ApplicationResult:
         return autofill_application(
@@ -193,13 +224,52 @@ class PlaywrightRunner:
             self._options(request, page),
         )
 
+    def _recover_driver(self) -> None:
+        """Close dead contexts and drop the driver so the next call relaunches."""
+        for session_id in list(self._sessions):
+            try:
+                self._close(session_id)
+            except Exception:
+                self._sessions.pop(session_id, None)
+        try:
+            self._driver.stop()
+        except Exception:
+            self._driver._browser = None
+            self._driver._playwright = None
+        self._driver = _SharedDriver(headless=self.headless, launch_args=self.launch_args)
+
+    def _retryable(self, request: FillRequest) -> ApplicationResult:
+        """The session stays. A later start can run it again. No second session is created."""
+        return ApplicationResult(
+            status=Status.FAILED_RETRYABLE,
+            ats=None,
+            current_step=Status.FAILED_RETRYABLE,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            messages=["Browser stopped. The session was kept and can be retried."],
+            timings=self._timings(request),
+        )
+
     def _run_with_page(self, request: FillRequest) -> ApplicationResult:
-        slot = self._sessions.get(request.session_id)
-        if slot is None:
-            slot = _SessionContext()
-            slot.open(self._driver, request.application_url)
-            self._sessions[request.session_id] = slot
-        return self._run_engine(request, slot.page)
+        attempts = 0
+        while True:
+            try:
+                slot = self._sessions.get(request.session_id)
+                if slot is None or slot.page is None:
+                    slot = _SessionContext()
+                    slot.open(self._driver, request.application_url)
+                    self._sessions[request.session_id] = slot
+                return self._run_engine(request, slot.page)
+            except Exception as exc:
+                if not is_browser_crash(exc) or attempts >= 1:
+                    if is_browser_crash(exc):
+                        self._recover_driver()
+                        return self._retryable(request)
+                    raise
+                attempts += 1
+                self._recover_driver()
 
     def _close(self, session_id: str) -> None:
         slot = self._sessions.pop(session_id, None)

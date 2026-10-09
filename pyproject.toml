@@ -1,6 +1,6 @@
 [project]
 name = "auto-fill"
-version = "0.3.0"
+version = "0.4.0"
 description = "Job-application form autofill service that can sign in, fills fields, and stops before submit."
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -37,6 +37,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The `pytest` console script does not put the checkout on sys.path.
+# This makes `import tests...` the same locally and in GitHub Actions.
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

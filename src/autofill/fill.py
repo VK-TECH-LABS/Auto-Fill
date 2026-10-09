@@ -62,14 +62,23 @@ _SET_NATIVE = """
 """
 
 
-def _apply_mapped(page, control: Control, mapped: MappedField) -> FieldOutcome:
+def apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
+    """Write one mapped value. Clicks still go through the submit guard.
+
+    ``overwrite`` replaces a value this step already wrote, which a validation
+    correction needs. The default still leaves a pre-filled value alone.
+    """
+    return _apply_mapped(page, control, mapped, overwrite=overwrite)
+
+
+def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
     try:
         locator = page.locator(control.selector)
         if mapped.action == "fill":
             current = locator.input_value()
-            if current.strip() and current.strip() != mapped.text:
+            if not overwrite and current.strip() and current.strip() != mapped.text:
                 return _outcome(
                     control,
                     mapped,

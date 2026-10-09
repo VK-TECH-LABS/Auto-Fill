@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.helpers import empty_credentials as _empty_credentials
+from tests.helpers import job_context as _job_object
 
 from autofill.ats import site_domain
 from autofill.credentials import SiteContext
@@ -458,18 +460,6 @@ def _profile_object():
     return CandidateProfile.from_dict(profile())
 
 
-def _job_object():
-    from autofill.models import JobContext
-
-    return JobContext(url="https://boards.greenhouse.io/example/jobs/1")
-
-
-def _empty_credentials():
-    from autofill.credentials import MemoryCredentialProvider
-
-    return MemoryCredentialProvider()
-
-
 def test_library_imports_without_a_host_checkout():
     env = os.environ.copy()
     env.pop("AUTOFILL_SERVICE_TOKEN", None)
@@ -481,7 +471,7 @@ def test_library_imports_without_a_host_checkout():
         text=True,
         env=env,
     )
-    assert completed.stdout.strip() == "0.3.0"
+    assert completed.stdout.strip() == "0.4.0"
     scan = subprocess.run(
         [
             sys.executable,

@@ -35,6 +35,13 @@ EXTRACT_JS = r"""
     return root.querySelector("#" + CSS.escape(id));
   }
 
+  function legendText(el) {
+    const fieldset = el.closest("fieldset");
+    if (!fieldset) return "";
+    const legend = fieldset.querySelector("legend");
+    return legend ? textOf(legend) : "";
+  }
+
   function labelFor(root, el) {
     const bits = [];
     if (el.id) {
@@ -132,6 +139,9 @@ EXTRACT_JS = r"""
           selector: options[0].selector,
           inputMode: "",
           inputType: "radio",
+          role: "radio",
+          nearby: "",
+          group: textOf(legend),
         });
         continue;
       }
@@ -186,6 +196,7 @@ EXTRACT_JS = r"""
         inputType,
         role,
         nearby: textOf(headingNode).slice(0, 160),
+        group: legendText(el),
       });
     }
 
@@ -231,7 +242,16 @@ EXTRACT_JS = r"""
   if (alertNode && !isHidden(alertNode)) {
     banner = (alertNode.innerText || alertNode.textContent || "").replace(/\s+/g, " ").trim();
   }
-  return { controls, buttons, captcha, password, heading, banner };
+  const alerts = [];
+  eachRoot(document, (root) => {
+    for (const node of root.querySelectorAll("[role='alert'], .field-error")) {
+      if (!isHidden(node)) {
+        const text = textOf(node);
+        if (text) alerts.push(text.slice(0, 300));
+      }
+    }
+  });
+  return { controls, buttons, captcha, password, heading, banner, alerts };
 }
 """
 
@@ -267,6 +287,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 input_type=str(raw.get("inputType", "")),
                 role=str(raw.get("role", "")),
                 nearby=str(raw.get("nearby", "")),
+                group=str(raw.get("group", "")),
             )
         )
     buttons = [
@@ -284,6 +305,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         password_present=bool(data.get("password", False)),
         heading=str(data.get("heading", "")),
         banner=str(data.get("banner", "")),
+        alerts=[str(item) for item in data.get("alerts", []) if str(item).strip()],
     )
 
 

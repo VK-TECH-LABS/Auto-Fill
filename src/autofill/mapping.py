@@ -463,6 +463,21 @@ def _nearby_key(control: Control) -> str | None:
     return _match_rule(probe)
 
 
+def match_field_key(control: Control) -> str | None:
+    """Internal profile key for a control, or None when nothing matched.
+
+    This does not read a profile value. Resolver mode uses it only to decide
+    which normalized key to request.
+    """
+    if control.kind == "password" or control.input_type == "password":
+        return None
+    if control.disabled or control.hidden or control.read_only:
+        return None
+    if is_honeypot(control):
+        return None
+    return _match_rule(control)
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):

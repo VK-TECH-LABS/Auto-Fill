@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Synthetic eight page application</title>
+</head>
+<body>
+  <form id="application" onsubmit="window.__submitCount += 1; return false;">
+    <section id="step-login">
+      <h1 id="page-title">Sign in</h1>
+      <div id="login-fields">
+        <label for="login-email">Email</label>
+        <input id="login-email" name="login_email" type="email" autocomplete="username">
+        <label for="login-password">Password</label>
+        <input id="login-password" name="login_password" type="password" autocomplete="current-password">
+        <p id="login-error" class="field-error" role="alert" hidden>Invalid credentials</p>
+        <button type="button" id="sign-in">Sign in</button>
+      </div>
+      <div id="identity-fields" hidden>
+        <label for="first">First name</label>
+        <input id="first" name="first_name" autocomplete="given-name">
+        <label for="last">Last name</label>
+        <input id="last" name="last_name" autocomplete="family-name">
+        <button type="button" id="identity-next">Next</button>
+      </div>
+    </section>
+
+    <section id="step-contact" hidden>
+      <h1>Contact</h1>
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email">
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel" autocomplete="tel">
+      <p id="phone-error" class="field-error" role="alert" hidden>invalid phone</p>
+      <label for="website">Website</label>
+      <input id="website" name="website" type="url" autocomplete="url">
+      <label for="linkedin">LinkedIn</label>
+      <input id="linkedin" name="linkedin" type="url">
+      <button type="button" id="contact-back">Back</button>
+      <button type="button" id="contact-next">Next</button>
+    </section>
+
+    <section id="step-address" hidden>
+      <h1>Address</h1>
+      <label for="street">Street address</label>
+      <input id="street" name="street" autocomplete="street-address">
+      <label for="state">State</label>
+      <select id="state" name="state">
+        <option value="">Select...</option>
+        <option value="california">California</option>
+        <option value="new-york">New York</option>
+      </select>
+      <p id="state-error" class="field-error" role="alert" hidden>select one</p>
+      <label for="postal">Postal code</label>
+      <input id="postal" name="postal" autocomplete="postal-code">
+      <label for="country">Country</label>
+      <select id="country" name="country">
+        <option value="">Select...</option>
+        <option>Canada</option>
+        <option>United States</option>
+      </select>
+      <button type="button" id="address-next">Save and Continue</button>
+    </section>
+
+    <section id="step-employment" hidden>
+      <h1>Employment</h1>
+      <label for="employer">Employer</label>
+      <input id="employer" name="employer">
+      <label for="job-title">Job title</label>
+      <input id="job-title" name="job_title">
+      <label for="start-date">Start date</label>
+      <input id="start-date" name="start_date">
+      <p id="date-error" class="field-error" role="alert" hidden>valid date</p>
+      <label for="years">Years of experience</label>
+      <input id="years" name="years" type="number">
+      <label for="skills">Skills</label>
+      <input id="skills" name="skills">
+      <label for="project">Project name</label>
+      <input id="project" name="project_name">
+      <button type="button" id="employment-next">Continue</button>
+    </section>
+
+    <section id="step-education" hidden>
+      <h1>Education</h1>
+      <label for="school">School</label>
+      <input id="school" name="school">
+      <label for="degree">Degree</label>
+      <input id="degree" name="degree">
+      <label for="major">Field of study</label>
+      <input id="major" name="major">
+      <label for="end-date">End date</label>
+      <input id="end-date" name="end_date" type="date">
+      <button type="button" id="education-next">Next</button>
+    </section>
+
+    <section id="step-questions" hidden>
+      <h1>Questions</h1>
+      <fieldset>
+        <legend>Are you legally authorized to work in the United States?</legend>
+        <label><input type="radio" name="auth" id="auth-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="auth" id="auth-no" value="No"> No</label>
+      </fieldset>
+      <fieldset>
+        <legend>Do you now require visa sponsorship?</legend>
+        <label><input type="radio" name="sponsor-now" id="sponsor-now-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="sponsor-now" id="sponsor-now-no" value="No"> No</label>
+      </fieldset>
+      <label for="sponsor-future">Will you require sponsorship in the future?</label>
+      <select id="sponsor-future" name="sponsor_future">
+        <option value="">Select...</option>
+        <option>Yes</option>
+        <option>No</option>
+      </select>
+      <fieldset>
+        <legend>Are you 18 or older?</legend>
+        <label><input type="radio" name="age" id="age-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="age" id="age-no" value="No"> No</label>
+      </fieldset>
+      <fieldset>
+        <legend>Are you willing to relocate?</legend>
+        <label><input type="radio" name="relocate" id="relocate-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="relocate" id="relocate-no" value="No"> No</label>
+      </fieldset>
+      <label for="travel">What percentage of the time are you willing to travel?</label>
+      <select id="travel" name="travel">
+        <option value="">Select...</option>
+        <option>0%</option>
+        <option>25%</option>
+        <option>50%</option>
+        <option>75%</option>
+        <option>100%</option>
+      </select>
+      <fieldset>
+        <legend>Which shifts are you available to work?</legend>
+        <label><input type="checkbox" id="shift-day" value="Day"> Day</label>
+        <label><input type="checkbox" id="shift-night" value="Night"> Night</label>
+        <label><input type="checkbox" id="shift-weekend" value="Weekend"> Weekend</label>
+      </fieldset>
+      <label for="clearance">Do you hold an active security clearance?</label>
+      <select id="clearance" name="clearance">
+        <option value="">Select...</option>
+        <option>Yes</option>
+        <option>No</option>
+      </select>
+      <fieldset>
+        <legend>Do you hold a PE license?</legend>
+        <label><input type="radio" name="pe" id="pe-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="pe" id="pe-no" value="No"> No</label>
+      </fieldset>
+      <fieldset>
+        <legend>Do you have a valid driver's license?</legend>
+        <label><input type="radio" name="driver" id="driver-yes" value="Yes"> Yes</label>
+        <label><input type="radio" name="driver" id="driver-no" value="No"> No</label>
+      </fieldset>
+      <label for="salary">What is your salary expectation?</label>
+      <input id="salary" name="salary">
+      <label for="employment-type">Employment type</label>
+      <input id="employment-type" role="combobox" aria-controls="employment-type-list" aria-label="Employment type">
+      <ul id="employment-type-list" role="listbox">
+        <li id="opt-full" role="option" data-value="Full-time">Full-time</li>
+        <li id="opt-part" role="option" data-value="Part-time">Part-time</li>
+        <li id="opt-contract" role="option" data-value="Contract">Contract</li>
+      </ul>
+      <label for="prime">What is your favorite prime number?</label>
+      <input id="prime" name="prime">
+      <button type="button" id="questions-next">Next</button>
+    </section>
+
+    <section id="step-resume" hidden>
+      <h1>Resume</h1>
+      <label for="resume">Resume</label>
+      <input id="resume" name="resume" type="file">
+      <button type="button" id="resume-next">Next</button>
+    </section>
+
+    <section id="step-review" hidden>
+      <h1>Review</h1>
+      <label><input type="checkbox" id="terms"> I agree to the terms of service</label>
+      <button type="button" id="review-back">Back</button>
+      <button type="button" id="review-save">Save</button>
+      <button type="button" id="withdraw">Withdraw</button>
+      <button type="button" id="delete-application">Delete</button>
+      <button type="button" id="decline">Decline</button>
+      <button type="button" id="cancel-application">Cancel Application</button>
+      <button type="submit" id="final-submit">Submit application</button>
+    </section>
+  </form>
+  <script>
+    window.__submitCount = 0;
+    window.__clicked = [];
+    const PASSWORD = "synthetic-password-candidate-a";
+    const params = new URLSearchParams(location.search);
+    const caseId = params.get("case") || "default";
+    if (!sessionStorage.getItem("owner")) sessionStorage.setItem("owner", caseId);
+    document.documentElement.dataset.owner = sessionStorage.getItem("owner");
+    const order = [
+      "step-login", "step-contact", "step-address", "step-employment",
+      "step-education", "step-questions", "step-resume", "step-review"
+    ];
+    function show(id) {
+      for (const step of order) {
+        const node = document.getElementById(step);
+        node.hidden = step !== id;
+      }
+      report(id);
+    }
+    function report(step) {
+      const values = {};
+      document.querySelectorAll("input, select, textarea").forEach((el) => {
+        if (!el.id || el.type === "password" || el.type === "file") return;
+        values[el.id] = (el.type === "checkbox" || el.type === "radio") ? el.checked : el.value;
+      });
+      const body = JSON.stringify({
+        step: step,
+        owner: sessionStorage.getItem("owner"),
+        submitCount: window.__submitCount,
+        values: values
+      });
+      try {
+        fetch("/__autofill_report", {method: "POST", headers: {"Content-Type": "application/json"}, body: body}).catch(() => {});
+      } catch (err) {}
+    }
+    document.getElementById("sign-in").addEventListener("click", () => {
+      window.__clicked.push("Sign in");
+      const password = document.getElementById("login-password").value;
+      const error = document.getElementById("login-error");
+      if (password !== PASSWORD) {
+        error.hidden = false;
+        return;
+      }
+      error.hidden = true;
+      document.getElementById("login-fields").hidden = true;
+      document.getElementById("identity-fields").hidden = false;
+      document.getElementById("page-title").textContent = "Identity";
+    });
+    document.getElementById("identity-next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      show("step-contact");
+    });
+    document.getElementById("contact-back").addEventListener("click", () => window.__clicked.push("Back"));
+    document.getElementById("contact-next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      const phone = document.getElementById("phone").value;
+      const error = document.getElementById("phone-error");
+      if (/[^0-9]/.test(phone)) {
+        error.hidden = false;
+        return;
+      }
+      error.hidden = true;
+      show("step-address");
+    });
+    document.getElementById("address-next").addEventListener("click", () => {
+      window.__clicked.push("Save and Continue");
+      const error = document.getElementById("state-error");
+      if (!document.getElementById("state").value) {
+        error.hidden = false;
+        return;
+      }
+      error.hidden = true;
+      show("step-employment");
+    });
+    document.getElementById("employment-next").addEventListener("click", () => {
+      window.__clicked.push("Continue");
+      const error = document.getElementById("date-error");
+      if (!/^\d{2}\/\d{2}\/\d{4}$/.test(document.getElementById("start-date").value)) {
+        error.hidden = false;
+        return;
+      }
+      error.hidden = true;
+      show("step-education");
+    });
+    document.getElementById("education-next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      show("step-questions");
+    });
+    document.getElementById("questions-next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      show("step-resume");
+    });
+    document.getElementById("resume-next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      show("step-review");
+    });
+    document.getElementById("final-submit").addEventListener("click", () => {
+      window.__submitCount += 1;
+      window.__clicked.push("Submit application");
+    });
+    for (const id of ["review-back", "review-save", "withdraw", "delete-application", "decline", "cancel-application"]) {
+      document.getElementById(id).addEventListener("click", (event) => {
+        window.__clicked.push(event.currentTarget.textContent.trim());
+      });
+    }
+    document.querySelectorAll("#employment-type-list [role='option']").forEach((option) => {
+      option.addEventListener("click", () => {
+        document.getElementById("employment-type").value = (option.textContent || "").trim();
+      });
+    });
+  </script>
+</body>
+</html>
