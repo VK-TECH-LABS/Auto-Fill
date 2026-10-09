@@ -20,7 +20,7 @@ from autofill.profile import CandidateProfile, ProfileError
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired, SubmitBlockedError
 from autofill.salary import resolve_salary
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "HUMAN_SUBMIT_ONLY",

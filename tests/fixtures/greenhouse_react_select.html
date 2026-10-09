@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Questions</title></head>
+<body>
+  <h1>Questions</h1>
+  <label for="relocate">Are you willing to relocate?</label>
+  <div class="select__control">
+    <input id="relocate" class="select__input" role="combobox" aria-controls="relocate-list" aria-label="Are you willing to relocate?">
+  </div>
+  <ul id="relocate-list" role="listbox">
+    <li id="relocate-yes" role="option" data-value="Yes">Yes</li>
+    <li id="relocate-no" role="option" data-value="No">No</li>
+  </ul>
+  <label for="gender">Gender</label>
+  <div class="select__control">
+    <input id="gender" class="select__input" role="combobox" aria-controls="gender-list" aria-label="Gender">
+  </div>
+  <ul id="gender-list" role="listbox">
+    <li id="gender-decline" role="option" data-value="Decline">Decline to self-identify</li>
+  </ul>
+  <label for="eeo">Voluntary Self-Identification</label>
+  <div class="select__control">
+    <input id="eeo" class="select__input" role="combobox" aria-controls="eeo-list" aria-label="Voluntary Self-Identification">
+  </div>
+  <ul id="eeo-list" role="listbox">
+    <li id="eeo-yes" role="option" data-value="Yes">Yes</li>
+  </ul>
+  <script>
+    window.__picked = [];
+    for (const id of ["relocate-yes", "relocate-no", "gender-decline", "eeo-yes"]) {
+      document.getElementById(id).addEventListener("click", () => window.__picked.push(id));
+    }
+  </script>
+</body>
+</html>

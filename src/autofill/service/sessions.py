@@ -39,6 +39,9 @@ class ServiceSession:
     expires_at: float = 0.0
     timings: dict[str, int] = field(default_factory=dict)
     manual_questions: list[dict[str, str | None]] = field(default_factory=list)
+    screenshot_version: int = 0
+    human_outcome: str = ""
+    interact_marks: list[float] = field(default_factory=list)
 
     def __repr__(self) -> str:
         return f"ServiceSession(session_id={self.session_id!r}, status={self.status!r}, mode={self.mode!r})"

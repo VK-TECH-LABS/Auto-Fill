@@ -8,11 +8,12 @@ The in-process Python API still exists. This service calls `autofill_application
 
 ## What the service will not do
 
-- It will not click Submit, Submit Application, Finish, Complete, or Apply. There is no submit route. `stopped_before_submit` is always true. A refused submit raises `HumanSubmissionRequired` inside the process and the HTTP call returns 409.
-- It will not upload a resume. A resume file input stops the run with `RESUME_UPLOAD_REQUIRED`. The caller confirms, after a person has uploaded, with `resumeUploaded: true`. The service does not accept resume bytes.
-- It will not solve, bypass, or inject a token for CAPTCHA or any other challenge. The status is `CAPTCHA_REQUIRED` and continue is rejected.
+- It will not click Submit or Submit Application on a form. There is no submit route. `stopped_before_submit` is always true. A refused automation click raises `HumanSubmissionRequired` inside the process and the HTTP call returns 409. `Apply`, `Apply now`, `Apply for this job`, `I'm interested`, and `Apply Manually` may be clicked only when the page has no application form yet.
+- It will not accept resume bytes in the JSON body. A resolver `resume.file` descriptor (`url`, `filename`, `contentType`, `expiresAt`) is downloaded into memory with a size cap and attached to the file input, then deleted. Any other resume input stops at `RESUME_UPLOAD_REQUIRED` until `resumeUploaded: true`.
+- It will not solve, bypass, or inject a token for CAPTCHA, DataDome, Cloudflare, or PerimeterX. The status is `CAPTCHA_REQUIRED`. An invisible reCAPTCHA badge alone does not stop the run. `continue` with `humanResolved: true` resumes after a person has cleared a challenge.
 - It will not open a caller database. `DATABASE_URL` is ignored. Do not send database URLs, API tokens, or resume files in the JSON body.
-- It will not log raw profile values, passwords, or the service token. Logs contain the session id, status, ATS name, and step.
+- It will not fill demographic or voluntary self-identification questions, including Greenhouse-style react-select EEO controls.
+- It will not log raw profile values, passwords, typed interaction text, screenshot bytes, or the service token. Logs contain the session id, status, ATS name, and step. Screenshots stay in memory for the response only.
 
 ## Run
 
@@ -183,8 +184,17 @@ Status includes `protocolVersion`, `manualQuestions` (`[{intent, text}]` only, a
 | `browserReadyMs` | Same per-session context time. It is not the process startup measurement. |
 | `browserPrewarmMs` | Wall time to launch the worker browsers at process start. |
 | `firstFormInspectedMs` | Time from the start of the run until the first page inspection. |
+| `firstFillMs` | Time from the start of the run until the first field is written. |
 
-`POST /v1/sessions/{sessionId}/continue` accepts `{candidateRef, resumeUploaded, answersUpdated}`. `answersUpdated: true` while `MANUAL_ANSWER_REQUIRED` resumes the same browser context and asks the resolver again for the pending intents. `resumeUploaded: true` while `RESUME_UPLOAD_REQUIRED` continues past the file input. The service never chooses a resume file.
+`POST /v1/sessions/{sessionId}/continue` accepts `{candidateRef, resumeUploaded, answersUpdated, humanResolved}`. `answersUpdated: true` while `MANUAL_ANSWER_REQUIRED` resumes the same browser context and asks the resolver again for the pending intents. `resumeUploaded: true` while `RESUME_UPLOAD_REQUIRED` continues past the file input. `humanResolved: true` while `LOGIN_REQUIRED`, `CAPTCHA_REQUIRED`, or `NO_FORM_FOUND` resumes automation in the same context after a person has solved that stop. Protocol `0.5.0` uses the same resolver body as `0.4.0`.
+
+`GET /v1/sessions/{sessionId}/screenshot` returns `image/jpeg` (quality 60, 1280x800 viewport) for the current page. Unknown sessions are `404`. A session with no open page is `409`. The bytes are not logged or written to disk. Response headers are `X-Autofill-Status` and `X-Autofill-Url-Host` (hostname only). The capture runs on the session's browser worker.
+
+`POST /v1/sessions/{sessionId}/interact` performs one action while the session is in `LOGIN_REQUIRED`, `CAPTCHA_REQUIRED`, `MANUAL_ANSWER_REQUIRED`, `RESUME_UPLOAD_REQUIRED`, `NO_FORM_FOUND`, or `READY_FOR_HUMAN_SUBMIT`: `{action: click, x, y}`, `{action: type, text}` (at most 500 characters), `{action: key, key}` for Enter, Tab, Backspace, Escape, the arrow keys, or Space, or `{action: scroll, dy}`. The response is `{status, screenshotVersion}`. A candidate mismatch or any other status is `409`. Typed text is not logged. A session is limited to 30 actions per minute. A human click is a coordinate and may land on Submit. Automation still never clicks Submit.
+
+`POST /v1/sessions/{sessionId}/human-done` accepts `{candidateRef, outcome: submitted|abandoned}`, records `humanOutcome`, closes the browser context, and returns `200`.
+
+Before each inspection the engine waits for the page to render (network idle, then a poll of up to 12 seconds for form controls or known markers). A non-review step with no fields ends as `NO_FORM_FOUND`, not `READY_FOR_HUMAN_SUBMIT`.
 
 The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 4). A session is pinned to one worker. Each session gets a new browser context that is never reused. A browser crash relaunches that worker's Chromium, retries the session once, and otherwise records `FAILED_RETRYABLE` on the same session id. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
 
@@ -211,8 +221,9 @@ Profile mode keeps the earlier statuses. Resolver mode also uses the protocol 0.
 | `CREATED` | Session is stored. `start` has not run. |
 | `LOGIN_REQUIRED` | The page needs a login and this session has no credentials. Nothing was typed. |
 | `LOGIN_FAILED` | The site rejected the login. Filling did not start. |
-| `CAPTCHA_REQUIRED` | A challenge widget is present. The run stopped. |
-| `RESUME_UPLOAD_REQUIRED` | A person uploads the resume, then the caller continues. |
+| `CAPTCHA_REQUIRED` | A visible challenge or bot wall is present. The run stopped. |
+| `NO_FORM_FOUND` | A non-review step rendered with no application fields. |
+| `RESUME_UPLOAD_REQUIRED` | A person uploads the resume, or a `resume.file` download failed. |
 | `MANUAL_REVIEW_REQUIRED` | Account creation, or a host left for a person. |
 | `READY_FOR_HUMAN_SUBMIT` | Review, or a final submit control was seen and not clicked. |
 | `FILLED` | No further safe page turn. |
@@ -237,7 +248,7 @@ docker build -t auto-fill .
 docker run --rm -p 8080:8080 -e AUTOFILL_SERVICE_TOKEN -e PORT=8080 auto-fill
 ```
 
-Use a health check on `GET /health`. Sessions are memory-only, so a new instance starts empty. The browser runs inside the container. This API does not expose that browser to a person and does not accept the resume file. `continue` is only the confirmation checkpoint.
+Use a health check on `GET /health`. Sessions are memory-only, so a new instance starts empty. The browser runs inside the container. A person can view the current page and send one bounded action through the screenshot and interact routes. The JSON API still does not accept resume bytes.
 
 ## Errors
 

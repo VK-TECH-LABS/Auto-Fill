@@ -269,6 +269,11 @@ def _parse_body(
     for key, value in fields_raw.items():
         if key not in requested_fields:
             continue
+        if str(key) == "resume.file":
+            descriptor = _resume_descriptor(value)
+            if descriptor is not None:
+                fields["resume.file"] = descriptor
+            continue
         parsed = _bounded_value(value)
         if parsed is not _INVALID:
             fields[str(key)] = parsed
@@ -314,6 +319,24 @@ def _parse_body(
 
 
 _INVALID = object()
+
+
+def _resume_descriptor(value: Any) -> dict[str, str] | None:
+    """Keep a remote resume pointer. Local paths and token URLs are dropped."""
+    if not isinstance(value, dict):
+        return None
+    url = value.get("url")
+    if not isinstance(url, str) or len(url) > 2048 or not url.startswith(("http://", "https://")):
+        return None
+    filename = value.get("filename")
+    content_type = value.get("contentType")
+    expires = value.get("expiresAt")
+    return {
+        "url": url,
+        "filename": filename[:200] if isinstance(filename, str) else "resume.bin",
+        "contentType": content_type[:120] if isinstance(content_type, str) else "",
+        "expiresAt": expires[:40] if isinstance(expires, str) else "",
+    }
 
 
 def _bounded_value(value: Any) -> Any:

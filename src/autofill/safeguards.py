@@ -132,6 +132,29 @@ def is_add_row(name: str) -> bool:
     return bool(_ADD_RE.search(" ".join(name.split())))
 
 
+_ENTRY_LABELS = frozenset(
+    {
+        "apply",
+        "apply now",
+        "apply for this job",
+        "apply manually",
+        "i'm interested",
+    }
+)
+
+
+def is_entry_label(name: str) -> bool:
+    """True for a job-description entry control, never for Submit on a form.
+
+    ``Apply`` on a posting with no application form is an entry. ``Submit``
+    and ``Submit application`` are not, and stay on the final-submit path.
+    """
+    label = " ".join(name.split()).casefold().replace("\u2019", "'")
+    if "submit" in label:
+        return False
+    return label in _ENTRY_LABELS
+
+
 def field_class_for_button(name: str, *, control_type: str = "") -> str:
     """Field class for a button. Final submit and navigation stay distinct from login."""
     klass = action_class(name, control_type=control_type)
@@ -195,6 +218,21 @@ def activate(page, selector: str, name: str, *, control_type: str = "") -> None:
 def activate_login(page, selector: str, name: str, *, control_type: str = "") -> None:
     """Click Log in or Sign in. Final application submit stays forbidden."""
     perform_click(page, selector, name, control_type=control_type, purpose="login")
+
+
+def activate_entry(page, selector: str, name: str, *, control_type: str = "") -> None:
+    """Open a job description into the application. Submit on a form stays forbidden.
+
+    The caller must already know the page has no application form. This does
+    not classify ``Apply`` as safe navigation for later pages.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if not is_entry_label(name):
+        raise HumanSubmissionRequired(
+            f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
+        )
+    page.locator(selector).click()
 
 
 def choose_option(page, opener_selector: str, option_selector: str, option_name: str) -> None:

@@ -27,6 +27,7 @@ from autofill.intents import (
 from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
+from autofill.resume_fetch import ResumeFetchError, fetch_resume
 
 logger = logging.getLogger("autofill.stepfill")
 
@@ -172,8 +173,12 @@ def fill_resolved_page(
         )
         _apply(page, requests, response, active, outcome, snapshot.heading)
         adapter = adapter_for(ats_name)
+        resume_code = "none"
+        if "resume.file" in field_keys:
+            resume_code = "blocked" if outcome.resume_blocked else "attached"
         logger.info(
-            "session=%s step=%s adapter=%s field_keys=%s intents=%s requested=%s returned=%s result=%s latency_ms=%s",
+            "session=%s step=%s adapter=%s field_keys=%s intents=%s "
+            "requested=%s returned=%s result=%s resume=%s latency_ms=%s",
             session_id,
             step,
             adapter.name if adapter else "generic",
@@ -182,6 +187,7 @@ def fill_resolved_page(
             len(field_keys) + len(questions),
             len(response.fields) + len(response.answers),
             response.result_code,
+            resume_code,
             response.latency_ms,
         )
         return outcome
@@ -247,7 +253,7 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         return None
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if "resume" in blob or "cv" in blob or "curriculum vitae" in blob:
-            return _Ask(controls=controls, resume=True)
+            return _Ask(controls=controls, field_key="resume.file")
         return None
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
@@ -353,6 +359,9 @@ def _apply(
     project_rows = _rows(response.fields.get("projects[]"))
     employment_index = -1
     for ask in requests:
+        if ask.field_key == "resume.file":
+            _apply_resume(page, ask, response, outcome)
+            continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
             answer = _take_answer(match, by_intent, unnamed, by_text)
@@ -396,6 +405,47 @@ def _apply(
         _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
 
 
+_EEO_RE = re.compile(
+    r"\b(eeo|equal employment|self-identif(?:y|ication)|self identif(?:y|ication))\b",
+    re.IGNORECASE,
+)
+
+
+def _eeo(text: str) -> bool:
+    """Voluntary self-identification stays manual even when a value is saved."""
+    return bool(_EEO_RE.search(text or ""))
+
+
+def _apply_resume(page, ask: _Ask, response: ResolverResponse, outcome: ResolvedPage) -> None:
+    """Attach ``resume.file`` from a remote descriptor, or leave the input for a person."""
+    control = ask.controls[0]
+    descriptor = response.fields.get("resume.file")
+    if not isinstance(descriptor, dict):
+        outcome.resume_blocked = True
+        _skip(control, outcome, "resume.file", "Resolver did not return a resume file.")
+        return
+    path = None
+    try:
+        path = fetch_resume(descriptor)
+        mapped = MappedField(
+            key="resume.file",
+            action="upload",
+            text=str(path),
+            field_class="RESUME_FIELD",
+            confidence="high",
+        )
+        result = apply_mapped(page, control, mapped)
+        outcome.fields.append(result)
+        if result.action == "error":
+            outcome.resume_blocked = True
+    except ResumeFetchError:
+        outcome.resume_blocked = True
+        _skip(control, outcome, "resume.file", "Resume file was not attached.")
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
     """TileArc already matched this exact question text to a saved answer."""
     return match.intent is None and answer.confidence == "HIGH" and answer.source == "saved_answer"
@@ -415,7 +465,7 @@ def _apply_question(
     outcome: ResolvedPage,
 ) -> None:
     match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-    if match.intent in DEMOGRAPHIC_INTENTS:
+    if match.intent in DEMOGRAPHIC_INTENTS or _eeo(match.text) or _eeo(_question_text(ask.controls)):
         _manual(outcome, match, blocking=any(item.required for item in ask.controls))
         return
     if answer is None or not (

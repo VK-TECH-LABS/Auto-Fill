@@ -135,7 +135,7 @@ class _SessionContext:
             return self.page
         started = time.perf_counter()
         # A fresh context every time. No user-data directory and no stored profile.
-        context = driver.browser().new_context()
+        context = driver.browser().new_context(viewport={"width": 1280, "height": 800})
         self.context_ready_ms = elapsed_ms(started)
         try:
             page = context.new_page()
@@ -399,6 +399,58 @@ class PlaywrightRunner:
             if is_ats_timeout(exc):
                 return self._retryable(request, category="ats_timeout")
             raise
+
+    def _pinned_worker(self, session_id: str) -> _Worker | None:
+        with self._assign:
+            pinned = self._pins.get(session_id)
+        if pinned is None:
+            return None
+        return self._workers[pinned]
+
+    def screenshot(self, session_id: str) -> tuple[bytes, str] | None:
+        """JPEG of the current page, taken on that session's worker. Not stored."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return None
+
+        def take() -> tuple[bytes, str] | None:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return None
+            from urllib.parse import urlparse
+
+            host = urlparse(slot.page.url).hostname or ""
+            image = slot.page.screenshot(type="jpeg", quality=60)
+            return image, host
+
+        return worker.submit(take)
+
+    def interact(self, session_id: str, action: dict) -> bool:
+        """One human action on the session page. Typed text is not logged."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return False
+
+        def apply() -> bool:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return False
+            page = slot.page
+            kind = action.get("action")
+            if kind == "click":
+                page.mouse.click(float(action["x"]), float(action["y"]))
+            elif kind == "type":
+                page.keyboard.type(str(action.get("text") or ""))
+            elif kind == "key":
+                key = str(action.get("key") or "")
+                page.keyboard.press(" " if key == "Space" else key)
+            elif kind == "scroll":
+                page.mouse.wheel(0, float(action.get("dy") or 0))
+            else:
+                return False
+            return True
+
+        return worker.submit(apply)
 
     def discard(self, session_id: str) -> None:
         """Close this session's context. Other sessions and the browsers stay open."""
