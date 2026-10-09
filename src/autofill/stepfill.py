@@ -179,7 +179,7 @@ def fill_resolved_page(
             ",".join(intent or "unknown" for intent in outcome.requested_intents),
             len(field_keys) + len(questions),
             len(response.fields) + len(response.answers),
-            "ok",
+            response.result_code,
             response.latency_ms,
         )
         return outcome

@@ -52,8 +52,15 @@ def resolver_url():
                 self.send_response(503)
                 self.end_headers()
                 return
-            if mode in {"401", "409", "410"}:
+            if mode in {"401", "409", "410", "422"}:
                 self.send_response(int(mode))
+                if mode == "422":
+                    encoded = b'{"fields":{"email":"sentinel-must-not-fill@example.com"}}'
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                    return
                 self.end_headers()
                 return
             if mode == "huge":
@@ -134,6 +141,27 @@ def test_auth_mismatch_and_expiry(resolver_url, mode: str, code: str):
         resolve_step(_binding(url), session_id="sess", step="contact", fields=["email"], questions=[])
     assert raised.value.code == code
     assert TOKEN not in str(raised.value)
+
+
+def test_422_leaves_requested_keys_unresolved(resolver_url, caplog):
+    server, url = resolver_url
+    server.mode = "422"
+    caplog.set_level("INFO")
+    result = resolve_step(
+        _binding(url, retries=2),
+        session_id="sess",
+        step="contact",
+        fields=["email", "phone"],
+        questions=[{"intent": "RELOCATE", "text": "Relocate?", "options": ["Yes", "No"], "control": "radio"}],
+    )
+    assert result.result_code == "unprocessable"
+    assert result.fields == {}
+    assert result.answers == []
+    assert result.unresolved == ["email", "phone", "RELOCATE"]
+    assert len(server.calls) == 1
+    assert "unprocessable" in caplog.text
+    assert "sentinel-must-not-fill" not in caplog.text
+    assert TOKEN not in caplog.text
 
 
 def test_retry_is_bounded(resolver_url):

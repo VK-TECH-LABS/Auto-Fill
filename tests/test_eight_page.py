@@ -103,8 +103,20 @@ def resolver():
                     "body": body,
                 }
             )
-            if server.mode in {"401", "409", "410"}:
+            if server.mode in {"401", "409", "410", "422"}:
                 self.send_response(int(server.mode))
+                if server.mode == "422":
+                    encoded = json.dumps(
+                        {
+                            "fields": {"email": "sentinel-must-not-fill@example.com"},
+                            "answers": [{"intent": "RELOCATE", "value": "Yes", "confidence": "HIGH"}],
+                        }
+                    ).encode("utf-8")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                    return
                 self.end_headers()
                 return
             step = body.get("step", "")
@@ -347,5 +359,34 @@ def test_resolver_401_expired_and_mismatch_stop_clean(browser, resolver):
         )
         assert mismatch.status == Status.FAILED_FINAL
         assert page.locator("#email").input_value() == ""
+    finally:
+        page.close()
+
+
+def test_resolver_422_stays_on_the_session_with_blanks(browser, resolver, caplog):
+    server, url = resolver
+    caplog.set_level(logging.INFO)
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Contact</h1>"
+            "<label for='email'>Email</label><input id='email' type='email'>"
+            "<label for='relocate'>Are you willing to relocate?</label>"
+            "<select id='relocate'><option value=''>Select...</option><option>Yes</option><option>No</option></select>"
+        )
+        server.mode = "422"
+        result = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-422", candidate_id="ref-a"),
+        )
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert result.status not in {Status.FAILED_FINAL, Status.FAILED_RETRYABLE, Status.EXPIRED, Status.FAILED}
+        assert page.locator("#email").input_value() == ""
+        assert page.locator("#relocate").input_value() == ""
+        assert any(item.get("intent") == "RELOCATE" for item in result.manual_questions)
+        assert "unprocessable" in caplog.text
+        assert "sentinel-must-not-fill" not in caplog.text
     finally:
         page.close()

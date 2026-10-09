@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from playwright.sync_api import sync_playwright
-from tests.test_service import _empty_credentials, _job_object
+from tests.helpers import empty_credentials, job_context
 
 from autofill.engine import ApplicationResult, Status
 from autofill.profile import CandidateProfile
@@ -30,8 +30,8 @@ def _request(url: str, session_id: str = "sess-crash"):
         job_id="job-crash",
         application_url=url,
         profile=_profile(),
-        job=_job_object(),
-        credentials=_empty_credentials(),
+        job=job_context(),
+        credentials=empty_credentials(),
         resume_uploaded=False,
         cover_letter_text=None,
     )

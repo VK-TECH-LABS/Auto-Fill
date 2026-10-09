@@ -51,6 +51,7 @@ class ResolverResponse:
     answers: list[ResolverAnswer] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
     latency_ms: int = 0
+    result_code: str = "ok"
 
     def wipe(self) -> None:
         """Drop values as soon as the step has applied or abandoned them."""
@@ -154,6 +155,22 @@ def resolve_step(
             return parsed
         except ResolverCallError as exc:
             last = exc
+            if exc.code == "unprocessable":
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "session=%s step=%s result=%s requested=%s returned=%s latency_ms=%s",
+                    session_id,
+                    step,
+                    exc.code,
+                    len(fields) + len(questions),
+                    0,
+                    latency_ms,
+                )
+                return ResolverResponse(
+                    unresolved=_requested_names(fields, questions),
+                    latency_ms=latency_ms,
+                    result_code=exc.code,
+                )
             if exc.code != "retryable" or attempt + 1 >= attempts:
                 logger.info(
                     "session=%s step=%s result=%s requested=%s returned=%s latency_ms=%s",
@@ -195,6 +212,9 @@ def _post(binding: ResolverBinding, raw: bytes) -> tuple[bytes, int]:
             raise ResolverCallError("mismatch", code) from None
         if code == 410:
             raise ResolverCallError("expired", code) from None
+        if code == 422:
+            # A step the resolver will not answer. The body is not read or logged.
+            raise ResolverCallError("unprocessable", code) from None
         if code in _RETRYABLE_HTTP:
             raise ResolverCallError("retryable", code) from None
         raise ResolverCallError("invalid", code) from None
@@ -202,6 +222,15 @@ def _post(binding: ResolverBinding, raw: bytes) -> tuple[bytes, int]:
         raise
     except (TimeoutError, urllib.error.URLError, OSError):
         raise ResolverCallError("retryable") from None
+
+
+def _requested_names(fields: list[str], questions: list[dict[str, Any]]) -> list[str]:
+    """Keys this step asked for. Used when the resolver refuses the step."""
+    names = list(fields)
+    for item in questions:
+        intent = item.get("intent")
+        names.append(intent if isinstance(intent, str) and intent else "unknown")
+    return names
 
 
 def _read_limited(response: Any, max_bytes: int) -> bytes:
