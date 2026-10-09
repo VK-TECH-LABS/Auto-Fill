@@ -807,6 +807,59 @@ def test_radio_and_checkbox_questions_use_the_group_label(browser, resolver):
         page.close()
 
 
+def test_lever_checkbox_options_and_section_headings_are_not_questions(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<h4>ADDITIONAL INFORMATION</h4>"
+            "<div><textarea id='notes' name='notes' required></textarea></div>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Language Skill(s)<span class='required'>✱</span></div>"
+            "<div class='application-field'><ul>"
+            "<li><input type='checkbox' name='cards[lang][field0]' value='English (ENG)' required>"
+            "<label>English (ENG)</label></li>"
+            "<li><input type='checkbox' name='cards[lang][field1]' value='Spanish (SPA)' required>"
+            "<span class='application-answer-alternative'>Spanish (SPA)</span></li>"
+            "<li><label><input type='checkbox' name='cards[lang][field2]' value='French (FRA)' required>"
+            " French (FRA)</label></li>"
+            "</ul></div></div>"
+            "<fieldset><legend>Languages</legend>"
+            "<div><input type='checkbox' name='spoken-en' value='English' required><label>English</label></div>"
+            "<div><input type='checkbox' name='spoken-es' value='Spanish' required><label>Spanish</label></div>"
+            "</fieldset>"
+            "<label for='prime'>What is your favorite prime number?</label>"
+            "<textarea id='prime' name='prime' required></textarea>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        questions = [item for call in server.calls for item in call.get("questions", [])]
+        by_text = {item.get("text"): item.get("options") for item in questions}
+        assert by_text.get("Language Skill(s)") == ["English (ENG)", "Spanish (SPA)", "French (FRA)"]
+        assert by_text.get("Languages") == ["English", "Spanish"]
+        assert "What is your favorite prime number?" in by_text
+        assert "ADDITIONAL INFORMATION" not in by_text
+        assert "English (ENG)" not in by_text
+        assert "Spanish (SPA)" not in by_text
+        assert "French (FRA)" not in by_text
+        texts = [item.get("text") for item in result.manual_questions]
+        assert texts.count("Language Skill(s)") == 1
+        assert texts.count("Languages") == 1
+        assert "What is your favorite prime number?" in texts
+        assert "ADDITIONAL INFORMATION" not in texts
+        assert "English (ENG)" not in texts
+        assert "Spanish (SPA)" not in texts
+        assert "French (FRA)" not in texts
+        assert "English" not in texts
+        assert "Spanish" not in texts
+        assert page.locator("input[name='cards[lang][field0]']").is_checked() is False
+        assert page.locator("input[name='spoken-en']").is_checked() is False
+    finally:
+        page.close()
+
+
 def test_resume_bytes_survive_a_later_read(browser, resolver, files):
     server, url = resolver
     server.mode = "resume"

@@ -14,6 +14,7 @@ from autofill.stepfill import (
     _compose_location,
     _describe,
     _manual,
+    _note_unfilled_required,
     _question_text,
     _skip,
     choose_location_label,
@@ -114,6 +115,49 @@ def test_fieldset_and_shared_name_checkboxes_are_one_question():
     body = ask.question_body()
     assert body["text"] == "Which languages do you speak?"
     assert body["options"] == ["English", "Spanish", "French"]
+
+
+def test_grouped_checkbox_options_and_section_headings_are_not_questions():
+    boxes = [
+        Control(
+            kind="checkbox",
+            name=name,
+            label=label,
+            prompt="Language Skill(s)",
+            required=True,
+            selector=f"#{name}",
+        )
+        for name, label in (
+            ("lang-en", "English (ENG)"),
+            ("lang-es", "Spanish (SPA)"),
+            ("lang-fr", "French (FRA)"),
+        )
+    ]
+    heading = Control(
+        kind="textarea",
+        name="notes",
+        label="ADDITIONAL INFORMATION",
+        required=True,
+        selector="#notes",
+    )
+    snapshot = PageSnapshot(controls=[heading, *boxes], buttons=[])
+    clusters = _clusters(snapshot)
+    asks = [ask for kind, grouped in clusters if (ask := _describe(kind, grouped, "", None)) is not None]
+    questions = [ask.question_body() for ask in asks if ask.include_question]
+    assert [item["text"] for item in questions] == ["Language Skill(s)"]
+    assert questions[0]["options"] == ["English (ENG)", "Spanish (SPA)", "French (FRA)"]
+    outcome = ResolvedPage(snapshot=snapshot)
+    _manual(outcome, IntentMatch(None, "unknown", "none", "Language Skill(s)"), blocking=True)
+    for label in ("English (ENG)", "Spanish (SPA)", "French (FRA)", "ADDITIONAL INFORMATION"):
+        _manual(outcome, IntentMatch(None, "unknown", "none", label), blocking=True)
+    _note_unfilled_required(outcome)
+    texts = [item["text"] for item in outcome.manual_questions]
+    assert texts.count("Language Skill(s)") == 1
+    assert "English (ENG)" not in texts
+    assert "Spanish (SPA)" not in texts
+    assert "French (FRA)" not in texts
+    assert "ADDITIONAL INFORMATION" not in texts
+    assert _question_text([heading]) == ""
 
 
 def test_question_text_is_not_an_option_label():

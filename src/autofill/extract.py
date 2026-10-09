@@ -46,11 +46,55 @@ EXTRACT_JS = r"""
     return (text || "").replace(/[✱*＊]+$/, "").replace(/\s+/g, " ").trim();
   }
 
+  function lettersOf(text) {
+    return (text || "").replace(/[^A-Za-z]/g, "");
+  }
+
+  function isSectionHeading(node, text) {
+    // "ADDITIONAL INFORMATION" is a section title, not a question.
+    const cleaned = cleanPrompt(text);
+    if (!cleaned || cleaned.indexOf("?") !== -1) return false;
+    const tag = node && node.tagName ? node.tagName.toLowerCase() : "";
+    if (/^h[1-6]$/.test(tag)) return true;
+    const cls = ((node && node.getAttribute && node.getAttribute("class")) || "").toLowerCase();
+    if (
+      /(section|header|heading)/.test(cls) &&
+      cls.indexOf("application-label") === -1 &&
+      cls.indexOf("question") === -1
+    ) {
+      return true;
+    }
+    const letters = lettersOf(cleaned);
+    return letters.length >= 3 && letters === letters.toUpperCase();
+  }
+
+  function optionText(el) {
+    // The option is the wrapping label, or a label/span beside the input.
+    // The group title lives on an ancestor, so it is not part of the option.
+    const wrapping = el.closest("label");
+    if (wrapping) return cleanPrompt(textOf(wrapping));
+    const parent = el.parentElement;
+    if (!parent) return "";
+    const labels = [];
+    for (const child of Array.from(parent.children)) {
+      if (child === el || (child.contains && child.contains(el))) continue;
+      const tag = child.tagName ? child.tagName.toLowerCase() : "";
+      if (tag !== "label" && tag !== "span") continue;
+      if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
+      const text = cleanPrompt(textOf(child));
+      if (text && !isSectionHeading(child, text)) labels.push(text);
+    }
+    return labels.join(" ").trim();
+  }
+
   function groupQuestion(el) {
     // The question is the fieldset, the application-question text, or
     // aria-labelledby. An option label such as "Yes" is not the question.
+    // A section heading is not the question either.
+    const legendNode = el.closest("fieldset") ? el.closest("fieldset").querySelector("legend") : null;
     const legend = legendText(el);
-    if (legend) return cleanPrompt(legend);
+    if (legend && !isSectionHeading(legendNode, legend)) return cleanPrompt(legend);
+    const option = optionText(el);
     const stop = el.closest("form") || document.body;
     let node = el;
     for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
@@ -59,12 +103,12 @@ EXTRACT_JS = r"""
         const bits = [];
         for (const id of labelled.split(/\s+/)) {
           const target = document.getElementById(id);
-          if (!target || target.contains(el)) continue;
+          if (!target || target.contains(el) || isSectionHeading(target, textOf(target))) continue;
           const text = textOf(target);
           if (text) bits.push(text);
         }
         const joined = cleanPrompt(bits.join(" "));
-        if (joined) return joined;
+        if (joined && joined !== option) return joined;
       }
       if (node === stop) break;
     }
@@ -74,7 +118,8 @@ EXTRACT_JS = r"""
         if (child.contains(el)) break;
         if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
         const text = cleanPrompt(textOf(child));
-        if (text && text.length <= 200) return text;
+        if (!text || text.length > 200 || text === option || isSectionHeading(child, text)) continue;
+        return text;
       }
     }
     return "";
@@ -97,10 +142,17 @@ EXTRACT_JS = r"""
     }
     const aria = el.getAttribute("aria-label");
     if (aria) bits.push(aria.trim());
-    const fieldset = el.closest("fieldset");
-    if (fieldset) {
-      const legend = fieldset.querySelector("legend");
-      if (legend) bits.push(textOf(legend));
+    if (!bits.length) {
+      const option = optionText(el);
+      if (option) bits.push(option);
+    }
+    if (!bits.length) {
+      const fieldset = el.closest("fieldset");
+      if (fieldset) {
+        const legend = fieldset.querySelector("legend");
+        const text = legend ? textOf(legend) : "";
+        if (text && !isSectionHeading(legend, text)) bits.push(text);
+      }
     }
     if (!bits.length) {
       let node = el;
@@ -108,9 +160,9 @@ EXTRACT_JS = r"""
         const prev = node.previousElementSibling;
         if (!prev || !prev.tagName) continue;
         const tag = prev.tagName.toLowerCase();
-        if (tag === "label" || tag === "legend" || /^h[1-6]$/.test(tag)) {
+        if (tag === "label" || tag === "legend") {
           const text = textOf(prev);
-          if (text) {
+          if (text && !isSectionHeading(prev, text)) {
             bits.push(text);
             break;
           }
@@ -118,7 +170,12 @@ EXTRACT_JS = r"""
         if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
         const cls = (prev.getAttribute("class") || "").toLowerCase();
         const text = cleanPrompt(textOf(prev));
-        if (text && text.length <= 200 && (cls.indexOf("question") !== -1 || text.indexOf("?") !== -1)) {
+        if (
+          text &&
+          text.length <= 200 &&
+          !isSectionHeading(prev, text) &&
+          (cls.indexOf("question") !== -1 || cls.indexOf("application-label") !== -1 || text.indexOf("?") !== -1)
+        ) {
           bits.push(text);
           break;
         }
@@ -295,7 +352,7 @@ EXTRACT_JS = r"""
       const node = document.getElementById(labelled.split(/\s+/)[0]);
       if (node && !container.contains(node)) {
         const text = textOf(node);
-        if (text) return text;
+        if (text && !isSectionHeading(node, text)) return text;
       }
     }
     const aria = (container.getAttribute("aria-label") || "").trim();
@@ -303,7 +360,7 @@ EXTRACT_JS = r"""
     const inside = container.querySelector("label, legend, .ashby-application-form-question-title");
     if (inside && !inside.querySelector("button, [role='button']")) {
       const text = textOf(inside);
-      if (text) return text;
+      if (text && !isSectionHeading(inside, text)) return text;
     }
     let node = container;
     for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
@@ -311,7 +368,7 @@ EXTRACT_JS = r"""
       if (!prev || !prev.tagName) continue;
       if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
       const text = textOf(prev);
-      if (text && text.length <= 200) return text;
+      if (text && text.length <= 200 && !isSectionHeading(prev, text)) return text;
     }
     return "";
   }
@@ -381,7 +438,7 @@ EXTRACT_JS = r"""
       const bits = [];
       for (const id of labelled.split(/\s+/)) {
         const node = document.getElementById(id);
-        if (!node || node === el || el.contains(node)) continue;
+        if (!node || node === el || el.contains(node) || isSectionHeading(node, textOf(node))) continue;
         const text = cleanPrompt(textOf(node));
         if (text) bits.push(text);
       }
@@ -402,12 +459,12 @@ EXTRACT_JS = r"""
       const tag = prev.tagName.toLowerCase();
       const cls = (prev.getAttribute("class") || "").toLowerCase();
       const text = cleanPrompt(textOf(prev));
-      if (!text || text.length > 200) continue;
+      if (!text || text.length > 200 || isSectionHeading(prev, text)) continue;
       if (
         tag === "label" ||
         tag === "legend" ||
-        /^h[1-6]$/.test(tag) ||
         cls.indexOf("question") !== -1 ||
+        cls.indexOf("application-label") !== -1 ||
         text.indexOf("?") !== -1
       ) {
         return text;
@@ -418,7 +475,7 @@ EXTRACT_JS = r"""
       const legend = fieldset.querySelector("legend");
       if (legend && !legend.contains(el)) {
         const text = cleanPrompt(textOf(legend));
-        if (text) return text;
+        if (text && !isSectionHeading(legend, text)) return text;
       }
     }
     return "";
