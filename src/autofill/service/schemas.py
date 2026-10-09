@@ -96,11 +96,11 @@ class CreateSessionIn(BaseModel):
     @model_validator(mode="after")
     def _mode(self) -> CreateSessionIn:
         version = self.protocol_version.strip()
-        if self.resolver is not None or version == "0.4.0":
-            if version != "0.4.0":
-                raise ValueError("protocolVersion must be 0.4.0 when resolver is set")
+        if self.resolver is not None or version in {"0.4.0", "0.5.0"}:
+            if version not in {"0.4.0", "0.5.0"}:
+                raise ValueError("protocolVersion must be 0.4.0 or 0.5.0 when resolver is set")
             if self.resolver is None:
-                raise ValueError("resolver is required for protocol 0.4.0")
+                raise ValueError("resolver is required for protocol 0.4.0 and 0.5.0")
             if not self.candidate_ref.strip() or not self.job_ref.strip():
                 raise ValueError("candidateRef and jobRef are required")
             if "@" in self.candidate_ref or "@" in self.job_ref:
@@ -128,6 +128,63 @@ class ContinueIn(BaseModel):
 
     resume_uploaded: bool = Field(default=False, alias="resumeUploaded")
     answers_updated: bool = Field(default=False, alias="answersUpdated")
+    human_resolved: bool = Field(default=False, alias="humanResolved")
+    candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
+    candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
+
+
+_INTERACT_KEYS = frozenset(
+    {"Enter", "Tab", "Backspace", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"}
+)
+
+
+class InteractIn(BaseModel):
+    """One bounded human action. Typed text is not logged and is not a submit call."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    action: Literal["click", "type", "key", "scroll"]
+    candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
+    candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
+    x: float | None = None
+    y: float | None = None
+    text: str = Field(default="", max_length=500)
+    key: str = ""
+    dy: int = 0
+
+    @model_validator(mode="after")
+    def _shape(self) -> InteractIn:
+        if self.action == "click":
+            if self.x is None or self.y is None:
+                raise ValueError("click requires x and y")
+            if not (-4000 <= self.x <= 4000 and -4000 <= self.y <= 4000):
+                raise ValueError("coordinates are out of range")
+        elif self.action == "type":
+            if not self.text.strip():
+                raise ValueError("type requires text")
+        elif self.action == "key":
+            if self.key not in _INTERACT_KEYS:
+                raise ValueError("key is not allowed")
+        elif abs(self.dy) > 4000:
+            raise ValueError("dy is out of range")
+        return self
+
+
+class InteractOut(BaseModel):
+    """The session status after one human action. The image itself is a different route."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str
+    screenshot_version: int = Field(alias="screenshotVersion")
+
+
+class HumanDoneIn(BaseModel):
+    """Record that a person finished or left the remote page. This route does not click."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    outcome: Literal["submitted", "abandoned"]
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
     candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
 
@@ -163,6 +220,7 @@ class TimingsOut(BaseModel):
     first_form_inspected_ms: int = Field(default=0, alias="firstFormInspectedMs")
     context_ready_ms: int = Field(default=0, alias="contextReadyMs")
     browser_prewarm_ms: int = Field(default=0, alias="browserPrewarmMs")
+    first_fill_ms: int = Field(default=0, alias="firstFillMs")
 
 
 class RunStatusOut(BaseModel):
@@ -188,6 +246,7 @@ class RunStatusOut(BaseModel):
     protocol_version: str = Field(default="", alias="protocolVersion")
     manual_questions: list[ManualQuestionOut] = Field(default_factory=list, alias="manualQuestions")
     timings: TimingsOut | None = None
+    human_outcome: str = Field(default="", alias="humanOutcome")
 
 
 class CredentialsOut(BaseModel):

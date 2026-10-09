@@ -1,6 +1,6 @@
 [project]
 name = "auto-fill"
-version = "0.4.0"
+version = "0.5.0"
 description = "Job-application form autofill service that can sign in, fills fields, and stops before submit."
 readme = "README.md"
 license = "AGPL-3.0-only"

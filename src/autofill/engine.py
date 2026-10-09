@@ -22,9 +22,17 @@ from autofill.extract import extract_page
 from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
 from autofill.models import FillResult, JobContext
+from autofill.pagewait import choose_entry, is_login_wall, is_review, visible_fields, wait_for_render
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding, ResolverCallError
-from autofill.safeguards import HUMAN_SUBMIT_ONLY, activate, field_class_for_button, is_add_row, is_forward_navigation
+from autofill.safeguards import (
+    HUMAN_SUBMIT_ONLY,
+    activate,
+    activate_entry,
+    field_class_for_button,
+    is_add_row,
+    is_forward_navigation,
+)
 from autofill.session import SessionStore
 from autofill.stepfill import FillFlags, fill_resolved_page, flags_for_alerts, validation_blob
 
@@ -48,6 +56,7 @@ class Status:
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_FINAL = "FAILED_FINAL"
     CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    NO_FORM_FOUND = "NO_FORM_FOUND"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
 
@@ -238,6 +247,34 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
             )
+        snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        if snapshot.captcha_present:
+            session.mark("FAILED")
+            return _result(
+                session,
+                status=Status.CAPTCHA_REQUIRED,
+                ats=ats_name,
+                login_status="NOT_REQUIRED",
+                messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+            )
+        if not visible_fields(snapshot) and not is_review(snapshot):
+            if is_login_wall(snapshot):
+                session.mark("LOGIN_FAILED")
+                return _result(
+                    session,
+                    status=Status.LOGIN_REQUIRED,
+                    ats=ats_name,
+                    login_status="LOGIN_REQUIRED",
+                    messages=["Sign-in is required before the application form. Nothing was typed."],
+                )
+            session.mark(Status.NO_FORM_FOUND)
+            return _result(
+                session,
+                status=Status.NO_FORM_FOUND,
+                ats=ats_name,
+                login_status="NOT_REQUIRED",
+                messages=["No application form was found. A person can open the page and continue."],
+            )
 
         session.mark("CHECK_AUTH")
         detector = LoginDetector()
@@ -333,6 +370,51 @@ def autofill_application(
                     messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
                     submit_controls=submit_controls,
                 )
+            snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+            if snapshot.captcha_present:
+                session.mark("FAILED")
+                detected, filled, skipped = _counts(fields)
+                return _result(
+                    session,
+                    status=Status.CAPTCHA_REQUIRED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+                    submit_controls=submit_controls,
+                )
+            if not visible_fields(snapshot) and not is_review(snapshot):
+                detected, filled, skipped = _counts(fields)
+                if is_login_wall(snapshot):
+                    session.mark("LOGIN_FAILED")
+                    return _result(
+                        session,
+                        status=Status.LOGIN_REQUIRED,
+                        ats=ats_name,
+                        login_status="LOGIN_REQUIRED",
+                        fields_detected=detected,
+                        fields_filled=filled,
+                        fields_skipped=skipped,
+                        manual_actions=manual,
+                        messages=["Sign-in is required before the application form. Nothing was typed."],
+                        submit_controls=submit_controls,
+                    )
+                session.mark(Status.NO_FORM_FOUND)
+                return _result(
+                    session,
+                    status=Status.NO_FORM_FOUND,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=["No application form was found. A person can open the page and continue."],
+                    submit_controls=submit_controls,
+                )
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
             if visible in seen:
                 break
@@ -355,6 +437,7 @@ def autofill_application(
                 )
                 fields.extend(page_fields)
                 manual.extend(page_manual)
+                _note_fill(page_fields, opts, run_started, inspect_state)
                 session.mark("REVIEW_PAGE")
                 session.mark("READY_FOR_HUMAN_SUBMIT")
                 detected, filled, skipped = _counts(fields)
@@ -381,6 +464,7 @@ def autofill_application(
             )
             fields.extend(page_fields)
             manual.extend(page_manual)
+            _note_fill(page_fields, opts, run_started, inspect_state)
             for button in snapshot.buttons:
                 if field_class_for_button(button.name, control_type=button.control_type) == "FINAL_SUBMIT":
                     if button.name not in submit_controls:
@@ -424,9 +508,23 @@ def autofill_application(
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if "review" in (snapshot.heading or "").casefold():
             session.mark("REVIEW_PAGE")
-        session.mark("READY_FOR_HUMAN_SUBMIT")
         detected, filled, skipped = _counts(fields)
         on_review = "review" in (snapshot.heading or "").casefold()
+        if not visible_fields(snapshot) and not on_review:
+            session.mark(Status.NO_FORM_FOUND)
+            return _result(
+                session,
+                status=Status.NO_FORM_FOUND,
+                ats=ats_name,
+                login_status=login_status,
+                fields_detected=detected,
+                fields_filled=filled,
+                fields_skipped=skipped,
+                manual_actions=manual,
+                messages=["No application form was found. A person can open the page and continue."],
+                submit_controls=submit_controls,
+            )
+        session.mark("READY_FOR_HUMAN_SUBMIT")
         terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
         return _result(
             session,
@@ -530,13 +628,41 @@ def _timings(opts: AutofillOptions) -> dict[str, int]:
     return {key: int(value) for key, value in opts.timings.items()}
 
 
+def _mark_ms(opts: AutofillOptions, key: str, started: float) -> None:
+    if opts.timings is None:
+        return
+    elapsed = (time.perf_counter() - started) * 1000
+    opts.timings[key] = 0 if elapsed <= 0 else max(1, int(elapsed))
+
+
+def _note_fill(fields, opts: AutofillOptions, started: float, state: dict) -> None:
+    if state.get("filled"):
+        return
+    if any(getattr(item, "action", "") in {"fill", "select", "check", "uncheck", "upload"} for item in fields):
+        state["filled"] = True
+        _mark_ms(opts, "firstFillMs", started)
+
+
 def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
+    wait_for_render(page)
     snapshot = extract_page(page)
     if not state.get("seen"):
         state["seen"] = True
-        if opts.timings is not None:
-            elapsed = (time.perf_counter() - started) * 1000
-            opts.timings["firstFormInspectedMs"] = 0 if elapsed <= 0 else max(1, int(elapsed))
+        _mark_ms(opts, "firstFormInspectedMs", started)
+    return snapshot
+
+
+def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float, state: dict):
+    """Click at most two entry controls while the page still has no form."""
+    for _ in range(2):
+        if snapshot.captcha_present or visible_fields(snapshot):
+            return snapshot
+        button = choose_entry(snapshot)
+        if button is None:
+            return snapshot
+        logger.info("session=%s action=entry", session.session_id)
+        activate_entry(page, button.selector, button.name, control_type=button.control_type)
+        snapshot = _timed_extract(page, opts, started, state)
     return snapshot
 
 
@@ -610,6 +736,25 @@ def _run_resolver_pages(
                 Status.CAPTCHA_REQUIRED,
                 ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
             )
+        snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        if snapshot.captcha_present:
+            session.mark("FAILED")
+            return finish(
+                Status.CAPTCHA_REQUIRED,
+                ["CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."],
+            )
+        if not visible_fields(snapshot) and not is_review(snapshot):
+            if is_login_wall(snapshot):
+                session.mark("LOGIN_FAILED")
+                return finish(
+                    Status.LOGIN_REQUIRED,
+                    ["Sign-in is required before the application form. Nothing was typed."],
+                )
+            session.mark(Status.NO_FORM_FOUND)
+            return finish(
+                Status.NO_FORM_FOUND,
+                ["No application form was found. A person can open the page and continue."],
+            )
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
             break
@@ -631,6 +776,7 @@ def _run_resolver_pages(
             )
             fields.extend(outcome.fields)
             manual.extend(outcome.manual_actions)
+            _note_fill(outcome.fields, opts, run_started, inspect_state)
             if outcome.snapshot is not None:
                 snapshot = outcome.snapshot
                 _remember_submit(snapshot, submit_controls)
@@ -704,8 +850,14 @@ def _run_resolver_pages(
     _remember_submit(snapshot, submit_controls)
     if "review" in (snapshot.heading or "").casefold():
         session.mark("REVIEW_PAGE")
-    session.mark(Status.READY_FOR_HUMAN_SUBMIT)
     on_review = "review" in (snapshot.heading or "").casefold()
+    if not visible_fields(snapshot) and not on_review:
+        session.mark(Status.NO_FORM_FOUND)
+        return finish(
+            Status.NO_FORM_FOUND,
+            ["No application form was found. A person can open the page and continue."],
+        )
+    session.mark(Status.READY_FOR_HUMAN_SUBMIT)
     terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
     return finish(terminal, ["Filled what it could. A person clicks Submit or Apply."])
 

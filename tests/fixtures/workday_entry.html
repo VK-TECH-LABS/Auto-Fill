@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Example Role</title></head>
+<body>
+  <h1>Example Role</h1>
+  <button type="button" id="signin">Sign In</button>
+  <button type="button" id="autofill">Autofill with Resume</button>
+  <button type="button" id="manual">Apply Manually</button>
+  <button type="button" id="last">Use My Last Application</button>
+  <section id="form" hidden>
+    <h1>My Information</h1>
+    <label for="email">Email</label>
+    <input id="email" type="email">
+    <button type="submit" id="submit">Submit</button>
+  </section>
+  <script>
+    window.__clicked = [];
+    document.getElementById("manual").addEventListener("click", () => {
+      window.__clicked.push("Apply Manually");
+      document.getElementById("form").hidden = false;
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__clicked.push("Submit");
+    });
+    document.getElementById("signin").addEventListener("click", () => {
+      window.__clicked.push("Sign In");
+    });
+    document.getElementById("autofill").addEventListener("click", () => {
+      window.__clicked.push("Autofill with Resume");
+    });
+  </script>
+</body>
+</html>

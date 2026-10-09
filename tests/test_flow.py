@@ -22,7 +22,7 @@ from autofill.dates import format_for_control
 from autofill.engine import autofill_application as engine_entry
 from autofill.mapping import map_field
 from autofill.models import Control, Option
-from autofill.safeguards import ActionClass, action_class, perform_click
+from autofill.safeguards import ActionClass, action_class, activate_entry, perform_click
 from autofill.session import SessionStore
 
 FIXTURE = Path(__file__).parent / "fixtures" / "multi_step_application.html"
@@ -232,13 +232,24 @@ def test_sessions_are_isolated_and_not_global():
 def test_guard_blocks_a_hostile_final_submit(browser):
     page = browser.new_page()
     try:
-        page.set_content("<button id='go' type='submit'>Submit application</button><script>window.__n=0</script>")
+        page.set_content(
+            "<button id='go' type='submit'>Submit application</button>"
+            "<button id='apply'>Apply</button>"
+            "<script>window.__n=0; window.__apply=0</script>"
+        )
         page.locator("#go").evaluate("(el) => el.addEventListener('click', () => { window.__n += 1 })")
+        page.locator("#apply").evaluate("(el) => el.addEventListener('click', () => { window.__apply += 1 })")
         with pytest.raises(HumanSubmissionRequired):
             perform_click(page, "#go", "Submit application", control_type="submit", purpose="login")
         with pytest.raises(HumanSubmissionRequired):
             perform_click(page, "#go", "Finish", control_type="submit", purpose="navigation")
+        with pytest.raises(HumanSubmissionRequired):
+            perform_click(page, "#apply", "Apply", control_type="button", purpose="navigation")
+        with pytest.raises(HumanSubmissionRequired):
+            activate_entry(page, "#go", "Submit application", control_type="submit")
+        activate_entry(page, "#apply", "Apply Manually")
         assert page.evaluate("() => window.__n") == 0
+        assert page.evaluate("() => window.__apply") == 1
     finally:
         page.close()
 

@@ -156,6 +156,10 @@ EXTRACT_JS = r"""
       else if (tag === "select") kind = "select";
       else if (tag === "textarea") kind = "textarea";
       else if (role === "combobox") kind = "combobox";
+      const classToken = el.getAttribute("class") || "";
+      if (classToken.indexOf("select__input") !== -1 || (el.closest && el.closest(".select__control"))) {
+        kind = "combobox";
+      }
 
       let options = [];
       if (tag === "select") {
@@ -164,7 +168,7 @@ EXTRACT_JS = r"""
           label: (option.textContent || "").replace(/\s+/g, " ").trim(),
           selector: "",
         })).filter((option) => option.label || option.value);
-      } else if (role === "combobox") {
+      } else if (kind === "combobox") {
         const listId = el.getAttribute("aria-controls");
         const list = listId ? byId(root, listId) : root.querySelector("[role='listbox']");
         if (list) {
@@ -215,18 +219,35 @@ EXTRACT_JS = r"""
   });
 
   let captcha = false;
+  const wallText = (document.body ? document.body.innerText : "").slice(0, 5000).toLowerCase();
+  if (
+    wallText.indexOf("datadome") !== -1 ||
+    wallText.indexOf("captcha-delivery") !== -1 ||
+    wallText.indexOf("checking your browser") !== -1 ||
+    wallText.indexOf("just a moment") !== -1 ||
+    wallText.indexOf("perimeterx") !== -1 ||
+    wallText.indexOf("px-captcha") !== -1
+  ) {
+    captcha = true;
+  }
   eachRoot(document, (root) => {
     const captchaSelector = [
       ".h-captcha",
       ".g-recaptcha",
       ".cf-turnstile",
+      "#px-captcha",
+      ".px-captcha",
       "iframe[src*='hcaptcha.com']",
-      "iframe[src*='recaptcha']",
       "iframe[src*='challenges.cloudflare.com']",
       "iframe[src*='arkoselabs']",
+      "iframe[src*='datadome']",
+      "iframe[src*='captcha-delivery']",
     ].join(", ");
     if (root.querySelector(captchaSelector)) {
       captcha = true;
+    }
+    for (const frame of root.querySelectorAll("iframe[src*='recaptcha']")) {
+      if (!frame.closest(".grecaptcha-badge")) captcha = true;
     }
   });
   const password = controls.some((control) => control.kind === "password" && !control.hidden);

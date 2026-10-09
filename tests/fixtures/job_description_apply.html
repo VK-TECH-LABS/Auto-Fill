@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Example Engineer</title></head>
+<body>
+  <h1>Example Engineer</h1>
+  <p>Example Labs is hiring an example engineer.</p>
+  <button type="button" id="apply">Apply</button>
+  <section id="form" hidden>
+    <h1>Application</h1>
+    <label for="email">Email</label>
+    <input id="email" type="email">
+    <button type="submit" id="submit">Submit application</button>
+  </section>
+  <script>
+    window.__clicked = [];
+    document.getElementById("apply").addEventListener("click", () => {
+      window.__clicked.push("Apply");
+      document.getElementById("form").hidden = false;
+      document.getElementById("apply").hidden = true;
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__clicked.push("Submit application");
+    });
+  </script>
+</body>
+</html>

@@ -37,6 +37,9 @@ from autofill.service.schemas import (
     CredentialsIn,
     CredentialsOut,
     HealthOut,
+    HumanDoneIn,
+    InteractIn,
+    InteractOut,
     ManualQuestionOut,
     RunStatusOut,
     TimingsOut,
@@ -47,6 +50,27 @@ logger = logging.getLogger("autofill.service")
 
 _REFUSED_STATUSES = frozenset({"SUBMITTED", "APPLIED", "SUBMIT_CLICKED", "APPLICATION_SUBMITTED"})
 _STARTABLE = frozenset({Status.LOGIN_REQUIRED, Status.LOGIN_FAILED, Status.CREATED, "CREATED", Status.FAILED_RETRYABLE})
+_HUMAN_STOP = frozenset(
+    {
+        Status.LOGIN_REQUIRED,
+        Status.CAPTCHA_REQUIRED,
+        Status.MANUAL_ANSWER_REQUIRED,
+        Status.RESUME_UPLOAD_REQUIRED,
+        Status.NO_FORM_FOUND,
+        Status.READY_FOR_HUMAN_SUBMIT,
+    }
+)
+
+
+def _limit_interact(session) -> None:
+    """At most 30 human actions per minute for one session."""
+    now = time.monotonic()
+    session.interact_marks = [mark for mark in session.interact_marks if now - mark < 60]
+    if len(session.interact_marks) >= 30:
+        raise HTTPException(status_code=429, detail="Too many interactions for this session.")
+    session.interact_marks.append(now)
+
+
 _DESCRIPTION = """
 Public Auto-Fill HTTP service.
 
@@ -81,6 +105,7 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
         firstFormInspectedMs=int(raw.get("firstFormInspectedMs", 0)),
         contextReadyMs=int(raw.get("contextReadyMs", 0)),
         browserPrewarmMs=int(raw.get("browserPrewarmMs", 0)),
+        firstFillMs=int(raw.get("firstFillMs", 0)),
     )
 
 
@@ -95,6 +120,7 @@ def _status_out(session: ServiceSession) -> RunStatusOut:
         protocolVersion=session.protocol_version,
         manualQuestions=_questions_out(session),
         timings=_timings_out(session),
+        humanOutcome=session.human_outcome,
     )
     if result is None:
         return body
@@ -369,7 +395,7 @@ def create_app(
                     job=job,
                     cover_letter_text=None,
                     mode="resolver",
-                    protocol_version="0.4.0",
+                    protocol_version=body.protocol_version.strip(),
                     candidate_ref=binding.candidate_ref,
                     job_ref=binding.job_ref,
                     resolver_url=binding.url,
@@ -418,6 +444,13 @@ def create_app(
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        if body.human_resolved:
+            if session.status not in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="humanResolved continues only after login, a challenge, or a missing form.",
+                )
+            return _run(session, store, active_runner, limits, resume_uploaded=False)
         if session.status == Status.READY_FOR_HUMAN_SUBMIT:
             raise HTTPException(
                 status_code=409,
@@ -470,6 +503,50 @@ def create_app(
             redaction_filter().add(body.email.strip())
         logger.info("session=%s credentials_stored=true", session.session_id)
         return CredentialsOut(sessionId=session.session_id)
+
+    @router.get("/sessions/{session_id}/screenshot", tags=["sessions"])
+    def session_screenshot(session_id: str) -> Response:
+        session = _session_or_404(session_id)
+        shot = getattr(active_runner, "screenshot", None)
+        image = shot(session_id) if shot is not None else None
+        if not image:
+            raise HTTPException(status_code=409, detail="No page is open for this session.")
+        payload, host = image
+        session.screenshot_version += 1
+        logger.info("session=%s action=screenshot result=ok", session.session_id)
+        return Response(
+            content=payload,
+            media_type="image/jpeg",
+            headers={
+                "X-Autofill-Status": session.status,
+                "X-Autofill-Url-Host": host,
+            },
+        )
+
+    @router.post("/sessions/{session_id}/interact", response_model=InteractOut, tags=["sessions"])
+    def interact_session(session_id: str, body: InteractIn) -> InteractOut:
+        session = _session_or_404(session_id)
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        if session.status not in _HUMAN_STOP:
+            raise HTTPException(status_code=409, detail=f"Cannot interact with a session in status {session.status}.")
+        _limit_interact(session)
+        action = {"action": body.action, "x": body.x, "y": body.y, "text": body.text, "key": body.key, "dy": body.dy}
+        apply = getattr(active_runner, "interact", None)
+        moved = apply(session_id, action) if apply is not None else False
+        if not moved:
+            raise HTTPException(status_code=409, detail="No page is open for this session.")
+        session.screenshot_version += 1
+        logger.info("session=%s action=%s result=ok", session.session_id, body.action)
+        return InteractOut(status=session.status, screenshotVersion=session.screenshot_version)
+
+    @router.post("/sessions/{session_id}/human-done", response_model=RunStatusOut, tags=["sessions"])
+    def human_done(session_id: str, body: HumanDoneIn) -> RunStatusOut:
+        session = _session_or_404(session_id)
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        session.human_outcome = body.outcome
+        active_runner.discard(session_id)
+        logger.info("session=%s human_outcome=%s", session.session_id, body.outcome)
+        return _status_out(session)
 
     @router.delete("/sessions/{session_id}", status_code=204, tags=["sessions"])
     def delete_session(session_id: str) -> Response:
