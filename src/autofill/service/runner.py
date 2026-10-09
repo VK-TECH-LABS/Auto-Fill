@@ -1,10 +1,10 @@
-"""Run ``autofill_application`` on one browser thread per process.
+"""Run ``autofill_application`` on a pool of browser threads.
 
-Playwright's sync driver can be started only once on that thread. This runner
-starts one driver lazily, gives every session its own browser context, and
-stops the driver on shutdown. A session delete closes only that context, so
-cookies, storage, and pages are never shared. Sync Playwright objects are
-touched only on the browser thread. Passwords are not logged.
+Playwright's sync driver cannot be shared across threads, and one thread
+would run every session one after another. Each worker thread owns one
+prewarmed Chromium. A session is pinned to one worker. Every session still
+gets a new browser context that is never reused. Sync Playwright objects are
+touched only on their worker thread. Passwords are not logged.
 """
 
 from __future__ import annotations
@@ -18,12 +18,27 @@ from typing import Any, Protocol, TypeVar
 
 from autofill.ats import is_blocked_sso, is_manual_ats
 from autofill.credentials import MemoryCredentialProvider
-from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application, is_browser_crash
+from autofill.engine import (
+    ApplicationResult,
+    AutofillOptions,
+    Status,
+    autofill_application,
+    is_ats_timeout,
+    is_browser_crash,
+)
 from autofill.models import JobContext
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 
 _T = TypeVar("_T")
+
+
+def elapsed_ms(started: float) -> int:
+    """Whole milliseconds, at least 1 when any time passed."""
+    elapsed = (time.perf_counter() - started) * 1000
+    if elapsed <= 0:
+        return 0
+    return max(1, int(elapsed))
 
 
 class BrowserDisabled(RuntimeError):
@@ -69,7 +84,7 @@ class FillRunner(Protocol):
 
 
 class _SharedDriver:
-    """One Playwright driver and one Chromium process. Browser thread only."""
+    """One Playwright driver and one Chromium process. One worker thread only."""
 
     def __init__(self, *, headless: bool, launch_args: list[str]) -> None:
         self._headless = headless
@@ -78,7 +93,7 @@ class _SharedDriver:
         self._browser: Any = None
 
     def browser(self) -> Any:
-        """Launch Chromium on first use. Later sessions reuse this browser."""
+        """Launch Chromium on first use. Later calls on this worker reuse it."""
         if self._browser is not None:
             return self._browser
         from playwright.sync_api import sync_playwright
@@ -108,17 +123,20 @@ class _SharedDriver:
 
 
 class _SessionContext:
-    """One session's browser context. Only the browser thread touches it."""
+    """One session's browser context. Only its worker thread touches it."""
 
     def __init__(self) -> None:
         self.context: Any = None
         self.page: Any = None
+        self.context_ready_ms = 0
 
     def open(self, driver: _SharedDriver, url: str) -> Any:
         if self.page is not None:
             return self.page
+        started = time.perf_counter()
         # A fresh context every time. No user-data directory and no stored profile.
         context = driver.browser().new_context()
+        self.context_ready_ms = elapsed_ms(started)
         try:
             page = context.new_page()
             page.goto(url)
@@ -130,7 +148,7 @@ class _SessionContext:
         return page
 
     def close(self) -> None:
-        """Close this context only. The shared driver stays up for other sessions."""
+        """Close this context only. The worker's browser stays up."""
         context = self.context
         self.page = None
         self.context = None
@@ -138,37 +156,18 @@ class _SessionContext:
             context.close()
 
 
-class PlaywrightRunner:
-    """Default runner. Manual-ATS and SSO decisions do not launch a browser."""
+class _Worker:
+    """One thread, one Chromium, and the sessions pinned to it."""
 
-    def __init__(
-        self,
-        *,
-        enabled: bool = True,
-        headless: bool = True,
-        launch_args: list[str] | None = None,
-    ) -> None:
-        self.enabled = enabled
-        self.headless = headless
-        self.launch_args = list(launch_args or [])
-        self._sessions: dict[str, _SessionContext] = {}
-        self._driver = _SharedDriver(headless=headless, launch_args=self.launch_args)
+    def __init__(self, index: int, *, headless: bool, launch_args: list[str]) -> None:
+        self.index = index
+        self.driver = _SharedDriver(headless=headless, launch_args=launch_args)
+        self.sessions: dict[str, _SessionContext] = {}
         self._queue: queue.Queue = queue.Queue()
         self._accept = threading.Lock()
         self._stopped = False
-        self.browser_ready_ms = 0
-        self._thread = threading.Thread(target=self._loop, name="autofill-browser", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name=f"autofill-browser-{index}", daemon=True)
         self._thread.start()
-
-    def prewarm(self) -> int:
-        """Launch the shared Chromium once. Later sessions only open a context."""
-        if not self.enabled:
-            self.browser_ready_ms = 0
-            return 0
-        started = time.perf_counter()
-        self._submit(lambda: self._driver.browser())
-        self.browser_ready_ms = int((time.perf_counter() - started) * 1000)
-        return self.browser_ready_ms
 
     def _loop(self) -> None:
         while True:
@@ -181,8 +180,7 @@ class PlaywrightRunner:
             except BaseException as exc:
                 done.put((False, exc))
 
-    def _submit(self, function: Callable[[], _T]) -> _T:
-        """Run ``function`` on the browser thread. Playwright calls stay there."""
+    def submit(self, function: Callable[[], _T]) -> _T:
         done: queue.Queue = queue.Queue()
         with self._accept:
             if self._stopped:
@@ -193,116 +191,10 @@ class PlaywrightRunner:
             raise value
         return value
 
-    def _options(self, request: FillRequest, page: object | None) -> AutofillOptions:
-        return AutofillOptions(
-            job_id=request.job_id,
-            session_id=request.session_id,
-            candidate_id=request.candidate_id,
-            page=page,
-            resume_uploaded=request.resume_uploaded,
-            cover_letter_text=request.cover_letter_text,
-            headless=self.headless,
-            job=request.job,
-            resolver=request.resolver,
-            answers_updated=request.answers_updated,
-            timings=self._timings(request),
-            max_pages=request.max_pages,
-            intent_hook=request.intent_hook,
-        )
-
-    def _timings(self, request: FillRequest) -> dict[str, int]:
-        timings = dict(request.timings or {})
-        timings.setdefault("sessionCreatedMs", request.session_created_ms)
-        timings.setdefault("browserReadyMs", self.browser_ready_ms)
-        return timings
-
-    def _run_engine(self, request: FillRequest, page: object | None) -> ApplicationResult:
-        return autofill_application(
-            request.application_url,
-            request.profile,
-            request.credentials,
-            self._options(request, page),
-        )
-
-    def _recover_driver(self) -> None:
-        """Close dead contexts and drop the driver so the next call relaunches."""
-        for session_id in list(self._sessions):
-            try:
-                self._close(session_id)
-            except Exception:
-                self._sessions.pop(session_id, None)
-        try:
-            self._driver.stop()
-        except Exception:
-            self._driver._browser = None
-            self._driver._playwright = None
-        self._driver = _SharedDriver(headless=self.headless, launch_args=self.launch_args)
-
-    def _retryable(self, request: FillRequest) -> ApplicationResult:
-        """The session stays. A later start can run it again. No second session is created."""
-        return ApplicationResult(
-            status=Status.FAILED_RETRYABLE,
-            ats=None,
-            current_step=Status.FAILED_RETRYABLE,
-            login_status="NOT_REQUIRED",
-            session_id=request.session_id,
-            candidate_id=request.candidate_id,
-            job_id=request.job_id,
-            messages=["Browser stopped. The session was kept and can be retried."],
-            timings=self._timings(request),
-        )
-
-    def _run_with_page(self, request: FillRequest) -> ApplicationResult:
-        attempts = 0
-        while True:
-            try:
-                slot = self._sessions.get(request.session_id)
-                if slot is None or slot.page is None:
-                    slot = _SessionContext()
-                    slot.open(self._driver, request.application_url)
-                    self._sessions[request.session_id] = slot
-                return self._run_engine(request, slot.page)
-            except Exception as exc:
-                if not is_browser_crash(exc) or attempts >= 1:
-                    if is_browser_crash(exc):
-                        self._recover_driver()
-                        return self._retryable(request)
-                    raise
-                attempts += 1
-                self._recover_driver()
-
-    def _close(self, session_id: str) -> None:
-        slot = self._sessions.pop(session_id, None)
-        if slot is not None:
-            slot.close()
-
-    def _shutdown_driver(self) -> None:
-        try:
-            for session_id in list(self._sessions):
-                self._close(session_id)
-        finally:
-            self._driver.stop()
-
-    def run(self, request: FillRequest) -> ApplicationResult:
-        if is_manual_ats(request.application_url) or is_blocked_sso(request.application_url):
-            return self._run_engine(request, None)
-        if not self.enabled:
-            raise BrowserDisabled("AUTOFILL_RUN_BROWSER is off. This process will not launch a browser.")
-        return self._submit(lambda: self._run_with_page(request))
-
-    def discard(self, session_id: str) -> None:
-        """Close this session's context. Other sessions and the driver stay open."""
-        with self._accept:
-            if self._stopped:
-                return
-            done: queue.Queue = queue.Queue()
-            self._queue.put((lambda: self._close(session_id), done))
-        ok, value = done.get()
-        if not ok:
-            raise value
+    def prewarm(self) -> None:
+        self.submit(lambda: self.driver.browser())
 
     def shutdown(self) -> None:
-        """Close every session context, then stop the shared Playwright driver."""
         done: queue.Queue = queue.Queue()
         with self._accept:
             if self._stopped:
@@ -316,3 +208,207 @@ class PlaywrightRunner:
         finally:
             self._queue.put(None)
             self._thread.join(timeout=10)
+
+    def _shutdown_driver(self) -> None:
+        try:
+            for session_id in list(self.sessions):
+                self._close(session_id)
+        finally:
+            self.driver.stop()
+
+    def _close(self, session_id: str) -> None:
+        slot = self.sessions.pop(session_id, None)
+        if slot is not None:
+            slot.close()
+
+    def _recover_driver(self) -> None:
+        for session_id in list(self.sessions):
+            try:
+                self._close(session_id)
+            except Exception:
+                self.sessions.pop(session_id, None)
+        try:
+            self.driver.stop()
+        except Exception:
+            self.driver._browser = None
+            self.driver._playwright = None
+        self.driver = _SharedDriver(headless=self.driver._headless, launch_args=self.driver._launch_args)
+
+
+class PlaywrightRunner:
+    """Default runner. Manual-ATS and SSO decisions do not launch a browser."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        headless: bool = True,
+        launch_args: list[str] | None = None,
+        workers: int = 4,
+    ) -> None:
+        if workers < 1:
+            raise ValueError("workers must be at least 1.")
+        self.enabled = enabled
+        self.headless = headless
+        self.launch_args = list(launch_args or [])
+        self.workers = workers
+        self._assign = threading.Lock()
+        self._loads = [0 for _ in range(workers)]
+        self._pins: dict[str, int] = {}
+        self._workers = [
+            _Worker(index, headless=headless, launch_args=self.launch_args) for index in range(workers)
+        ]
+        self.browser_ready_ms = 0
+        self.browser_prewarm_ms = 0
+
+    @property
+    def _sessions(self) -> dict[str, _SessionContext]:
+        """Every open context, for tests. Mutations go through the owning worker."""
+        merged: dict[str, _SessionContext] = {}
+        for worker in self._workers:
+            merged.update(worker.sessions)
+        return merged
+
+    @property
+    def _driver(self) -> _SharedDriver:
+        """Worker 0's driver. Tests that close one browser use ``workers=1``."""
+        return self._workers[0].driver
+
+    def _worker_for(self, session_id: str) -> _Worker:
+        with self._assign:
+            pinned = self._pins.get(session_id)
+            if pinned is None:
+                pinned = min(range(self.workers), key=lambda index: (self._loads[index], index))
+                self._pins[session_id] = pinned
+                self._loads[pinned] += 1
+            return self._workers[pinned]
+
+    def _unpin(self, session_id: str) -> None:
+        with self._assign:
+            pinned = self._pins.pop(session_id, None)
+            if pinned is not None and self._loads[pinned] > 0:
+                self._loads[pinned] -= 1
+
+    def prewarm(self) -> int:
+        """Launch each worker's Chromium. Wall time is the process prewarm."""
+        if not self.enabled:
+            self.browser_ready_ms = 0
+            self.browser_prewarm_ms = 0
+            return 0
+        started = time.perf_counter()
+        threads = [
+            threading.Thread(target=worker.prewarm, name=f"autofill-prewarm-{worker.index}")
+            for worker in self._workers
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.browser_prewarm_ms = elapsed_ms(started)
+        self.browser_ready_ms = self.browser_prewarm_ms
+        return self.browser_prewarm_ms
+
+    def _submit(self, function: Callable[[], _T], session_id: str | None = None) -> _T:
+        """Run ``function`` on the worker that owns ``session_id``."""
+        worker = self._workers[0] if session_id is None else self._worker_for(session_id)
+        return worker.submit(function)
+
+    def _options(self, request: FillRequest, page: object | None, slot: _SessionContext | None) -> AutofillOptions:
+        return AutofillOptions(
+            job_id=request.job_id,
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            page=page,
+            resume_uploaded=request.resume_uploaded,
+            cover_letter_text=request.cover_letter_text,
+            headless=self.headless,
+            job=request.job,
+            resolver=request.resolver,
+            answers_updated=request.answers_updated,
+            timings=self._timings(request, slot),
+            max_pages=request.max_pages,
+            intent_hook=request.intent_hook,
+        )
+
+    def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
+        timings = dict(request.timings or {})
+        timings.setdefault("sessionCreatedMs", request.session_created_ms)
+        timings.setdefault("browserPrewarmMs", self.browser_prewarm_ms)
+        if slot is not None and slot.context_ready_ms:
+            timings["contextReadyMs"] = slot.context_ready_ms
+            timings.setdefault("browserReadyMs", slot.context_ready_ms)
+        return timings
+
+    def _run_engine(
+        self,
+        request: FillRequest,
+        page: object | None,
+        slot: _SessionContext | None = None,
+    ) -> ApplicationResult:
+        return autofill_application(
+            request.application_url,
+            request.profile,
+            request.credentials,
+            self._options(request, page, slot),
+        )
+
+    def _retryable(self, request: FillRequest, *, category: str) -> ApplicationResult:
+        """The session stays. A later start can run it again. No second session is created."""
+        return ApplicationResult(
+            status=Status.FAILED_RETRYABLE,
+            ats=None,
+            current_step=Status.FAILED_RETRYABLE,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            messages=[category],
+            timings=self._timings(request),
+        )
+
+    def _run_with_page(self, request: FillRequest) -> ApplicationResult:
+        worker = self._worker_for(request.session_id)
+        attempts = 0
+        while True:
+            try:
+                slot = worker.sessions.get(request.session_id)
+                if slot is None or slot.page is None:
+                    slot = _SessionContext()
+                    slot.open(worker.driver, request.application_url)
+                    worker.sessions[request.session_id] = slot
+                return self._run_engine(request, slot.page, slot)
+            except Exception as exc:
+                if is_ats_timeout(exc):
+                    return self._retryable(request, category="ats_timeout")
+                if not is_browser_crash(exc) or attempts >= 1:
+                    if is_browser_crash(exc):
+                        worker._recover_driver()
+                        return self._retryable(request, category="browser_closed")
+                    raise
+                attempts += 1
+                worker._recover_driver()
+
+    def run(self, request: FillRequest) -> ApplicationResult:
+        if is_manual_ats(request.application_url) or is_blocked_sso(request.application_url):
+            return self._run_engine(request, None)
+        if not self.enabled:
+            raise BrowserDisabled("AUTOFILL_RUN_BROWSER is off. This process will not launch a browser.")
+        try:
+            return self._submit(lambda: self._run_with_page(request), request.session_id)
+        except Exception as exc:
+            if is_ats_timeout(exc):
+                return self._retryable(request, category="ats_timeout")
+            raise
+
+    def discard(self, session_id: str) -> None:
+        """Close this session's context. Other sessions and the browsers stay open."""
+        worker = self._worker_for(session_id)
+        try:
+            worker.submit(lambda: worker._close(session_id))
+        finally:
+            self._unpin(session_id)
+
+    def shutdown(self) -> None:
+        """Close every session context, then stop each worker's Playwright driver."""
+        for worker in self._workers:
+            worker.shutdown()

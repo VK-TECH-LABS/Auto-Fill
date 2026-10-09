@@ -69,6 +69,7 @@ FIELDS = {
 class _Resolver(ThreadingHTTPServer):
     calls: list[dict]
     mode: str
+    custom_answers: list[dict] | None
 
 
 def _future() -> str:
@@ -122,21 +123,24 @@ def resolver():
             step = body.get("step", "")
             known = FIELDS.get(step, {})
             fields = {key: known[key] for key in body.get("fields", []) if key in known}
-            answers = []
-            for question in body.get("questions", []):
-                intent = question.get("intent")
-                saved = ANSWERS.get(intent)
-                if saved is None:
-                    continue
-                answers.append(
-                    {
-                        "intent": intent,
-                        "value": saved["value"],
-                        "values": saved["values"],
-                        "confidence": "HIGH",
-                        "source": "saved_answer",
-                    }
-                )
+            if server.custom_answers is not None:
+                answers = list(server.custom_answers)
+            else:
+                answers = []
+                for question in body.get("questions", []):
+                    intent = question.get("intent")
+                    saved = ANSWERS.get(intent)
+                    if saved is None:
+                        continue
+                    answers.append(
+                        {
+                            "intent": intent,
+                            "value": saved["value"],
+                            "values": saved["values"],
+                            "confidence": "HIGH",
+                            "source": "saved_answer",
+                        }
+                    )
             encoded = json.dumps({"fields": fields, "answers": answers, "unresolved": []}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -150,6 +154,7 @@ def resolver():
     server = _Resolver(("127.0.0.1", 0), Handler)
     server.calls = []
     server.mode = "ok"
+    server.custom_answers = None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -294,6 +299,8 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
             ),
         )
         assert second.status == Status.RESUME_UPLOAD_REQUIRED, second.messages
+        assert {"intent": None, "text": "What is your favorite prime number?"} in second.manual_questions
+        assert page.locator("#prime").input_value() == ""
         assert page.locator("#resume").input_value() == ""
         third = autofill_application(
             URL,
@@ -389,4 +396,264 @@ def test_resolver_422_stays_on_the_session_with_blanks(browser, resolver, caplog
         assert "unprocessable" in caplog.text
         assert "sentinel-must-not-fill" not in caplog.text
     finally:
+        page.close()
+
+
+_UNKNOWN_FIELDS = """
+<h1>Questions</h1>
+<label for="prime">What is your favorite prime number?</label>
+<input id="prime">
+<label for="color">What is your favorite color?</label>
+<select id="color">
+  <option value="">Select...</option>
+  <option>Red</option>
+  <option>Blue</option>
+</select>
+<button type="button">Next</button>
+"""
+
+_QUESTIONS = (
+    _UNKNOWN_FIELDS.replace(
+        "<button",
+        """<label for="gender">Gender</label>
+<select id="gender">
+  <option value="">Select...</option>
+  <option>Decline</option>
+</select>
+<button""",
+    )
+)
+
+
+def _answer(intent, text, value, confidence="HIGH", source="saved_answer"):
+    return {
+        "intent": intent,
+        "text": text,
+        "value": value,
+        "values": [],
+        "confidence": confidence,
+        "source": source,
+    }
+
+
+def test_saved_answer_fills_an_unknown_question_and_rejects_a_bad_option(browser, resolver):
+    server, url = resolver
+    page = browser.new_page()
+    try:
+        page.set_content(_QUESTIONS)
+        server.custom_answers = [
+            _answer(None, "What is your favorite prime number?", "17"),
+            _answer(None, "What is your favorite color?", "Purple"),
+            _answer("GENDER", "Gender", "Decline"),
+        ]
+        blocked = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-unknown", candidate_id="ref-a"),
+        )
+        assert blocked.status == Status.MANUAL_ANSWER_REQUIRED, blocked.messages
+        assert page.locator("#prime").input_value() == "17"
+        assert page.locator("#color").input_value() == ""
+        assert page.locator("#gender").input_value() == ""
+        published = {(item.get("intent"), item.get("text")) for item in blocked.manual_questions}
+        assert (None, "What is your favorite prime number?") not in published
+        assert (None, "What is your favorite color?") in published
+        assert ("GENDER", "Gender") in published
+
+        page.set_content(_UNKNOWN_FIELDS)
+        server.custom_answers = [
+            _answer(None, "What is your favorite prime number?", "17"),
+            _answer(None, "What is your favorite color?", "Blue"),
+        ]
+        filled = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-unknown-ok", candidate_id="ref-a"),
+        )
+        assert filled.status != Status.MANUAL_ANSWER_REQUIRED, filled.manual_questions
+        assert page.locator("#prime").input_value() == "17"
+        assert page.locator("#color").input_value() == "Blue"
+
+        page.set_content(_UNKNOWN_FIELDS)
+        server.custom_answers = [
+            _answer(None, "What is your favorite prime number?", "17", confidence="MEDIUM"),
+        ]
+        medium = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-unknown-med", candidate_id="ref-a"),
+        )
+        assert medium.status == Status.MANUAL_ANSWER_REQUIRED
+        assert page.locator("#prime").input_value() == ""
+
+        page.set_content(_UNKNOWN_FIELDS)
+        server.custom_answers = [
+            _answer(None, "What is your favorite prime number?", "17", source="profile"),
+        ]
+        profile_source = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-unknown-src", candidate_id="ref-a"),
+        )
+        assert profile_source.status == Status.MANUAL_ANSWER_REQUIRED
+        assert page.locator("#prime").input_value() == ""
+    finally:
+        server.custom_answers = None
+        page.close()
+
+
+_PE_PAGE = """
+<section id="step-questions">
+  <h1>Questions</h1>
+  <fieldset>
+    <legend>Do you hold a PE license?</legend>
+    <label><input type="radio" name="pe" id="pe-yes" value="Yes"> Yes</label>
+    <label><input type="radio" name="pe" id="pe-no" value="No"> No</label>
+  </fieldset>
+  <label for="prime">What is your favorite prime number?</label>
+  <input id="prime">
+  <button type="button" id="next">Next</button>
+</section>
+<section id="step-resume" hidden>
+  <h1>Resume</h1>
+  <label for="resume">Resume</label>
+  <input id="resume" type="file">
+</section>
+<script>
+  document.getElementById("next").addEventListener("click", () => {
+    document.getElementById("step-questions").hidden = true;
+    document.getElementById("step-resume").hidden = false;
+  });
+</script>
+"""
+
+
+def test_continue_stops_again_when_value_does_not_map(browser, resolver):
+    server, url = resolver
+    page = browser.new_page()
+    try:
+        page.set_content(_PE_PAGE)
+        server.custom_answers = [
+            _answer("PE_LICENSE", "Do you hold a PE license?", "7"),
+        ]
+        first = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-pe", candidate_id="ref-a"),
+        )
+        assert first.status == Status.MANUAL_ANSWER_REQUIRED, first.messages
+        assert page.locator("#pe-yes").is_checked() is False
+        assert page.locator("#pe-no").is_checked() is False
+        assert page.locator("#prime").input_value() == ""
+        assert {"intent": "PE_LICENSE", "text": "Do you hold a PE license?"} in first.manual_questions
+        asked = len(server.calls)
+
+        second = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                resolver=_binding(url),
+                session_id="sess-pe",
+                candidate_id="ref-a",
+                answers_updated=True,
+            ),
+        )
+        assert len(server.calls) > asked
+        assert second.status == Status.MANUAL_ANSWER_REQUIRED, second.messages
+        assert second.status not in {Status.RESUME_UPLOAD_REQUIRED, Status.READY_FOR_HUMAN_SUBMIT}
+        assert second.manual_questions == [{"intent": "PE_LICENSE", "text": "Do you hold a PE license?"}]
+        assert page.locator("#pe-yes").is_checked() is False
+        assert page.locator("#step-resume").is_hidden()
+
+        server.custom_answers = [
+            _answer("PE_LICENSE", "Do you hold a PE license?", "Yes"),
+        ]
+        third = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                resolver=_binding(url),
+                session_id="sess-pe",
+                candidate_id="ref-a",
+                answers_updated=True,
+            ),
+        )
+        assert third.status == Status.RESUME_UPLOAD_REQUIRED, third.messages
+        assert page.locator("#pe-yes").is_checked()
+        assert page.locator("#resume").input_value() == ""
+        assert {"intent": None, "text": "What is your favorite prime number?"} in third.manual_questions
+        assert page.locator("#step-resume").is_hidden() is False
+    finally:
+        server.custom_answers = None
+        page.close()
+
+
+_REQUIRED_PAGE = """
+<section id="step-questions">
+  <h1>Questions</h1>
+  <label for="relocate">Are you willing to relocate?</label>
+  <select id="relocate" required>
+    <option value="">Select...</option>
+    <option>Yes</option>
+    <option>No</option>
+  </select>
+  <button type="button" id="next">Next</button>
+</section>
+<section id="step-resume" hidden>
+  <h1>Resume</h1>
+  <label for="resume">Resume</label>
+  <input id="resume" type="file">
+</section>
+<script>
+  document.getElementById("next").addEventListener("click", () => {
+    document.getElementById("step-questions").hidden = true;
+    document.getElementById("step-resume").hidden = false;
+  });
+</script>
+"""
+
+
+def test_continue_stops_again_when_a_required_question_is_unresolved(browser, resolver):
+    server, url = resolver
+    page = browser.new_page()
+    try:
+        page.set_content(_REQUIRED_PAGE)
+        server.custom_answers = []
+        first = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(page=page, resolver=_binding(url), session_id="sess-required", candidate_id="ref-a"),
+        )
+        assert first.status == Status.MANUAL_ANSWER_REQUIRED, first.messages
+        assert page.locator("#relocate").input_value() == ""
+        assert {"intent": "RELOCATE", "text": "Are you willing to relocate?"} in first.manual_questions
+
+        second = autofill_application(
+            URL,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                resolver=_binding(url),
+                session_id="sess-required",
+                candidate_id="ref-a",
+                answers_updated=True,
+            ),
+        )
+        assert second.status == Status.MANUAL_ANSWER_REQUIRED, second.messages
+        assert second.manual_questions == [{"intent": "RELOCATE", "text": "Are you willing to relocate?"}]
+        assert page.locator("#relocate").input_value() == ""
+        assert page.locator("#step-resume").is_hidden()
+    finally:
+        server.custom_answers = None
         page.close()

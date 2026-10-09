@@ -161,6 +161,8 @@ class TimingsOut(BaseModel):
     session_created_ms: int = Field(default=0, alias="sessionCreatedMs")
     browser_ready_ms: int = Field(default=0, alias="browserReadyMs")
     first_form_inspected_ms: int = Field(default=0, alias="firstFormInspectedMs")
+    context_ready_ms: int = Field(default=0, alias="contextReadyMs")
+    browser_prewarm_ms: int = Field(default=0, alias="browserPrewarmMs")
 
 
 class RunStatusOut(BaseModel):

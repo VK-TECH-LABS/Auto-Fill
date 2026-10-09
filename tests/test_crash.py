@@ -50,15 +50,19 @@ def test_closed_browser_relaunches_for_the_same_session(tmp_path):
     _chromium_or_skip()
     page = tmp_path / "one.html"
     page.write_text("<h1>Contact</h1><label for='email'>Email</label><input id='email' type='email'>", encoding="utf-8")
-    runner = PlaywrightRunner(enabled=True, headless=True)
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
     try:
         runner.prewarm()
-        assert runner.browser_ready_ms >= 0
+        assert runner.browser_prewarm_ms >= 1
         runner._submit(lambda: runner._driver._browser.close())
         result = runner.run(_request(page.as_uri()))
         assert result.session_id == "sess-crash"
         assert result.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
         assert list(runner._sessions) == ["sess-crash"]
+        assert result.timings["contextReadyMs"] >= 1
+        assert result.timings["browserReadyMs"] == result.timings["contextReadyMs"]
+        assert result.timings["browserPrewarmMs"] >= 1
+        assert result.timings["firstFormInspectedMs"] >= 1
     finally:
         runner.shutdown()
 
@@ -67,12 +71,12 @@ def test_repeated_browser_fault_keeps_one_session(monkeypatch):
     _chromium_or_skip()
     calls: list[str] = []
 
-    def explode(_self, request, _page):
+    def explode(_self, request, _page, _slot=None):
         calls.append(request.session_id)
         raise RuntimeError("browser has been closed")
 
     monkeypatch.setattr(PlaywrightRunner, "_run_engine", explode)
-    runner = PlaywrightRunner(enabled=True, headless=True)
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
     try:
         result = runner.run(_request("about:blank", session_id="sess-retry"))
         assert isinstance(result, ApplicationResult)

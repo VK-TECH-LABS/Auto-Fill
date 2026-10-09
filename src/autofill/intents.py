@@ -37,6 +37,16 @@ PROTOCOL_INTENTS: tuple[str, ...] = (
     "DISABILITY_STATUS",
 )
 
+# Demographic questions are never written by the engine.
+DEMOGRAPHIC_INTENTS = frozenset(
+    {
+        "GENDER",
+        "RACE_ETHNICITY",
+        "VETERAN_STATUS",
+        "DISABILITY_STATUS",
+    }
+)
+
 # Legal, work-authorization, and demographic intents are never filled below HIGH.
 STRICT_INTENTS = frozenset(
     {
@@ -323,7 +333,13 @@ def classify_question(
 
 
 def may_fill(*, local: IntentMatch, resolver_confidence: str) -> bool:
-    """HIGH local and HIGH resolver confidence are both required."""
+    """HIGH local and HIGH resolver confidence are both required.
+
+    Demographic intents are never filled. An unknown question is not filled
+    here; a saved answer for that exact question is handled by the step filler.
+    """
+    if local.intent in DEMOGRAPHIC_INTENTS:
+        return False
     if local.intent is None or local.confidence != "HIGH":
         return False
     if resolver_confidence != "HIGH":

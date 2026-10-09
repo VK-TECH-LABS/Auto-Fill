@@ -53,7 +53,7 @@ def test_http_service_fills_local_form_and_stops_before_submit(fixture_origin: s
     _chromium_or_skip()
     raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     raw["candidateId"] = "candidate-example"
-    runner = PlaywrightRunner(enabled=True, headless=True)
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
     app = create_app(token=TOKEN, runner=runner, run_browser=True)
     email = raw["personal"]["email"]
     with TestClient(app) as client:
@@ -141,7 +141,7 @@ def _eval(runner: PlaywrightRunner, session_id: str, expression: str, argument: 
             return page.evaluate(expression)
         return page.evaluate(expression, argument)
 
-    return runner._submit(read)
+    return runner._submit(read, session_id)
 
 
 _FORM_VALUES = """() => ({
@@ -158,7 +158,7 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
     first = _candidate(source, "candidate-a", "Casey Example", "Casey", "casey.example@example.com", "Casey City")
     second = _candidate(source, "candidate-b", "Blair Example", "Blair", "blair.example@example.com", "Blair City")
     third = _candidate(source, "candidate-c", "Drew Example", "Drew", "drew.example@example.com", "Drew City")
-    runner = PlaywrightRunner(enabled=True, headless=True)
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
     app = create_app(token=TOKEN, runner=runner, run_browser=True)
     with TestClient(app) as client:
         session_a = _create_session(client, fixture_origin, first, "job-a")

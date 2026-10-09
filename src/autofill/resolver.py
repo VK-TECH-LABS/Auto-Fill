@@ -41,6 +41,7 @@ class ResolverAnswer:
     values: list[str] = field(default_factory=list)
     confidence: str = "LOW"
     source: str = ""
+    text: str = ""
 
 
 @dataclass
@@ -291,6 +292,8 @@ def _parse_body(
         values = [entry for entry in values_raw if isinstance(entry, str)] if isinstance(values_raw, list) else []
         source_raw = item.get("source")
         source = source_raw if isinstance(source_raw, str) else ""
+        question_text = item.get("text")
+        question_text = question_text if isinstance(question_text, str) else ""
         if len(text) > 4000 or any(len(entry) > 4000 for entry in values):
             continue
         answers.append(
@@ -300,6 +303,7 @@ def _parse_body(
                 values=values[:32],
                 confidence=str(confidence),
                 source=source[:64],
+                text=question_text[:300],
             )
         )
     if isinstance(unresolved_raw, list):

@@ -42,6 +42,7 @@ python -m autofill.service
 | `AUTOFILL_RESOLVER_TIMEOUT_SECONDS` | no | Resolver HTTP timeout. Default `5`. |
 | `AUTOFILL_RESOLVER_RETRIES` | no | Extra attempts after a retryable resolver failure. Default `2`. |
 | `AUTOFILL_RESOLVER_MAX_BYTES` | no | Maximum resolver response body. Default `65536`. |
+| `AUTOFILL_BROWSER_WORKERS` | no | Browser worker threads. Each has its own Chromium. Default `4`. |
 
 Interactive API docs are served at `/docs`. The schema is `/openapi.json`. Neither document contains a real token.
 
@@ -177,27 +178,29 @@ Status includes `protocolVersion`, `manualQuestions` (`[{intent, text}]` only, a
 
 | Field | Meaning |
 | --- | --- |
-| `sessionCreatedMs` | Time spent creating the session. |
-| `browserReadyMs` | Time spent launching the shared Chromium at process start. `0` when the browser is disabled. |
+| `sessionCreatedMs` | Time spent handling session create. At least 1 when any time passed. |
+| `contextReadyMs` | Time to open this session's browser context. |
+| `browserReadyMs` | Same per-session context time. It is not the process startup measurement. |
+| `browserPrewarmMs` | Wall time to launch the worker browsers at process start. |
 | `firstFormInspectedMs` | Time from the start of the run until the first page inspection. |
 
 `POST /v1/sessions/{sessionId}/continue` accepts `{candidateRef, resumeUploaded, answersUpdated}`. `answersUpdated: true` while `MANUAL_ANSWER_REQUIRED` resumes the same browser context and asks the resolver again for the pending intents. `resumeUploaded: true` while `RESUME_UPLOAD_REQUIRED` continues past the file input. The service never chooses a resume file.
 
-The process launches one shared Chromium during startup and opens a new browser context for each session. Contexts are not reused. A browser crash relaunches Chromium, retries that session once, and otherwise records `FAILED_RETRYABLE` on the same session id. There is no persistent profile directory.
+The process prewarms one Chromium per worker thread (`AUTOFILL_BROWSER_WORKERS`, default 4). A session is pinned to one worker. Each session gets a new browser context that is never reused. A browser crash relaunches that worker's Chromium, retries the session once, and otherwise records `FAILED_RETRYABLE` on the same session id. A navigation timeout records `FAILED_RETRYABLE` with category `ats_timeout`. There is no persistent profile directory.
 
 A background reaper closes an expired session's context and wipes the resolver token, site credentials, and held values, then sets `EXPIRED`. Shutdown does the same wipe. Logs for resolver steps record the session id, step, adapter, field keys, intents, counts, result codes, and latency. They do not record values, emails, phones, or tokens.
 
-Question classification is local. Level 1 maps normalized text and synonyms to a canonical intent. Level 2 is an in-process token matcher and does not call a network or a language model. Level 3 is an in-process hook, off by default. A hook would receive sanitized question text, option labels, and the intent catalogue, and would return an intent only. A value is written only when both the local match and the resolver confidence are `HIGH`. `MEDIUM`, `LOW`, and unknown questions stay blank and the run stops with `MANUAL_ANSWER_REQUIRED`. Legal, authorization, and demographic intents are never filled below `HIGH`. Option labels match only when they are exact or an allowed equivalent (`Yes`/`No`, `True`/`False`, `Authorized`/`Not Authorized`, and the exact percent buckets `0`/`25`/`50`/`75`/`100`). A multiselect is checked only when every saved value maps.
+Question classification is local. Level 1 maps normalized text and synonyms to a canonical intent. Level 2 is an in-process token matcher and does not call a network or a language model. Level 3 is an in-process hook, off by default. A hook would receive sanitized question text, option labels, and the intent catalogue, and would return an intent only. A value is written only when both the local match and the resolver confidence are `HIGH`. An unknown question (`intent` null) is filled only when the resolver answer for that exact question has source `saved_answer` and confidence `HIGH`, and a choice control still needs an exact option. Demographic intents are never filled. Legal and authorization intents are never filled below `HIGH`. Option labels match only when they are exact or an allowed equivalent (`Yes`/`No`, `True`/`False`, `Authorized`/`Not Authorized`, and the exact percent buckets `0`/`25`/`50`/`75`/`100`). A multiselect is checked only when every saved value maps.
 
 ### Clarifications
 
 - Address components are requested as `address.line1`, `address.region`, `address.postalCode`, and `address.country`, not as a single `address.*` wildcard.
 - `DELETE` wipes secrets and removes the session (`204`, then `404`). `CANCELLED` is set on the detached object and is not kept as a tombstone.
-- The first unresolved question stops at `MANUAL_ANSWER_REQUIRED`. After `answersUpdated`, a question that is still below `HIGH` stays blank and the run continues, so a later resume or review step can still be reached.
+- The first unresolved question stops at `MANUAL_ANSWER_REQUIRED`. `answersUpdated` asks the resolver again. A question that is still unresolved, or whose saved value does not match an option, stops again at `MANUAL_ANSWER_REQUIRED`. An optional question with no saved answer may stay blank when the page advances, and it is still listed on `manualQuestions`.
 - A Level 3 hook is capped at `MEDIUM`, so it cannot cause a fill. There is no network client for Level 3.
 - The phrase "now or in the future require sponsorship" maps to `SPONSORSHIP_NOW`. A future-only phrase maps to `SPONSORSHIP_FUTURE`.
 - The 0.3.0 statuses `LOGIN_FAILED`, `FILLED`, `UNSUPPORTED`, `MANUAL_REVIEW_REQUIRED`, `APPLICATION_READY`, and `FAILED` remain for the profile mode.
-- `browserReadyMs` is the shared startup prewarm, not a per-session launch.
+- `browserPrewarmMs` is the process startup prewarm. `contextReadyMs` and `browserReadyMs` are the per-session context open. `sessionCreatedMs` is create handling.
 
 ## Status values
 
