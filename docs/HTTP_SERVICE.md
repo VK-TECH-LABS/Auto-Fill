@@ -206,7 +206,7 @@ Question classification is local. Level 1 maps normalized text and synonyms to a
 
 ### Clarifications
 
-- Address components are requested as `address.line1`, `address.region`, `address.postalCode`, and `address.country`, not as a single `address.*` wildcard.
+- Address components are requested as `address.line1`, `address.region`, `address.postalCode`, and `address.country`, not as a single `address.*` wildcard. A current-location field also requests `address.state` and uses it as the region when `address.region` is absent. The state and country may be a full name or an abbreviation (`TX` or `Texas`, `US` or `USA`).
 - `DELETE` wipes secrets and removes the session (`204`, then `404`). `CANCELLED` is set on the detached object and is not kept as a tombstone.
 - The first unresolved question stops at `MANUAL_ANSWER_REQUIRED`. `answersUpdated` asks the resolver again. A question that is still unresolved, or whose saved value does not match an option, stops again at `MANUAL_ANSWER_REQUIRED`. An optional question with no saved answer may stay blank when the page advances, and it is still listed on `manualQuestions`.
 - A Level 3 hook is capped at `MEDIUM`, so it cannot cause a fill. There is no network client for Level 3.

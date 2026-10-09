@@ -4,10 +4,20 @@ import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from autofill.intents import IntentMatch
 from autofill.models import Control, Option, PageSnapshot
 from autofill.resolver import _resume_descriptor
 from autofill.resume_fetch import fetch_resume_payload, resume_filename, sanitized_resume_name
-from autofill.stepfill import _clusters, _compose_location, _describe, _question_text, choose_location_label
+from autofill.stepfill import (
+    ResolvedPage,
+    _clusters,
+    _compose_location,
+    _describe,
+    _manual,
+    _question_text,
+    _skip,
+    choose_location_label,
+)
 
 _PDF = b"%PDF-1.1\ngrant-bytes\n%%EOF\n"
 
@@ -120,6 +130,54 @@ def test_question_text_is_not_an_option_label():
         options=[Option("Yes", "Yes"), Option("No", "No")],
     )
     assert _question_text([unnamed]) == ""
+
+
+def test_location_state_alias_picks_austin_tx():
+    labels = [
+        "Austin, TX, USA",
+        "Austin, MN, USA",
+        "Austin, IN, USA",
+        "Austin, AR, USA",
+    ]
+    assert choose_location_label(labels, city="Austin", region="TX", country="US") == "Austin, TX, USA"
+    assert choose_location_label(labels, city="Austin", region="Texas", country="USA") == "Austin, TX, USA"
+    assert choose_location_label(labels, city="Austin", region="", country="US") is None
+    assert _compose_location({"address.city": "Austin", "address.state": "TX"}) == "Austin, TX"
+    assert (
+        _compose_location({"address.city": "Austin", "address.region": "TX", "address.state": "MN"}) == "Austin, TX"
+    )
+
+
+def test_required_unfilled_control_becomes_a_manual_question():
+    years = Control(
+        kind="text",
+        label="How many years of experience do you have?",
+        required=True,
+        selector="#yoe",
+    )
+    field = _describe("one", [years], "", None)
+    assert field is not None and field.field_key == "yearsExperience"
+    outcome = ResolvedPage()
+    _skip(years, outcome, "yearsExperience", "Resolver did not return this key.")
+    assert outcome.manual_questions == [
+        {
+            "intent": None,
+            "text": "How many years of experience do you have?",
+            "blocking": True,
+        }
+    ]
+    optional = Control(kind="text", label="Internal badge number", selector="#badge")
+    assert _describe("one", [optional], "", None) is None
+    skipped = ResolvedPage()
+    _skip(optional, skipped, "badge", "Resolver did not return this key.")
+    assert skipped.manual_questions == []
+    blank = ResolvedPage()
+    _manual(blank, IntentMatch(None, "unknown", "none", ""), blocking=True)
+    _manual(blank, IntentMatch(None, "unknown", "none", "Where do you plan on working from?"), blocking=True)
+    assert [item["text"] for item in blank.manual_questions] == ["Where do you plan on working from?"]
+    required_text = Control(kind="text", label="Years of experience using Python", required=True, selector="#py")
+    asked = _describe("one", [required_text], "", None)
+    assert asked is not None and asked.include_question is True and asked.field_key is None
 
 
 def test_location_pick_normalizes_region_and_country():

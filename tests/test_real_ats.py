@@ -618,6 +618,107 @@ def test_lever_location_without_a_match_stays_manual(browser, resolver):
         page.close()
 
 
+def test_lever_dropdown_location_uses_address_state(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Austin",
+        "address.state": "TX",
+        "address.country": "US",
+    }
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='current-location'>Current location</label>"
+            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "<div id='location-results' hidden>"
+            "<div class='dropdown-location' id='location-0'>Austin, TX, USA</div>"
+            "<div class='dropdown-location' id='location-1'>Austin, MN, USA</div>"
+            "<div class='dropdown-location' id='location-2'>Austin, IN, USA</div>"
+            "<div class='dropdown-location' id='location-3'>Austin, AR, USA</div>"
+            "</div></form>"
+            "<script>"
+            "const input = document.getElementById('current-location');"
+            "const dropdown = document.getElementById('location-results');"
+            "const hidden = document.getElementById('selected-location');"
+            "input.addEventListener('input', () => {"
+            "hidden.value = '';"
+            "dropdown.hidden = !input.value.trim();"
+            "});"
+            "dropdown.querySelectorAll('.dropdown-location').forEach((item) => {"
+            "item.addEventListener('mousedown', (event) => {"
+            "event.preventDefault();"
+            "input.value = item.textContent;"
+            "hidden.value = item.textContent;"
+            "dropdown.hidden = true;"
+            "});"
+            "});"
+            "input.addEventListener('blur', () => {"
+            "setTimeout(() => { if (!hidden.value) input.value = ''; }, 30);"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "address.state" in requested
+        assert "address.region" in requested
+        picked = "Austin, TX, USA"
+        assert page.locator("#current-location").input_value() == picked
+        assert page.locator("#selected-location").input_value() == picked
+        assert [item.get("text") for item in result.manual_questions] == []
+    finally:
+        page.close()
+
+
+def test_ashby_required_questions_stay_in_manual(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='email'>Email</label>"
+            "<input id='email' type='email' autocomplete='email'>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<label id='work-label' class='ashby-application-form-question-title' for='work-from'>"
+            "Where do you plan on working from for this role?</label>"
+            "<button id='work-from' type='button' aria-haspopup='listbox' aria-required='true' "
+            "aria-labelledby='work-label'>Select...</button>"
+            "</div>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<label id='yoe-sec-label' class='ashby-application-form-question-title' for='yoe-sec'>"
+            "How many years of experience do you have with security engineering?</label>"
+            "<button id='yoe-sec' type='button' aria-haspopup='listbox' aria-required='true' "
+            "aria-labelledby='yoe-sec-label'>Select...</button>"
+            "</div>"
+            "<div class='ashby-application-form-field-entry'>"
+            "<div class='ashby-application-form-question-title'>"
+            "How many years of experience do you have using Python?</div>"
+            "<input id='yoe-py' type='number' required>"
+            "</div>"
+            "<label for='yoe-total'>How many years of experience do you have?</label>"
+            "<input id='yoe-total' type='text' required>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Where do you plan on working from for this role?" in texts
+        assert "How many years of experience do you have with security engineering?" in texts
+        assert "How many years of experience do you have using Python?" in texts
+        assert "How many years of experience do you have?" in texts
+        assert "Email" not in texts
+        assert "Select..." not in texts
+        assert page.locator("#yoe-py").input_value() == ""
+        assert page.locator("#yoe-total").input_value() == ""
+        assert page.locator("#work-from").inner_text() == "Select..."
+        assert page.locator("#yoe-sec").inner_text() == "Select..."
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+    finally:
+        page.close()
+
+
 def test_radio_and_checkbox_questions_use_the_group_label(browser, resolver):
     server, url = resolver
     server.custom_answers = []  # type: ignore[attr-defined]

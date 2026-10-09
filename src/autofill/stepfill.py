@@ -87,7 +87,7 @@ _PROTOCOL = {
     "website_url": "links.website",
     "years_of_experience_total": "yearsExperience",
 }
-_LOCATION_KEYS = ("address.city", "address.region", "address.country", "location")
+_LOCATION_KEYS = ("address.city", "address.region", "address.state", "address.country", "location")
 _ALIASES = (
     frozenset({"california", "ca"}),
     frozenset({"new york", "ny"}),
@@ -166,6 +166,7 @@ def fill_resolved_page(
     outcome.requested_intents = [ask.match.intent if ask.match else None for ask in requests if ask.include_question]
 
     if not field_keys and not questions:
+        _note_unfilled_required(outcome)
         return outcome
 
     response: ResolverResponse | None = None
@@ -179,6 +180,7 @@ def fill_resolved_page(
         )
         response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
         _apply(page, requests, response, active, outcome, snapshot.heading)
+        _note_unfilled_required(outcome)
         adapter = adapter_for(ats_name)
         resume_code = "none"
         if "resume.file" in field_keys:
@@ -301,6 +303,8 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     if key:
         return _Ask(controls=controls, field_key=key, subfield=_subfield(control, heading))
     if control.kind in {"radio", "select", "combobox", "checkbox", "textarea"} or "?" in control.label:
+        return _Ask(controls=controls, unknown=True, include_question=True)
+    if _required_question(control) and _question_text(controls):
         return _Ask(controls=controls, unknown=True, include_question=True)
     return None
 
@@ -490,11 +494,30 @@ _LOCATION_OPTIONS_JS = r"""
   function textOf(node) {
     return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
   }
+  function isSuggestion(node) {
+    if (!node || node === el || node.nodeType !== 1) return false;
+    if (node.contains && node.contains(el)) return false;
+    const role = (node.getAttribute("role") || "").toLowerCase();
+    if (role === "option") return true;
+    if (node.classList && node.classList.contains("dropdown-location")) return true;
+    const id = node.id || "";
+    return id.indexOf("location-") === 0;
+  }
   let root = el.parentElement;
   for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
+    const candidates = [];
+    const selector = "[role='option'], .dropdown-location, [id^='location-']";
+    for (const option of root.querySelectorAll(selector)) {
+      if (!isSuggestion(option) || !visible(option)) continue;
+      candidates.push(option);
+    }
     const found = [];
-    for (const option of root.querySelectorAll("[role='option']")) {
-      if (!visible(option)) continue;
+    for (const option of candidates) {
+      let nested = false;
+      for (const other of candidates) {
+        if (other !== option && option.contains(other)) nested = true;
+      }
+      if (nested) continue;
       const label = textOf(option);
       if (!label) continue;
       if (!option.id) option.setAttribute("data-autofill-option", String(found.length));
@@ -523,7 +546,7 @@ _SELECTED_LOCATION_JS = """
 
 def _location_parts(fields: dict) -> tuple[str, str, str]:
     city = str(fields.get("address.city") or "").strip()
-    region = str(fields.get("address.region") or "").strip()
+    region = str(fields.get("address.region") or fields.get("address.state") or "").strip()
     country = str(fields.get("address.country") or "").strip()
     raw = fields.get("location")
     if isinstance(raw, str) and raw.strip():
@@ -544,15 +567,35 @@ def _phrase_in(folded: str, phrase: str) -> bool:
     return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", folded) is not None
 
 
-def _alias_in(folded: str, value: str, table: dict[str, str]) -> bool:
+def _alias_phrases(value: str, table: dict[str, str]) -> list[str]:
+    """Abbreviation and full name for one state or country, including USA for US."""
     token = normalize(value)
-    if _phrase_in(folded, token):
-        return True
-    full = table.get(token)
-    if full and _phrase_in(folded, full):
-        return True
+    if not token:
+        return []
+    canonical = table.get(token, "")
+    if not canonical:
+        for name in table.values():
+            if token == name:
+                canonical = name
+                break
+    phrases = [token]
+    if not canonical:
+        return phrases
+    phrases.append(canonical)
     for short, name in table.items():
-        if token == name and _phrase_in(folded, short):
+        if name == canonical:
+            phrases.append(short)
+            phrases.append(name)
+    return phrases
+
+
+def _alias_in(folded: str, value: str, table: dict[str, str]) -> bool:
+    seen: set[str] = set()
+    for phrase in _alias_phrases(value, table):
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        if _phrase_in(folded, phrase):
             return True
     return False
 
@@ -1078,6 +1121,20 @@ def _write_text(page, control: Control, text: str, outcome: ResolvedPage, *, key
     outcome.fields.append(apply_mapped(page, control, mapped, overwrite=True))
 
 
+_FILLED_ACTIONS = frozenset({"fill", "select", "check", "uncheck", "upload"})
+
+
+def _required_question(control: Control) -> bool:
+    """A visible required answer that is not a file, a password, or a legal attestation."""
+    if not control.required or control.hidden or control.disabled or control.read_only:
+        return False
+    if control.kind in {"file", "password"} or control.input_type == "password":
+        return False
+    if is_honeypot(control) or _LEGAL_RE.search(haystack(control)):
+        return False
+    return True
+
+
 def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str) -> None:
     outcome.fields.append(
         FieldOutcome(
@@ -1089,15 +1146,61 @@ def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str)
             field_class="UNKNOWN_FIELD",
         )
     )
+    if _required_question(control):
+        _manual(outcome, IntentMatch(None, "unknown", "none", _manual_label(control)), blocking=True)
 
 
 def _manual(outcome: ResolvedPage, match: IntentMatch, *, blocking: bool) -> None:
     text = sanitize_question(match.text or "")
+    if not text:
+        return
     entry = {"intent": match.intent, "text": text, "blocking": blocking}
     if not any(item.get("intent") == entry["intent"] and item.get("text") == text for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
     outcome.manual_actions.append(f"{label}: manual answer required")
+
+
+def _control_filled(control: Control, filled: set[str]) -> bool:
+    selectors = [control.selector] if control.selector else []
+    selectors.extend(option.selector for option in control.options if option.selector)
+    return any(selector in filled for selector in selectors)
+
+
+def _group_filled(control: Control, controls: list[Control], filled: set[str]) -> bool:
+    if control.kind not in {"checkbox", "radio"}:
+        return False
+    token = control.group or control.name
+    if not token:
+        return False
+    for other in controls:
+        if other.kind != control.kind or (other.group or other.name) != token:
+            continue
+        if _control_filled(other, filled):
+            return True
+    return False
+
+
+def _note_unfilled_required(outcome: ResolvedPage) -> None:
+    """Every required visible control that is still empty is a manual question."""
+    snapshot = outcome.snapshot
+    if snapshot is None:
+        return
+    filled = {item.selector for item in outcome.fields if item.action in _FILLED_ACTIONS and item.selector}
+    seen = {normalize_question(str(item.get("text") or "")) for item in outcome.manual_questions}
+    for control in snapshot.controls:
+        if not _required_question(control):
+            continue
+        if _control_filled(control, filled) or _group_filled(control, snapshot.controls, filled):
+            continue
+        text = sanitize_question(_manual_label(control))
+        if not text:
+            continue
+        key = normalize_question(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
 
 
 def _index_answers(
@@ -1296,7 +1399,16 @@ def _question_text(controls: list[Control]) -> str:
         cleaned = _clean_prompt(control.group)
         if cleaned and not _matches_option(cleaned, [control]):
             return cleaned
-    return control.label or control.aria_label or control.placeholder
+    for raw in (control.label, control.aria_label, control.placeholder, control.prompt):
+        text = _clean_prompt(raw)
+        if text and not _matches_option(text, controls):
+            return text
+    return ""
+
+
+def _manual_label(control: Control) -> str:
+    """The question a person would read, not an option and not a bare asterisk."""
+    return _question_text([control])
 
 
 def _option_labels(controls: list[Control]) -> list[str]:
