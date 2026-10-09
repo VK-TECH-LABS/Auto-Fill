@@ -56,6 +56,124 @@ def _run(page, url: str, *, profile: CandidateProfile | None = None, **options):
     return result, timings
 
 
+def test_unknown_radio_answer_matches_by_question_hash(browser, resolver):
+    server, url = resolver
+
+    def dynamic(body: dict) -> dict:
+        answers = []
+        for question in body.get("questions", []):
+            text = str(question.get("text") or "")
+            folded = text.casefold()
+            if "singapore" in folded:
+                answers.append(
+                    {
+                        "intent": question.get("id"),
+                        "value": "No",
+                        "confidence": "HIGH",
+                        "source": "saved_answer",
+                    }
+                )
+            elif "prime" in folded:
+                answers.append(
+                    {
+                        "intent": None,
+                        "text": "what is your favorite prime number",
+                        "value": "17",
+                        "confidence": "HIGH",
+                        "source": "saved_answer",
+                    }
+                )
+        return {"fields": {}, "answers": answers, "unresolved": []}
+
+    server.dynamic = dynamic  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='color'>What is your favorite color?</label>"
+            "<input id='color'>"
+            "<label for='prime'>What is your favorite prime number?</label>"
+            "<input id='prime'>"
+            "<div class='application-question'>"
+            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<ul>"
+            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
+            "</ul></div>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        questions = [item for call in server.calls for item in call.get("questions", [])]
+        citizen = next(item for item in questions if "Singapore" in str(item.get("text")))
+        assert citizen.get("intent") is None
+        assert citizen.get("text") == "Are you a Singapore citizen?"
+        assert citizen.get("id")
+        assert citizen.get("options") == ["Yes", "No"]
+        assert page.locator("input[value='No']").is_checked()
+        assert page.locator("input[value='Yes']").is_checked() is False
+        assert page.locator("#prime").input_value() == "17"
+        assert page.locator("#color").input_value() == ""
+        texts = [item.get("text") for item in result.manual_questions]
+        assert "Are you a Singapore citizen?" not in texts
+        assert "What is your favorite prime number?" not in texts
+    finally:
+        page.close()
+
+
+def test_greenhouse_labels_are_not_doubled_and_visa_sponsorship_is_classified(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [  # type: ignore[attr-defined]
+        {
+            "intent": "SPONSORSHIP_NOW_OR_FUTURE",
+            "value": "No",
+            "confidence": "HIGH",
+            "source": "saved_answer",
+        },
+        {
+            "intent": None,
+            "text": "what is your favorite prime number",
+            "value": "17",
+            "confidence": "HIGH",
+            "source": "saved_answer",
+        },
+    ]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label id='gender-label' for='gender'>Gender*</label>"
+            "<select id='gender' aria-labelledby='gender-label' aria-label='Gender'>"
+            "<option value=''>Select</option>"
+            "<option>Decline to self-identify</option></select>"
+            "<label id='sponsor-label' for='sponsor'>"
+            "Will you now or in the future require sponsorship for a visa to remain in your country?*"
+            "</label>"
+            "<select id='sponsor' aria-labelledby='sponsor-label' "
+            "aria-label='Will you now or in the future require sponsorship for a visa to remain in your country?'>"
+            "<option value=''>Select</option><option>Yes</option><option>No</option></select>"
+            "<label id='q-label' for='prime'>What is your favorite prime number?*</label>"
+            "<input id='prime' aria-labelledby='q-label' aria-label='What is your favorite prime number?'>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        questions = [item for call in server.calls for item in call.get("questions", [])]
+        texts = [str(item.get("text") or "") for item in questions]
+        sponsor = "Will you now or in the future require sponsorship for a visa to remain in your country?"
+        assert texts.count("Gender") == 1
+        assert "Gender Gender" not in texts
+        assert all("*" not in text for text in texts)
+        assert texts.count(sponsor) == 1
+        assert texts.count("What is your favorite prime number?") == 1
+        intents = [item.get("intent") for item in questions]
+        assert "SPONSORSHIP_NOW_OR_FUTURE" in intents
+        assert page.locator("#sponsor").input_value() == "No"
+        assert page.locator("#prime").input_value() == "17"
+        assert page.locator("#gender").input_value() == ""
+        assert any(item.get("intent") == "GENDER" and item.get("text") == "Gender" for item in result.manual_questions)
+    finally:
+        page.close()
+
+
 def test_workday_entry_clicks_apply_manually_and_not_submit(browser):
     page = browser.new_page()
     try:
@@ -102,6 +220,7 @@ def test_datadome_block_is_captcha_not_ready(browser):
         page.goto((FIXTURES / "datadome_block.html").as_uri())
         result, timings = _run(page, "https://jobs.smartrecruiters.com/example/role")
         assert result.status == Status.CAPTCHA_REQUIRED, result.messages
+        assert result.messages == ["site blocked automated access"]
         assert result.fields_detected == 0
         assert timings["firstFormInspectedMs"] < 8000
     finally:
@@ -139,6 +258,8 @@ def test_visible_hcaptcha_checkbox_stops(browser):
         page.goto((FIXTURES / "visible_hcaptcha.html").as_uri())
         result, _timings = _run(page, "https://jobs.lever.co/example/role")
         assert result.status == Status.CAPTCHA_REQUIRED, result.messages
+        assert "site blocked automated access" not in result.messages
+        assert any("CAPTCHA" in message for message in result.messages)
         assert page.locator("#email").input_value() == ""
     finally:
         page.close()

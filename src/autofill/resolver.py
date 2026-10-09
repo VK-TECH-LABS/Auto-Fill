@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from autofill.intents import normalize_question, question_hash
 from autofill.resume_fetch import resume_filename
 
 logger = logging.getLogger("autofill.resolver")
@@ -49,6 +50,7 @@ class ResolverAnswer:
     confidence: str = "LOW"
     source: str = ""
     text: str = ""
+    question_id: str = ""
 
 
 @dataclass
@@ -129,6 +131,9 @@ def limit_question(question: dict[str, Any]) -> dict[str, Any]:
     bounded = dict(question)
     bounded["text"] = text
     bounded["options"] = limited
+    digest = question_hash(text)
+    if digest:
+        bounded["id"] = digest
     return bounded
 
 
@@ -211,6 +216,7 @@ def _resolve_once(
                 body,
                 requested_fields=requested_fields,
                 requested_intents=requested_intents,
+                question_keys=_question_keys(questions),
             )
             parsed.latency_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
@@ -317,11 +323,36 @@ def _read_limited(response: Any, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _question_keys(questions: list[dict[str, Any]]) -> set[str]:
+    """Ids, hashes, and normalized text this step can match an answer to."""
+    keys: set[str] = set()
+    for item in questions:
+        text = item.get("text") if isinstance(item.get("text"), str) else ""
+        qid = item.get("id") if isinstance(item.get("id"), str) else ""
+        if text:
+            keys.add(normalize_question(text))
+            digest = question_hash(text)
+            if digest:
+                keys.add(digest)
+        if qid:
+            keys.add(qid.lower())
+    return keys
+
+
+def _is_question_key(value: str, question_keys: set[str]) -> bool:
+    token = value.strip().lower()
+    if token and token in question_keys:
+        return True
+    folded = normalize_question(value)
+    return bool(folded) and folded in question_keys
+
+
 def _parse_body(
     raw: bytes,
     *,
     requested_fields: set[str],
     requested_intents: set[Any],
+    question_keys: set[str] | None = None,
 ) -> ResolverResponse:
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -353,7 +384,21 @@ def _parse_body(
         intent = item.get("intent")
         if intent is not None and not isinstance(intent, str):
             continue
-        if intent not in requested_intents:
+        if isinstance(intent, str) and intent.casefold() == "unknown":
+            intent = None
+        keys = question_keys or set()
+        question_id = ""
+        for raw_key in (item.get("id"), item.get("questionId"), item.get("hash")):
+            if isinstance(raw_key, str) and raw_key.strip():
+                question_id = raw_key.strip()
+                break
+        if isinstance(intent, str) and intent not in requested_intents:
+            if _is_question_key(intent, keys):
+                question_id = question_id or intent
+                intent = None
+            else:
+                continue
+        elif intent not in requested_intents:
             continue
         confidence = item.get("confidence", "LOW")
         if confidence not in {"HIGH", "MEDIUM", "LOW"}:
@@ -378,6 +423,7 @@ def _parse_body(
                 confidence=str(confidence),
                 source=source[:64],
                 text=question_text[:300],
+                question_id=question_id[:80],
             )
         )
     if isinstance(unresolved_raw, list):
