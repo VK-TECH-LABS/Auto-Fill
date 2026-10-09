@@ -481,7 +481,7 @@ def test_library_imports_without_a_host_checkout():
         text=True,
         env=env,
     )
-    assert completed.stdout.strip() == "0.3.0"
+    assert completed.stdout.strip() == "0.4.0"
     scan = subprocess.run(
         [
             sys.executable,

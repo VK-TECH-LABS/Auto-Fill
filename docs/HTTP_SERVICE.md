@@ -35,8 +35,13 @@ python -m autofill.service
 | `PORT` | no | Listen port. Default `8080`. |
 | `HOST` | no | Listen address. Default `0.0.0.0`. |
 | `AUTOFILL_RUN_BROWSER` | no | `1` (default) launches Chromium for fill runs. `0` still serves the API and still applies manual-ATS and SSO refusals, and it will not launch a browser. |
-| `AUTOFILL_MAX_SESSIONS` | no | Cap on sessions kept in memory. Default `32`. |
+| `AUTOFILL_MAX_SESSIONS` | no | Cap on sessions kept in memory. Default `32`. Expired sessions do not count. |
 | `AUTOFILL_BROWSER_NO_SANDBOX` | no | `1` adds Chromium `--no-sandbox`. The container image sets this. Leave it unset on a normal desktop. |
+| `AUTOFILL_SESSION_TTL_SECONDS` | no | Session lifetime. Default `1800`. A background reaper then marks the session `EXPIRED` and wipes secrets. |
+| `AUTOFILL_REAPER_INTERVAL_SECONDS` | no | How often the reaper runs. Default `30`. |
+| `AUTOFILL_RESOLVER_TIMEOUT_SECONDS` | no | Resolver HTTP timeout. Default `5`. |
+| `AUTOFILL_RESOLVER_RETRIES` | no | Extra attempts after a retryable resolver failure. Default `2`. |
+| `AUTOFILL_RESOLVER_MAX_BYTES` | no | Maximum resolver response body. Default `65536`. |
 
 Interactive API docs are served at `/docs`. The schema is `/openapi.json`. Neither document contains a real token.
 
@@ -142,9 +147,61 @@ Allowed only when the status is `RESUME_UPLOAD_REQUIRED` and `resumeUploaded` is
 
 Drop the session, close its browser, and forget its site password. `204` on success. `404` when the id is unknown.
 
+## Protocol 0.4.0 resolver mode
+
+`POST /v1/sessions` may create a resolver session instead of sending a profile. The body carries opaque refs, the application URL, and a per-session resolver. It does not carry candidate profile values or approved answers.
+
+```json
+{
+  "protocolVersion": "0.4.0",
+  "candidateRef": "candidate-ref-example",
+  "jobRef": "job-ref-example",
+  "jobContext": {
+    "applicationUrl": "https://boards.greenhouse.io/example/jobs/1",
+    "title": "Example Engineer",
+    "company": "Example Labs"
+  },
+  "resolver": {
+    "url": "https://resolver.example/v1/resolve",
+    "token": "<32 or more random bytes, memory only>",
+    "expiresAt": "2026-10-09T12:00:00+00:00"
+  }
+}
+```
+
+`201` returns `{sessionId, status: CREATED, stopped_before_submit: true, ...}`. The resolver token is not echoed. A resolver URL that contains the token, a userinfo password, or a `token` / `access_token` / `authorization` query key is rejected. `candidateContext` and `approvedAnswers` are rejected when `resolver` is set. The 0.3.0 profile body above still works when `resolver` is omitted.
+
+On each form step the engine inspects the page, derives normalized field keys and question intents, and `POST`s the resolver URL with `Authorization: Bearer <token>`. The token is never placed in the URL. The body is `{sessionId, candidateRef, jobRef, step, fields, questions}`. Returned values are held only for that step and then dropped. Calls use a timeout, a bounded retry count, and a response size limit. Redirects are not followed. `401`, `409`, and `410` are not retried.
+
+Status includes `protocolVersion`, `manualQuestions` (`[{intent, text}]` only, and only while `MANUAL_ANSWER_REQUIRED`), and `timings`:
+
+| Field | Meaning |
+| --- | --- |
+| `sessionCreatedMs` | Time spent creating the session. |
+| `browserReadyMs` | Time spent launching the shared Chromium at process start. `0` when the browser is disabled. |
+| `firstFormInspectedMs` | Time from the start of the run until the first page inspection. |
+
+`POST /v1/sessions/{sessionId}/continue` accepts `{candidateRef, resumeUploaded, answersUpdated}`. `answersUpdated: true` while `MANUAL_ANSWER_REQUIRED` resumes the same browser context and asks the resolver again for the pending intents. `resumeUploaded: true` while `RESUME_UPLOAD_REQUIRED` continues past the file input. The service never chooses a resume file.
+
+The process launches one shared Chromium during startup and opens a new browser context for each session. Contexts are not reused. A browser crash relaunches Chromium, retries that session once, and otherwise records `FAILED_RETRYABLE` on the same session id. There is no persistent profile directory.
+
+A background reaper closes an expired session's context and wipes the resolver token, site credentials, and held values, then sets `EXPIRED`. Shutdown does the same wipe. Logs for resolver steps record the session id, step, adapter, field keys, intents, counts, result codes, and latency. They do not record values, emails, phones, or tokens.
+
+Question classification is local. Level 1 maps normalized text and synonyms to a canonical intent. Level 2 is an in-process token matcher and does not call a network or a language model. Level 3 is an in-process hook, off by default. A hook would receive sanitized question text, option labels, and the intent catalogue, and would return an intent only. A value is written only when both the local match and the resolver confidence are `HIGH`. `MEDIUM`, `LOW`, and unknown questions stay blank and the run stops with `MANUAL_ANSWER_REQUIRED`. Legal, authorization, and demographic intents are never filled below `HIGH`. Option labels match only when they are exact or an allowed equivalent (`Yes`/`No`, `True`/`False`, `Authorized`/`Not Authorized`, and the exact percent buckets `0`/`25`/`50`/`75`/`100`). A multiselect is checked only when every saved value maps.
+
+### Clarifications
+
+- Address components are requested as `address.line1`, `address.region`, `address.postalCode`, and `address.country`, not as a single `address.*` wildcard.
+- `DELETE` wipes secrets and removes the session (`204`, then `404`). `CANCELLED` is set on the detached object and is not kept as a tombstone.
+- The first unresolved question stops at `MANUAL_ANSWER_REQUIRED`. After `answersUpdated`, a question that is still below `HIGH` stays blank and the run continues, so a later resume or review step can still be reached.
+- A Level 3 hook is capped at `MEDIUM`, so it cannot cause a fill. There is no network client for Level 3.
+- The phrase "now or in the future require sponsorship" maps to `SPONSORSHIP_NOW`. A future-only phrase maps to `SPONSORSHIP_FUTURE`.
+- The 0.3.0 statuses `LOGIN_FAILED`, `FILLED`, `UNSUPPORTED`, `MANUAL_REVIEW_REQUIRED`, `APPLICATION_READY`, and `FAILED` remain for the profile mode.
+- `browserReadyMs` is the shared startup prewarm, not a per-session launch.
+
 ## Status values
 
-The engine statuses are unchanged:
+Profile mode keeps the earlier statuses. Resolver mode also uses the protocol 0.4.0 statuses below.
 
 | Status | Meaning |
 | --- | --- |
@@ -158,6 +215,13 @@ The engine statuses are unchanged:
 | `FILLED` | No further safe page turn. |
 | `UNSUPPORTED` | Identity-provider SSO. Not an ATS password form. |
 | `FAILED` | The run stopped on an unexpected error. The message names the error type only. |
+| `STARTED` | A run has begun for this session. |
+| `FORM_IN_PROGRESS` | Resolver mode is filling the current step. |
+| `MANUAL_ANSWER_REQUIRED` | A question was not `HIGH` confidence. `manualQuestions` lists `{intent, text}` only. |
+| `FAILED_RETRYABLE` | A bounded failure (validation, or a browser fault after one relaunch). The same session can be started again. |
+| `FAILED_FINAL` | The resolver rejected the call (`401` or `409`) or the response was invalid. |
+| `CANCELLED` | Recorded when a session is deleted. The store does not keep a tombstone. |
+| `EXPIRED` | The TTL elapsed, or the resolver returned `410`. Secrets are wiped. `start` is rejected. |
 
 `stopped_before_submit` is true on every success body. `loginStatus` is `NOT_REQUIRED`, `LOGIN_REQUIRED`, `AUTHENTICATED`, `LOGIN_FAILED`, or `CAPTCHA_REQUIRED` after a run.
 

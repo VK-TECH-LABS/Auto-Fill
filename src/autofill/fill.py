@@ -62,6 +62,11 @@ _SET_NATIVE = """
 """
 
 
+def apply_mapped(page, control: Control, mapped: MappedField) -> FieldOutcome:
+    """Write one mapped value. Clicks still go through the submit guard."""
+    return _apply_mapped(page, control, mapped)
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -14,9 +15,20 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from autofill import __version__
 from autofill.credentials import Credentials
 from autofill.engine import ApplicationResult, Status
+from autofill.models import JobContext
+from autofill.redact import install_redaction, redaction_filter
+from autofill.resolver import ResolverBinding
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
 from autofill.service.auth import require_configured_token, tokens_match
-from autofill.service.context import ContextError, build_profile, credential_domain, require_login_name
+from autofill.service.context import (
+    ContextError,
+    build_binding,
+    build_profile,
+    credential_domain,
+    placeholder_profile,
+    require_login_name,
+    validate_application_url,
+)
 from autofill.service.runner import BrowserDisabled, FillRequest, FillRunner, PlaywrightRunner
 from autofill.service.schemas import (
     CandidateCheckIn,
@@ -25,14 +37,16 @@ from autofill.service.schemas import (
     CredentialsIn,
     CredentialsOut,
     HealthOut,
+    ManualQuestionOut,
     RunStatusOut,
+    TimingsOut,
 )
 from autofill.service.sessions import ServiceSession, ServiceSessionStore, new_session_id
 
 logger = logging.getLogger("autofill.service")
 
 _REFUSED_STATUSES = frozenset({"SUBMITTED", "APPLIED", "SUBMIT_CLICKED", "APPLICATION_SUBMITTED"})
-_STARTABLE = frozenset({Status.LOGIN_REQUIRED, Status.LOGIN_FAILED, "CREATED"})
+_STARTABLE = frozenset({Status.LOGIN_REQUIRED, Status.LOGIN_FAILED, Status.CREATED, "CREATED", Status.FAILED_RETRYABLE})
 _DESCRIPTION = """
 Public Auto-Fill HTTP service.
 
@@ -52,34 +66,48 @@ URL, a browser page, or client-side JavaScript.
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _questions_out(session: ServiceSession) -> list[ManualQuestionOut]:
+    source = session.result.manual_questions if session.result is not None else session.manual_questions
+    return [ManualQuestionOut(intent=item.get("intent"), text=item.get("text") or "") for item in source]
+
+
+def _timings_out(session: ServiceSession) -> TimingsOut:
+    raw = dict(session.timings)
+    if session.result is not None:
+        raw.update(session.result.timings)
+    return TimingsOut(
+        sessionCreatedMs=int(raw.get("sessionCreatedMs", 0)),
+        browserReadyMs=int(raw.get("browserReadyMs", 0)),
+        firstFormInspectedMs=int(raw.get("firstFormInspectedMs", 0)),
+    )
+
+
 def _status_out(session: ServiceSession) -> RunStatusOut:
     result = session.result
-    if result is None:
-        return RunStatusOut(
-            sessionId=session.session_id,
-            status=session.status,
-            stopped_before_submit=True,
-            candidateId=session.candidate_id,
-            jobId=session.job_id,
-        )
-    payload = result.to_dict()
-    return RunStatusOut(
+    body = RunStatusOut(
         sessionId=session.session_id,
         status=session.status,
         stopped_before_submit=True,
         candidateId=session.candidate_id,
         jobId=session.job_id,
-        ats=payload["ats"],
-        currentStep=payload["currentStep"],
-        loginStatus=payload["loginStatus"],
-        fieldsDetected=payload["fieldsDetected"],
-        fieldsFilled=payload["fieldsFilled"],
-        fieldsSkipped=payload["fieldsSkipped"],
-        manualActions=list(payload["manualActions"]),
-        steps=list(payload["steps"]),
-        messages=list(payload["messages"]),
-        submitControls=list(payload["submitControls"]),
+        protocolVersion=session.protocol_version,
+        manualQuestions=_questions_out(session),
+        timings=_timings_out(session),
     )
+    if result is None:
+        return body
+    payload = result.to_dict()
+    body.ats = payload["ats"]
+    body.current_step = payload["currentStep"]
+    body.login_status = payload["loginStatus"]
+    body.fields_detected = payload["fieldsDetected"]
+    body.fields_filled = payload["fieldsFilled"]
+    body.fields_skipped = payload["fieldsSkipped"]
+    body.manual_actions = list(payload["manualActions"])
+    body.steps = list(payload["steps"])
+    body.messages = list(payload["messages"])
+    body.submit_controls = list(payload["submitControls"])
+    return body
 
 
 def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunStatusOut:
@@ -93,6 +121,9 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         raise HTTPException(status_code=409, detail="Job does not match this session.")
     session.result = result
     session.status = result.status
+    session.manual_questions = [dict(item) for item in result.manual_questions]
+    if result.timings:
+        session.timings.update(result.timings)
     logger.info(
         "session=%s status=%s ats=%s step=%s",
         session.session_id,
@@ -118,12 +149,41 @@ def _failed(session: ServiceSession, exc: BaseException) -> RunStatusOut:
     return _accept_result(session, result)
 
 
-def _check_candidate(session: ServiceSession, candidate_id: str) -> None:
-    if candidate_id and candidate_id != session.candidate_id:
+def _check_candidate(session: ServiceSession, candidate_id: str, candidate_ref: str = "") -> None:
+    presented = candidate_ref.strip() or candidate_id.strip()
+    if not presented:
+        return
+    allowed = {session.candidate_id}
+    if session.candidate_ref:
+        allowed.add(session.candidate_ref)
+    if presented not in allowed:
         raise HTTPException(status_code=409, detail="Candidate does not match this session.")
 
 
-def _request_for(session: ServiceSession, *, resume_uploaded: bool) -> FillRequest:
+def _binding(session: ServiceSession, limits: dict[str, float | int]) -> ResolverBinding | None:
+    if session.mode != "resolver":
+        return None
+    if not session.resolver_token or not session.resolver_url:
+        raise HTTPException(status_code=409, detail="Resolver credentials are no longer available.")
+    return ResolverBinding(
+        url=session.resolver_url,
+        token=session.resolver_token,
+        expires_at=session.resolver_expires_at,
+        candidate_ref=session.candidate_ref,
+        job_ref=session.job_ref,
+        timeout_seconds=float(limits["timeout"]),
+        retries=int(limits["retries"]),
+        max_bytes=int(limits["max_bytes"]),
+    )
+
+
+def _request_for(
+    session: ServiceSession,
+    limits: dict[str, float | int],
+    *,
+    resume_uploaded: bool,
+    answers_updated: bool = False,
+) -> FillRequest:
     return FillRequest(
         session_id=session.session_id,
         candidate_id=session.candidate_id,
@@ -134,6 +194,10 @@ def _request_for(session: ServiceSession, *, resume_uploaded: bool) -> FillReque
         credentials=session.credentials,
         resume_uploaded=resume_uploaded,
         cover_letter_text=session.cover_letter_text,
+        resolver=_binding(session, limits),
+        answers_updated=answers_updated,
+        session_created_ms=int(session.timings.get("sessionCreatedMs", 0)),
+        max_pages=12 if session.mode == "resolver" else 8,
     )
 
 
@@ -141,8 +205,10 @@ def _run(
     session: ServiceSession,
     store: ServiceSessionStore,
     runner: FillRunner,
+    limits: dict[str, float | int],
     *,
     resume_uploaded: bool,
+    answers_updated: bool = False,
 ) -> RunStatusOut:
     try:
         session = store.begin_run(session.session_id)
@@ -150,15 +216,28 @@ def _run(
         raise HTTPException(status_code=404, detail="Session not found.") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail="Session is already running.") from exc
+    previous = session.status
+    session.status = Status.STARTED
     try:
         try:
-            result = runner.run(_request_for(session, resume_uploaded=resume_uploaded))
+            result = runner.run(
+                _request_for(
+                    session,
+                    limits,
+                    resume_uploaded=resume_uploaded,
+                    answers_updated=answers_updated,
+                )
+            )
             return _accept_result(session, result)
         except HTTPException:
+            session.status = previous
             raise
         except BrowserDisabled as exc:
+            session.status = previous
             raise HTTPException(status_code=409, detail="Browser execution is disabled.") from exc
         except HumanSubmissionRequired as exc:
+            session.status = previous
+            session.result = None
             raise HTTPException(
                 status_code=409,
                 detail="Final submit was refused. A person must submit.",
@@ -176,18 +255,38 @@ def create_app(
     run_browser: bool = True,
     max_sessions: int = 32,
     browser_no_sandbox: bool = False,
+    session_ttl_seconds: float = 1800,
+    reaper_interval_seconds: float = 30,
+    resolver_timeout_seconds: float = 5,
+    resolver_retries: int = 2,
+    resolver_max_bytes: int = 65536,
 ) -> FastAPI:
     """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
     expected = require_configured_token(token)
+    install_redaction()
     store = ServiceSessionStore(max_sessions=max_sessions)
     launch_args = ["--disable-dev-shm-usage"]
     if browser_no_sandbox:
         launch_args.append("--no-sandbox")
     active_runner = runner if runner is not None else PlaywrightRunner(enabled=run_browser, launch_args=launch_args)
+    limits: dict[str, float | int] = {
+        "timeout": resolver_timeout_seconds,
+        "retries": resolver_retries,
+        "max_bytes": resolver_max_bytes,
+    }
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        prewarm = getattr(app.state.runner, "prewarm", None)
+        if prewarm is not None:
+            prewarm()
+        app.state.store.start_reaper(app.state.runner.discard, interval_seconds=reaper_interval_seconds)
         yield
+        app.state.store.stop_reaper()
+        for session_id in app.state.store.ids():
+            held = app.state.store.get(session_id)
+            if held is not None:
+                held.wipe_secrets()
         app.state.runner.shutdown()
 
     app = FastAPI(
@@ -235,22 +334,59 @@ def create_app(
 
     @router.post("/sessions", response_model=RunStatusOut, status_code=201, tags=["sessions"])
     def create_session(body: CreateSessionIn) -> RunStatusOut:
+        started = time.perf_counter()
         try:
-            profile, job, cover = build_profile(body)
+            if body.resolver is not None:
+                binding = build_binding(
+                    body,
+                    timeout_seconds=resolver_timeout_seconds,
+                    retries=resolver_retries,
+                    max_bytes=resolver_max_bytes,
+                )
+                application_url = validate_application_url(body.job_context.application_url)
+                profile = placeholder_profile(binding.candidate_ref)
+                job = JobContext(
+                    title=body.job_context.title.strip(),
+                    company=body.job_context.company.strip(),
+                    url=application_url,
+                )
+                session = ServiceSession(
+                    session_id=new_session_id(),
+                    candidate_id=binding.candidate_ref,
+                    job_id=binding.job_ref,
+                    application_url=application_url,
+                    profile=profile,
+                    job=job,
+                    cover_letter_text=None,
+                    mode="resolver",
+                    protocol_version="0.4.0",
+                    candidate_ref=binding.candidate_ref,
+                    job_ref=binding.job_ref,
+                    resolver_url=binding.url,
+                    resolver_token=binding.token,
+                    resolver_expires_at=binding.expires_at,
+                )
+                redaction_filter().add(binding.token)
+            else:
+                profile, job, cover = build_profile(body)
+                session = ServiceSession(
+                    session_id=new_session_id(),
+                    candidate_id=profile.candidate_id,
+                    job_id=body.job_context.job_id.strip(),
+                    application_url=job.url,
+                    profile=profile,
+                    job=job,
+                    cover_letter_text=cover,
+                    protocol_version=body.protocol_version.strip(),
+                )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        session = ServiceSession(
-            session_id=new_session_id(),
-            candidate_id=profile.candidate_id,
-            job_id=body.job_context.job_id.strip(),
-            application_url=job.url,
-            profile=profile,
-            job=job,
-            cover_letter_text=cover,
-        )
+        session.expires_at = time.monotonic() + session_ttl_seconds
+        session.timings["sessionCreatedMs"] = int((time.perf_counter() - started) * 1000)
         try:
             store.create(session)
         except RuntimeError as exc:
+            session.wipe_secrets()
             raise HTTPException(status_code=429, detail="Too many open sessions.") from exc
         logger.info("session=%s status=CREATED", session.session_id)
         return _status_out(session)
@@ -258,10 +394,11 @@ def create_app(
     @router.post("/sessions/{session_id}/start", response_model=RunStatusOut, tags=["sessions"])
     def start_session(session_id: str, body: CandidateCheckIn | None = None) -> RunStatusOut:
         session = _session_or_404(session_id)
-        _check_candidate(session, body.candidate_id.strip() if body is not None else "")
+        if body is not None:
+            _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if session.status not in _STARTABLE:
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
-        return _run(session, store, active_runner, resume_uploaded=False)
+        return _run(session, store, active_runner, limits, resume_uploaded=False)
 
     @router.get("/sessions/{session_id}/status", response_model=RunStatusOut, tags=["sessions"])
     def session_status(session_id: str) -> RunStatusOut:
@@ -270,7 +407,7 @@ def create_app(
     @router.post("/sessions/{session_id}/continue", response_model=RunStatusOut, tags=["sessions"])
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
-        _check_candidate(session, body.candidate_id.strip())
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if session.status == Status.READY_FOR_HUMAN_SUBMIT:
             raise HTTPException(
                 status_code=409,
@@ -286,11 +423,18 @@ def create_app(
                 status_code=409,
                 detail="Sign-in credentials are missing. Post credentials, then start again.",
             )
+        if session.status == Status.MANUAL_ANSWER_REQUIRED:
+            if not body.answers_updated:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Continue with answersUpdated after the saved answers change.",
+                )
+            return _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
         if session.status != Status.RESUME_UPLOAD_REQUIRED:
             raise HTTPException(status_code=409, detail=f"Cannot continue a session in status {session.status}.")
         if not body.resume_uploaded:
             raise HTTPException(status_code=409, detail="Continue only after a person has uploaded the resume.")
-        return _run(session, store, active_runner, resume_uploaded=True)
+        return _run(session, store, active_runner, limits, resume_uploaded=True)
 
     @router.post("/sessions/{session_id}/credentials", response_model=CredentialsOut, tags=["sessions"])
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:
@@ -311,6 +455,9 @@ def create_app(
                 password=body.password,
             ),
         )
+        redaction_filter().add(body.password)
+        if body.email.strip():
+            redaction_filter().add(body.email.strip())
         logger.info("session=%s credentials_stored=true", session.session_id)
         return CredentialsOut(sessionId=session.session_id)
 
@@ -319,8 +466,10 @@ def create_app(
         removed = store.delete(session_id)
         if removed is None:
             raise HTTPException(status_code=404, detail="Session not found.")
+        removed.status = Status.CANCELLED
+        removed.wipe_secrets()
         active_runner.discard(session_id)
-        logger.info("session=%s status=DELETED", session_id)
+        logger.info("session=%s status=%s", session_id, Status.CANCELLED)
         return Response(status_code=204)
 
     app.include_router(router)

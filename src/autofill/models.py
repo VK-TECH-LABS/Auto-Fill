@@ -35,6 +35,7 @@ class Control:
     input_type: str = ""
     role: str = ""
     nearby: str = ""
+    group: str = ""
 
 
 @dataclass
@@ -56,6 +57,7 @@ class PageSnapshot:
     password_present: bool = False
     heading: str = ""
     banner: str = ""
+    alerts: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -75,6 +75,8 @@ Auto-Fill does not accept a database URL, a TileArc API token, or a resume files
 
 `result.stopped_before_submit` is always true. `result.login_status` is `NOT_REQUIRED`, `LOGIN_REQUIRED`, `AUTHENTICATED`, `LOGIN_FAILED`, or `CAPTCHA_REQUIRED`.
 
+Protocol 0.4.0 adds an HTTP resolver mode, documented in [HTTP_SERVICE.md](HTTP_SERVICE.md). In that mode the create body carries opaque `candidateRef` and `jobRef` values, `jobContext.applicationUrl`, and a per-session `resolver` (`url`, `token`, `expiresAt`). Auto-Fill asks that resolver only for the field keys and question intents on the current step, holds the returned values in memory for that step, and then drops them. The resolver token is sent as a bearer header and is never written to a URL, a log line, or disk. This repository does not store a hash of that token and does not define the caller's schema.
+
 ## Sessions and credentials
 
 Each call builds its own session from `candidate_id + job_id + application_url + session_id`. There is no process-wide "last profile". Two calls in parallel cannot read each other's profile or credentials.

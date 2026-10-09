@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Synthetic leak check</title>
+</head>
+<body>
+  <h1>Contact</h1>
+  <form onsubmit="return false;">
+    <label for="first">First name</label>
+    <input id="first" name="first_name" autocomplete="given-name">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email">
+    <label for="note">City</label>
+    <input id="note" name="city" autocomplete="address-level2">
+  </form>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const caseId = params.get("case") || "default";
+    if (!sessionStorage.getItem("owner")) sessionStorage.setItem("owner", caseId);
+    document.documentElement.dataset.owner = sessionStorage.getItem("owner");
+  </script>
+</body>
+</html>

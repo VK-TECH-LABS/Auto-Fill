@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from autofill.ats import site_domain
 from autofill.models import JobContext
 from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
+from autofill.resolver import ResolverBinding, ResolverCallError, assert_token_not_in_url
 from autofill.service.schemas import ApprovedAnswerIn, CreateSessionIn, CredentialsIn
 
 _SECRET_KEYS = frozenset({"password", "databaseurl", "token", "apikey", "secret", "database_url"})
@@ -101,6 +102,40 @@ def credential_domain(application_url: str, site: str) -> str:
     if presented != expected:
         raise ContextError("Credentials must be for this session's application site.", status_code=409)
     return expected
+
+
+def placeholder_profile(candidate_ref: str) -> CandidateProfile:
+    """A non-PII stand-in so the engine can run. Resolver mode never fills it."""
+    return CandidateProfile.from_dict(
+        {
+            "candidateId": candidate_ref,
+            "personal": {"full_name": "Synthetic Candidate", "email": "synthetic@example.com"},
+        }
+    )
+
+
+def build_binding(body: CreateSessionIn, *, timeout_seconds: float, retries: int, max_bytes: int) -> ResolverBinding:
+    """Validate the resolver URL and token. The token is not logged."""
+    if body.resolver is None:
+        raise ContextError("resolver is required")
+    try:
+        url = validate_application_url(body.resolver.url)
+        assert_token_not_in_url(url, body.resolver.token)
+    except ResolverCallError as exc:
+        raise ContextError("resolver url must be http(s) and must not carry the token") from exc
+    binding = ResolverBinding(
+        url=url,
+        token=body.resolver.token,
+        expires_at=body.resolver.expires_at.strip(),
+        candidate_ref=body.candidate_ref.strip(),
+        job_ref=body.job_ref.strip(),
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+        max_bytes=max_bytes,
+    )
+    if binding.expired():
+        raise ContextError("resolver expiresAt is not a future timestamp")
+    return binding
 
 
 def require_login_name(body: CredentialsIn) -> None:
