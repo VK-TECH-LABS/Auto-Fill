@@ -561,7 +561,9 @@ def test_public_api_stops_on_captcha_without_solving(browser):
             """
             <h1>Sign in</h1>
             <label for="email">Email</label><input id="email" type="email">
-            <div class="g-recaptcha" data-sitekey="not-a-real-sitekey"></div>
+            <div class="g-recaptcha" data-sitekey="not-a-real-sitekey">
+              <iframe title="recaptcha" src="/recaptcha/api2/anchor" style="width:304px;height:78px;border:0"></iframe>
+            </div>
             <button type="button">Sign in</button>
             """
         )

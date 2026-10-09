@@ -107,6 +107,55 @@ def test_datadome_block_is_captcha_not_ready(browser):
         page.close()
 
 
+def test_invisible_recaptcha_outside_the_badge_does_not_stop(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "invisible_recaptcha.html").as_uri())
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role")
+        assert result.status == Status.READY_FOR_HUMAN_SUBMIT, result.messages
+        assert result.fields_filled > 0
+        assert page.locator("#email").input_value() == EMAIL
+        assert page.evaluate("() => window.__submitted") is not True
+    finally:
+        page.close()
+
+
+def test_invisible_hcaptcha_does_not_stop(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "invisible_hcaptcha.html").as_uri())
+        result, _timings = _run(page, "https://jobs.lever.co/example/role")
+        assert result.status == Status.READY_FOR_HUMAN_SUBMIT, result.messages
+        assert result.fields_filled > 0
+        assert page.locator("#email").input_value() == EMAIL
+    finally:
+        page.close()
+
+
+def test_visible_hcaptcha_checkbox_stops(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "visible_hcaptcha.html").as_uri())
+        result, _timings = _run(page, "https://jobs.lever.co/example/role")
+        assert result.status == Status.CAPTCHA_REQUIRED, result.messages
+        assert page.locator("#email").input_value() == ""
+    finally:
+        page.close()
+
+
+def test_visible_challenge_after_next_stops(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "captcha_after_next.html").as_uri())
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role")
+        assert result.status == Status.CAPTCHA_REQUIRED, result.messages
+        assert page.locator("#email").input_value() == EMAIL
+        assert page.evaluate("() => window.__continued") is True
+        assert result.fields_filled > 0
+    finally:
+        page.close()
+
+
 def test_invisible_recaptcha_badge_does_not_stop(browser):
     page = browser.new_page()
     try:
