@@ -122,6 +122,7 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("START_DATE", "when can you start"),
     ("START_DATE", "start date"),
     ("START_DATE", "date available"),
+    ("PREVIOUSLY_EMPLOYED", "previously been employed"),
     ("PREVIOUSLY_EMPLOYED", "previously employed"),
     ("PREVIOUSLY_EMPLOYED", "previously worked"),
     ("PREVIOUSLY_EMPLOYED", "worked here before"),

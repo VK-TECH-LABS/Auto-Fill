@@ -567,7 +567,7 @@ def _write_text(page, control: Control, text: str, outcome: ResolvedPage, *, key
         _skip(control, outcome, key, "Empty value left blank.")
         return
     mapped = MappedField(key=key, action="fill", text=str(text), field_class="PROFILE_FIELD", confidence="high")
-    outcome.fields.append(apply_mapped(page, control, mapped))
+    outcome.fields.append(apply_mapped(page, control, mapped, overwrite=True))
 
 
 def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str) -> None:
@@ -625,10 +625,16 @@ def _option_labels(controls: list[Control]) -> list[str]:
 
 
 def _checkbox_label(control: Control) -> str:
+    """Option text with the fieldset legend removed from either end."""
     label = control.label.strip()
     group = control.group.strip()
-    if group and label.casefold().startswith(group.casefold()):
-        label = label[len(group) :].strip()
+    if group:
+        folded = label.casefold()
+        group_folded = group.casefold()
+        if folded.startswith(group_folded):
+            label = label[len(group) :].strip(" :-")
+        elif folded.endswith(group_folded):
+            label = label[: -len(group)].strip(" :-")
     return sanitize_question(label or control.aria_label or control.name, limit=80)
 
 
