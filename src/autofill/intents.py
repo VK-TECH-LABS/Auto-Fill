@@ -18,7 +18,9 @@ from autofill.models import Option
 PROTOCOL_INTENTS: tuple[str, ...] = (
     "US_WORK_AUTHORIZATION",
     "AUTHORIZED_ANY_EMPLOYER",
+    "AUTHORIZED_WITHOUT_SPONSORSHIP",
     "SPONSORSHIP_NOW",
+    "SPONSORSHIP_NOW_OR_FUTURE",
     "SPONSORSHIP_FUTURE",
     "AGE_18_PLUS",
     "RELOCATE",
@@ -52,7 +54,9 @@ STRICT_INTENTS = frozenset(
     {
         "US_WORK_AUTHORIZATION",
         "AUTHORIZED_ANY_EMPLOYER",
+        "AUTHORIZED_WITHOUT_SPONSORSHIP",
         "SPONSORSHIP_NOW",
+        "SPONSORSHIP_NOW_OR_FUTURE",
         "SPONSORSHIP_FUTURE",
         "AGE_18_PLUS",
         "SECURITY_CLEARANCE",
@@ -78,8 +82,10 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("US_WORK_AUTHORIZATION", "authorized to work"),
     ("US_WORK_AUTHORIZATION", "eligible to work"),
     ("US_WORK_AUTHORIZATION", "work auth"),
-    ("SPONSORSHIP_NOW", "now or in the future require sponsorship"),
-    ("SPONSORSHIP_NOW", "now or in the future require visa sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future require sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future require visa sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or will you in the future require sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or will you in the future require visa sponsorship"),
     ("SPONSORSHIP_FUTURE", "require sponsorship in the future"),
     ("SPONSORSHIP_FUTURE", "require visa sponsorship in the future"),
     ("SPONSORSHIP_FUTURE", "sponsorship in the future"),
@@ -150,7 +156,9 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
 _PROTOTYPES: dict[str, str] = {
     "US_WORK_AUTHORIZATION": "legally authorized work united states eligibility authorization",
     "AUTHORIZED_ANY_EMPLOYER": "authorized work any employer unrestricted",
+    "AUTHORIZED_WITHOUT_SPONSORSHIP": "authorized work without sponsorship visa",
     "SPONSORSHIP_NOW": "visa sponsorship required now current",
+    "SPONSORSHIP_NOW_OR_FUTURE": "visa sponsorship required now or future",
     "SPONSORSHIP_FUTURE": "visa sponsorship required future later",
     "AGE_18_PLUS": "age eighteen older years",
     "RELOCATE": "relocate relocation move city willing",
@@ -232,10 +240,27 @@ class IntentMatch:
     confidence: str
     source: str
     text: str = ""
+    fallback_intents: tuple[str, ...] = ()
+    combine: str = ""
 
     @property
     def known(self) -> bool:
         return self.intent is not None and self.confidence != "unknown"
+
+
+_NOW_RE = re.compile(r"\b(?:now|currently)\b")
+_FUTURE_RE = re.compile(r"\bfuture\b")
+_WITHOUT_SPONSOR_RE = re.compile(
+    r"\bwithout\b(?:\s+\w+){0,6}\s+sponsorship\b"
+    r"|\bno\s+(?:visa\s+)?sponsorship\b"
+    r"|\b(?:do\s+not|not)\s+(?:require|need)\b(?:\s+\w+){0,4}\s+sponsorship\b"
+)
+_WORK_AUTH_RE = re.compile(
+    r"\b(?:authorized|authorised)\s+to\s+work\b"
+    r"|\blegally\s+authorized\b"
+    r"|\beligible\s+to\s+work\b"
+    r"|\bwork\s+authorization\b"
+)
 
 
 def normalize_question(text: str) -> str:
@@ -262,15 +287,72 @@ def _tokens(text: str) -> set[str]:
     return {token for token in normalize_question(text).split() if token not in _STOP and len(token) > 1}
 
 
+def _compound_intent(folded: str) -> str | None:
+    """Compound legal questions before a shorter phrase can claim them.
+
+    "Now or in the future" is not the same fact as sponsorship now. "Authorized
+    to work without sponsorship" is not work authorization alone.
+    """
+    if "sponsorship" not in folded:
+        return None
+    if _WITHOUT_SPONSOR_RE.search(folded):
+        return "AUTHORIZED_WITHOUT_SPONSORSHIP"
+    now = _NOW_RE.search(folded) is not None
+    future = _FUTURE_RE.search(folded) is not None
+    if now and future:
+        return "SPONSORSHIP_NOW_OR_FUTURE"
+    if future:
+        return "SPONSORSHIP_FUTURE"
+    if now:
+        return "SPONSORSHIP_NOW"
+    return None
+
+
+def compound_plan(text: str, intent: str | None) -> tuple[tuple[str, ...], str]:
+    """Component intents used when the resolver does not know the compound."""
+    if intent == "SPONSORSHIP_NOW_OR_FUTURE":
+        return (("SPONSORSHIP_NOW", "SPONSORSHIP_FUTURE"), "sponsorship_or")
+    if intent != "AUTHORIZED_WITHOUT_SPONSORSHIP":
+        return ((), "")
+    folded = normalize_question(text)
+    authorizations: list[str] = []
+    if _WORK_AUTH_RE.search(folded):
+        if "any employer" in folded:
+            authorizations.append("AUTHORIZED_ANY_EMPLOYER")
+        united_states = "united states" in folded or "legally authorized" in folded or "work authorization" in folded
+        if united_states or not authorizations:
+            authorizations.append("US_WORK_AUTHORIZATION")
+    now = _NOW_RE.search(folded) is not None
+    future = _FUTURE_RE.search(folded) is not None
+    if future and not now:
+        sponsorships = ["SPONSORSHIP_FUTURE"]
+    elif now and not future:
+        sponsorships = ["SPONSORSHIP_NOW"]
+    else:
+        sponsorships = ["SPONSORSHIP_NOW", "SPONSORSHIP_FUTURE"]
+    combine = "authorized_without" if authorizations else "sponsorship_negated"
+    return (tuple(authorizations + sponsorships), combine)
+
+
 def _level1(text: str) -> str | None:
     folded = normalize_question(text)
     if not folded:
         return None
+    compound = _compound_intent(folded)
+    if compound is not None:
+        return compound
     ordered = sorted(_SYNONYMS, key=lambda item: len(item[1]), reverse=True)
     for intent, phrase in ordered:
         if phrase in folded:
             return intent
     return None
+
+
+def _planned(match: IntentMatch) -> IntentMatch:
+    fallback, combine = compound_plan(match.text, match.intent)
+    if not combine:
+        return match
+    return IntentMatch(match.intent, match.confidence, match.source, match.text, fallback, combine)
 
 
 def _level2(text: str) -> IntentMatch | None:
@@ -312,7 +394,7 @@ def classify_question(
         return IntentMatch(None, "unknown", "none", "")
     level1 = _level1(sanitized)
     if level1 is not None:
-        return IntentMatch(level1, "HIGH", "level1", sanitized)
+        return _planned(IntentMatch(level1, "HIGH", "level1", sanitized))
     semantic = _level2(sanitized)
     if semantic is not None and semantic.confidence == "HIGH":
         return IntentMatch(semantic.intent, semantic.confidence, semantic.source, sanitized)
@@ -349,6 +431,50 @@ def may_fill(*, local: IntentMatch, resolver_confidence: str) -> bool:
     if local.intent in STRICT_INTENTS and local.confidence != "HIGH":
         return False
     return True
+
+
+def _high_bool(confidence: str, value: str) -> str | None:
+    """Yes or no only when the resolver confidence is HIGH."""
+    if confidence != "HIGH" or not value:
+        return None
+    if options_equivalent(value, "Yes"):
+        return "yes"
+    if options_equivalent(value, "No"):
+        return "no"
+    return None
+
+
+def combine_yes_if_either(parts: list[tuple[str, str]]) -> str | None:
+    """Yes when any part is HIGH Yes. No only when every part is HIGH No."""
+    flags = [_high_bool(confidence, value) for confidence, value in parts]
+    if any(flag == "yes" for flag in flags):
+        return "Yes"
+    if parts and all(flag == "no" for flag in flags):
+        return "No"
+    return None
+
+
+def combine_authorized_without(
+    authorizations: list[tuple[str, str]],
+    sponsorships: list[tuple[str, str]],
+) -> str | None:
+    """Yes only when every authorization is HIGH Yes and every sponsorship is HIGH No.
+
+    A HIGH No authorization, or a HIGH Yes sponsorship, answers the compound No.
+    Anything incomplete stays unanswered.
+    """
+    auth_flags = [_high_bool(confidence, value) for confidence, value in authorizations]
+    sponsor_flags = [_high_bool(confidence, value) for confidence, value in sponsorships]
+    if any(flag == "no" for flag in auth_flags) or any(flag == "yes" for flag in sponsor_flags):
+        return "No"
+    if (
+        authorizations
+        and sponsorships
+        and all(flag == "yes" for flag in auth_flags)
+        and all(flag == "no" for flag in sponsor_flags)
+    ):
+        return "Yes"
+    return None
 
 
 def _compact(value: str) -> str:

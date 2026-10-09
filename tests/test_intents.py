@@ -8,6 +8,8 @@ from autofill.intents import (
     PROTOCOL_INTENTS,
     IntentMatch,
     classify_question,
+    combine_authorized_without,
+    combine_yes_if_either,
     match_all_options,
     may_fill,
     options_equivalent,
@@ -26,8 +28,15 @@ _MATRIX = [
     ),
     ("Are you authorized to work for any employer?", "AUTHORIZED_ANY_EMPLOYER", "exact"),
     ("Do you now require visa sponsorship?", "SPONSORSHIP_NOW", "exact"),
-    ("Will you now or in the future require sponsorship?", "SPONSORSHIP_NOW", "synonym"),
+    ("Do you currently require sponsorship?", "SPONSORSHIP_NOW", "currently"),
+    ("Will you now or in the future require sponsorship?", "SPONSORSHIP_NOW_OR_FUTURE", "compound"),
+    (
+        "Will you now or will you in the future require visa sponsorship?",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "now-or-will-you",
+    ),
     ("Will you require sponsorship in the future?", "SPONSORSHIP_FUTURE", "exact"),
+    ("Will you require future visa sponsorship?", "SPONSORSHIP_FUTURE", "future-visa"),
     ("Are you 18 or older?", "AGE_18_PLUS", "exact"),
     ("18+", "AGE_18_PLUS", "short"),
     ("Are you willing to relocate?", "RELOCATE", "exact"),
@@ -135,6 +144,68 @@ def test_sanitize_drops_email_and_phone_and_bounds_length():
     assert "river.example@example.com" not in text
     assert "555-010-0199" not in text
     assert len(text) <= 300
+
+
+def test_compound_sponsorship_does_not_collapse_to_now_or_work_auth():
+    compound = classify_question("Will you now or in the future require sponsorship for employment visa status?")
+    assert compound.intent == "SPONSORSHIP_NOW_OR_FUTURE"
+    assert compound.confidence == "HIGH"
+    assert compound.fallback_intents == ("SPONSORSHIP_NOW", "SPONSORSHIP_FUTURE")
+    assert compound.combine == "sponsorship_or"
+    future = classify_question("Will you require sponsorship in the future?")
+    assert future.intent == "SPONSORSHIP_FUTURE"
+    assert future.combine == ""
+    current = classify_question("Do you currently require visa sponsorship?")
+    assert current.intent == "SPONSORSHIP_NOW"
+    plain = classify_question("Will you require sponsorship?")
+    assert plain.intent == "SPONSORSHIP_NOW"
+    authorized = classify_question(
+        "Are you legally authorized to work in the United States without the need for sponsorship now or in the future?"
+    )
+    assert authorized.intent == "AUTHORIZED_WITHOUT_SPONSORSHIP"
+    assert authorized.combine == "authorized_without"
+    assert "US_WORK_AUTHORIZATION" in authorized.fallback_intents
+    assert "SPONSORSHIP_NOW" in authorized.fallback_intents
+    assert "SPONSORSHIP_FUTURE" in authorized.fallback_intents
+    any_employer = classify_question("Are you authorized to work for any employer?")
+    assert any_employer.intent == "AUTHORIZED_ANY_EMPLOYER"
+    without = classify_question("Are you authorized to work for any employer without sponsorship?")
+    assert without.intent == "AUTHORIZED_WITHOUT_SPONSORSHIP"
+    assert "AUTHORIZED_ANY_EMPLOYER" in without.fallback_intents
+    assert "US_WORK_AUTHORIZATION" not in without.fallback_intents
+
+
+def test_sponsorship_and_authorization_are_not_filled_below_high():
+    for intent in (
+        "SPONSORSHIP_NOW",
+        "SPONSORSHIP_FUTURE",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "AUTHORIZED_WITHOUT_SPONSORSHIP",
+        "US_WORK_AUTHORIZATION",
+    ):
+        match = IntentMatch(intent, "HIGH", "level1", intent)
+        assert may_fill(local=match, resolver_confidence="HIGH") is True
+        assert may_fill(local=match, resolver_confidence="MEDIUM") is False
+        medium = IntentMatch(intent, "MEDIUM", "level2", intent)
+        assert may_fill(local=medium, resolver_confidence="HIGH") is False
+
+
+def test_sponsorship_or_combines_only_high_answers():
+    assert combine_yes_if_either([("HIGH", "No"), ("HIGH", "Yes")]) == "Yes"
+    assert combine_yes_if_either([("HIGH", "Yes"), ("MEDIUM", "No")]) == "Yes"
+    assert combine_yes_if_either([("HIGH", "No"), ("HIGH", "No")]) == "No"
+    assert combine_yes_if_either([("HIGH", "No"), ("MEDIUM", "Yes")]) is None
+    assert combine_yes_if_either([("HIGH", "No"), ("", "")]) is None
+    assert combine_yes_if_either([("LOW", "Yes"), ("HIGH", "No")]) is None
+
+
+def test_authorized_without_sponsorship_requires_every_part():
+    auths = [("HIGH", "Yes")]
+    assert combine_authorized_without(auths, [("HIGH", "No"), ("HIGH", "No")]) == "Yes"
+    assert combine_authorized_without(auths, [("HIGH", "No"), ("HIGH", "Yes")]) == "No"
+    assert combine_authorized_without([("HIGH", "No")], [("HIGH", "No"), ("HIGH", "No")]) == "No"
+    assert combine_authorized_without(auths, [("HIGH", "No"), ("MEDIUM", "No")]) is None
+    assert combine_authorized_without([("MEDIUM", "Yes")], [("HIGH", "No")]) is None
 
 
 def test_option_mapping_is_exact_or_equivalent():

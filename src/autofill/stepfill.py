@@ -20,6 +20,8 @@ from autofill.intents import (
     DEMOGRAPHIC_INTENTS,
     IntentMatch,
     classify_question,
+    combine_authorized_without,
+    combine_yes_if_either,
     match_all_options,
     match_option_exact,
     may_fill,
@@ -177,6 +179,7 @@ def fill_resolved_page(
             fields=field_keys,
             questions=questions,
         )
+        response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
         _apply(page, requests, response, active, outcome, snapshot.heading, resume_name)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -762,31 +765,52 @@ _RESUME_STATUS_JS = """
     if (style.display === "none" || style.visibility === "hidden") return false;
     return true;
   }
-  function message(node) {
-    return ((node.innerText || node.textContent || "").replace(/\\s+/g, " ")).trim();
+  function rawText(node) {
+    return node.innerText || node.textContent || "";
   }
-  const expected = name || "";
-  const foldedName = expected.toLowerCase();
+  function fold(value) {
+    return String(value || "").toLowerCase().replace(/[_\\s]+/g, " ").replace(/\\s+/g, " ").trim();
+  }
+  function isSuccess(value) {
+    return /(^|[^a-z0-9])success!(?![a-z0-9])/i.test(value || "");
+  }
+  function mentionsFile(value, needles) {
+    const folded = fold(value);
+    return needles.some((needle) => needle && folded.indexOf(needle) !== -1);
+  }
+  function isFailure(value) {
+    const folded = fold(value);
+    if (!folded) return false;
+    if (folded.indexOf("failed to upload") !== -1) return true;
+    return folded.indexOf("fail") !== -1 || folded.indexOf("error") !== -1;
+  }
+  const expected = fold(name || "");
   const alerts = document.querySelectorAll("[role='alert'], .field-error, .error, [class*='toast'], [class*='Toast']");
   for (const alert of alerts) {
     if (!shown(alert)) continue;
-    const text = message(alert);
-    if (!text) continue;
-    const folded = text.toLowerCase();
-    if (folded.indexOf("failed to upload") !== -1) return "error";
-    const mentionsFile = foldedName && folded.indexOf(foldedName) !== -1;
-    const mentionsFailure = folded.indexOf("fail") !== -1 || folded.indexOf("error") !== -1;
-    if (mentionsFile && mentionsFailure) return "error";
+    const text = rawText(alert);
+    if (!text.trim()) continue;
+    if (fold(text).indexOf("failed to upload") !== -1) return "error";
+    if (mentionsFile(text, [expected]) && isFailure(text)) return "error";
   }
   const el = document.querySelector(selector);
   if (!el || !el.files || !el.files.length) return "missing";
-  const fileName = el.files[0].name || "";
+  const fileName = fold((el.files[0] && el.files[0].name) || "");
+  const needles = [expected, fileName];
   const box = el.closest("div, section, fieldset, li") || el.parentElement;
   if (!box) return "missing";
   const local = box.querySelector("[role='alert'], .field-error, .error");
-  if (local && shown(local) && message(local)) return "error";
-  const body = box.innerText || box.textContent || "";
-  if ((fileName && body.indexOf(fileName) !== -1) || (expected && body.indexOf(expected) !== -1)) return "shown";
+  if (local && shown(local)) {
+    const note = rawText(local);
+    if (note.trim() && !isSuccess(note)) return "error";
+  }
+  const body = rawText(box);
+  if (mentionsFile(body, needles)) return "shown";
+  if (isSuccess(body)) return "shown";
+  const marks = document.querySelectorAll("[role='status'], [class*='success'], [class*='Success']");
+  for (const mark of marks) {
+    if (shown(mark) && isSuccess(rawText(mark))) return "shown";
+  }
   return "missing";
 }
 """
@@ -1122,6 +1146,123 @@ def _take_answer(
     if unnamed:
         return unnamed.pop(0)
     return None
+
+
+def _complete_compounds(
+    binding: ResolverBinding,
+    *,
+    session_id: str,
+    step: str,
+    requests: list[_Ask],
+    response: ResolverResponse,
+) -> ResolverResponse:
+    """When a compound intent comes back unresolved, combine the saved parts.
+
+    Older resolvers do not know ``SPONSORSHIP_NOW_OR_FUTURE``. A second call
+    asks for the component intents. Yes if either sponsorship answer is Yes,
+    No only if both are No. Authorization compounds stay manual until every
+    part is HIGH.
+    """
+    pending = [ask for ask in requests if _needs_components(ask, response)]
+    if not pending:
+        return response
+    questions: list[dict] = []
+    seen: set[str] = set()
+    for ask in pending:
+        match = ask.match
+        if match is None:
+            continue
+        for intent in match.fallback_intents:
+            if intent in seen or _boolean_answer(response, intent) is not None:
+                continue
+            seen.add(intent)
+            body = ask.question_body()
+            body["intent"] = intent
+            questions.append(body)
+    extra: ResolverResponse | None = None
+    try:
+        if questions:
+            extra = resolve_step(binding, session_id=session_id, step=step, fields=[], questions=questions)
+            response.answers.extend(list(extra.answers))
+            response.latency_ms += extra.latency_ms
+        for ask in pending:
+            _write_combined(response, ask)
+    finally:
+        if extra is not None:
+            extra.wipe()
+    return response
+
+
+def _needs_components(ask: _Ask, response: ResolverResponse) -> bool:
+    match = ask.match
+    if match is None or match.confidence != "HIGH" or not match.combine or not match.fallback_intents:
+        return False
+    intent = match.intent or ""
+    if intent in response.unresolved:
+        return True
+    return _boolean_answer(response, intent) is None
+
+
+def _boolean_answer(response: ResolverResponse, intent: str) -> ResolverAnswer | None:
+    """A HIGH Yes or No that the resolver did not list as unresolved."""
+    if not intent or intent in response.unresolved:
+        return None
+    for item in response.answers:
+        if item.intent != intent or item.confidence != "HIGH":
+            continue
+        value = item.value or (item.values[0] if item.values else "")
+        if options_yes(value) or options_no(value):
+            return item
+    return None
+
+
+def _answer_pair(response: ResolverResponse, intent: str) -> tuple[str, str]:
+    found = _boolean_answer(response, intent)
+    if found is None:
+        return ("", "")
+    return (found.confidence, found.value or (found.values[0] if found.values else ""))
+
+
+def _combined_value(response: ResolverResponse, match: IntentMatch) -> str | None:
+    parts = [_answer_pair(response, intent) for intent in match.fallback_intents]
+    if match.combine == "sponsorship_or":
+        return combine_yes_if_either(parts)
+    if match.combine == "sponsorship_negated":
+        positive = combine_yes_if_either(parts)
+        if positive == "Yes":
+            return "No"
+        if positive == "No":
+            return "Yes"
+        return None
+    if match.combine == "authorized_without":
+        authorizations = [intent for intent in match.fallback_intents if not intent.startswith("SPONSORSHIP_")]
+        sponsorships = [intent for intent in match.fallback_intents if intent.startswith("SPONSORSHIP_")]
+        return combine_authorized_without(
+            [_answer_pair(response, intent) for intent in authorizations],
+            [_answer_pair(response, intent) for intent in sponsorships],
+        )
+    return None
+
+
+def _write_combined(response: ResolverResponse, ask: _Ask) -> None:
+    match = ask.match
+    if match is None or not match.intent:
+        return
+    combined = _combined_value(response, match)
+    response.answers = [item for item in response.answers if item.intent != match.intent]
+    if match.intent in response.unresolved:
+        response.unresolved = [item for item in response.unresolved if item != match.intent]
+    if combined is None:
+        return
+    response.answers.append(
+        ResolverAnswer(
+            intent=match.intent,
+            value=combined,
+            confidence="HIGH",
+            source="combined",
+            text=match.text,
+        )
+    )
 
 
 def _rows(value: object) -> list[dict[str, str]]:
