@@ -14,6 +14,7 @@ from autofill.stepfill import (
     _compose_location,
     _describe,
     _is_current_location,
+    _location_free_text,
     _location_suggestion_log,
     _manual,
     _note_unfilled_required,
@@ -207,6 +208,11 @@ def test_location_state_alias_picks_austin_tx():
     assert (
         _compose_location({"address.city": "Austin", "address.region": "TX", "address.state": "MN"}) == "Austin, TX"
     )
+
+
+def test_location_free_text_expands_state_and_country():
+    assert _location_free_text("Austin", "TX", "US") == "Austin, Texas, United States"
+    assert _location_free_text("Austin", "Texas", "USA") == "Austin, Texas, United States"
 
 
 def test_required_unfilled_control_becomes_a_manual_question():

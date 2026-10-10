@@ -207,45 +207,58 @@ EXTRACT_JS = r"""
     if (!bits.length) {
       let node = el;
       const stop = el.closest ? el.closest("form") : null;
-      for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      let found = "";
+      for (let depth = 0; node && depth < 8 && !found; depth += 1, node = node.parentElement) {
         if (stop && node === stop) break;
-        const prev = node.previousElementSibling;
-        if (!prev || !prev.tagName) continue;
-        const tag = prev.tagName.toLowerCase();
-        if (tag === "label" || tag === "legend") {
-          const text = textOf(prev);
-          if (text && !isSectionHeading(prev, text) && !isPlaceholderPrompt(text)) {
-            bits.push(text);
-            break;
+        let prev = node.previousElementSibling;
+        while (prev && !found) {
+          if (isHidden(prev)) {
+            prev = prev.previousElementSibling;
+            continue;
           }
-        }
-        if (prev.querySelector && prev.querySelector("input, select, textarea, button, [role='combobox']")) continue;
-        const inner = prev.querySelector && prev.querySelector("label, legend");
-        if (inner) {
-          const text = textOf(inner);
-          if (text && !isSectionHeading(inner, text) && !isPlaceholderPrompt(text)) {
-            bits.push(text);
-            break;
+          const tag = prev.tagName ? prev.tagName.toLowerCase() : "";
+          if (tag === "label" || tag === "legend") {
+            const text = textOf(prev);
+            if (text && !isSectionHeading(prev, text) && !isPlaceholderPrompt(text)) found = text;
           }
-        }
-        const cls = (prev.getAttribute("class") || "").toLowerCase();
-        const text = cleanPrompt(textOf(prev));
-        if (
-          text &&
-          text.length <= 200 &&
-          !isSectionHeading(prev, text) &&
-          !isPlaceholderPrompt(text) &&
-          (
-            cls.indexOf("question") !== -1 ||
-            cls.indexOf("application-label") !== -1 ||
-            cls.indexOf("label") !== -1 ||
-            text.indexOf("?") !== -1
-          )
-        ) {
-          bits.push(text);
-          break;
+          const blocks =
+            tag === "input" ||
+            tag === "textarea" ||
+            tag === "button" ||
+            tag === "select" ||
+            (prev.querySelector &&
+              prev.querySelector("input:not([type='hidden']), textarea, button, [role='combobox']"));
+          if (blocks && !found) break;
+          if (!found) {
+            const inner = prev.querySelector && prev.querySelector("label, legend");
+            if (inner && !isHidden(inner)) {
+              const text = textOf(inner);
+              if (text && !isSectionHeading(inner, text) && !isPlaceholderPrompt(text)) found = text;
+            }
+          }
+          if (!found) {
+            const cls = (prev.getAttribute("class") || "").toLowerCase();
+            const text = cleanPrompt(textOf(prev));
+            if (
+              text &&
+              text.length <= 200 &&
+              !isSectionHeading(prev, text) &&
+              !isPlaceholderPrompt(text) &&
+              (
+                cls.indexOf("question") !== -1 ||
+                cls.indexOf("application-label") !== -1 ||
+                cls.indexOf("label") !== -1 ||
+                text.indexOf("?") !== -1
+              )
+            ) {
+              found = text;
+            }
+          }
+          if (found) break;
+          prev = prev.previousElementSibling;
         }
       }
+      if (found) bits.push(found);
     }
     return dedupeBits(bits);
   }

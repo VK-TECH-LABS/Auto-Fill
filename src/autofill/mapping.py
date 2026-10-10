@@ -145,6 +145,7 @@ _RULES: tuple[_Rule, ...] = (
             (
                 r"\bcurrent company\b",
                 r"\bcurrent employer\b",
+                r"\bmost recent employer\b",
                 r"\bmost recent company\b",
                 r"\bemployer\b",
                 r"\bcompany name\b",
@@ -341,7 +342,8 @@ def _profile_text(
     if key == "last_name":
         return personal.last_name
     if key == "preferred_name":
-        return personal.preferred_or_first
+        # An empty preferred name stays blank. Do not substitute the legal first name.
+        return personal.preferred_name.strip()
     if key == "email":
         return personal.email
     if key == "phone":
@@ -466,6 +468,56 @@ def _nearby_key(control: Control) -> str | None:
     return _match_rule(probe)
 
 
+def _not_employer_question(blob: str) -> bool:
+    """Referral, relative, and contact questions are not the employer field."""
+    return bool(
+        re.search(
+            r"\b(referral|referrer|referred|relative|relatives|contact)\b",
+            blob,
+        )
+        or "who referred" in blob
+    )
+
+
+def is_current_company_label(control: Control) -> bool:
+    """True for a company box, not a question that merely mentions an employer.
+
+    Short work-history labels (``Employer``, ``Company name``) still match.
+    ``current company``, ``current employer``, and ``most recent employer`` match.
+    A referral, a previous-employer contact, or relatives employed do not.
+    """
+    blob = haystack(control)
+    if _not_employer_question(blob):
+        return False
+    label = normalize(control.label or control.aria_label or control.placeholder)
+    if label in {
+        "employer",
+        "company",
+        "company name",
+        "current company",
+        "current employer",
+        "most recent employer",
+        "most recent company",
+    }:
+        return True
+    return bool(
+        re.search(
+            r"\b(current company|current employer|most recent employer|most recent company)\b",
+            label,
+        )
+    )
+
+
+def mentions_work_history(control: Control) -> bool:
+    """A work-history company or title row, not a referral or contact question."""
+    if _not_employer_question(haystack(control)):
+        return False
+    if is_current_company_label(control):
+        return True
+    label = normalize(control.label or control.aria_label or control.placeholder)
+    return bool(re.search(r"\b(employer|employment|company)\b", label))
+
+
 def match_field_key(control: Control) -> str | None:
     """Internal profile key for a control, or None when nothing matched.
 
@@ -481,15 +533,37 @@ def match_field_key(control: Control) -> str | None:
     return _match_rule(control)
 
 
+def _is_referral_question(blob: str) -> bool:
+    """A referrer-name question. ``preferred`` does not contain the word referred.
+
+    ``Referral source`` is how the candidate heard about the role, not the
+    name of the person who referred them.
+    """
+    if "referral source" in blob or "source of referral" in blob:
+        return False
+    return bool(
+        re.search(r"\b(referral|referrer|referred)\b", blob)
+        or "who referred" in blob
+        or "employee referral" in blob
+    )
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
+    blob = haystack(control)
+    if _is_referral_question(blob):
+        return None
+    if re.search(r"\bpreferred\b", blob) and re.search(r"\bname\b", blob):
+        return "preferred_name"
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]
-        if autocomplete == "tel-national":
-            return "phone"
-        return mapped
-    blob = haystack(control)
+        if mapped == "current_company" and not is_current_company_label(control):
+            mapped = ""
+        if mapped:
+            if autocomplete == "tel-national":
+                return "phone"
+            return mapped
     if "country code" in blob:
         return None
     label = normalize(control.label or control.aria_label or control.placeholder)
@@ -499,6 +573,8 @@ def _match_rule(control: Control) -> str | None:
         if rule.kinds is not None and control.kind not in rule.kinds:
             continue
         if rule.key == "years_of_experience_total" and _specific_years_question(blob):
+            continue
+        if rule.key == "current_company" and not is_current_company_label(control):
             continue
         if any(pattern.search(blob) for pattern in rule.patterns):
             return rule.key

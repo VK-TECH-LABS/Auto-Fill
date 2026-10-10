@@ -494,6 +494,288 @@ def test_greenhouse_react_select_fills_and_eeo_stays_manual(browser, resolver):
         page.close()
 
 
+def test_referral_is_not_filled_from_employment(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "employment[]": [{"company": "Example Works", "title": "Example Engineer"}],
+        "firstName": "River",
+    }
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='employer'>Employer</label><input id='employer' name='employer'>"
+            "<label for='referral'>If an employee referred you, please list their name</label>"
+            "<input id='referral' name='referral'>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        questions = list(server.calls[0].get("questions", []))
+        referral = next(item for item in questions if "referred you" in str(item.get("text")))
+        assert referral.get("intent") == "REFERRAL"
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "employment[]" in requested
+        assert page.locator("#employer").input_value() == "Example Works"
+        assert page.locator("#referral").input_value() == ""
+        manual = [item for item in result.manual_questions if item.get("intent") == "REFERRAL"]
+        assert manual
+        assert "referred you" in str(manual[0].get("text"))
+        assert "Example Works" not in page.locator("#referral").input_value()
+    finally:
+        page.close()
+
+
+def test_preferred_first_name_stays_blank_without_preferred_name(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {"firstName": "River"}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='first'>First name</label><input id='first'>"
+            "<label for='preferred'>Preferred First Name</label><input id='preferred'>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "firstName" in requested
+        assert "preferredName" in requested
+        assert page.locator("#first").input_value() == "River"
+        assert page.locator("#preferred").input_value() == ""
+        assert "Preferred First Name" not in [item.get("text") for item in result.manual_questions]
+    finally:
+        page.close()
+
+
+def test_select2_demographics_are_listed_and_not_filled(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='gender'>Gender</label>"
+            "<select id='gender'><option value=''>Select</option>"
+            "<option>Decline to self-identify</option></select>"
+            "<div class='field'>"
+            "<label>Are you Hispanic/Latino?</label>"
+            "<select id='hispanic-native' aria-hidden='true' style='display:none'>"
+            "<option value=''>Select...</option><option>Yes</option><option>No</option></select>"
+            "<span class='select2'><span class='selection'>"
+            "<span id='hispanic-box' role='combobox' tabindex='0'>Select...</span>"
+            "</span></span></div>"
+            "<label for='race'>Race</label>"
+            "<select id='race'><option value=''>Select</option><option>Decline</option></select>"
+            "<div class='field'>"
+            "<label>Veteran status</label>"
+            "<select id='veteran-native' aria-hidden='true' style='display:none'>"
+            "<option value=''>Select...</option><option>I am not a protected veteran</option></select>"
+            "<span class='select2'><span class='selection'>"
+            "<span id='veteran-box' role='combobox' tabindex='0'>Select...</span>"
+            "</span></span></div>"
+            "<div class='field'>"
+            "<label>Disability status</label>"
+            "<select id='disability-native' aria-hidden='true' style='display:none'>"
+            "<option value=''>Select...</option><option>I do not wish to answer</option></select>"
+            "<span class='select2'><span class='selection'>"
+            "<span id='disability-box' role='combobox' tabindex='0'>Select...</span>"
+            "</span></span></div>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        questions = list(server.calls[0].get("questions", []))
+        by_intent = {item.get("intent"): item.get("text") for item in questions}
+        assert by_intent.get("GENDER") == "Gender"
+        assert by_intent.get("RACE_ETHNICITY") in {"Are you Hispanic/Latino?", "Race"}
+        texts = [str(item.get("text") or "") for item in questions]
+        assert "Are you Hispanic/Latino?" in texts
+        assert "Race" in texts
+        assert "Veteran status" in texts
+        assert "Disability status" in texts
+        manual = {item.get("intent"): item.get("text") for item in result.manual_questions}
+        assert manual.get("GENDER") == "Gender"
+        assert "Are you Hispanic/Latino?" in [item.get("text") for item in result.manual_questions]
+        assert "Race" in [item.get("text") for item in result.manual_questions]
+        assert manual.get("VETERAN_STATUS") == "Veteran status"
+        assert manual.get("DISABILITY_STATUS") == "Disability status"
+        assert page.locator("#gender").input_value() == ""
+        assert page.locator("#race").input_value() == ""
+        assert page.locator("#hispanic-native").input_value() == ""
+        assert page.locator("#hispanic-box").inner_text() == "Select..."
+    finally:
+        page.close()
+
+
+_SPONSOR = (
+    "Will you now or in the future require sponsorship for a visa to remain in your current location?"
+)
+
+
+def _sponsorship_select(commit_on_enter: bool) -> str:
+    enter = (
+        "if ((input.value || '').trim().toLowerCase() === 'no') {"
+        "hidden.value = 'No';"
+        "error.hidden = true;"
+        "error.textContent = '';"
+        "input.removeAttribute('aria-invalid');"
+        "}"
+        if commit_on_enter
+        else ""
+    )
+    return (
+        "<h1>Application</h1><form><div class='field'>"
+        f"<label for='sponsor'>{_SPONSOR}</label>"
+        "<div class='select'><div class='select__control'>"
+        "<div class='select__single-value' id='sponsor-shown' hidden></div>"
+        "<input id='sponsor' class='select__input' role='combobox' aria-controls='sponsor-list'>"
+        "</div>"
+        "<input type='hidden' id='sponsor-hidden' name='sponsorship'>"
+        "<div class='field-error' id='sponsor-error' hidden></div></div>"
+        "<ul id='sponsor-list' role='listbox'>"
+        "<li id='sponsor-yes' role='option'>Yes</li>"
+        "<li id='sponsor-no' role='option'>No</li>"
+        "</ul></div></form>"
+        "<script>"
+        "const input = document.getElementById('sponsor');"
+        "const hidden = document.getElementById('sponsor-hidden');"
+        "const shown = document.getElementById('sponsor-shown');"
+        "const error = document.getElementById('sponsor-error');"
+        "document.getElementById('sponsor-no').addEventListener('click', () => {"
+        "shown.hidden = false;"
+        "shown.textContent = 'No';"
+        "hidden.value = '';"
+        "error.hidden = false;"
+        "error.textContent = 'Please select an option';"
+        "input.setAttribute('aria-invalid', 'true');"
+        "});"
+        "input.addEventListener('keydown', (event) => {"
+        "if (event.key !== 'Enter') return;"
+        "event.preventDefault();"
+        f"{enter}"
+        "});"
+        "document.querySelector('form').addEventListener('submit', (event) => event.preventDefault());"
+        "</script>"
+    )
+
+
+def test_react_select_retries_with_enter_when_the_click_does_not_commit(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [_saved("SPONSORSHIP_NOW_OR_FUTURE", "No")]  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_sponsorship_select(True))
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        assert page.locator("#sponsor-hidden").input_value() == "No"
+        assert page.locator("#sponsor-error").is_hidden()
+        assert _SPONSOR not in [item.get("text") for item in result.manual_questions]
+    finally:
+        page.close()
+
+
+def test_react_select_stays_manual_when_enter_does_not_commit(browser, resolver):
+    server, url = resolver
+    server.custom_answers = [_saved("SPONSORSHIP_NOW_OR_FUTURE", "No")]  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_sponsorship_select(False))
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        assert page.locator("#sponsor-hidden").input_value() == ""
+        assert page.locator("#sponsor-error").is_hidden() is False
+        assert _SPONSOR in [item.get("text") for item in result.manual_questions]
+    finally:
+        page.close()
+
+
+def test_lever_location_portal_uses_keyboard_when_the_click_does_not_commit(browser, resolver, caplog):
+    server, url = resolver
+    caplog.set_level("INFO")
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Austin",
+        "address.state": "TX",
+        "address.country": "US",
+    }
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='location-input'>Current location</label>"
+            "<input id='location-input' name='location' type='text' autocomplete='off'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "</form>"
+            "<script>"
+            "const input = document.getElementById('location-input');"
+            "const hidden = document.getElementById('selected-location');"
+            "let generation = 0;"
+            "input.addEventListener('input', () => {"
+            "const token = ++generation;"
+            "document.querySelectorAll('.dropdown-location').forEach((node) => node.remove());"
+            "hidden.value = '';"
+            "setTimeout(() => {"
+            "if (token !== generation) return;"
+            "['Austin, TX, USA', 'Austin, MN, USA'].forEach((place, index) => {"
+            "const item = document.createElement('div');"
+            "item.className = 'dropdown-location';"
+            "item.id = 'location-' + index;"
+            "item.textContent = place;"
+            "item.addEventListener('mousedown', (event) => event.preventDefault());"
+            "document.body.appendChild(item);"
+            "});"
+            "}, 400);"
+            "});"
+            "input.addEventListener('keydown', (event) => {"
+            "if (event.key !== 'Enter') return;"
+            "event.preventDefault();"
+            "const first = document.querySelector('.dropdown-location');"
+            "if (!first) return;"
+            "input.value = first.textContent;"
+            "hidden.value = first.textContent;"
+            "});"
+            "</script>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        picked = "Austin, TX, USA"
+        assert page.locator("#location-input").input_value() == picked
+        assert page.locator("#selected-location").input_value() == picked
+        assert [item.get("text") for item in result.manual_questions] == []
+        assert "location left manual" not in caplog.text
+    finally:
+        page.close()
+
+
+def test_lever_location_free_text_when_no_suggestions_appear(browser, resolver, caplog):
+    server, url = resolver
+    caplog.set_level("INFO")
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.city": "Austin",
+        "address.state": "TX",
+        "address.country": "US",
+    }
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='location-input'>Current location</label>"
+            "<input id='location-input' name='location' type='text' autocomplete='off'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation'>"
+            "</form>"
+        )
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        picked = "Austin, Texas, United States"
+        assert page.locator("#location-input").input_value() == picked
+        assert page.locator("#selected-location").input_value() == picked
+        assert [item.get("text") for item in result.manual_questions] == []
+        assert "location left manual" not in caplog.text
+    finally:
+        page.close()
+
+
 def test_closed_greenhouse_selects_are_sent_to_the_resolver(browser, resolver):
     server, url = resolver
     server.custom_answers = []  # type: ignore[attr-defined]
