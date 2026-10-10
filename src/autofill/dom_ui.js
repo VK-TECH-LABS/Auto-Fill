@@ -76,25 +76,79 @@
     return true;
   }
 
-  function highlight(el) {
-    if (!el || !el.style) {
+  function controlBox(el) {
+    if (!el || !el.closest) {
+      return el;
+    }
+    const react = el.closest("[class*='select__control']");
+    if (react) {
+      return react;
+    }
+    const role = String(el.getAttribute("role") || "").toLowerCase();
+    if (role === "combobox") {
+      if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+        return el.parentElement || el;
+      }
+      return el;
+    }
+    const combo = el.closest("[role='combobox']");
+    if (combo) {
+      return combo;
+    }
+    const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+    if (type === "radio" || role === "radio") {
+      return el.closest("fieldset") || el.closest("[class*='question']") || el.closest(".field") || el;
+    }
+    return el;
+  }
+
+  function paint(node) {
+    if (!node || !node.style) {
       return;
     }
-    el.style.outline = "3px solid #FF3B30";
-    el.style.outlineOffset = "2px";
-    el.setAttribute("data-af-highlight", "1");
+    node.style.outline = "3px solid #FF3B30";
+    node.style.outlineOffset = "2px";
+    node.style.boxShadow = "inset 0 0 0 3px #FF3B30, 0 0 0 3px #FF3B30";
+    node.setAttribute("data-af-highlight", "1");
+  }
+
+  function unpaint(node) {
+    if (!node || !node.style) {
+      return;
+    }
+    node.style.outline = "";
+    node.style.outlineOffset = "";
+    node.style.boxShadow = "";
+    node.removeAttribute("data-af-highlight");
+  }
+
+  function highlight(el) {
+    if (!el) {
+      return;
+    }
+    clearHighlight(null);
+    paint(controlBox(el));
   }
 
   function clearHighlight(el) {
-    const nodes = el ? [el] : Array.from(document.querySelectorAll("[data-af-highlight]"));
-    for (const node of nodes) {
-      if (!node || !node.style) {
-        continue;
+    const nodes = new Set();
+    if (!el) {
+      document.querySelectorAll("[data-af-highlight]").forEach((node) => nodes.add(node));
+    } else {
+      nodes.add(el);
+      const box = controlBox(el);
+      if (box) {
+        nodes.add(box);
       }
-      node.style.outline = "";
-      node.style.outlineOffset = "";
-      node.removeAttribute("data-af-highlight");
+      let parent = el.parentElement;
+      while (parent) {
+        if (parent.getAttribute && parent.getAttribute("data-af-highlight") === "1") {
+          nodes.add(parent);
+        }
+        parent = parent.parentElement;
+      }
     }
+    nodes.forEach((node) => unpaint(node));
   }
 
   window.__afUI = { focusField, typeVisible, highlight, clearHighlight };

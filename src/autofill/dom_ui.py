@@ -85,6 +85,15 @@ _CLEAR_JS = """(selector) => {
   return true;
 }"""
 
+_COMBOBOX_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el || el.tagName === "SELECT") return false;
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  const cls = String(el.className || "");
+  if (role === "combobox" || cls.indexOf("select__input") !== -1) return true;
+  return !!(el.closest && el.closest("[class*='select__control']"));
+}"""
+
 _CHOOSE_JS = """({ selector, expected, multi }) => {
   const root = document.querySelector(selector);
   if (!root) return false;
@@ -746,6 +755,16 @@ def _choice(answer_type: str) -> bool:
     return answer_type in {"single_select", "multi_select", "boolean"}
 
 
+def _looks_like_combobox(page: Any, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_COMBOBOX_JS, selector))
+    except Exception:
+        return False
+
+
 def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     """Fill one field visibly, verify the commit, and clear the outline."""
     selector = str(target.get("selector") or "")
@@ -760,6 +779,17 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         return {"filled": False, "reason": "empty"}
     install(page)
     focus_field(page, selector)
+    if _looks_like_combobox(page, selector):
+        from autofill.combobox import select_combobox
+
+        try:
+            picked = select_combobox(page, selector, values[0])
+        except Exception:
+            picked = None
+        if picked is None:
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
     if _choice(answer_type):
         evaluate = getattr(page, "evaluate", None)
         if evaluate is None:

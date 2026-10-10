@@ -322,7 +322,7 @@ def _run(
                     answers_updated=answers_updated,
                 )
             )
-            return _accept_result(session, result)
+            accepted = _accept_result(session, result)
         except HTTPException:
             session.status = previous
             raise
@@ -338,6 +338,10 @@ def _run(
             ) from exc
         except Exception as exc:
             return _failed(session, exc)
+        if session.status == Status.EXPIRED:
+            session.wipe_secrets()
+            runner.discard(session.session_id)
+        return accepted
     finally:
         store.finish_run(session)
 
@@ -422,6 +426,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found.")
         return session
 
+    def _reject_expired(session: ServiceSession) -> None:
+        """Stop a call on an expired session before it pauses, fills, or stores a secret."""
+        timed_out = bool(session.expires_at) and time.monotonic() >= session.expires_at
+        if session.status != Status.EXPIRED and not timed_out:
+            return
+        if not session.busy and session.status != Status.EXPIRED:
+            session.status = Status.EXPIRED
+            session.wipe_secrets()
+            active_runner.discard(session.session_id)
+        raise HTTPException(status_code=410, detail="Session expired.")
+
     @app.exception_handler(RequestValidationError)
     async def _hide_rejected_input(_request, exc: RequestValidationError) -> JSONResponse:
         detail = [{key: value for key, value in error.items() if key not in {"input", "ctx"}} for error in exc.errors()]
@@ -503,11 +518,14 @@ def create_app(
 
     @router.get("/sessions/{session_id}/status", response_model=RunStatusOut, tags=["sessions"])
     def session_status(session_id: str) -> RunStatusOut:
-        return _status_out(_session_or_404(session_id))
+        session = _session_or_404(session_id)
+        _reject_expired(session)
+        return _status_out(session)
 
     @router.post("/sessions/{session_id}/continue", response_model=RunStatusOut, tags=["sessions"])
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
+        _reject_expired(session)
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
@@ -554,6 +572,7 @@ def create_app(
     def pause_session(session_id: str) -> RunStatusOut:
         """Stop between fields. A second pause is a no-op and does not start a fill."""
         session = _session_or_404(session_id)
+        _reject_expired(session)
         session.pause_gate.pause()
         session.paused = True
         logger.info("session=%s action=pause", session.session_id)
@@ -563,6 +582,7 @@ def create_app(
     def resume_session(session_id: str) -> RunStatusOut:
         """Release a paused fill. This does not start a run that has already stopped."""
         session = _session_or_404(session_id)
+        _reject_expired(session)
         session.pause_gate.resume()
         session.paused = False
         logger.info("session=%s action=resume", session.session_id)
@@ -577,6 +597,7 @@ def create_app(
     def answer_session(session_id: str, body: AnswerIn) -> AnswerOut:
         """Fill one open field visibly, then continue. The value is not logged."""
         session = _session_or_404(session_id)
+        _reject_expired(session)
         if session.status in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED}:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(
@@ -639,6 +660,7 @@ def create_app(
     @router.post("/sessions/{session_id}/credentials", response_model=CredentialsOut, tags=["sessions"])
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:
         session = _session_or_404(session_id)
+        _reject_expired(session)
         _check_candidate(session, body.candidate_id.strip())
         try:
             require_login_name(body)
@@ -664,6 +686,7 @@ def create_app(
     @router.get("/sessions/{session_id}/screenshot", tags=["sessions"])
     def session_screenshot(session_id: str) -> Response:
         session = _session_or_404(session_id)
+        _reject_expired(session)
         shot = getattr(active_runner, "screenshot", None)
         try:
             image = shot(session_id) if shot is not None else None
@@ -691,6 +714,7 @@ def create_app(
     @router.post("/sessions/{session_id}/interact", response_model=InteractOut, tags=["sessions"])
     def interact_session(session_id: str, body: InteractIn) -> InteractOut:
         session = _session_or_404(session_id)
+        _reject_expired(session)
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         if session.status not in _HUMAN_STOP:
             raise HTTPException(status_code=409, detail=f"Cannot interact with a session in status {session.status}.")

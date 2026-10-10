@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -338,3 +339,181 @@ def test_unanswered_required_question_blocks_until_answer(fixture_origin: str):
         assert _eval(runner, session_id, "() => document.querySelector('#color').value") == "Blue"
         assert _eval(runner, session_id, highlighted) is None
         assert _eval(runner, session_id, "() => window.__submitted") is not True
+
+
+_HIGHLIGHT_BOX = """() => {
+  const node = document.querySelector("[data-af-highlight]");
+  if (!node) return null;
+  const box = node.getBoundingClientRect();
+  return {
+    id: node.id,
+    className: String(node.className || ""),
+    height: box.height,
+    shadow: node.style.boxShadow || "",
+    inputMarked: document.querySelector("#desk").getAttribute("data-af-highlight"),
+  };
+}"""
+
+_COUNTRY_VALUE = """() => ({
+  hidden: document.querySelector("#country-hidden").value,
+  shown: document.querySelector("#country-single").textContent,
+})"""
+
+
+def test_react_select_outline_answer_and_country_alias(fixture_origin: str):
+    """A Greenhouse-style combobox is outlined on its box, answered from the menu, and country aliases match."""
+    _chromium_or_skip()
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    raw["candidateId"] = "candidate-example"
+    raw["personal"]["full_name"] = "River Example"
+    raw["personal"]["email"] = "river.example@example.com"
+    raw["personal"]["country"] = "USA"
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    app = create_app(token=TOKEN, runner=runner, run_browser=True)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/sessions",
+            headers=AUTH,
+            json={
+                "candidateContext": raw,
+                "jobContext": {
+                    "applicationUrl": f"{fixture_origin}/react_select_country.html",
+                    "jobId": "job-example",
+                    "candidateId": "candidate-example",
+                    "title": "Example Engineer",
+                    "company": "Example Labs",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        body = started.json()
+        assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
+        blocking = body["blocking"]
+        assert blocking["kind"] == "QUESTION"
+        assert "desk" in blocking["text"].lower()
+        assert "Window" in blocking["options"]
+        assert "Aisle" in blocking["options"]
+        assert len(blocking["options"]) <= 200
+        assert all(len(option) <= 200 for option in blocking["options"])
+        country = _eval(runner, session_id, _COUNTRY_VALUE)
+        shown = str(country["shown"]).casefold().strip()
+        hidden = str(country["hidden"]).casefold().strip()
+        aliases = {"united states", "united states of america", "usa", "us"}
+        assert shown in aliases or hidden in aliases
+        box = _eval(runner, session_id, _HIGHLIGHT_BOX)
+        assert box["height"] > 20
+        assert "select__control" in box["className"]
+        assert box["id"] == "desk-control"
+        assert box["inputMarked"] is None
+        assert "255, 59, 48" in box["shadow"] or "FF3B30" in box["shadow"].upper()
+        answered = client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": blocking["questionHash"], "value": "Window"},
+        )
+        assert answered.status_code == 200, answered.text
+        assert answered.json() == {"filled": True}
+        finished = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert finished.status_code == 200, finished.text
+        done = finished.json()
+        assert done["status"] == Status.READY_FOR_HUMAN_SUBMIT, done.get("messages")
+        assert done["progress"]["percent"] == 100
+        assert done["stopped_before_submit"] is True
+        assert "river.example@example.com" not in finished.text
+        desk = _eval(
+            runner,
+            session_id,
+            "() => ({"
+            " hidden: document.querySelector('#desk-hidden').value,"
+            " shown: document.querySelector('#desk-single').textContent,"
+            " mark: document.querySelector('[data-af-highlight]')"
+            " })",
+        )
+        assert desk["hidden"] == "Window"
+        assert desk["shown"] == "Window"
+        assert desk["mark"] is None
+        assert _eval(runner, session_id, "() => window.__submitted") is not True
+
+
+def test_ttl_reaper_closes_the_live_browser_context(fixture_origin: str):
+    """An expired session drops its browser context and rejects every follow-up."""
+    _chromium_or_skip()
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    raw["candidateId"] = "candidate-example"
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    app = create_app(token=TOKEN, runner=runner, run_browser=True, reaper_interval_seconds=0.05)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/sessions",
+            headers=AUTH,
+            json={
+                "candidateContext": raw,
+                "jobContext": {
+                    "applicationUrl": f"{fixture_origin}/required_question.html",
+                    "jobId": "job-example",
+                    "candidateId": "candidate-example",
+                    "title": "Example Engineer",
+                    "company": "Example Labs",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        assert started.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert session_id in runner._sessions
+        held = app.state.store.get(session_id)
+        assert held is not None
+        color_before = _eval(runner, session_id, "() => document.querySelector('#color').value")
+        assert color_before == ""
+        held.expires_at = time.monotonic() - 1
+        deadline = time.monotonic() + 3
+        while session_id in runner._sessions and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert session_id not in runner._sessions
+        assert held.status == Status.EXPIRED
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        shot = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
+        interact = client.post(
+            f"/v1/sessions/{session_id}/interact",
+            headers=AUTH,
+            json={"action": "key", "key": "Escape"},
+        )
+        pause = client.post(f"/v1/sessions/{session_id}/pause", headers=AUTH)
+        resume = client.post(f"/v1/sessions/{session_id}/resume", headers=AUTH)
+        answer = client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": "color", "value": "Blue"},
+        )
+        continued = client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"resumeUploaded": True, "candidateId": "candidate-example"},
+        )
+        credentials = client.post(
+            f"/v1/sessions/{session_id}/credentials",
+            headers=AUTH,
+            json={"email": "river.example@example.com", "password": "synthetic-password-expired-session"},
+        )
+        codes = [
+            status.status_code,
+            shot.status_code,
+            interact.status_code,
+            pause.status_code,
+            resume.status_code,
+            answer.status_code,
+            continued.status_code,
+            credentials.status_code,
+        ]
+        assert codes == [410] * len(codes)
+        assert "synthetic-password-expired-session" not in credentials.text
+        assert session_id not in runner._sessions
+        assert held.paused is False
+        assert held.held_answers == []
+        missing = client.get("/v1/sessions/missing-session/status", headers=AUTH)
+        assert missing.status_code == 404

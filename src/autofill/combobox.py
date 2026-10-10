@@ -7,10 +7,51 @@ from ``aria-controls`` / ``aria-owns``, or from the list inside that control.
 
 from __future__ import annotations
 
+import re
+
 from autofill.dom_ui import focus_field
 from autofill.intents import match_option_exact
 from autofill.models import Option
 from autofill.safeguards import click_choice, dismiss_combobox, open_combobox
+
+# A menu may show any of these for one country. Longer names are typed first.
+_COUNTRY_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"united states", "united states of america", "usa", "us"}),
+    frozenset({"united kingdom", "great britain", "uk", "gb"}),
+)
+
+
+def _fold(value: str) -> str:
+    text = str(value or "").casefold().replace(".", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def country_aliases(value: str) -> list[str]:
+    """Names a country menu might show for ``value``, longest first."""
+    token = _fold(value)
+    if not token:
+        return []
+    for group in _COUNTRY_GROUPS:
+        if token in group:
+            return sorted(group, key=len, reverse=True)
+    return [token]
+
+
+def _known_country(value: str) -> bool:
+    token = _fold(value)
+    return any(token in group for group in _COUNTRY_GROUPS)
+
+
+def match_country_option(desired: str, options: list[Option]) -> Option | None:
+    """Case-insensitive match across United States / USA / US and the other groups."""
+    if not _known_country(desired):
+        return None
+    aliases = set(country_aliases(desired))
+    for option in options:
+        if _fold(option.label) in aliases or _fold(option.value) in aliases:
+            return option
+    return None
+
 
 _SCOPED_OPTIONS_JS = r"""
 (selector) => {
@@ -168,6 +209,75 @@ def _read_options(page, selector: str) -> list[Option]:
     return found
 
 
+def _match_desired(desired: str, found: list[Option]) -> Option | None:
+    country = match_country_option(desired, found)
+    if country is not None:
+        return country
+    return match_option_exact(desired, found)
+
+
+def _filter_terms(desired: str) -> list[str]:
+    if _known_country(desired):
+        return country_aliases(desired)
+    return [desired]
+
+
+def _poll_options(page, selector: str, attempts: int, delay_ms: int) -> list[Option]:
+    found: list[Option] = []
+    for _ in range(attempts):
+        found = _read_options(page, selector)
+        if found:
+            return found
+        if getattr(page, "wait_for_timeout", None) is None:
+            break
+        _pause(page, delay_ms)
+    return found
+
+
+def _type_filter(page, selector: str, text: str) -> None:
+    """Type into the combobox so an async menu can filter."""
+    try:
+        page.evaluate(_BLOCK_SUBMIT_JS)
+    except Exception:
+        return
+    field = page.locator(selector)
+    try:
+        target = field
+        inner = field.locator("input:not([type='hidden']), textarea")
+        if inner.count():
+            target = inner.first
+        target.fill("")
+        target.press_sequentially(text, delay=20)
+    except Exception:
+        return
+    _pause(page, 80)
+
+
+def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
+    """Open the menu once, read option text, and close it."""
+    if not selector:
+        return []
+    focus_field(page, selector)
+    try:
+        open_combobox(page, selector)
+        found = _poll_options(page, selector, 6, 80)
+    except Exception:
+        found = []
+    labels: list[str] = []
+    for option in found:
+        label = (option.label or option.value).strip()
+        if not label:
+            continue
+        labels.append(label[:200])
+        if len(labels) >= limit:
+            break
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        return labels
+    return labels
+
+
 def _keyboard_commit(page, selector: str, desired: str) -> None:
     """Type the option into the combobox input and confirm with Enter."""
     field = page.locator(selector)
@@ -204,15 +314,15 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return None
     focus_field(page, selector)
     open_combobox(page, selector)
-    found: list[Option] = []
-    for _ in range(10):
-        found = _read_options(page, selector)
-        if found:
-            break
-        if getattr(page, "wait_for_timeout", None) is None:
-            break
-        _pause(page, 100)
-    match = match_option_exact(desired, found)
+    found = _poll_options(page, selector, 4, 50)
+    match = _match_desired(desired, found)
+    if match is None:
+        for term in _filter_terms(desired):
+            _type_filter(page, selector, term)
+            found = _poll_options(page, selector, 10, 80)
+            match = _match_desired(desired, found)
+            if match is not None:
+                break
     if match is None or not match.selector:
         dismiss_combobox(page)
         return None

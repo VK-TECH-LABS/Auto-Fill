@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from autofill.adapters import adapter_for
-from autofill.combobox import select_combobox
+from autofill.combobox import list_combobox_options, select_combobox
 from autofill.dates import format_for_control
 from autofill.dom_ui import (
     answer_type_name,
@@ -1363,6 +1363,22 @@ def _write_control(
     if not text:
         _skip(control, outcome, key, "No value for this control.")
         return
+    if control.kind == "combobox" and not control.options:
+        picked = select_combobox(page, control.selector, text)
+        if picked is None:
+            _skip(control, outcome, key, "No option matched this value.")
+            return
+        outcome.fields.append(
+            FieldOutcome(
+                selector=control.selector,
+                label=control.label,
+                key=key,
+                action="select",
+                detail=picked.label,
+                field_class="PROFILE_FIELD",
+            )
+        )
+        return
     if control.kind in {"select", "radio", "combobox"}:
         option = match_option_exact(text, control.options)
         if option is None and flags.aliases:
@@ -1976,7 +1992,7 @@ def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     return "QUESTION"
 
 
-def _gap_item(controls: list[Control], profile: CandidateProfile | None) -> dict[str, Any]:
+def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=None) -> dict[str, Any]:
     primary = controls[0]
     text = sanitize_question(
         _question_text(controls) or primary.label or primary.aria_label or "Required field"
@@ -1989,6 +2005,8 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None) -> dict
     elif mapped is not None and mapped.key and kind != "DEMOGRAPHIC":
         field_key = mapped.key
     options = _option_labels(controls)
+    if page is not None and primary.kind == "combobox" and not options and primary.selector:
+        options = list_combobox_options(page, primary.selector)
     match = classify_question(text, options)
     named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
     intent = match.intent if named else None
@@ -2032,6 +2050,8 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
             chosen["selector"] = gap.get("selector") or ""
         if not chosen.get("kind"):
             chosen["kind"] = gap.get("kind")
+        if not chosen.get("options") and gap.get("options"):
+            chosen["options"] = list(gap.get("options") or [])
         merged.append(chosen)
     return merged
 
@@ -2057,7 +2077,7 @@ def required_gaps(
             committed.update(keys)
             continue
         open_keys.update(keys)
-        gaps.append(_gap_item(cluster, profile))
+        gaps.append(_gap_item(cluster, profile, page))
     sync_required_progress(committed, open_keys)
     if prior:
         return _merge_gap_items(gaps, prior)
