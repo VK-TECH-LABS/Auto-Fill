@@ -45,7 +45,7 @@ from autofill.safeguards import (
     is_forward_navigation,
 )
 from autofill.session import SessionStore
-from autofill.stepfill import FillFlags, fill_resolved_page, flags_for_alerts, validation_blob
+from autofill.stepfill import FillFlags, fill_resolved_page, flags_for_alerts, required_gaps, validation_blob
 
 logger = logging.getLogger("autofill.engine")
 
@@ -476,6 +476,17 @@ def autofill_application(
                 fields.extend(page_fields)
                 manual.extend(page_manual)
                 _note_fill(page_fields, opts, run_started, inspect_state)
+                gaps = required_gaps(page, snapshot, candidate_profile)
+                if gaps:
+                    return _manual_for_gaps(
+                        session,
+                        gaps,
+                        ats=ats_name,
+                        login_status=login_status,
+                        fields=fields,
+                        manual=manual,
+                        submit_controls=submit_controls,
+                    )
                 session.mark("REVIEW_PAGE")
                 session.mark("READY_FOR_HUMAN_SUBMIT")
                 detected, filled, skipped = _counts(fields)
@@ -527,6 +538,18 @@ def autofill_application(
                 resume_seen = True
                 session.mark("CONTINUE_AFTER_RESUME")
 
+            gaps = required_gaps(page, snapshot, candidate_profile)
+            if gaps:
+                return _manual_for_gaps(
+                    session,
+                    gaps,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields=fields,
+                    manual=manual,
+                    submit_controls=submit_controls,
+                )
+
             nxt = next(
                 (
                     button
@@ -560,6 +583,17 @@ def autofill_application(
                 fields_skipped=skipped,
                 manual_actions=manual,
                 messages=["No application form was found. A person can open the page and continue."],
+                submit_controls=submit_controls,
+            )
+        gaps = required_gaps(page, snapshot, candidate_profile)
+        if gaps:
+            return _manual_for_gaps(
+                session,
+                gaps,
+                ats=ats_name,
+                login_status=login_status,
+                fields=fields,
+                manual=manual,
                 submit_controls=submit_controls,
             )
         session.mark("READY_FOR_HUMAN_SUBMIT")
@@ -709,6 +743,34 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
     return snapshot
 
 
+def _manual_for_gaps(
+    session,
+    gaps: list[dict],
+    *,
+    ats: str | None,
+    login_status: str,
+    fields,
+    manual: list[str],
+    submit_controls: list[str],
+) -> ApplicationResult:
+    remember_open_items(gaps)
+    session.mark(Status.MANUAL_ANSWER_REQUIRED)
+    detected, filled, skipped = _counts(fields)
+    return _result(
+        session,
+        status=Status.MANUAL_ANSWER_REQUIRED,
+        ats=ats,
+        login_status=login_status,
+        fields_detected=detected,
+        fields_filled=filled,
+        fields_skipped=skipped,
+        manual_actions=manual,
+        messages=["A required field is still empty."],
+        submit_controls=submit_controls,
+        manual_questions=_public_questions(gaps),
+    )
+
+
 def _public_questions(items: list[dict]) -> list[dict]:
     """Intent and question text only. Blocking is an internal flag."""
     published: list[dict] = []
@@ -771,6 +833,17 @@ def _run_resolver_pages(
             submit_controls=submit_controls,
             manual_questions=published,
             timings=_timings(opts),
+        )
+
+    def stop_required(current, existing: list[dict] | None = None):
+        gaps = required_gaps(page, current, None, existing)
+        if not gaps:
+            return None
+        session.mark(Status.MANUAL_ANSWER_REQUIRED)
+        return finish(
+            Status.MANUAL_ANSWER_REQUIRED,
+            ["A required field is still empty."],
+            questions=gaps,
         )
 
     for index in range(opts.max_pages):
@@ -850,6 +923,9 @@ def _run_resolver_pages(
                         questions=blocking or outcome.manual_questions,
                     )
                 carried.extend(optional)
+                held = stop_required(snapshot, outcome.manual_questions)
+                if held is not None:
+                    return held
                 session.mark("REVIEW_PAGE")
                 session.mark(Status.READY_FOR_HUMAN_SUBMIT)
                 return finish(Status.READY_FOR_HUMAN_SUBMIT, ["Review page reached. A person clicks Submit."])
@@ -862,6 +938,9 @@ def _run_resolver_pages(
                     questions=pending,
                 )
             carried.extend(optional)
+            held = stop_required(snapshot, outcome.manual_questions)
+            if held is not None:
+                return held
             nxt = next(
                 (
                     button
@@ -902,6 +981,9 @@ def _run_resolver_pages(
             Status.NO_FORM_FOUND,
             ["No application form was found. A person can open the page and continue."],
         )
+    held = stop_required(snapshot)
+    if held is not None:
+        return held
     session.mark(Status.READY_FOR_HUMAN_SUBMIT)
     terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
     return finish(terminal, ["Filled what it could. A person clicks Submit or Apply."])

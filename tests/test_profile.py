@@ -76,4 +76,7 @@ def test_screening_defaults_are_blank():
         {"personal": {"full_name": "Casey Example", "email": "casey.example@example.com"}}
     )
     assert profile.screening.felony_conviction == ""
-    assert profile.eeo_voluntary.gender == "Decline to self-identify"
+    assert profile.eeo_voluntary.gender == ""
+    assert profile.eeo_voluntary.race_ethnicity == ""
+    assert profile.eeo_voluntary.veteran_status == ""
+    assert profile.eeo_voluntary.disability_status == ""

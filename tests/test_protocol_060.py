@@ -35,10 +35,11 @@ from autofill.dom_ui import (
 )
 from autofill.engine import ApplicationResult
 from autofill.fill import apply_mapped
-from autofill.models import Control, MappedField
+from autofill.models import Control, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 from autofill.service.app import create_app
+from autofill.stepfill import required_gaps
 
 TOKEN = "synthetic-service-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -189,7 +190,8 @@ def browser():
 
 def test_progress_percent_is_computed():
     assert progress_percent("READY", 0, 0) == 100
-    assert progress_percent("READY", 4, 1) == 100
+    assert progress_percent("READY", 4, 1) == 25
+    assert progress_percent("READY", 3, 2) == 67
     assert progress_percent("EMPLOYMENT", 0, 0) == 45
     assert progress_percent("QUESTIONS", 0, 0) == 75
     assert progress_percent("OPENING", 0, 0) == 5
@@ -200,6 +202,56 @@ def test_progress_percent_is_computed():
     assert stage_for("application", "", Status.READY_FOR_HUMAN_SUBMIT) == "READY"
     assert "river.example@example.com" not in safe_label("Contact river.example@example.com today")
     assert safe_label("Employment History") == "Employment History"
+
+
+def test_required_gaps_classify_empty_fields_in_page_order():
+    profile = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "River Example",
+                "email": "river.example@example.com",
+                "country": "Exampleland",
+            },
+            "eeo_voluntary": {"veteran_status": "I am not a protected veteran"},
+        }
+    )
+    snapshot = PageSnapshot(
+        controls=[
+            Control(kind="text", label="Phone", selector="#phone", required=True, autocomplete="tel"),
+            Control(kind="text", label="What is your favorite color?", selector="#color", required=True),
+            Control(
+                kind="select",
+                label="Country",
+                selector="#country",
+                required=True,
+                options=[Option("Canada", "Canada"), Option("Mexico", "Mexico")],
+            ),
+            Control(
+                kind="select",
+                label="Veteran status",
+                selector="#veteran",
+                required=True,
+                options=[Option("I am not a protected veteran", "I am not a protected veteran")],
+            ),
+        ],
+        buttons=[],
+    )
+
+    class Page:
+        def evaluate(self, script, arg=None):
+            del script
+            return False
+
+    gaps = required_gaps(Page(), snapshot, profile)
+    assert [item["kind"] for item in gaps] == [
+        "MISSING_PROFILE_VALUE",
+        "QUESTION",
+        "OPTION_MISMATCH",
+        "DEMOGRAPHIC",
+    ]
+    assert gaps[0]["fieldKey"] == "phone"
+    assert gaps[1]["text"] == "What is your favorite color?"
+    assert gaps[3]["intent"] == "VETERAN_STATUS"
 
 
 def test_blocking_picks_status_then_the_first_human_item():
@@ -521,6 +573,58 @@ def test_highlight_only_human_kinds_and_answer_clears_it(browser):
         assert filled == {"filled": True}
         assert page.locator("#years").input_value() == "5"
         assert page.locator("#years").get_attribute("data-af-highlight") is None
+    finally:
+        page.close()
+
+
+def test_profile_mode_blocks_on_the_first_empty_required_field(browser):
+    profile = CandidateProfile.from_dict(
+        {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+    )
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='name'>Full name</label><input id='name' autocomplete='name' required>"
+            "<label for='email'>Email</label><input id='email' type='email' autocomplete='email' required>"
+            "<label for='phone'>Phone</label><input id='phone' autocomplete='tel' required>"
+            "<label for='country'>Country</label><input id='country' autocomplete='country-name' required>"
+            "<label for='auth'>Are you legally authorized to work?</label>"
+            "<select id='auth' required><option value=''>Select...</option>"
+            "<option>Yes</option><option>No</option></select>"
+            "<label for='sponsor'>Will you now or in the future require sponsorship?</label>"
+            "<select id='sponsor' required><option value=''>Select...</option>"
+            "<option>Yes</option><option>No</option></select>"
+            "<label for='veteran'>Veteran status</label>"
+            "<select id='veteran'><option value=''>Select</option>"
+            "<option>I am not a protected veteran</option></select>"
+            "<button type='submit'>Submit application</button>"
+            "</form>"
+        )
+        result = autofill_application(
+            "https://boards.greenhouse.io/example/jobs/1",
+            profile,
+            None,
+            AutofillOptions(page=page, session_id="sess-ready", candidate_id="candidate-a", job_id="job-1"),
+        )
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED, result.messages
+        assert result.blocking is not None
+        assert result.blocking["kind"] == "MISSING_PROFILE_VALUE"
+        assert result.blocking["fieldKey"] == "phone"
+        assert result.progress["requiredDone"] < result.progress["requiredTotal"]
+        assert result.progress["percent"] != 100
+        assert result.progress["percent"] == progress_percent(
+            result.progress["stage"],
+            result.progress["requiredTotal"],
+            result.progress["requiredDone"],
+        )
+        assert page.locator("#phone").get_attribute("data-af-highlight") == "1"
+        assert page.locator("#name").input_value()
+        assert page.locator("#email").input_value() == "river.example@example.com"
+        assert page.locator("#country").input_value() == ""
+        assert page.locator("#auth").input_value() == ""
+        assert page.locator("#sponsor").input_value() == ""
+        assert page.locator("#veteran").input_value() == ""
     finally:
         page.close()
 

@@ -2,8 +2,9 @@
 
 Label synonyms cover the fields ApplyPilot's apply prompt fills from the
 profile: identity, contact, address, links, work authorization, compensation,
-experience, voluntary EEO, and the standard screening answers (age, background
-check, convictions, prior employment, referral source). Honeypot and hidden
+experience, and the standard screening answers (age, background
+check, convictions, prior employment, referral source). Demographic questions
+are never filled. Honeypot and hidden
 text inputs are skipped, matching that prompt's form notes.
 
 This mapper does not guess. ApplyPilot told its agent to answer "yes" to
@@ -432,14 +433,8 @@ def _profile_text(
     if key == "project_description":
         row = _row(profile.projects, cursor, "project_description")
         return row.description if row else ""
-    if key == "gender":
-        return profile.eeo_voluntary.gender
-    if key == "race_ethnicity":
-        return profile.eeo_voluntary.race_ethnicity
-    if key == "veteran_status":
-        return profile.eeo_voluntary.veteran_status
-    if key == "disability_status":
-        return profile.eeo_voluntary.disability_status
+    if key in {"gender", "race_ethnicity", "veteran_status", "disability_status"}:
+        return ""
     if key == "age_18_or_older":
         return profile.screening.age_18_or_older
     if key == "willing_background_check":
@@ -732,6 +727,13 @@ def map_field(
         )
 
     key = _retarget_date(key, cursor)
+    if key in {"gender", "race_ethnicity", "veteran_status", "disability_status"}:
+        return MappedField(
+            key=key,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Demographic questions are left blank.",
+        )
     if key == "resume":
         return MappedField(
             key=key,
