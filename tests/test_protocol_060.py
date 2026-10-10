@@ -19,6 +19,7 @@ from autofill import AutofillOptions, Status, autofill_application
 from autofill.dom_ui import (
     HIGHLIGHT_KINDS,
     PauseGate,
+    _committed,
     begin_run,
     checkpoint,
     choose_blocking,
@@ -573,6 +574,79 @@ def test_highlight_only_human_kinds_and_answer_clears_it(browser):
         assert filled == {"filled": True}
         assert page.locator("#years").input_value() == "5"
         assert page.locator("#years").get_attribute("data-af-highlight") is None
+    finally:
+        page.close()
+
+
+def test_phone_commit_compares_digits_and_other_fields_fold(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<label for='phone'>Phone</label><input id='phone' type='tel'>"
+            "<label for='city'>City</label><input id='city'>"
+            "<label for='region'>State</label><select id='region'><option value='tx'>Texas</option></select>"
+        )
+        page.evaluate(
+            """() => {
+              const phone = document.querySelector('#phone');
+              const valueOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+              phone.addEventListener('input', () => {
+                const digits = phone.value.replace(/\\D/g, '');
+                const national = digits.length > 10 ? digits.slice(digits.length - 10) : digits;
+                if (national.length === 10) {
+                  const formatted = '(' + national.slice(0, 3) + ') ' + national.slice(3, 6) + '-' + national.slice(6);
+                  valueOf.call(phone, formatted);
+                }
+              });
+              const city = document.querySelector('#city');
+              city.addEventListener('input', () => {
+                valueOf.call(city, city.value.replace(/\\s+/g, ' ').trim().toLowerCase());
+              });
+            }"""
+        )
+        filled = commit_visible(
+            page,
+            {
+                "selector": "#phone",
+                "answerType": "text",
+                "fieldKey": "phone",
+                "value": "5550100000",
+                "values": ["5550100000"],
+            },
+        )
+        assert filled == {"filled": True}
+        assert page.locator("#phone").input_value() == "(555) 010-0000"
+        page.evaluate("() => { document.querySelector('#phone').value = ''; }")
+        international = commit_visible(
+            page,
+            {
+                "selector": "#phone",
+                "answerType": "text",
+                "fieldKey": "phone",
+                "value": "+1 5550100000",
+                "values": ["+1 5550100000"],
+            },
+        )
+        assert international == {"filled": True}
+        assert page.locator("#phone").input_value() == "(555) 010-0000"
+        assert _committed(page, "#phone", ["5550100001"], multi=False, field_key="phone") is False
+        assert _committed(page, "#phone", ["+44 5550100000"], multi=False, field_key="") is True
+        assert _committed(page, "#phone", ["12345550100000"], multi=False, field_key="phone") is False
+        city = commit_visible(
+            page,
+            {
+                "selector": "#city",
+                "answerType": "text",
+                "fieldKey": "city",
+                "value": "  Austin   TX ",
+                "values": ["  Austin   TX "],
+            },
+        )
+        assert city == {"filled": True}
+        assert page.locator("#city").input_value() == "austin tx"
+        page.select_option("#region", "tx")
+        assert _committed(page, "#region", ["texas"], multi=False, field_key="state") is True
+        assert _committed(page, "#region", ["  TEXAS "], multi=False, field_key="state") is True
     finally:
         page.close()
 

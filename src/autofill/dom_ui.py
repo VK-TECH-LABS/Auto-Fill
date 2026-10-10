@@ -140,21 +140,51 @@ _CHOOSE_JS = """({ selector, expected, multi }) => {
   return hits === wanted.length && hits > 0;
 }"""
 
-_VERIFY_JS = """({ selector, expected, multi }) => {
+_VERIFY_JS = """({ selector, expected, multi, fieldKey }) => {
   const root = document.querySelector(selector);
   if (!root) return false;
   const wanted = (multi && Array.isArray(expected) ? expected : [expected]).map((item) => String(item || "").trim());
+  function fold(value) {
+    return String(value || "").replace(/\\s+/g, " ").trim().toLowerCase();
+  }
+  function digits(value) {
+    return String(value || "").replace(/\\D/g, "");
+  }
   function labelOf(node) {
     const wrap = node.closest("label");
-    const raw = wrap ? wrap.innerText : (node.getAttribute("aria-label") || "");
+    let raw = wrap ? wrap.innerText : "";
+    if (!raw && node.id) {
+      const labelled = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+      raw = labelled ? labelled.innerText : "";
+    }
+    if (!raw) raw = node.getAttribute("aria-label") || "";
     return String(raw || "").replace(/\\s+/g, " ").trim();
+  }
+  function phoneField(node) {
+    const key = String(fieldKey || "").toLowerCase();
+    if (key === "phone") return true;
+    const type = String(node.getAttribute("type") || node.type || "").toLowerCase();
+    const auto = String(node.getAttribute("autocomplete") || "").toLowerCase();
+    if (type === "tel" || auto === "tel" || auto === "tel-national" || auto.indexOf("tel") === 0) return true;
+    const hint = [node.id, node.name, node.getAttribute("placeholder") || "", labelOf(node)].join(" ").toLowerCase();
+    return /\\b(phone|mobile|telephone|cell)\\b/.test(hint);
+  }
+  function phonesEqual(left, right) {
+    const a = digits(left);
+    const b = digits(right);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const longer = a.length >= b.length ? a : b;
+    const shorter = a.length >= b.length ? b : a;
+    const extra = longer.length - shorter.length;
+    return shorter.length >= 7 && extra >= 1 && extra <= 3 && longer.slice(extra) === shorter;
   }
   if (root.tagName === "SELECT") {
     const chosen = root.options[root.selectedIndex];
     if (!chosen) return false;
-    const label = String(chosen.label || chosen.text || "").trim();
-    const value = String(root.value || "").trim();
-    return label === wanted[0] || value === wanted[0];
+    const label = String(chosen.label || chosen.text || "");
+    const value = String(root.value || "");
+    return fold(label) === fold(wanted[0]) || fold(value) === fold(wanted[0]);
   }
   if (root.type === "radio" || (root.type === "checkbox" && multi)) {
     const name = root.name || "";
@@ -163,7 +193,7 @@ _VERIFY_JS = """({ selector, expected, multi }) => {
       ? Array.from(document.querySelectorAll("input")).filter((node) => node.type === kind && node.name === name)
       : [root];
     return wanted.every((word) => group.some((node) => {
-      return node.checked && (String(node.value || "").trim() === word || labelOf(node) === word);
+      return node.checked && (fold(node.value) === fold(word) || fold(labelOf(node)) === fold(word));
     }));
   }
   if (root.type === "checkbox") {
@@ -171,7 +201,8 @@ _VERIFY_JS = """({ selector, expected, multi }) => {
     const on = word === "Yes" || word === "True" || word === "true";
     return root.checked === on;
   }
-  return String(root.value || "").trim() === wanted[0];
+  if (phoneField(root)) return phonesEqual(root.value, wanted[0]);
+  return fold(root.value) === fold(wanted[0]);
 }"""
 
 
@@ -805,13 +836,19 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     else:
         if not type_visible(page, selector, values[0]):
             return {"filled": False, "reason": "not_committed"}
-    if not _committed(page, selector, values, multi=answer_type == "multi_select"):
+    if not _committed(
+        page,
+        selector,
+        values,
+        multi=answer_type == "multi_select",
+        field_key=str(target.get("fieldKey") or ""),
+    ):
         return {"filled": False, "reason": "not_committed"}
     clear_highlight(page, selector)
     return {"filled": True}
 
 
-def _committed(page: Any, selector: str, values: list[str], *, multi: bool) -> bool:
+def _committed(page: Any, selector: str, values: list[str], *, multi: bool, field_key: str = "") -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return False
@@ -819,7 +856,12 @@ def _committed(page: Any, selector: str, values: list[str], *, multi: bool) -> b
         return bool(
             evaluate(
                 _VERIFY_JS,
-                {"selector": selector, "expected": values if multi else values[0], "multi": multi},
+                {
+                    "selector": selector,
+                    "expected": values if multi else values[0],
+                    "multi": multi,
+                    "fieldKey": field_key,
+                },
             )
         )
     except Exception:
