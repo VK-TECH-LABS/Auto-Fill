@@ -1,7 +1,7 @@
 """Fill one application step from resolver values, then drop those values.
 
-Profile records are not consulted. The only values written are the ones the
-resolver returned for the keys and intents on this step.
+Profile records are not consulted while writing. The only values written are
+the ones the resolver returned for the keys and intents on this step.
 """
 
 from __future__ import annotations
@@ -15,7 +15,15 @@ from typing import Any
 from autofill.adapters import adapter_for
 from autofill.combobox import select_combobox
 from autofill.dates import format_for_control
-from autofill.dom_ui import answer_type_name, checkpoint, selector_held, type_visible
+from autofill.dom_ui import (
+    answer_type_name,
+    checkpoint,
+    control_committed,
+    counts_required,
+    selector_held,
+    sync_required_progress,
+    type_visible,
+)
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped, attach_resume
 from autofill.intents import (
@@ -33,8 +41,9 @@ from autofill.intents import (
     question_hash,
     sanitize_question,
 )
-from autofill.mapping import haystack, is_honeypot, match_field_key, mentions_work_history, normalize
+from autofill.mapping import haystack, is_honeypot, map_field, match_field_key, mentions_work_history, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
+from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice
@@ -1917,3 +1926,139 @@ def _alias_option(desired: str, options: list[Option]) -> Option | None:
         if normalize(option.label) in allowed or normalize(option.value) in allowed:
             return option
     return None
+
+
+_DEMOGRAPHIC_KEYS = frozenset({"gender", "race_ethnicity", "veteran_status", "disability_status"})
+
+
+def _required_key(control: Control) -> str:
+    return str(control.selector or control.name or control.label or "")
+
+
+def _gap_clusters(snapshot: PageSnapshot) -> list[list[Control]]:
+    """Required controls in page order. A checkbox group is one cluster."""
+    clusters: list[list[Control]] = []
+    seen: set[str] = set()
+    buckets = _checkbox_buckets(snapshot.controls)
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or control.read_only:
+            continue
+        if not counts_required(control) or is_honeypot(control):
+            continue
+        key = _checkbox_key(control)
+        if key and len(buckets.get(key, [])) > 1:
+            if key in seen:
+                continue
+            seen.add(key)
+            clusters.append(buckets[key])
+            continue
+        clusters.append([control])
+    return clusters
+
+
+def _cluster_committed(page, controls: list[Control]) -> bool:
+    if len(controls) > 1 and all(item.kind == "checkbox" for item in controls):
+        return any(control_committed(page, item.selector) for item in controls)
+    return control_committed(page, controls[0].selector)
+
+
+def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
+    text = _question_text(controls) or controls[0].label
+    if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
+        return "DEMOGRAPHIC"
+    match = classify_question(text, _option_labels(controls))
+    if match.intent in DEMOGRAPHIC_INTENTS or _eeo(text) or _eeo(controls[0].label):
+        return "DEMOGRAPHIC"
+    if mapped is not None and "No option matched" in (mapped.reason or ""):
+        return "OPTION_MISMATCH"
+    if (mapped is not None and mapped.key) or match_field_key(controls[0]):
+        return "MISSING_PROFILE_VALUE"
+    return "QUESTION"
+
+
+def _gap_item(controls: list[Control], profile: CandidateProfile | None) -> dict[str, Any]:
+    primary = controls[0]
+    text = sanitize_question(
+        _question_text(controls) or primary.label or primary.aria_label or "Required field"
+    )
+    mapped = map_field(primary, profile) if profile is not None and len(controls) == 1 else None
+    kind = _gap_kind(controls, mapped)
+    field_key = None
+    if kind == "MISSING_PROFILE_VALUE":
+        field_key = (mapped.key if mapped is not None and mapped.key else None) or match_field_key(primary)
+    elif mapped is not None and mapped.key and kind != "DEMOGRAPHIC":
+        field_key = mapped.key
+    options = _option_labels(controls)
+    match = classify_question(text, options)
+    named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
+    intent = match.intent if named else None
+    if kind != "DEMOGRAPHIC" and intent in DEMOGRAPHIC_INTENTS:
+        intent = None
+    digest = question_hash(text) or None
+    multi = len(controls) > 1 and any(item.kind == "checkbox" for item in controls)
+    return {
+        "intent": intent,
+        "text": text,
+        "blocking": True,
+        "questionId": digest,
+        "questionHash": digest,
+        "fieldKey": field_key,
+        "answerType": answer_type_name(primary.kind, primary.input_type, multi=multi),
+        "options": options,
+        "required": True,
+        "selector": primary.selector,
+        "kind": kind,
+    }
+
+
+def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_selector = {str(item.get("selector") or ""): item for item in existing if item.get("selector")}
+    by_text: dict[str, dict[str, Any]] = {}
+    for item in existing:
+        folded = normalize_question(str(item.get("text") or ""))
+        if folded:
+            by_text[folded] = item
+    merged: list[dict[str, Any]] = []
+    for gap in gaps:
+        prior = by_selector.get(str(gap.get("selector") or ""))
+        if prior is None:
+            prior = by_text.get(normalize_question(str(gap.get("text") or "")))
+        if prior is None:
+            merged.append(gap)
+            continue
+        chosen = dict(prior)
+        chosen["blocking"] = True
+        if not chosen.get("selector"):
+            chosen["selector"] = gap.get("selector") or ""
+        if not chosen.get("kind"):
+            chosen["kind"] = gap.get("kind")
+        merged.append(chosen)
+    return merged
+
+
+def required_gaps(
+    page,
+    snapshot: PageSnapshot,
+    profile: CandidateProfile | None = None,
+    prior: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Visible required controls that are still empty, in page order.
+
+    ``profile`` classifies a profile-mode field. Resolver mode passes None and
+    keeps a prior manual item when one already names the same control.
+    """
+    clusters = _gap_clusters(snapshot)
+    committed: set[str] = set()
+    open_keys: set[str] = set()
+    gaps: list[dict[str, Any]] = []
+    for cluster in clusters:
+        keys = [key for key in (_required_key(item) for item in cluster) if key]
+        if _cluster_committed(page, cluster):
+            committed.update(keys)
+            continue
+        open_keys.update(keys)
+        gaps.append(_gap_item(cluster, profile))
+    sync_required_progress(committed, open_keys)
+    if prior:
+        return _merge_gap_items(gaps, prior)
+    return gaps

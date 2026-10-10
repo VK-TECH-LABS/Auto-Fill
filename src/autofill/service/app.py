@@ -130,7 +130,7 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         stopped_before_submit=True,
         candidateId=session.candidate_id,
         jobId=session.job_id,
-        protocolVersion=session.protocol_version,
+        protocolVersion=session.protocol_version.strip() or "0.6.0",
         manualQuestions=_questions_out(session),
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
@@ -458,7 +458,7 @@ def create_app(
                     job=job,
                     cover_letter_text=None,
                     mode="resolver",
-                    protocol_version=body.protocol_version.strip(),
+                    protocol_version=body.protocol_version.strip() or "0.6.0",
                     candidate_ref=binding.candidate_ref,
                     job_ref=binding.job_ref,
                     resolver_url=binding.url,
@@ -476,7 +476,7 @@ def create_app(
                     profile=profile,
                     job=job,
                     cover_letter_text=cover,
-                    protocol_version=body.protocol_version.strip(),
+                    protocol_version=body.protocol_version.strip() or "0.6.0",
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

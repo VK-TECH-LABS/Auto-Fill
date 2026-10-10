@@ -189,7 +189,13 @@ def test_approved_answer_overrides_screening_for_the_same_question():
     assert unknown.field_class == "UNKNOWN_FIELD"
 
 
-def test_eeo_decline_matches_a_similar_option():
+def test_eeo_decline_is_not_selected():
+    filled = CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "eeo_voluntary": {"gender": "Prefer not to say"},
+        }
+    )
     mapped = map_field(
         control(
             "Gender",
@@ -200,10 +206,10 @@ def test_eeo_decline_matches_a_similar_option():
                 Option("decline", "Prefer not to say"),
             ],
         ),
-        profile(),
+        filled,
     )
-    assert mapped.action == "select"
-    assert mapped.option_label == "Prefer not to say"
+    assert mapped.action == "unanswered"
+    assert mapped.key == "gender"
 
 
 def test_hidden_and_honeypot_fields_are_skipped():
@@ -271,3 +277,30 @@ def test_unrecognized_control_is_left_alone():
     mapped = map_field(control("Pronouns"), profile())
     assert mapped.action == "unanswered"
     assert mapped.key is None
+
+
+def test_demographic_values_are_never_mapped():
+    filled = CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "eeo_voluntary": {
+                "gender": "Decline to self-identify",
+                "veteran_status": "I am not a protected veteran",
+                "disability_status": "I do not wish to answer",
+                "race_ethnicity": "Decline to self-identify",
+            },
+        }
+    )
+    assert filled.eeo_voluntary.veteran_status == "I am not a protected veteran"
+    veteran = control(
+        "Veteran status",
+        kind="select",
+        required=True,
+        options=[Option("I am not a protected veteran", "I am not a protected veteran")],
+    )
+    mapped = map_field(veteran, filled)
+    assert mapped.action == "unanswered"
+    assert mapped.key == "veteran_status"
+    assert map_field(control("Gender", kind="select", options=[Option("Decline", "Decline")]), filled).action == (
+        "unanswered"
+    )

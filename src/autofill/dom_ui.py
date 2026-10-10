@@ -281,11 +281,13 @@ def begin_run(
     shared = progress if progress is not None else empty_progress()
     shared.clear()
     shared.update(empty_progress())
+    items = open_items if open_items is not None else []
+    items.clear()
     state = RunState(
         page=page,
         pause_gate=pause_gate,
         held_selectors=held_selectors if held_selectors is not None else set(),
-        open_items=open_items if open_items is not None else [],
+        open_items=items,
         progress=shared,
         url=url,
         ats=ats,
@@ -316,12 +318,15 @@ def typing_delays(text: str, randint) -> list[int]:
 
 
 def progress_percent(stage: str, required_total: int, required_done: int) -> int:
-    """Required progress when there are required fields. Otherwise a fixed stage value."""
-    if stage == "READY":
-        return 100
+    """Required progress when there are required fields. Otherwise a fixed stage value.
+
+    100 means every counted field is done. A partial count never rounds up to 100.
+    """
     if required_total > 0:
         done = min(max(required_done, 0), required_total)
-        return max(0, min(100, int(round(100 * done / required_total))))
+        if done >= required_total:
+            return 100
+        return min(99, max(0, int(round(100 * done / required_total))))
     return STAGE_PERCENT.get(stage, STAGE_PERCENT["OPENING"])
 
 
@@ -378,6 +383,119 @@ def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False) ->
     if input_type in {"number", "range"} or kind == "number":
         return "number"
     return "text"
+
+
+_COMMITTED_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+  const tag = String(el.tagName || "");
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  function placeholder(text) {
+    const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!folded) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+  }
+  if (type === "radio") {
+    const name = el.getAttribute("name") || "";
+    if (!name) return !!el.checked;
+    const nodes = document.querySelectorAll("input[type='radio']");
+    for (const node of nodes) {
+      if (node.getAttribute("name") === name && node.checked) return true;
+    }
+    return false;
+  }
+  if (type === "checkbox") {
+    if (el.checked) return true;
+    const name = el.getAttribute("name") || "";
+    if (!name) return false;
+    const nodes = document.querySelectorAll("input[type='checkbox']");
+    for (const node of nodes) {
+      if (node.getAttribute("name") === name && node.checked) return true;
+    }
+    return false;
+  }
+  if (tag === "SELECT") {
+    const value = String(el.value || "").trim();
+    if (!value) return false;
+    const option = el.options[el.selectedIndex];
+    const label = option ? String(option.label || option.text || "") : "";
+    return !placeholder(label);
+  }
+  if (type === "file") return !!(el.files && el.files.length);
+  if (tag === "BUTTON" || role === "button" || role === "listbox" || role === "combobox") {
+    const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+    if (popup === "listbox" || role === "listbox") {
+      const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      return shown.length > 0 && !placeholder(shown);
+    }
+    if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
+      const typed = String(el.value || "").trim();
+      if (typed && !placeholder(typed)) return true;
+      const root = el.closest(".select__control") || el.parentElement;
+      const choice = root ? root.querySelector(".select__single-value, .select__multi-value") : null;
+      const shown = choice ? String(choice.textContent || "").replace(/\s+/g, " ").trim() : "";
+      return shown.length > 0 && !placeholder(shown);
+    }
+    function selected(node) {
+      if (!node) return false;
+      if (node.getAttribute("aria-pressed") === "true" || node.getAttribute("aria-checked") === "true") {
+        return true;
+      }
+      const cls = String(node.className || "").toLowerCase();
+      return /(^|\s)(selected|is-selected|checked)(\s|$)/.test(cls);
+    }
+    let box = el.parentElement;
+    for (let depth = 0; box && depth < 6; depth += 1, box = box.parentElement) {
+      const kids = box.querySelectorAll("button, [role='button']");
+      if (kids.length < 2 || kids.length > 8) continue;
+      for (const kid of kids) {
+        if (selected(kid)) return true;
+      }
+      return false;
+    }
+    return selected(el);
+  }
+  const value = "value" in el ? el.value : el.textContent;
+  return String(value || "").trim().length > 0;
+}"""
+
+
+def control_committed(page: Any, selector: str) -> bool:
+    """True when the live control holds a real value.
+
+    A page with no ``evaluate`` (a unit-test double) is treated as committed so
+    those tests do not invent a blocker. A real page that throws is not committed.
+    """
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate(_COMMITTED_JS, selector))
+    except Exception:
+        return False
+
+
+def sync_required_progress(committed_keys: set[str], open_keys: set[str]) -> None:
+    """Count a required field done only when its value is still on the page."""
+    state = current_run()
+    if state is None:
+        return
+    for key in committed_keys:
+        if not key:
+            continue
+        state.seen.add(key)
+        state.done.add(key)
+    for key in open_keys:
+        if not key:
+            continue
+        state.seen.add(key)
+        state.done.discard(key)
+    state.progress["requiredTotal"] = len(state.seen)
+    state.progress["requiredDone"] = len(state.done)
+    _refresh(state)
 
 
 def counts_required(control: Any) -> bool:

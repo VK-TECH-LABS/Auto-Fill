@@ -84,7 +84,7 @@ Profiles are JSON. Load them from a path the caller provides or from `AUTOFILL_P
 | `experience` | `years_of_experience_total`, `education_level`, `current_job_title`, `current_company`, `target_role` | "Years of experience with Kubernetes" is not treated as total years. |
 | `skills` | list of strings | "Do you have experience with Python?" is Yes only when Python is in this list. Otherwise it is left for a person. |
 | `screening` | `age_18_or_older`, `willing_background_check`, `felony_conviction`, `previously_employed_here`, `how_heard` | Empty stays empty. ApplyPilot hardcoded several of these; Auto-Fill will not. |
-| `eeo_voluntary` | `gender`, `race_ethnicity`, `veteran_status`, `disability_status` | Default is to decline. Set them when the candidate wants to self-identify. |
+| `eeo_voluntary` | `gender`, `race_ethnicity`, `veteran_status`, `disability_status` | Never filled, in any mode. A person answers them. They are listed as demographic questions and left blank. |
 | `documents` | `cover_letter_text` | Used only when the caller also passes that text into the API. File uploads are separate arguments. |
 | Extended | `candidateId`, `basics`, `address`, `employment[]`, `education[]`, `internships[]`, `projects[]`, `applicationAnswers[]`, `workAuthorization`, `sponsorship`, `salaryExpectation` | Folded into the sections above. `personal` wins when both `basics` and `personal` set the same key. Unknown questions stay blank. Salary and work authorization are never invented. |
 

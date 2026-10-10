@@ -274,3 +274,67 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
             "email": "drew.example@example.com",
             "city": "Drew City",
         }
+
+
+def test_unanswered_required_question_blocks_until_answer(fixture_origin: str):
+    """READY waits until every visible required field is committed."""
+    _chromium_or_skip()
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    raw["candidateId"] = "candidate-example"
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    app = create_app(token=TOKEN, runner=runner, run_browser=True)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/sessions",
+            headers=AUTH,
+            json={
+                "candidateContext": raw,
+                "jobContext": {
+                    "applicationUrl": f"{fixture_origin}/required_question.html",
+                    "jobId": "job-example",
+                    "candidateId": "candidate-example",
+                    "title": "Example Engineer",
+                    "company": "Example Labs",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["protocolVersion"] == "0.6.0"
+        session_id = created.json()["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        body = started.json()
+        assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
+        blocking = body["blocking"]
+        assert blocking["kind"] == "QUESTION"
+        assert "favorite color" in blocking["text"].lower()
+        progress = body["progress"]
+        assert progress["requiredDone"] < progress["requiredTotal"]
+        assert progress["percent"] != 100
+        assert progress["percent"] == min(
+            99,
+            round(100 * progress["requiredDone"] / progress["requiredTotal"]),
+        )
+        highlighted = "() => document.querySelector('#color').getAttribute('data-af-highlight')"
+        assert _eval(runner, session_id, highlighted) == "1"
+        plain = "() => document.querySelector('#name').getAttribute('data-af-highlight')"
+        assert _eval(runner, session_id, plain) is None
+        assert _eval(runner, session_id, "() => document.querySelector('#color').value") == ""
+        answered = client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": blocking["questionHash"], "value": "Blue"},
+        )
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["filled"] is True
+        finished = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert finished.status_code == 200, finished.text
+        done = finished.json()
+        assert done["status"] == Status.READY_FOR_HUMAN_SUBMIT, done.get("messages")
+        assert done["blocking"] is None
+        assert done["progress"]["requiredDone"] == done["progress"]["requiredTotal"]
+        assert done["progress"]["percent"] == 100
+        assert done["stopped_before_submit"] is True
+        assert _eval(runner, session_id, "() => document.querySelector('#color').value") == "Blue"
+        assert _eval(runner, session_id, highlighted) is None
+        assert _eval(runner, session_id, "() => window.__submitted") is not True

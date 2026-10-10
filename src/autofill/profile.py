@@ -125,12 +125,12 @@ class Experience:
 
 @dataclass
 class EeoVoluntary:
-    """Voluntary self-identification. Defaults decline rather than guess."""
+    """Voluntary self-identification. Never filled; a person answers these."""
 
-    gender: str = "Decline to self-identify"
-    race_ethnicity: str = "Decline to self-identify"
-    veteran_status: str = "I am not a protected veteran"
-    disability_status: str = "I do not wish to answer"
+    gender: str = ""
+    race_ethnicity: str = ""
+    veteran_status: str = ""
+    disability_status: str = ""
 
 
 @dataclass
@@ -258,7 +258,6 @@ class CandidateProfile:
         if not isinstance(skills_raw, list) or not all(isinstance(item, str) for item in skills_raw):
             raise ProfileError("skills must be a list of strings.")
 
-        eeo_defaults = EeoVoluntary()
         return cls(
             personal=Personal(
                 full_name=full_name,
@@ -300,13 +299,10 @@ class CandidateProfile:
                 target_role=_text(experience, "target_role"),
             ),
             eeo_voluntary=EeoVoluntary(
-                gender=_text(eeo, "gender", eeo_defaults.gender) or eeo_defaults.gender,
-                race_ethnicity=_text(eeo, "race_ethnicity", eeo_defaults.race_ethnicity)
-                or eeo_defaults.race_ethnicity,
-                veteran_status=_text(eeo, "veteran_status", eeo_defaults.veteran_status)
-                or eeo_defaults.veteran_status,
-                disability_status=_text(eeo, "disability_status", eeo_defaults.disability_status)
-                or eeo_defaults.disability_status,
+                gender=_text(eeo, "gender"),
+                race_ethnicity=_text(eeo, "race_ethnicity"),
+                veteran_status=_text(eeo, "veteran_status"),
+                disability_status=_text(eeo, "disability_status"),
             ),
             screening=Screening(
                 age_18_or_older=_text(screening, "age_18_or_older"),

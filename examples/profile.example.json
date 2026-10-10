@@ -47,10 +47,10 @@
     "how_heard": "Online job board"
   },
   "eeo_voluntary": {
-    "gender": "Decline to self-identify",
-    "race_ethnicity": "Decline to self-identify",
-    "veteran_status": "I am not a protected veteran",
-    "disability_status": "I do not wish to answer"
+    "gender": "",
+    "race_ethnicity": "",
+    "veteran_status": "",
+    "disability_status": ""
   },
   "documents": {
     "cover_letter_text": "Casey Example is a fictional candidate. This sentence exists so a cover-letter box can be filled in tests."
