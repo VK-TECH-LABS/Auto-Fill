@@ -1824,3 +1824,65 @@ def test_missing_grant_filename_uses_resume_pdf_not_the_placeholder(browser, res
         _assert_placeholder_stayed_off_the_page(page, result)
     finally:
         page.close()
+
+
+_LEVER_AUSTINS = (
+    "<h1>Application</h1><form>"
+    "<label for='current-location'>Current location</label>"
+    "<input id='current-location' name='location' type='text' autocomplete='off'>"
+    "<input id='selected-location' type='hidden' name='selectedLocation'>"
+    "<div id='location-results' hidden>"
+    "<div class='dropdown-location' id='location-0'>Austin, TX, USA</div>"
+    "<div class='dropdown-location' id='location-1'>Austin, MN, USA</div>"
+    "<div class='dropdown-location' id='location-2'>Austin, IN, USA</div>"
+    "<div class='dropdown-location' id='location-3'>Austin, AR, USA</div>"
+    "</div></form>"
+    "<script>"
+    "const input = document.getElementById('current-location');"
+    "const dropdown = document.getElementById('location-results');"
+    "input.addEventListener('input', () => { dropdown.hidden = !input.value.trim(); });"
+    "</script>"
+)
+
+
+def test_lever_location_without_a_city_says_why(browser, resolver, caplog):
+    """No city from the resolver is a profile gap. It is logged, not silent."""
+    server, url = resolver
+    caplog.set_level("INFO")
+    server.custom_fields = {"fullName": "River Example"}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_LEVER_AUSTINS)
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("#current-location").input_value() == ""
+        assert "Current location" in [item.get("text") for item in result.manual_questions]
+        assert "location left manual reason=no_city" in caplog.text
+        assert "has_region=False" in caplog.text
+        assert "River Example" not in caplog.text
+        step = next(line for line in caplog.text.splitlines() if "returned_keys=" in line)
+        requested = step.split("field_keys=")[1].split(" intents=")[0].split(",")
+        returned = step.split("returned_keys=")[1].split(" result=")[0].split(",")
+        assert "address.city" in requested
+        assert "address.city" not in returned
+        assert all(key != "River Example" for key in returned)
+    finally:
+        page.close()
+
+
+def test_lever_location_city_without_state_is_ambiguous(browser, resolver, caplog):
+    """Four Austins and no state: nothing is guessed, and the reason is logged."""
+    server, url = resolver
+    caplog.set_level("INFO")
+    server.custom_fields = {"address.city": "Austin"}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_LEVER_AUSTINS)
+        result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
+        assert page.locator("#selected-location").input_value() == ""
+        assert "Current location" in [item.get("text") for item in result.manual_questions]
+        assert "location left manual reason=ambiguous" in caplog.text
+        assert "Austin, TX, USA" in caplog.text
+    finally:
+        page.close()

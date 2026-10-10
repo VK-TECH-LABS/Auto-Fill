@@ -189,7 +189,7 @@ def fill_resolved_page(
             resume_code = "blocked" if outcome.resume_blocked else "attached"
         logger.info(
             "session=%s step=%s adapter=%s field_keys=%s intents=%s "
-            "requested=%s returned=%s result=%s resume=%s latency_ms=%s",
+            "requested=%s returned=%s returned_keys=%s result=%s resume=%s latency_ms=%s",
             session_id,
             step,
             adapter.name if adapter else "generic",
@@ -197,6 +197,7 @@ def fill_resolved_page(
             ",".join(intent or "unknown" for intent in outcome.requested_intents),
             len(field_keys) + len(questions),
             len(response.fields) + len(response.answers),
+            ",".join(sorted(str(key) for key in response.fields)),
             response.result_code,
             resume_code,
             response.latency_ms,
@@ -871,6 +872,10 @@ _WRITE_LOCATION_JS = """
 """
 
 
+def _city_hits(options: list[tuple[str, str]], city: str) -> int:
+    return sum(1 for label, _selector in options if _same_city(label, city))
+
+
 def _remember_location(outcome: ResolvedPage, control: Control, detail: str) -> None:
     outcome.fields.append(
         FieldOutcome(
@@ -888,13 +893,22 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
     if not city:
+        # The resolver sent no city and no location string. Say so: this is a
+        # profile gap, not a picker failure, and it was silent before.
+        logger.info(
+            "location left manual reason=no_city has_region=%s has_country=%s has_location=%s",
+            bool(region),
+            bool(country),
+            bool(str(fields.get("location") or "").strip()),
+        )
         _manual_location(outcome, control)
         return
     field = page.locator(control.selector)
     try:
         field.fill("")
         field.press_sequentially(city, delay=50)
-    except Exception:
+    except Exception as exc:
+        logger.info("location left manual reason=type_error error=%s", type(exc).__name__)
         _manual_location(outcome, control)
         return
     _wait_location_network(page)
@@ -931,7 +945,17 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
         if text and _location_committed(page, control, city):
             _remember_location(outcome, control, text)
             return
-    logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
+    if not options:
+        reason = "no_suggestions"
+    elif match is None:
+        reason = "ambiguous" if not region and _city_hits(options, city) > 1 else "no_match"
+    else:
+        reason = "not_committed"
+    logger.info(
+        "location left manual reason=%s suggestions=%s",
+        reason,
+        _location_suggestion_log([item[0] for item in options]),
+    )
     try:
         field.fill("")
     except Exception:
