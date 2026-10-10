@@ -79,16 +79,32 @@
     return usable(inner) ? inner : null;
   }
 
-  async function typeVisible(el, text) {
+  async function typeVisible(el, text, append) {
     const target = typingTarget(el);
     if (!target) {
       return false;
     }
-    const value = text == null ? "" : String(text);
+    const incoming = text == null ? "" : String(text);
     focusField(el);
     if (target !== el) {
       focusField(target);
     }
+    if (append) {
+      let current = String(target.value || "");
+      const visibleCount = Math.min(incoming.length, 8);
+      for (let index = 0; index < visibleCount; index += 1) {
+        await sleep(nextDelay());
+        current += incoming.charAt(index);
+        setNative(target, current);
+      }
+      const full = String(target.value || "").slice(0, current.length - visibleCount) + incoming;
+      if (full !== current) {
+        setNative(target, full);
+      }
+      finish(target);
+      return true;
+    }
+    const value = incoming;
     setNative(target, "");
     const visibleCount = value.length > 200 ? 40 : value.length;
     let current = "";

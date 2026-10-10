@@ -825,6 +825,106 @@ def test_screenshot_runs_between_fields_on_the_worker():
         worker.shutdown()
 
 
+def test_answer_rescan_sets_the_section_and_does_not_return_to_opening():
+    from autofill.follow import _progress
+
+    snapshot = PageSnapshot(heading="Apply", controls=[], buttons=[])
+    city = _progress(
+        snapshot,
+        Status.MANUAL_ANSWER_REQUIRED,
+        4,
+        1,
+        step="application",
+        blocker={"fieldKey": "city", "text": "City"},
+        previous_stage="PERSONAL",
+    )
+    assert city["stage"] == "ADDRESS"
+    assert city["currentLabel"] == "Address"
+    assert city["percent"] == progress_percent("ADDRESS", 4, 1)
+    question = _progress(
+        snapshot,
+        Status.MANUAL_ANSWER_REQUIRED,
+        4,
+        2,
+        step="application",
+        blocker={"text": "What is your favorite color?"},
+        previous_stage="PERSONAL",
+    )
+    assert question["stage"] == "QUESTIONS"
+    kept = _progress(
+        PageSnapshot(heading="", controls=[], buttons=[]),
+        Status.MANUAL_ANSWER_REQUIRED,
+        4,
+        2,
+        step="",
+        blocker={"text": "What is your favorite color?"},
+        previous_stage="EDUCATION",
+    )
+    assert kept["stage"] == "EDUCATION"
+    ready = _progress(
+        snapshot,
+        Status.READY_FOR_HUMAN_SUBMIT,
+        4,
+        4,
+        step="application",
+        previous_stage="QUESTIONS",
+    )
+    assert ready["stage"] == "READY"
+
+
+def test_follow_answer_reports_the_blocker_section(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Apply</h1>"
+            "<label for='name'>Full name</label><input id='name' required value='Casey Example'>"
+            "<label for='city'>City</label><input id='city' required>"
+        )
+        profile = CandidateProfile.from_dict(
+            {"personal": {"full_name": "Casey Example", "email": "casey.example@example.com"}}
+        )
+        follow = follow_answer(
+            page,
+            profile=profile,
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+            previous_stage="PERSONAL",
+        )
+        assert follow.status == Status.MANUAL_ANSWER_REQUIRED
+        assert follow.blocking is not None
+        assert follow.blocking["fieldKey"] == "city"
+        assert follow.progress["stage"] == "ADDRESS"
+        assert follow.progress["stage"] != "OPENING"
+        assert follow.progress["requiredTotal"] >= 1
+    finally:
+        page.close()
+
+
+def test_mid_type_flag_pumps_during_a_long_field(browser, monkeypatch):
+    monkeypatch.setenv("AUTOFILL_MID_TYPE", "1")
+    page = browser.new_page()
+    text = "Casey Example wrote a long note for the form."
+    seen: list[str] = []
+
+    def pump() -> None:
+        seen.append(page.locator("#note").input_value())
+
+    from autofill.dom_ui import bind_queue_pump, release_queue_pump
+
+    bind_queue_pump(pump)
+    try:
+        page.set_content("<textarea id='note'></textarea>")
+        assert type_visible(page, "#note", text) is True
+        assert page.locator("#note").input_value() == text
+        assert seen[0] == text[:8]
+        assert seen[-1] == text
+    finally:
+        release_queue_pump()
+        page.close()
+
+
 def test_follow_answer_does_not_type_when_the_step_changes(browser):
     page = browser.new_page()
     try:

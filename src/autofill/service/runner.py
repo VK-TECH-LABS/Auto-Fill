@@ -887,6 +887,7 @@ class PlaywrightRunner:
                     prior=list(request.open_items or []),
                     previous=slot.mark,
                     cover_letter_text=request.cover_letter_text,
+                    previous_stage=str((request.progress or {}).get("stage") or ""),
                 )
                 if follow.changed:
                     result = self._run_engine(request, slot.page, slot)
