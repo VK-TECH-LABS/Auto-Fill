@@ -62,10 +62,10 @@ _FOCUS_JS = """(selector) => {
   return true;
 }"""
 
-_TYPE_JS = """async ({ selector, text }) => {
+_TYPE_JS = """async ({ selector, text, append }) => {
   const el = document.querySelector(selector);
   if (!el || !window.__afUI) return false;
-  return await window.__afUI.typeVisible(el, text);
+  return await window.__afUI.typeVisible(el, text, !!append);
 }"""
 
 _HIGHLIGHT_JS = """(selector) => {
@@ -397,6 +397,57 @@ def safe_label(text: str) -> str:
     if len(cleaned) > 80:
         cleaned = cleaned[:80].rstrip()
     return cleaned
+
+
+_PERSONAL_KEYS = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "full_name",
+        "legal_name",
+        "preferred_name",
+        "email",
+        "phone",
+        "linkedin_url",
+        "github_url",
+        "portfolio_url",
+        "website_url",
+        "firstname",
+        "lastname",
+        "fullname",
+        "legalname",
+        "preferredname",
+    }
+)
+_ADDRESS_KEYS = frozenset({"address", "city", "state", "postal_code", "country", "location"})
+_EMPLOYMENT_KEYS = frozenset(
+    {"current_company", "current_job_title", "internship_company", "company", "employer", "job_title"}
+)
+_EDUCATION_KEYS = frozenset({"school", "field_of_study", "education_level", "degree", "major"})
+_RESUME_KEYS = frozenset({"resume", "cv", "resume.file"})
+
+
+def blocker_stage(item: dict[str, Any] | None) -> str | None:
+    """Section of the field a person is answering, or None when it is not a known section."""
+    if not item:
+        return None
+    raw = str(item.get("fieldKey") or "").strip()
+    folded = raw.casefold()
+    compact = folded.replace(".", "").replace("_", "").replace("-", "")
+    if folded.startswith("address.") or folded in _ADDRESS_KEYS or compact in _ADDRESS_KEYS:
+        return "ADDRESS"
+    if folded.startswith("employment") or folded in _EMPLOYMENT_KEYS or compact in _EMPLOYMENT_KEYS:
+        return "EMPLOYMENT"
+    if folded.startswith("education") or folded in _EDUCATION_KEYS or compact in _EDUCATION_KEYS:
+        return "EDUCATION"
+    if folded.startswith("resume") or folded in _RESUME_KEYS or compact in {"resume", "cv"}:
+        return "RESUME"
+    if folded.startswith("links.") or folded in _PERSONAL_KEYS or compact in _PERSONAL_KEYS:
+        return "PERSONAL"
+    named = stage_for("", str(item.get("text") or ""), "")
+    if named != "OPENING":
+        return named
+    return None
 
 
 def stage_for(step: str, heading: str, status: str) -> str:
@@ -769,6 +820,17 @@ def type_visible(page: Any, selector: str, text: str) -> bool:
     if not selector:
         return False
     focus_field(page, selector)
+    if _mid_type(text):
+        prefix = text[:8]
+        typed = _type_once(page, selector, prefix)
+        if not typed:
+            install(page)
+            typed = _type_once(page, selector, prefix)
+        if typed:
+            _pump_queue()
+            rest = _type_once(page, selector, text[8:], append=True)
+            _pump_queue()
+            return rest
     typed = _type_once(page, selector, text)
     if not typed:
         install(page)
@@ -777,12 +839,17 @@ def type_visible(page: Any, selector: str, text: str) -> bool:
     return typed
 
 
-def _type_once(page: Any, selector: str, text: str) -> bool:
+def _mid_type(text: str) -> bool:
+    """One screenshot window in a long field. Off unless AUTOFILL_MID_TYPE=1."""
+    return os.environ.get("AUTOFILL_MID_TYPE") == "1" and len(text) >= 40
+
+
+def _type_once(page: Any, selector: str, text: str, *, append: bool = False) -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return False
     try:
-        return bool(evaluate(_TYPE_JS, {"selector": selector, "text": text}))
+        return bool(evaluate(_TYPE_JS, {"selector": selector, "text": text, "append": append}))
     except Exception:
         return False
 

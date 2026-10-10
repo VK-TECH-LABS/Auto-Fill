@@ -13,6 +13,7 @@ from autofill.adapters import page_step
 from autofill.ats import detect_ats
 from autofill.dom_ui import (
     STAGE_TITLES,
+    blocker_stage,
     control_committed,
     present_blocking,
     progress_percent,
@@ -75,6 +76,7 @@ def follow_answer(
     previous: PageMark | None,
     cover_letter_text: str | None = None,
     cover_letter_path: str | None = None,
+    previous_stage: str = "",
 ) -> FollowUp:
     """Outline the next empty required field. Type only controls that just appeared."""
     mark, snapshot = read_page_mark(page)
@@ -85,7 +87,14 @@ def follow_answer(
             status=Status.CAPTCHA_REQUIRED,
             messages=["A visible challenge is on the page."],
             mark=mark,
-            progress=_progress(snapshot, Status.CAPTCHA_REQUIRED, 0, 0),
+            progress=_progress(
+                snapshot,
+                Status.CAPTCHA_REQUIRED,
+                0,
+                0,
+                step=mark.step,
+                previous_stage=previous_stage,
+            ),
         )
     if _page_changed(previous, mark):
         return FollowUp(changed=True, status="", mark=mark)
@@ -116,7 +125,15 @@ def follow_answer(
         changed=False,
         status=status,
         open_items=gaps,
-        progress=_progress(snapshot, status, total, done),
+        progress=_progress(
+            snapshot,
+            status,
+            total,
+            done,
+            step=mark.step,
+            blocker=gaps[0] if gaps else None,
+            previous_stage=previous_stage,
+        ),
         blocking=public_blocking(gaps[0]) if gaps else None,
         manual_questions=_public_questions(gaps),
         messages=messages,
@@ -140,9 +157,31 @@ def _page_changed(previous: PageMark | None, mark: PageMark) -> bool:
     return bool(previous.selectors) and not mark.selectors
 
 
-def _progress(snapshot: PageSnapshot, status: str, total: int, done: int) -> dict:
-    stage = stage_for("", snapshot.heading, status)
-    label = safe_label(snapshot.heading) or STAGE_TITLES.get(stage, STAGE_TITLES["QUESTIONS"])
+def _progress(
+    snapshot: PageSnapshot,
+    status: str,
+    total: int,
+    done: int,
+    *,
+    step: str = "",
+    blocker: dict | None = None,
+    previous_stage: str = "",
+) -> dict:
+    """Same section rules as a full fill, plus the field that is blocking now.
+
+    A scan must not put the stage back to OPENING after the form has been found.
+    """
+    stage = stage_for(step, snapshot.heading, status)
+    if stage not in {"READY", "LOGIN"}:
+        section = blocker_stage(blocker)
+        if section:
+            stage = section
+    if stage == "OPENING" and previous_stage not in {"", "OPENING"}:
+        stage = previous_stage
+    heading_stage = stage_for(step, snapshot.heading, "")
+    label = safe_label(snapshot.heading)
+    if not label or stage != heading_stage:
+        label = STAGE_TITLES.get(stage, STAGE_TITLES["QUESTIONS"])
     return {
         "stage": stage,
         "requiredTotal": total,
