@@ -180,7 +180,7 @@ def fill_resolved_page(
     outcome.requested_intents = [ask.match.intent if ask.match else None for ask in requests if ask.include_question]
 
     if not field_keys and not questions:
-        _note_unfilled_required(outcome)
+        _note_unfilled_required(outcome, page)
         return outcome
 
     response: ResolverResponse | None = None
@@ -194,7 +194,7 @@ def fill_resolved_page(
         )
         response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
         _apply(page, requests, response, active, outcome, snapshot.heading)
-        _note_unfilled_required(outcome)
+        _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
         if "resume.file" in field_keys:
@@ -216,6 +216,7 @@ def fill_resolved_page(
         )
         return outcome
     finally:
+        ensure_blocker_options(page, outcome.manual_questions)
         if response is not None:
             response.wipe()
 
@@ -1539,7 +1540,7 @@ def _checkbox_buckets(controls: list[Control]) -> dict[str, list[Control]]:
     return buckets
 
 
-def _note_unfilled_required(outcome: ResolvedPage) -> None:
+def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
     """Every required visible control that is still empty is a manual question.
 
     Options of a checkbox group stay on that one question. A section heading
@@ -1547,6 +1548,8 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
     """
     snapshot = outcome.snapshot
     if snapshot is None:
+        if page is not None:
+            ensure_blocker_options(page, outcome.manual_questions)
         return
     filled = {item.selector for item in outcome.fields if item.action in _FILLED_ACTIONS and item.selector}
     seen = {normalize_question(str(item.get("text") or "")) for item in outcome.manual_questions}
@@ -1583,6 +1586,8 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
         seen.add(key)
         _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, control=control)
     _drop_emitted_options(outcome)
+    if page is not None:
+        ensure_blocker_options(page, outcome.manual_questions)
 
 
 def _drop_emitted_options(outcome: ResolvedPage) -> None:
@@ -1870,6 +1875,31 @@ def _manual_label(control: Control) -> str:
     return _question_text([control])
 
 
+_CHOICE_ANSWER_TYPES = frozenset({"single_select", "multi_select"})
+
+
+def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
+    """Fill empty choice lists from the live control, including a closed combobox."""
+    if page is None or not items:
+        return
+    from autofill.dom_ui import read_choice_options
+
+    for item in items:
+        if str(item.get("answerType") or "") not in _CHOICE_ANSWER_TYPES:
+            continue
+        existing = [str(option).strip() for option in item.get("options") or [] if str(option).strip()]
+        if existing:
+            continue
+        selector = str(item.get("selector") or "")
+        if not selector:
+            continue
+        labels = read_choice_options(page, selector)
+        if not labels:
+            labels = list_combobox_options(page, selector)
+        if labels:
+            item["options"] = labels
+
+
 def _option_labels(controls: list[Control]) -> list[str]:
     if len(controls) > 1:
         return [_checkbox_label(item) for item in controls][:20]
@@ -2056,29 +2086,64 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
     return merged
 
 
+def inspect_required(
+    page,
+    snapshot: PageSnapshot,
+    profile: CandidateProfile | None = None,
+    prior: list[dict[str, Any]] | None = None,
+    *,
+    option_reads: int | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Empty required controls, plus how many required clusters are committed.
+
+    ``option_reads`` caps how many gaps open a menu while they are built.
+    Choice items that are still missing a list are read afterwards. A full
+    fill leaves the cap unset.
+    """
+    clusters = _gap_clusters(snapshot)
+    committed: set[str] = set()
+    open_keys: set[str] = set()
+    gaps: list[dict[str, Any]] = []
+    committed_clusters = 0
+    reads = 0
+    for cluster in clusters:
+        keys = [key for key in (_required_key(item) for item in cluster) if key]
+        if _cluster_committed(page, cluster):
+            committed.update(keys)
+            committed_clusters += 1
+            continue
+        open_keys.update(keys)
+        use_page = page
+        if option_reads is not None and reads >= option_reads:
+            use_page = None
+        gaps.append(_gap_item(cluster, profile, use_page))
+        reads += 1
+    sync_required_progress(committed, open_keys)
+    if prior:
+        gaps = _merge_gap_items(gaps, prior)
+    if page is not None:
+        ensure_blocker_options(page, gaps)
+    return gaps, len(clusters), committed_clusters
+
+
 def required_gaps(
     page,
     snapshot: PageSnapshot,
     profile: CandidateProfile | None = None,
     prior: list[dict[str, Any]] | None = None,
+    *,
+    option_reads: int | None = None,
 ) -> list[dict[str, Any]]:
     """Visible required controls that are still empty, in page order.
 
     ``profile`` classifies a profile-mode field. Resolver mode passes None and
     keeps a prior manual item when one already names the same control.
     """
-    clusters = _gap_clusters(snapshot)
-    committed: set[str] = set()
-    open_keys: set[str] = set()
-    gaps: list[dict[str, Any]] = []
-    for cluster in clusters:
-        keys = [key for key in (_required_key(item) for item in cluster) if key]
-        if _cluster_committed(page, cluster):
-            committed.update(keys)
-            continue
-        open_keys.update(keys)
-        gaps.append(_gap_item(cluster, profile, page))
-    sync_required_progress(committed, open_keys)
-    if prior:
-        return _merge_gap_items(gaps, prior)
+    gaps, _total, _done = inspect_required(
+        page,
+        snapshot,
+        profile,
+        prior,
+        option_reads=option_reads,
+    )
     return gaps

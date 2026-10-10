@@ -264,6 +264,7 @@ class AnswerOut(BaseModel):
 
     filled: bool
     reason: str | None = None
+    ms: int | None = None
 
 
 class ManualQuestionOut(BaseModel):

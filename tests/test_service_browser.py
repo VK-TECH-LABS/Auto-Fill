@@ -360,6 +360,100 @@ _COUNTRY_VALUE = """() => ({
 })"""
 
 
+def test_answer_does_not_refill_committed_fields(fixture_origin: str, monkeypatch: pytest.MonkeyPatch):
+    """An answer types the new field and the next blocker, not fields that already committed."""
+    _chromium_or_skip()
+    import autofill.engine as engine
+
+    fills = {"count": 0}
+    original = engine.fill_one_page
+
+    def counting(*args, **kwargs):
+        fills["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "fill_one_page", counting)
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    raw["candidateId"] = "candidate-example"
+    runner = PlaywrightRunner(enabled=True, headless=True, workers=1)
+    app = create_app(token=TOKEN, runner=runner, run_browser=True)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/sessions",
+            headers=AUTH,
+            json={
+                "candidateContext": raw,
+                "jobContext": {
+                    "applicationUrl": f"{fixture_origin}/incremental_answer.html",
+                    "jobId": "job-example",
+                    "candidateId": "candidate-example",
+                    "title": "Example Engineer",
+                    "company": "Example Labs",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        body = started.json()
+        assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
+        assert "color" in body["blocking"]["text"].lower()
+        assert fills["count"] >= 1
+        filled_pages = fills["count"]
+        _eval(
+            runner,
+            session_id,
+            """() => {
+              window.__writes = [];
+              document.addEventListener("input", (event) => {
+                window.__writes.push(event.target.id);
+              }, true);
+            }""",
+        )
+        answered = client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": body["blocking"]["questionHash"], "value": "Blue"},
+        )
+        assert answered.status_code == 200, answered.text
+        payload = answered.json()
+        assert payload["filled"] is True
+        assert isinstance(payload["ms"], int)
+        assert payload["ms"] < 3000
+        assert fills["count"] == filled_pages
+        writes = _eval(runner, session_id, "() => window.__writes.slice()")
+        assert "name" not in writes
+        assert "email" not in writes
+        assert "animal" not in writes
+        assert "city" in writes
+        values = _eval(
+            runner,
+            session_id,
+            """() => ({
+              name: document.querySelector('#name').value,
+              email: document.querySelector('#email').value,
+              color: document.querySelector('#color').value,
+              city: document.querySelector('#city').value,
+              animal: document.querySelector('#animal').value,
+              highlighted: document.querySelector('[data-af-highlight]')
+                ? document.querySelector('[data-af-highlight]').id
+                : ""
+            })""",
+        )
+        assert values["name"] == "Casey Example"
+        assert values["email"] == "casey.example@example.com"
+        assert values["color"] == "Blue"
+        assert values["city"] == "Example City"
+        assert values["animal"] == ""
+        assert values["highlighted"] == "animal"
+        follow = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert follow.status_code == 200, follow.text
+        assert follow.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert "animal" in follow.json()["blocking"]["text"].lower()
+        assert follow.json()["status"] != Status.RESUME_UPLOAD_REQUIRED
+
+
 def test_react_select_outline_answer_and_country_alias(fixture_origin: str):
     """A Greenhouse-style combobox is outlined on its box, answered from the menu, and country aliases match."""
     _chromium_or_skip()
@@ -415,7 +509,8 @@ def test_react_select_outline_answer_and_country_alias(fixture_origin: str):
             json={"questionHash": blocking["questionHash"], "value": "Window"},
         )
         assert answered.status_code == 200, answered.text
-        assert answered.json() == {"filled": True}
+        assert answered.json()["filled"] is True
+        assert isinstance(answered.json()["ms"], int)
         finished = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
         assert finished.status_code == 200, finished.text
         done = finished.json()

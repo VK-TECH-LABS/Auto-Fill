@@ -587,18 +587,98 @@ def options_equivalent(desired: str, option: str) -> bool:
     return False
 
 
-def match_option_exact(desired: str, options: list[Option]) -> Option | None:
-    """Pick the option whose label or value is exact or an allowed equivalent."""
-    if not desired or not options:
+def option_words(value: str) -> list[str]:
+    """Case-folded words. Apostrophes stay inside a word, then drop for comparison."""
+    text = value.casefold().replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+    cleaned: list[str] = []
+    for char in text:
+        if char.isalnum() or char in {"'", "+"}:
+            cleaned.append(char)
+        else:
+            cleaned.append(" ")
+    words: list[str] = []
+    for word in "".join(cleaned).split():
+        token = word.strip("'").replace("'", "")
+        if token:
+            words.append(token)
+    return words
+
+
+def _word_tier(desired: list[str], option: list[str]) -> int | None:
+    """0 exact, 1 prefix, 2 contains. None when the option does not contain the words."""
+    if not desired or not option or len(option) < len(desired):
         return None
-    for option in options:
-        if options_equivalent(desired, option.label) or options_equivalent(desired, option.value):
-            return option
+    span = len(desired)
+    for start in range(len(option) - span + 1):
+        if option[start : start + span] != desired:
+            continue
+        if start == 0 and len(option) == span:
+            return 0
+        if start == 0:
+            return 1
+        return 2
     return None
 
 
+def _option_tier(desired: list[str], option: Option) -> int | None:
+    tiers = [
+        tier
+        for tier in (
+            _word_tier(desired, option_words(option.label)),
+            _word_tier(desired, option_words(option.value)),
+        )
+        if tier is not None
+    ]
+    if not tiers:
+        return None
+    return min(tiers)
+
+
+def pick_option(desired: str, options: list[Option]) -> tuple[str, Option | None]:
+    """Match one option, or report that several options fit.
+
+    Exact labels and allowed equivalents win. Otherwise one option wins when
+    it is the only exact, prefix, or contains word match. ``ambiguous`` means
+    more than one option fits at that best tier.
+    """
+    if not desired.strip() or not options:
+        return "none", None
+    for option in options:
+        if options_equivalent(desired, option.label) or (
+            option.value and options_equivalent(desired, option.value)
+        ):
+            return "match", option
+    wanted = option_words(desired)
+    if not wanted:
+        return "none", None
+    best_tier: int | None = None
+    found: list[Option] = []
+    for option in options:
+        tier = _option_tier(wanted, option)
+        if tier is None:
+            continue
+        if best_tier is None or tier < best_tier:
+            best_tier = tier
+            found = [option]
+        elif tier == best_tier:
+            found.append(option)
+    if not found:
+        return "none", None
+    if len(found) > 1:
+        return "ambiguous", None
+    return "match", found[0]
+
+
+def match_option_exact(desired: str, options: list[Option]) -> Option | None:
+    """The unique option for this value. Ambiguous and unknown values return None."""
+    status, option = pick_option(desired, options)
+    if status != "match":
+        return None
+    return option
+
+
 def match_all_options(values: list[str], options: list[Option]) -> list[Option] | None:
-    """Map every saved value, or return None when any value has no exact option."""
+    """Map every saved value, or return None when any value has no unique option."""
     if not values:
         return None
     chosen: list[Option] = []

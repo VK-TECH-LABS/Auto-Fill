@@ -55,24 +55,52 @@
     }
   }
 
+  function typingTarget(el) {
+    if (!el) {
+      return null;
+    }
+    const blocked = { hidden: 1, radio: 1, checkbox: 1, file: 1, button: 1, submit: 1, reset: 1, image: 1 };
+    function usable(node) {
+      if (!(node instanceof HTMLInputElement) && !(node instanceof HTMLTextAreaElement)) {
+        return false;
+      }
+      const type = String(node.getAttribute("type") || node.type || "").toLowerCase();
+      return !blocked[type];
+    }
+    if (usable(el)) {
+      return el;
+    }
+    if (!el.querySelector) {
+      return null;
+    }
+    const inner = el.querySelector(
+      "textarea, input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='file']):not([type='button']):not([type='submit']):not([type='reset']):not([type='image'])"
+    );
+    return usable(inner) ? inner : null;
+  }
+
   async function typeVisible(el, text) {
-    if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLTextAreaElement)) {
+    const target = typingTarget(el);
+    if (!target) {
       return false;
     }
     const value = text == null ? "" : String(text);
     focusField(el);
-    setNative(el, "");
+    if (target !== el) {
+      focusField(target);
+    }
+    setNative(target, "");
     const visibleCount = value.length > 200 ? 40 : value.length;
     let current = "";
     for (let index = 0; index < visibleCount; index += 1) {
       await sleep(nextDelay());
       current += value.charAt(index);
-      setNative(el, current);
+      setNative(target, current);
     }
     if (current !== value) {
-      setNative(el, value);
+      setNative(target, value);
     }
-    finish(el);
+    finish(target);
     return true;
   }
 

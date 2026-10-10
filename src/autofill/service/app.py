@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from autofill import __version__
 from autofill.credentials import Credentials
-from autofill.dom_ui import empty_progress, match_open_item, values_fit
+from autofill.dom_ui import empty_progress, fit_choice_values, match_open_item
 from autofill.engine import ApplicationResult, Status
 from autofill.models import JobContext
 from autofill.redact import install_redaction, redaction_filter
@@ -209,6 +209,43 @@ def _mark_browser_crash(session: ServiceSession) -> None:
         session.result.current_step = Status.FAILED_RETRYABLE
         session.result.messages = ["browser_crash"]
     logger.info("session=%s status=%s result=browser_crash", session.session_id, session.status)
+
+
+def _same_blocker(blocking: dict, item: dict) -> bool:
+    for key in ("questionId", "questionHash", "fieldKey"):
+        left = str(blocking.get(key) or "")
+        right = str(item.get(key) or "")
+        if left and right and left == right:
+            return True
+    left_text = str(blocking.get("text") or "")
+    right_text = str(item.get("text") or "")
+    return bool(left_text) and left_text == right_text
+
+
+def _refresh_choice_options(session: ServiceSession, runner, item: dict) -> None:
+    """Read a choice list that the scan stored empty, so a 422 can name the options."""
+    answer_type = str(item.get("answerType") or "")
+    if answer_type not in {"single_select", "multi_select"}:
+        return
+    if any(str(option).strip() for option in item.get("options") or []):
+        return
+    selector = str(item.get("selector") or "")
+    reader = getattr(runner, "choice_options", None)
+    if reader is None or not selector:
+        return
+    try:
+        loaded = reader(session.session_id, selector) or []
+    except PageUnavailable as exc:
+        _mark_browser_crash(session)
+        raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+    options = [str(option) for option in loaded if str(option).strip()]
+    if not options:
+        return
+    item["options"] = options
+    result = session.result
+    blocking = result.blocking if result is not None else None
+    if isinstance(blocking, dict) and _same_blocker(blocking, item):
+        blocking["options"] = list(options)
 
 
 def _allow_browser_restart(session: ServiceSession) -> None:
@@ -629,22 +666,25 @@ def create_app(
         if not values:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(status_code=422, detail={"reason": "empty", "options": list(item.get("options") or [])})
-        if not values_fit(item, values):
+        _refresh_choice_options(session, active_runner, item)
+        reason, canonical = fit_choice_values(item, values)
+        if reason != "ok":
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(
                 status_code=422,
-                detail={"reason": "option_mismatch", "options": [str(option) for option in item.get("options") or []]},
+                detail={"reason": reason, "options": [str(option) for option in item.get("options") or []]},
             )
         for value in values:
             redaction_filter().add(value)
             session.held_answers.append(value)
         target = dict(item)
-        target["value"] = values[0]
-        target["values"] = values
+        target["value"] = canonical[0]
+        target["values"] = canonical
         apply = getattr(active_runner, "apply_answer", None)
         if apply is None:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             return AnswerOut(filled=False, reason="no_page")
+        started = time.perf_counter()
         try:
             filled = apply(session.session_id, target)
         except PageUnavailable as exc:
@@ -652,18 +692,37 @@ def create_app(
             raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
         if not filled.get("filled"):
             logger.info("session=%s action=answer result=rejected", session.session_id)
-            return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"))
+            return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"), ms=elapsed_ms(started))
         selector = str(item.get("selector") or "")
         if selector:
             session.held_selectors.add(selector)
-        logger.info("session=%s action=answer result=filled", session.session_id)
         session.pause_gate.resume()
         session.paused = False
-        if session.status == Status.MANUAL_ANSWER_REQUIRED:
+        advance = getattr(active_runner, "advance_after_answer", None)
+        if advance is not None:
+            try:
+                outcome = advance(
+                    _request_for(
+                        session,
+                        limits,
+                        resume_uploaded=session.resume_uploaded,
+                        human_resolved=session.human_resolved,
+                        answers_updated=True,
+                    )
+                )
+            except PageUnavailable as exc:
+                _mark_browser_crash(session)
+                raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+            if outcome is not None:
+                _accept_result(session, outcome)
+                spent = elapsed_ms(started)
+                logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
+                return AnswerOut(filled=True, ms=spent)
+        if session.status in {Status.MANUAL_ANSWER_REQUIRED, Status.RESUME_UPLOAD_REQUIRED}:
             _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
-        elif session.status == Status.RESUME_UPLOAD_REQUIRED:
-            _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
-        return AnswerOut(filled=True)
+        spent = elapsed_ms(started)
+        logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
+        return AnswerOut(filled=True, ms=spent)
 
     @router.post("/sessions/{session_id}/credentials", response_model=CredentialsOut, tags=["sessions"])
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:
