@@ -181,6 +181,156 @@ def test_continue_requeries_then_resume(client):
     assert mismatch.status_code == 409
 
 
+class _ConfirmRunner:
+    """Returns login, then resume, then a manual blocker. A forgotten confirmation falls back."""
+
+    def __init__(self) -> None:
+        self.flags: list[tuple[bool, bool, bool]] = []
+
+    def run(self, request):
+        self.flags.append((request.resume_uploaded, request.human_resolved, request.answers_updated))
+        if not request.human_resolved:
+            status = Status.LOGIN_REQUIRED
+            items: list[dict] = []
+        elif not request.resume_uploaded:
+            status = Status.RESUME_UPLOAD_REQUIRED
+            items = []
+        else:
+            status = Status.MANUAL_ANSWER_REQUIRED
+            name = "degree" if request.answers_updated else "school"
+            items = [
+                {
+                    "questionHash": name,
+                    "selector": f"#{name}",
+                    "text": name.title(),
+                    "answerType": "text",
+                    "options": [],
+                    "kind": "QUESTION",
+                    "fieldKey": name,
+                    "blocking": True,
+                }
+            ]
+        return ApplicationResult(
+            status=status,
+            ats="greenhouse",
+            current_step=status,
+            login_status="NOT_REQUIRED" if request.human_resolved else "LOGIN_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            open_items=items,
+            manual_questions=[{"intent": None, "text": items[0]["text"]}] if items else [],
+        )
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        return {"filled": True}
+
+    def discard(self, session_id: str) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_resume_and_login_confirmations_survive_answer_pause_and_continue():
+    runner = _ConfirmRunner()
+    app = create_app(
+        token=TOKEN,
+        runner=runner,
+        run_browser=False,
+        session_ttl_seconds=1800,
+        reaper_interval_seconds=60,
+    )
+    with TestClient(app) as test_client:
+        created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        started = test_client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        assert started.json()["status"] == Status.LOGIN_REQUIRED
+        signed_in = test_client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"humanResolved": True},
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        assert signed_in.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+        confirmed = test_client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"resumeUploaded": True},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        held = app.state.store.get(session_id)
+        assert held is not None
+        assert held.resume_uploaded is True
+        assert held.human_resolved is True
+        paused = test_client.post(f"/v1/sessions/{session_id}/pause", headers=AUTH)
+        assert paused.status_code == 200
+        released = test_client.post(f"/v1/sessions/{session_id}/resume", headers=AUTH)
+        assert released.status_code == 200
+        assert released.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert held.resume_uploaded is True
+        assert held.human_resolved is True
+        answered = test_client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": "school", "value": "Example University"},
+        )
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["filled"] is True
+        status = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.status_code == 200, status.text
+        assert status.json()["status"] != Status.RESUME_UPLOAD_REQUIRED
+        assert status.json()["status"] != Status.LOGIN_REQUIRED
+        assert status.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert held.resume_uploaded is True
+        assert held.human_resolved is True
+        assert runner.flags == [
+            (False, False, False),
+            (False, True, False),
+            (True, True, False),
+            (True, True, True),
+        ]
+
+
+def test_status_returns_410_when_the_ttl_clock_passes(monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("autofill.service.app.monotonic", lambda: clock["now"])
+    runner = ScriptedRunner()
+    app = create_app(
+        token=TOKEN,
+        runner=runner,
+        run_browser=False,
+        session_ttl_seconds=1800,
+        reaper_interval_seconds=3600,
+    )
+    with TestClient(app) as test_client:
+        created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        held = app.state.store.get(session_id)
+        assert held is not None
+        assert held.expires_at == 2800.0
+        live = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert live.status_code == 200
+        assert live.json()["status"] == "CREATED"
+        clock["now"] = 2799.0
+        still = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert still.status_code == 200
+        clock["now"] = 2800.0
+        expired = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert expired.status_code == 410
+        assert held.status == Status.EXPIRED
+        assert held.resolver_token == ""
+        assert session_id in runner.discarded
+        assert runner.calls == []
+        pause = test_client.post(f"/v1/sessions/{session_id}/pause", headers=AUTH)
+        assert pause.status_code == 410
+        assert held.paused is False
+
+
 def test_ttl_reaper_wipes_the_resolver_token(client):
     _test_client, _runner, app = client
     store = app.state.store

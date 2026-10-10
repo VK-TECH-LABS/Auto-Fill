@@ -370,6 +370,7 @@ class FillRequest:
     credentials: MemoryCredentialProvider
     resume_uploaded: bool
     cover_letter_text: str | None
+    human_resolved: bool = False
     resolver: ResolverBinding | None = None
     answers_updated: bool = False
     timings: dict[str, int] | None = None
@@ -633,6 +634,7 @@ class PlaywrightRunner:
             candidate_id=request.candidate_id,
             page=page,
             resume_uploaded=request.resume_uploaded,
+            human_resolved=request.human_resolved,
             cover_letter_text=request.cover_letter_text,
             headless=self.headless,
             job=request.job,

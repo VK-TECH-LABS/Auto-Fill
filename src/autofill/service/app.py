@@ -57,7 +57,7 @@ from autofill.service.schemas import (
     RunStatusOut,
     TimingsOut,
 )
-from autofill.service.sessions import ServiceSession, ServiceSessionStore, new_session_id
+from autofill.service.sessions import ServiceSession, ServiceSessionStore, monotonic, new_session_id
 
 logger = logging.getLogger("autofill.service")
 
@@ -272,6 +272,7 @@ def _request_for(
     limits: dict[str, float | int],
     *,
     resume_uploaded: bool,
+    human_resolved: bool = False,
     answers_updated: bool = False,
 ) -> FillRequest:
     return FillRequest(
@@ -283,6 +284,7 @@ def _request_for(
         job=session.job,
         credentials=session.credentials,
         resume_uploaded=resume_uploaded,
+        human_resolved=human_resolved,
         cover_letter_text=session.cover_letter_text,
         resolver=_binding(session, limits),
         answers_updated=answers_updated,
@@ -302,6 +304,7 @@ def _run(
     limits: dict[str, float | int],
     *,
     resume_uploaded: bool,
+    human_resolved: bool = False,
     answers_updated: bool = False,
 ) -> RunStatusOut:
     try:
@@ -310,6 +313,10 @@ def _run(
         raise HTTPException(status_code=404, detail="Session not found.") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail="Session is already running.") from exc
+    # A person confirms the resume or a login once. Later answer and continue
+    # calls keep that confirmation instead of asking again.
+    session.resume_uploaded = session.resume_uploaded or resume_uploaded
+    session.human_resolved = session.human_resolved or human_resolved
     previous = session.status
     session.status = Status.STARTED
     try:
@@ -318,7 +325,8 @@ def _run(
                 _request_for(
                     session,
                     limits,
-                    resume_uploaded=resume_uploaded,
+                    resume_uploaded=session.resume_uploaded,
+                    human_resolved=session.human_resolved,
                     answers_updated=answers_updated,
                 )
             )
@@ -428,7 +436,7 @@ def create_app(
 
     def _reject_expired(session: ServiceSession) -> None:
         """Stop a call on an expired session before it pauses, fills, or stores a secret."""
-        timed_out = bool(session.expires_at) and time.monotonic() >= session.expires_at
+        timed_out = bool(session.expires_at) and monotonic() >= session.expires_at
         if session.status != Status.EXPIRED and not timed_out:
             return
         if not session.busy and session.status != Status.EXPIRED:
@@ -495,7 +503,7 @@ def create_app(
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        session.expires_at = time.monotonic() + session_ttl_seconds
+        session.expires_at = monotonic() + session_ttl_seconds
         session.timings["sessionCreatedMs"] = elapsed_ms(started)
         try:
             store.create(session)
@@ -530,13 +538,13 @@ def create_app(
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
-                return _run(session, store, active_runner, limits, resume_uploaded=False)
+                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
             if session.status not in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}:
                 raise HTTPException(
                     status_code=409,
                     detail="humanResolved continues only after login, a challenge, or a missing form.",
                 )
-            return _run(session, store, active_runner, limits, resume_uploaded=False)
+            return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
             return _run(session, store, active_runner, limits, resume_uploaded=False)

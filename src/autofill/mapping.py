@@ -298,7 +298,9 @@ def match_option(desired: str, options: list[Option]) -> Option | None:
         for option in options:
             if normalize(option.label) in aliases or normalize(option.value) in aliases:
                 return option
-    return None
+    from autofill.combobox import match_country_option
+
+    return match_country_option(desired, options)
 
 
 def _alias_set(token: str) -> set[str]:
@@ -358,7 +360,11 @@ def _profile_text(
     if key == "state":
         return personal.province_state
     if key == "country":
-        return personal.country
+        if personal.country.strip():
+            return personal.country
+        from autofill.combobox import country_from_phone
+
+        return country_from_phone(personal.phone)
     if key == "location":
         parts = [personal.city, personal.province_state, personal.country]
         return ", ".join(part.strip() for part in parts if part and part.strip())
@@ -559,8 +565,8 @@ def _match_rule(control: Control) -> str | None:
             if autocomplete == "tel-national":
                 return "phone"
             return mapped
-    if "country code" in blob:
-        return None
+    if "country code" in blob or "dial code" in blob or "calling code" in blob:
+        return "country"
     label = normalize(control.label or control.aria_label or control.placeholder)
     if label in {"current location", "location", "your location"} and "relocat" not in label:
         return "location"

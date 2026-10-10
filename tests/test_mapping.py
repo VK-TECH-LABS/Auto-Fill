@@ -273,6 +273,52 @@ def test_non_iso_start_date_is_not_forced_into_a_date_input():
     assert mapped.action == "unanswered"
 
 
+def test_phone_country_menu_uses_the_address_or_the_calling_code():
+    options = [
+        Option("1", "Canada +1", selector="#ca"),
+        Option("1", "United States +1", selector="#us"),
+        Option("44", "United Kingdom +44", selector="#uk"),
+    ]
+    united = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "River Example",
+                "email": "river.example@example.com",
+                "phone": "+44 20 7946 0000",
+            },
+            "address": {"country": "United States"},
+        }
+    )
+    chosen = map_field(control("Country", kind="select", options=options), united)
+    assert chosen.key == "country"
+    assert chosen.action == "select"
+    assert chosen.option_label == "United States +1"
+    code = map_field(control("Country code", kind="combobox", options=options), united)
+    assert code.option_label == "United States +1"
+    uk = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Casey Example",
+                "email": "casey.example@example.com",
+                "phone": "0044 20 7946 0000",
+            }
+        }
+    )
+    from_phone = map_field(control("Country", kind="select", options=options), uk)
+    assert from_phone.option_label == "United Kingdom +44"
+    blank = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Avery Example",
+                "email": "avery.example@example.com",
+                "phone": "5550100000",
+            }
+        }
+    )
+    unanswered = map_field(control("Country", kind="select", options=options), blank)
+    assert unanswered.action == "unanswered"
+
+
 def test_unrecognized_control_is_left_alone():
     mapped = map_field(control("Pronouns"), profile())
     assert mapped.action == "unanswered"

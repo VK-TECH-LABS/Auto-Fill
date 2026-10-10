@@ -83,6 +83,7 @@ class AutofillOptions:
     cover_letter_text: str | None = None
     cover_letter_path: str | None = None
     resume_uploaded: bool = False
+    human_resolved: bool = False
     headless: bool = True
     page: Any = None
     job: JobContext | None = None
@@ -295,7 +296,7 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=[challenge_message(snapshot)],
             )
-        if not visible_fields(snapshot) and not is_review(snapshot):
+        if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
                 session.mark("LOGIN_FAILED")
                 return _result(
@@ -327,7 +328,7 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=["Password field is mixed with the application. Auto-Fill will not create an account."],
             )
-        if mode in {"password", "email_first"}:
+        if mode in {"password", "email_first"} and not opts.human_resolved:
             context = SiteContext(
                 url=application_url,
                 domain=domain,
@@ -424,7 +425,7 @@ def autofill_application(
                     messages=[challenge_message(snapshot)],
                     submit_controls=submit_controls,
                 )
-            if not visible_fields(snapshot) and not is_review(snapshot):
+            if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
                 detected, filled, skipped = _counts(fields)
                 if is_login_wall(snapshot):
                     session.mark("LOGIN_FAILED")
@@ -861,7 +862,7 @@ def _run_resolver_pages(
                 Status.CAPTCHA_REQUIRED,
                 [challenge_message(snapshot)],
             )
-        if not visible_fields(snapshot) and not is_review(snapshot):
+        if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
                 session.mark("LOGIN_FAILED")
                 return finish(

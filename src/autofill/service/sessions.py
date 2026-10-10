@@ -38,6 +38,8 @@ class ServiceSession:
     resolver_token: str = ""
     resolver_expires_at: str = ""
     expires_at: float = 0.0
+    resume_uploaded: bool = False
+    human_resolved: bool = False
     timings: dict[str, int] = field(default_factory=dict)
     manual_questions: list[dict[str, str | None]] = field(default_factory=list)
     screenshot_version: int = 0
@@ -133,7 +135,7 @@ class ServiceSessionStore:
 
     def reap(self, now: float | None = None) -> list[str]:
         """Mark due sessions EXPIRED and wipe secrets. Returns the ids."""
-        moment = time.monotonic() if now is None else now
+        moment = monotonic() if now is None else now
         expired: list[str] = []
         with self._lock:
             for session in self._sessions.values():
@@ -167,6 +169,11 @@ class ServiceSessionStore:
         if thread is not None:
             thread.join(timeout=2)
             self._thread = None
+
+
+def monotonic() -> float:
+    """TTL clock. Tests replace this to expire a session without waiting."""
+    return time.monotonic()
 
 
 def new_session_id() -> str:

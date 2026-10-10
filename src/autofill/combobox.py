@@ -15,10 +15,17 @@ from autofill.models import Option
 from autofill.safeguards import click_choice, dismiss_combobox, open_combobox
 
 # A menu may show any of these for one country. Longer names are typed first.
+# Calling codes let a phone-country row such as "United States +1" match too.
 _COUNTRY_GROUPS: tuple[frozenset[str], ...] = (
-    frozenset({"united states", "united states of america", "usa", "us"}),
-    frozenset({"united kingdom", "great britain", "uk", "gb"}),
+    frozenset({"united states", "united states of america", "usa", "us", "+1"}),
+    frozenset({"united kingdom", "great britain", "uk", "gb", "+44"}),
 )
+_CALLING_CODES: tuple[tuple[str, str], ...] = (
+    ("+44", "United Kingdom"),
+    ("+1", "United States"),
+)
+_DIAL_SUFFIX = re.compile(r"\s*\+\d{1,4}\s*$")
+_DIAL_PREFIX = re.compile(r"^\+\d{1,4}\s+")
 
 
 def _fold(value: str) -> str:
@@ -26,29 +33,52 @@ def _fold(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _country_name(value: str) -> str:
+    """Drop a leading or trailing dial code so ``United States +1`` is the country."""
+    text = _DIAL_SUFFIX.sub("", _fold(value))
+    return _DIAL_PREFIX.sub("", text).strip()
+
+
 def country_aliases(value: str) -> list[str]:
     """Names a country menu might show for ``value``, longest first."""
     token = _fold(value)
-    if not token:
+    name = _country_name(value)
+    if not token and not name:
         return []
     for group in _COUNTRY_GROUPS:
-        if token in group:
+        if token in group or name in group:
             return sorted(group, key=len, reverse=True)
-    return [token]
+    return [name or token]
+
+
+def country_from_phone(phone: str) -> str:
+    """Country name for a phone that starts with a known calling code, else empty."""
+    compact = re.sub(r"[^\d+]", "", str(phone or ""))
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    if not compact.startswith("+"):
+        return ""
+    for code, name in _CALLING_CODES:
+        if compact.startswith(code):
+            return name
+    return ""
 
 
 def _known_country(value: str) -> bool:
     token = _fold(value)
-    return any(token in group for group in _COUNTRY_GROUPS)
+    name = _country_name(value)
+    return any(token in group or name in group for group in _COUNTRY_GROUPS)
 
 
 def match_country_option(desired: str, options: list[Option]) -> Option | None:
-    """Case-insensitive match across United States / USA / US and the other groups."""
+    """Case-insensitive match across United States / USA / US / ``United States +1``."""
     if not _known_country(desired):
         return None
     aliases = set(country_aliases(desired))
     for option in options:
-        if _fold(option.label) in aliases or _fold(option.value) in aliases:
+        label = _country_name(option.label)
+        value = _country_name(option.value)
+        if label in aliases or value in aliases or _fold(option.label) in aliases or _fold(option.value) in aliases:
             return option
     return None
 
@@ -218,7 +248,8 @@ def _match_desired(desired: str, found: list[Option]) -> Option | None:
 
 def _filter_terms(desired: str) -> list[str]:
     if _known_country(desired):
-        return country_aliases(desired)
+        # Type the country name. A bare calling code would surface every +1 row.
+        return [term for term in country_aliases(desired) if not term.startswith("+")]
     return [desired]
 
 
