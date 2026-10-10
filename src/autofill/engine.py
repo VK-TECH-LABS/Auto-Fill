@@ -18,6 +18,17 @@ from typing import Any
 from autofill.adapters import adapter_for, page_step
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats, site_domain
 from autofill.credentials import CredentialProvider, SiteContext
+from autofill.dom_ui import (
+    attach_page,
+    begin_run,
+    current_run,
+    empty_progress,
+    end_run,
+    finalize_run,
+    note_filled,
+    note_snapshot,
+    remember_open_items,
+)
 from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
@@ -79,6 +90,10 @@ class AutofillOptions:
     answers_updated: bool = False
     timings: dict[str, int] | None = None
     intent_hook: Any = None
+    pause_gate: Any = None
+    held_selectors: set[str] | None = None
+    open_items: list[dict[str, Any]] | None = None
+    progress: dict[str, Any] | None = None
 
 
 @dataclass
@@ -102,6 +117,9 @@ class ApplicationResult:
     submit_controls: list[str] = field(default_factory=list)
     manual_questions: list[dict[str, str | None]] = field(default_factory=list)
     timings: dict[str, int] = field(default_factory=dict)
+    progress: dict[str, Any] = field(default_factory=empty_progress)
+    blocking: dict[str, Any] | None = None
+    open_items: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -128,6 +146,8 @@ class ApplicationResult:
             "submitControls": list(self.submit_controls),
             "manualQuestions": [dict(item) for item in self.manual_questions],
             "timings": dict(self.timings),
+            "progress": dict(self.progress),
+            "blocking": dict(self.blocking) if self.blocking else None,
         }
 
 
@@ -143,7 +163,8 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     )
     if "timings" not in kwargs:
         kwargs["timings"] = {key: int(value) for key, value in session.timings.items()}
-    return ApplicationResult(
+    progress, blocking, open_items = finalize_run(status)
+    result = ApplicationResult(
         status=status,
         ats=ats,
         current_step=session.current_step,
@@ -152,8 +173,15 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         session_id=session.session_id,
         candidate_id=session.candidate_id,
         job_id=session.job_id,
+        progress=progress,
+        blocking=blocking,
+        open_items=open_items,
         **kwargs,
     )
+    state = current_run()
+    if state is not None:
+        end_run(state.token)
+    return result
 
 
 def _counts(fields) -> tuple[int, int, int]:
@@ -196,6 +224,15 @@ def autofill_application(
     domain = site_domain(application_url)
     ats_info = detect_ats(application_url)
     ats_name = ats_info.name if ats_info else None
+    _run_token = begin_run(
+        page=opts.page,
+        pause_gate=opts.pause_gate,
+        held_selectors=opts.held_selectors,
+        open_items=opts.open_items,
+        progress=opts.progress,
+        url=application_url,
+        ats=ats_name,
+    )
     session.mark("DETECT_ATS")
     logger.info(
         "session=%s domain=%s ats=%s step=%s",
@@ -235,6 +272,7 @@ def autofill_application(
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(headless=opts.headless)
             page = browser.new_page()
+            attach_page(page)
             page.goto(application_url)
 
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
@@ -584,6 +622,7 @@ def autofill_application(
             browser.close()
         if playwright is not None:
             playwright.stop()
+        end_run(_run_token)
 
 
 _RESOLVER_STATUS = {
@@ -638,6 +677,7 @@ def _mark_ms(opts: AutofillOptions, key: str, started: float) -> None:
 
 
 def _note_fill(fields, opts: AutofillOptions, started: float, state: dict) -> None:
+    note_filled(fields)
     if state.get("filled"):
         return
     if any(getattr(item, "action", "") in {"fill", "select", "check", "uncheck", "upload"} for item in fields):
@@ -648,6 +688,7 @@ def _note_fill(fields, opts: AutofillOptions, started: float, state: dict) -> No
 def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
     wait_for_render(page)
     snapshot = extract_page(page)
+    note_snapshot(snapshot)
     if not state.get("seen"):
         state["seen"] = True
         _mark_ms(opts, "firstFormInspectedMs", started)
@@ -714,7 +755,9 @@ def _run_resolver_pages(
 
     def finish(status: str, messages: list[str], *, questions: list[dict] | None = None) -> ApplicationResult:
         detected, filled, skipped = _counts(fields)
-        published = _public_questions(list(questions or []) + carried)
+        rich = list(questions or []) + carried
+        remember_open_items(rich)
+        published = _public_questions(rich)
         return _result(
             session,
             status=status,

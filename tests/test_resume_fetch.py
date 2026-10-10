@@ -226,13 +226,10 @@ def test_required_unfilled_control_becomes_a_manual_question():
     assert field is not None and field.field_key == "yearsExperience"
     outcome = ResolvedPage()
     _skip(years, outcome, "yearsExperience", "Resolver did not return this key.")
-    assert outcome.manual_questions == [
-        {
-            "intent": None,
-            "text": "How many years of experience do you have?",
-            "blocking": True,
-        }
-    ]
+    assert outcome.manual_questions[0]["intent"] is None
+    assert outcome.manual_questions[0]["text"] == "How many years of experience do you have?"
+    assert outcome.manual_questions[0]["blocking"] is True
+    assert outcome.manual_questions[0]["kind"] == "MISSING_PROFILE_VALUE"
     optional = Control(kind="text", label="Internal badge number", selector="#badge")
     assert _describe("one", [optional], "", None) is None
     skipped = ResolvedPage()

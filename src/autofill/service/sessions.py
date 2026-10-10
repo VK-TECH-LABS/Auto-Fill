@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from autofill.credentials import MemoryCredentialProvider
+from autofill.dom_ui import PauseGate, empty_progress
 from autofill.engine import ApplicationResult, Status
 from autofill.models import JobContext
 from autofill.profile import CandidateProfile
@@ -43,6 +44,12 @@ class ServiceSession:
     human_outcome: str = ""
     interact_marks: list[float] = field(default_factory=list)
     browser_restarts: int = 0
+    paused: bool = False
+    pause_gate: PauseGate = field(default_factory=PauseGate)
+    progress: dict = field(default_factory=empty_progress)
+    open_items: list[dict] = field(default_factory=list)
+    held_selectors: set[str] = field(default_factory=set)
+    held_answers: list[str] = field(default_factory=list)
 
     def __repr__(self) -> str:
         return f"ServiceSession(session_id={self.session_id!r}, status={self.status!r}, mode={self.mode!r})"
@@ -56,6 +63,10 @@ class ServiceSession:
         self.resolver_token = ""
         self.resolver_url = ""
         self.cover_letter_text = None
+        for value in self.held_answers:
+            redaction_filter().discard(value)
+        self.held_answers.clear()
+        self.held_selectors.clear()
 
 
 class ServiceSessionStore:

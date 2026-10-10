@@ -7,6 +7,7 @@ from ``aria-controls`` / ``aria-owns``, or from the list inside that control.
 
 from __future__ import annotations
 
+from autofill.dom_ui import focus_field
 from autofill.intents import match_option_exact
 from autofill.models import Option
 from autofill.safeguards import click_choice, dismiss_combobox, open_combobox
@@ -201,6 +202,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     """
     if not selector or not desired.strip():
         return None
+    focus_field(page, selector)
     open_combobox(page, selector)
     found: list[Option] = []
     for _ in range(10):

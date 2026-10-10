@@ -96,11 +96,11 @@ class CreateSessionIn(BaseModel):
     @model_validator(mode="after")
     def _mode(self) -> CreateSessionIn:
         version = self.protocol_version.strip()
-        if self.resolver is not None or version in {"0.4.0", "0.5.0"}:
-            if version not in {"0.4.0", "0.5.0"}:
-                raise ValueError("protocolVersion must be 0.4.0 or 0.5.0 when resolver is set")
+        if self.resolver is not None or version in {"0.4.0", "0.5.0", "0.6.0"}:
+            if version not in {"0.4.0", "0.5.0", "0.6.0"}:
+                raise ValueError("protocolVersion must be 0.4.0, 0.5.0, or 0.6.0 when resolver is set")
             if self.resolver is None:
-                raise ValueError("resolver is required for protocol 0.4.0 and 0.5.0")
+                raise ValueError("resolver is required for protocol 0.4.0, 0.5.0, and 0.6.0")
             if not self.candidate_ref.strip() or not self.job_ref.strip():
                 raise ValueError("candidateRef and jobRef are required")
             if "@" in self.candidate_ref or "@" in self.job_ref:
@@ -201,6 +201,71 @@ class CredentialsIn(BaseModel):
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
 
 
+class ProgressOut(BaseModel):
+    """Computed fill progress. ``percent`` is never random."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    stage: str = "OPENING"
+    required_total: int = Field(default=0, alias="requiredTotal")
+    required_done: int = Field(default=0, alias="requiredDone")
+    percent: int = 5
+    current_label: str = Field(default="Opening", alias="currentLabel")
+
+
+class BlockingOut(BaseModel):
+    """The one item currently blocking. The answer value is not included."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: str
+    question_id: str | None = Field(default=None, alias="questionId")
+    question_hash: str | None = Field(default=None, alias="questionHash")
+    text: str = ""
+    field_key: str | None = Field(default=None, alias="fieldKey")
+    answer_type: str = Field(default="text", alias="answerType")
+    options: list[str] = Field(default_factory=list)
+    required: bool = False
+
+
+class AnswerIn(BaseModel):
+    """One saved value for the current blocker or another open item. Memory only."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    question_id: str = Field(default="", alias="questionId", max_length=128)
+    question_hash: str = Field(default="", alias="questionHash", max_length=128)
+    field_key: str = Field(default="", alias="fieldKey", max_length=128)
+    value: str = Field(default="", max_length=8000)
+    values: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("values")
+    @classmethod
+    def _bound_values(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in value:
+            text = str(item)
+            if len(text) > 2000:
+                raise ValueError("value is too long")
+            cleaned.append(text)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _target(self) -> AnswerIn:
+        if not (self.question_id.strip() or self.question_hash.strip() or self.field_key.strip()):
+            raise ValueError("questionId, questionHash, or fieldKey is required")
+        return self
+
+
+class AnswerOut(BaseModel):
+    """Whether the field committed. The value is not echoed."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    filled: bool
+    reason: str | None = None
+
+
 class ManualQuestionOut(BaseModel):
     """A question left blank. The answer value is not included."""
 
@@ -247,6 +312,9 @@ class RunStatusOut(BaseModel):
     manual_questions: list[ManualQuestionOut] = Field(default_factory=list, alias="manualQuestions")
     timings: TimingsOut | None = None
     human_outcome: str = Field(default="", alias="humanOutcome")
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+    paused: bool = False
+    blocking: BlockingOut | None = None
 
 
 class CredentialsOut(BaseModel):
