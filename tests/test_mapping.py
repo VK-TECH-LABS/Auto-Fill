@@ -42,6 +42,53 @@ def test_current_location_uses_city_state_and_country():
     assert map_field(control("Are you willing to relocate?"), filled).key != "location"
 
 
+def test_referral_and_relative_questions_are_not_the_employer():
+    filled = profile()
+    labels = [
+        "If an employee referred you, please list their name",
+        "Who referred you?",
+        "Employee referral",
+        "Previous employer contact",
+        "Do you have relatives employed here?",
+    ]
+    for label in labels:
+        mapped = map_field(control(label), filled)
+        assert mapped.key != "current_company", label
+        assert mapped.text != "Example Labs", label
+        assert "Example Labs" not in mapped.text
+
+
+def test_current_employer_labels_still_map():
+    filled = profile()
+    for label in ("Current company", "Current employer", "Most recent employer", "Employer", "Company name"):
+        mapped = map_field(control(label), filled)
+        assert mapped.key == "current_company", label
+        assert mapped.action == "fill"
+        assert mapped.text == "Example Labs"
+
+
+def test_preferred_first_name_stays_blank_without_a_preferred_name():
+    named = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Alexandra Example",
+                "preferred_name": "Alex",
+                "email": "alex.example@example.com",
+            }
+        }
+    )
+    assert map_field(control("Preferred First Name"), named).text == "Alex"
+    blank = CandidateProfile.from_dict(
+        {"personal": {"full_name": "Alexandra Example", "email": "alex.example@example.com"}}
+    )
+    preferred = map_field(control("Preferred First Name"), blank)
+    assert preferred.key == "preferred_name"
+    assert preferred.action == "unanswered"
+    assert preferred.text == ""
+    assert map_field(control("First name"), blank).text == "Alexandra"
+    assert map_field(control("Legal first name"), blank).text == "Alexandra"
+
+
 def test_preferred_name_versus_legal_name():
     person = CandidateProfile.from_dict(
         {

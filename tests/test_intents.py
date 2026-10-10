@@ -89,6 +89,10 @@ _MATRIX = [
         "visa-remain-current-location",
     ),
     ("Are you Hispanic/Latino?", "RACE_ETHNICITY", "hispanic-latino"),
+    ("Race", "RACE_ETHNICITY", "race"),
+    ("If an employee referred you, please list their name", "REFERRAL", "referred-you"),
+    ("Who referred you?", "REFERRAL", "who-referred"),
+    ("Employee referral", "REFERRAL", "employee-referral"),
 ]
 
 
@@ -121,6 +125,22 @@ def test_control_kind_does_not_change_the_intent(kind: str, options: list[str]):
 def test_demographic_intents_are_never_filled(intent: str):
     match = IntentMatch(intent, "HIGH", "level1", intent)
     assert may_fill(local=match, resolver_confidence="HIGH") is False
+
+
+def test_referral_is_never_filled():
+    match = classify_question("If an employee referred you, please list their name")
+    assert match.intent == "REFERRAL"
+    assert may_fill(local=match, resolver_confidence="HIGH") is False
+
+
+def test_race_does_not_match_inside_another_word():
+    assert classify_question("Race").intent == "RACE_ETHNICITY"
+    assert classify_question("Please leave a trace of your work").intent != "RACE_ETHNICITY"
+
+
+def test_referral_source_is_not_a_referrer_name():
+    assert classify_question("Referral source").intent != "REFERRAL"
+    assert classify_question("Employee referral").intent == "REFERRAL"
 
 
 def test_unknown_question_stays_unknown():

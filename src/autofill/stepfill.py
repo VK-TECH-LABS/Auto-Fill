@@ -17,7 +17,7 @@ from autofill.dates import format_for_control
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped, attach_resume
 from autofill.intents import (
-    DEMOGRAPHIC_INTENTS,
+    UNFILLED_INTENTS,
     IntentMatch,
     classify_question,
     combine_authorized_without,
@@ -30,7 +30,7 @@ from autofill.intents import (
     question_hash,
     sanitize_question,
 )
-from autofill.mapping import haystack, is_honeypot, match_field_key, normalize
+from autofill.mapping import haystack, is_honeypot, match_field_key, mentions_work_history, normalize
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
@@ -309,6 +309,8 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
     match = classify_question(text, options, hook=hook)
+    if match.intent == "REFERRAL":
+        return _Ask(controls=controls, match=match, include_question=True)
     internal = None if kind == "multi" else match_field_key(control)
     if kind != "multi" and _prefer_field(control, internal, match):
         key = _protocol_key(internal or "", heading, control)
@@ -347,12 +349,13 @@ def _prefer_field(control: Control, internal: str | None, match: IntentMatch) ->
 def _protocol_key(internal: str, heading: str, control: Control) -> str | None:
     blob = haystack(control)
     head = normalize(heading)
-    if internal in {"current_company", "current_job_title"} or "employ" in blob or (
+    work = mentions_work_history(control)
+    if internal in {"current_company", "current_job_title"} or work or (
         "start date" in blob and "employ" in head
     ):
         if internal in {"school", "education_level", "field_of_study"}:
             return "education[]"
-        if "employ" in blob or internal in {"current_company", "current_job_title"} or (
+        if work or internal in {"current_company", "current_job_title"} or (
             "start date" in blob and "employ" in head
         ):
             return "employment[]"
@@ -385,7 +388,7 @@ def _subfield(control: Control, heading: str) -> str:
         return "project.name"
     if normalize(control.label) in {"skills", "skill"}:
         return "skills"
-    if "employ" in blob or "company name" in blob:
+    if mentions_work_history(control):
         return "employment.company"
     if "job title" in blob or "position title" in blob or blob.strip() == "title":
         return "employment.title"
@@ -560,7 +563,20 @@ _LOCATION_OPTIONS_JS = r"""
     }
     if (found.length) return found;
   }
-  return [];
+  // Lever renders the geocoder list on document.body, outside the field.
+  const portal = [];
+  const extra = document.querySelectorAll(".dropdown-location, [role='option'][id^='location-']");
+  for (const option of extra) {
+    if (!isSuggestion(option) || !visible(option)) continue;
+    const label = textOf(option);
+    if (!label) continue;
+    if (!option.id) option.setAttribute("data-autofill-option", String(portal.length));
+    const itemSelector = option.id
+      ? "#" + CSS.escape(option.id)
+      : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
+    portal.push({ label, selector: itemSelector });
+  }
+  return portal;
 }
 """
 _SELECTED_LOCATION_JS = """
@@ -741,6 +757,133 @@ def _match_location(
     return next((item for item in options if item[0] == label), None)
 
 
+def _title_place(value: str) -> str:
+    parts: list[str] = []
+    for word in value.split():
+        if word.isalpha() and len(word) <= 2:
+            parts.append(word.upper())
+        else:
+            parts.append(word[:1].upper() + word[1:])
+    return " ".join(parts)
+
+
+def _place_name(value: str, table: dict[str, str]) -> str:
+    token = normalize(value)
+    if not token:
+        return ""
+    canonical = table.get(token, "")
+    if not canonical:
+        for name in table.values():
+            if token == name:
+                canonical = name
+                break
+    if canonical:
+        return _title_place(canonical)
+    return value.strip()
+
+
+def _location_free_text(city: str, region: str, country: str) -> str:
+    parts = [city.strip()]
+    region_name = _place_name(region, _STATES)
+    country_name = _place_name(country, _COUNTRIES)
+    if region_name:
+        parts.append(region_name)
+    if country_name:
+        parts.append(country_name)
+    return ", ".join(part for part in parts if part)
+
+
+def _keep_enter_from_submitting(page) -> None:
+    """Enter confirms a list choice. It must not submit the application."""
+    try:
+        page.evaluate(_BLOCK_SUBMIT_JS)
+    except Exception:
+        return
+
+
+_BLOCK_SUBMIT_JS = """
+() => {
+  if (window.__autofillBlockSubmit) return;
+  window.__autofillBlockSubmit = true;
+  document.addEventListener("submit", (event) => event.preventDefault(), true);
+}
+"""
+
+
+def _wait_location_network(page) -> None:
+    wait = getattr(page, "wait_for_load_state", None)
+    if wait is None:
+        return
+    try:
+        wait("networkidle", timeout=2500)
+    except Exception:
+        return
+
+
+def _location_committed(page, control: Control, city: str) -> bool:
+    """True when a suggestion was recorded, not when the city was only typed.
+
+    Lever keeps the chosen place in a hidden ``selectedLocation`` input. The
+    visible box still holds the city while that input is empty, so the typed
+    city alone is not a commit.
+    """
+    selected = _selected_location(page)
+    if selected and _phrase_in(normalize(selected), city):
+        return True
+    if _has_selected_location(page):
+        return False
+    try:
+        typed = str(page.locator(control.selector).input_value() or "")
+    except Exception:
+        typed = ""
+    folded = normalize(typed)
+    if not folded or folded == normalize(city):
+        return False
+    return _phrase_in(folded, city)
+
+
+def _has_selected_location(page) -> bool:
+    try:
+        return bool(page.evaluate(_HAS_SELECTED_LOCATION_JS))
+    except Exception:
+        return False
+
+
+_HAS_SELECTED_LOCATION_JS = """
+() => !!document.querySelector("input[name='selectedLocation'], input[name='selected_location']")
+"""
+
+_WRITE_LOCATION_JS = """
+({ selector, text }) => {
+  const el = document.querySelector(selector);
+  if (el) {
+    el.value = text;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  const hidden = document.querySelector("input[name='selectedLocation'], input[name='selected_location']");
+  if (hidden) {
+    hidden.value = text;
+    hidden.dispatchEvent(new Event("input", { bubbles: true }));
+    hidden.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
+"""
+
+
+def _remember_location(outcome: ResolvedPage, control: Control, detail: str) -> None:
+    outcome.fields.append(
+        FieldOutcome(
+            selector=control.selector,
+            label=control.label,
+            key="location",
+            action="select",
+            detail=detail,
+            field_class="PROFILE_FIELD",
+        )
+    )
+
+
 def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
@@ -750,50 +893,50 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
     field = page.locator(control.selector)
     try:
         field.fill("")
-        field.press_sequentially(city, delay=10)
+        field.press_sequentially(city, delay=50)
     except Exception:
         _manual_location(outcome, control)
         return
-    options = _poll_location_options(page, control.selector, 15, 100)
+    _wait_location_network(page)
+    options = _poll_location_options(page, control.selector, 20, 100)
     match = _match_location(options, city=city, region=region, country=country)
     if match is None:
-        # One more wait. Lever's list sometimes arrives after the first second.
+        # One more wait. Lever's geocoder list sometimes arrives after the first pass.
         _pause(page, 1000)
         options = _location_options(page, control.selector) or options
         match = _match_location(options, city=city, region=region, country=country)
-    if match is None:
-        logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
+    if match is not None:
+        click_choice(page, match[1], match[0])
+        if not _location_committed(page, control, city):
+            try:
+                _keep_enter_from_submitting(page)
+                field.press("ArrowDown")
+                field.press("Enter")
+            except Exception:
+                pass
+            for _ in range(8):
+                if _location_committed(page, control, city):
+                    break
+                _pause(page, 50)
+        if _location_committed(page, control, city):
+            detail = _selected_location(page) or match[0]
+            _remember_location(outcome, control, detail)
+            return
+    if not options and _has_selected_location(page):
+        text = _location_free_text(city, region, country)
         try:
-            field.fill("")
+            page.evaluate(_WRITE_LOCATION_JS, {"selector": control.selector, "text": text})
         except Exception:
-            pass
-        _manual_location(outcome, control)
-        return
-    click_choice(page, match[1], match[0])
-    selected = ""
-    for _ in range(10):
-        selected = _selected_location(page)
-        if selected and _phrase_in(normalize(selected), city):
-            break
-        pause = getattr(page, "wait_for_timeout", None)
-        if pause is None:
-            time.sleep(0.05)
-        else:
-            pause(50)
-    if not selected or not _phrase_in(normalize(selected), city):
-        logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
-        _manual_location(outcome, control)
-        return
-    outcome.fields.append(
-        FieldOutcome(
-            selector=control.selector,
-            label=control.label,
-            key="location",
-            action="select",
-            detail=selected,
-            field_class="PROFILE_FIELD",
-        )
-    )
+            text = ""
+        if text and _location_committed(page, control, city):
+            _remember_location(outcome, control, text)
+            return
+    logger.info("location left manual suggestions=%s", _location_suggestion_log([item[0] for item in options]))
+    try:
+        field.fill("")
+    except Exception:
+        pass
+    _manual_location(outcome, control)
 
 
 def _apply(
@@ -999,8 +1142,8 @@ def _apply_question(
     outcome: ResolvedPage,
 ) -> None:
     match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-    if match.intent in DEMOGRAPHIC_INTENTS or _eeo(match.text) or _eeo(_question_text(ask.controls)):
-        _manual(outcome, match, blocking=any(item.required for item in ask.controls))
+    if match.intent in UNFILLED_INTENTS or _eeo(match.text) or _eeo(_question_text(ask.controls)):
+        _manual(outcome, match, blocking=any(item.required for item in ask.controls) or match.intent == "REFERRAL")
         return
     if answer is None or not (
         may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)

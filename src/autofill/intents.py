@@ -38,6 +38,7 @@ PROTOCOL_INTENTS: tuple[str, ...] = (
     "RACE_ETHNICITY",
     "VETERAN_STATUS",
     "DISABILITY_STATUS",
+    "REFERRAL",
 )
 
 # Demographic questions are never written by the engine.
@@ -49,6 +50,9 @@ DEMOGRAPHIC_INTENTS = frozenset(
         "DISABILITY_STATUS",
     }
 )
+
+# Referral names are not work history. Leave them for a person.
+UNFILLED_INTENTS = frozenset({*DEMOGRAPHIC_INTENTS, "REFERRAL"})
 
 # Legal, work-authorization, and demographic intents are never filled below HIGH.
 STRICT_INTENTS = frozenset(
@@ -145,7 +149,13 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("PREVIOUSLY_EMPLOYED", "worked here before"),
     ("PREVIOUSLY_EMPLOYED", "former employee"),
     ("PREVIOUSLY_EMPLOYED", "worked for this company"),
+    ("REFERRAL", "who referred you"),
+    ("REFERRAL", "employee referral"),
+    ("REFERRAL", "referred you"),
+    ("REFERRAL", "referrer"),
+    ("REFERRAL", "referral"),
     ("GENDER", "gender"),
+    ("RACE_ETHNICITY", "race"),
     ("RACE_ETHNICITY", "race ethnicity"),
     ("RACE_ETHNICITY", "hispanic"),
     ("RACE_ETHNICITY", "latino"),
@@ -176,7 +186,8 @@ _PROTOTYPES: dict[str, str] = {
     "START_DATE": "start date available begin earliest",
     "PREVIOUSLY_EMPLOYED": "previously employed worked before former",
     "GENDER": "gender identity demographic",
-    "RACE_ETHNICITY": "race ethnicity demographic",
+    "RACE_ETHNICITY": "race ethnicity hispanic latino demographic",
+    "REFERRAL": "referral referrer who referred you employee",
     "VETERAN_STATUS": "veteran military status demographic",
     "DISABILITY_STATUS": "disability status demographic",
 }
@@ -399,9 +410,21 @@ def _level1(text: str) -> str | None:
         return compound
     ordered = sorted(_SYNONYMS, key=lambda item: len(item[1]), reverse=True)
     for intent, phrase in ordered:
-        if phrase in folded:
+        if _contains_phrase(folded, phrase):
             return intent
     return None
+
+
+def _contains_phrase(folded: str, phrase: str) -> bool:
+    """Substring match, except a short single word needs a word boundary.
+
+    ``race`` must not match inside ``trace`` or ``grace``.
+    """
+    if phrase == "referral" and ("referral source" in folded or "source of referral" in folded):
+        return False
+    if re.fullmatch(r"[a-z]+", phrase) and len(phrase) <= 4:
+        return re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", folded) is not None
+    return phrase in folded
 
 
 def _planned(match: IntentMatch) -> IntentMatch:
@@ -476,7 +499,7 @@ def may_fill(*, local: IntentMatch, resolver_confidence: str) -> bool:
     Demographic intents are never filled. An unknown question is not filled
     here; a saved answer for that exact question is handled by the step filler.
     """
-    if local.intent in DEMOGRAPHIC_INTENTS:
+    if local.intent in UNFILLED_INTENTS:
         return False
     if local.intent is None or local.confidence != "HIGH":
         return False
