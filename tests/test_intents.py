@@ -12,6 +12,7 @@ from autofill.intents import (
     combine_yes_if_either,
     dedupe_label,
     match_all_options,
+    match_option_exact,
     may_fill,
     options_equivalent,
     sanitize_question,
@@ -297,6 +298,27 @@ def test_option_mapping_is_exact_or_equivalent():
     assert match_all_options(["Day", "Graveyard"], [Option("Day", "Day"), Option("Night", "Night")]) is None
     assert match_all_options(["49%"], options) is None
     assert match_all_options(["50%"], options) is not None
+
+
+def test_unique_word_match_picks_one_option_and_leaves_a_tie():
+    phone = [
+        Option("ca", "Canada +1"),
+        Option("us", "United States +1"),
+        Option("uk", "United Kingdom +44"),
+    ]
+    country = match_option_exact("United States", phone)
+    assert country is not None
+    assert country.label == "United States +1"
+    degrees = [Option("ba", "Bachelor's Degree"), Option("ma", "Master's Degree")]
+    degree = match_option_exact("Bachelor's", degrees)
+    assert degree is not None
+    assert degree.label == "Bachelor's Degree"
+    curly = match_option_exact("Bachelor\u2019s", degrees)
+    assert curly is not None
+    assert curly.label == "Bachelor's Degree"
+    tied = [Option("cs", "Computer Science"), Option("ps", "Political Science")]
+    assert match_option_exact("Science", tied) is None
+    assert match_option_exact("Yes, I think so", [Option("yes", "Yes"), Option("no", "No")]) is None
 
 
 def test_repeated_labels_keep_one_copy_and_drop_a_trailing_star():

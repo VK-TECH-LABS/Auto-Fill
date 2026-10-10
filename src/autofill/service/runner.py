@@ -13,6 +13,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ from autofill.engine import (
     is_ats_timeout,
     is_browser_crash,
 )
+from autofill.follow import FollowUp, PageMark, follow_answer, read_page_mark
 from autofill.models import JobContext
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
@@ -442,6 +444,8 @@ class _SessionContext:
         self.context: Any = None
         self.page: Any = None
         self.context_ready_ms = 0
+        self.mark: PageMark | None = None
+        self.last_ats: str | None = None
 
     def open(self, driver: _SharedDriver, url: str) -> Any:
         if self.page is not None:
@@ -478,28 +482,73 @@ class _Worker:
         self.driver = _SharedDriver(headless=headless, launch_args=launch_args)
         self.sessions: dict[str, _SessionContext] = {}
         self._queue: queue.Queue = queue.Queue()
+        self._front: deque = deque()
+        self._local = threading.local()
         self._accept = threading.Lock()
         self._stopped = False
         self._thread = threading.Thread(target=self._loop, name=f"autofill-browser-{index}", daemon=True)
         self._thread.start()
 
     def _loop(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            function, done = item
-            try:
-                done.put((True, function()))
-            except BaseException as exc:
-                done.put((False, exc))
+        from autofill.dom_ui import bind_queue_pump, release_queue_pump
 
-    def submit(self, function: Callable[[], _T]) -> _T:
+        bind_queue_pump(self.drain_queued)
+        try:
+            while True:
+                item = self._take()
+                if item is None:
+                    return
+                function, done, _drainable = item
+                try:
+                    done.put((True, function()))
+                except BaseException as exc:
+                    done.put((False, exc))
+        finally:
+            release_queue_pump()
+
+    def _take(self):
+        if self._front:
+            return self._front.popleft()
+        return self._queue.get()
+
+    def _take_now(self):
+        if self._front:
+            return self._front.popleft()
+        return self._queue.get_nowait()
+
+    def drain_queued(self) -> None:
+        """Run a screenshot or interaction that arrived during this fill."""
+        if getattr(self._local, "busy", False):
+            return
+        self._local.busy = True
+        deferred: list = []
+        try:
+            while True:
+                try:
+                    item = self._take_now()
+                except queue.Empty:
+                    break
+                if item is None or not item[2]:
+                    deferred.append(item)
+                    continue
+                function, done, _drainable = item
+                try:
+                    done.put((True, function()))
+                except BaseException as exc:
+                    done.put((False, exc))
+        finally:
+            if deferred:
+                self._front.extendleft(reversed(deferred))
+            self._local.busy = False
+
+    def submit(self, function: Callable[[], _T], *, drainable: bool = False) -> _T:
+        if threading.current_thread() is self._thread:
+            return function()
         done: queue.Queue = queue.Queue()
         with self._accept:
             if self._stopped:
                 raise RunnerStopped("The browser runner has shut down.")
-            self._queue.put((function, done))
+            self._queue.put((function, done, drainable))
         ok, value = done.get()
         if not ok:
             raise value
@@ -514,7 +563,7 @@ class _Worker:
             if self._stopped:
                 return
             self._stopped = True
-            self._queue.put((self._shutdown_driver, done))
+            self._queue.put((self._shutdown_driver, done, False))
         try:
             ok, value = done.get()
             if not ok:
@@ -697,7 +746,10 @@ class PlaywrightRunner:
                     slot = _SessionContext()
                     slot.open(worker.driver, request.application_url)
                     worker.sessions[request.session_id] = slot
-                return self._run_engine(request, slot.page, slot)
+                result = self._run_engine(request, slot.page, slot)
+                slot.last_ats = result.ats
+                self._remember_mark(slot)
+                return result
             except Exception as exc:
                 if is_ats_timeout(exc):
                     return self._retryable(request, category="ats_timeout")
@@ -753,7 +805,7 @@ class PlaywrightRunner:
                 raise PageUnavailable(410) from None
             return image, host
 
-        return worker.submit(take)
+        return worker.submit(take, drainable=True)
 
     def interact(self, session_id: str, action: dict) -> bool:
         """One human action on the session page. Typed text is not logged."""
@@ -789,7 +841,71 @@ class PlaywrightRunner:
                 raise PageUnavailable(410) from None
             return True
 
-        return worker.submit(apply)
+        return worker.submit(apply, drainable=True)
+
+    def _remember_mark(self, slot: _SessionContext) -> None:
+        if slot.page is None:
+            return
+        try:
+            slot.mark, _snapshot = read_page_mark(slot.page)
+        except Exception:
+            return
+
+    def _result_from_follow(self, request: FillRequest, follow: FollowUp, ats: str | None) -> ApplicationResult:
+        return ApplicationResult(
+            status=follow.status,
+            ats=ats,
+            current_step=follow.status,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            messages=list(follow.messages),
+            timings=dict(request.timings or {}),
+            progress=dict(follow.progress),
+            blocking=dict(follow.blocking) if follow.blocking else None,
+            open_items=list(follow.open_items),
+            manual_questions=list(follow.manual_questions),
+        )
+
+    def advance_after_answer(self, request: FillRequest) -> ApplicationResult | None:
+        """Scan for the next blocker. A full fill runs only when the page or step changed."""
+        worker = self._pinned_worker(request.session_id)
+        if worker is None:
+            return None
+
+        def advance() -> ApplicationResult | None:
+            slot = worker.sessions.get(request.session_id)
+            if slot is None or slot.page is None:
+                return None
+            try:
+                follow = follow_answer(
+                    slot.page,
+                    profile=request.profile,
+                    job=request.job,
+                    held=set(request.held_selectors or ()),
+                    prior=list(request.open_items or []),
+                    previous=slot.mark,
+                    cover_letter_text=request.cover_letter_text,
+                )
+                if follow.changed:
+                    result = self._run_engine(request, slot.page, slot)
+                    slot.last_ats = result.ats
+                    self._remember_mark(slot)
+                    return result
+                if follow.mark is not None:
+                    slot.mark = follow.mark
+                return self._result_from_follow(request, follow, slot.last_ats)
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(request.session_id)
+                except Exception:
+                    worker.sessions.pop(request.session_id, None)
+                raise PageUnavailable(410) from None
+
+        return worker.submit(advance)
 
     def apply_answer(self, session_id: str, target: dict) -> dict:
         """Fill one field on the open page. The value is not logged."""
@@ -815,6 +931,33 @@ class PlaywrightRunner:
                 raise PageUnavailable(410) from None
 
         return worker.submit(apply)
+
+    def choice_options(self, session_id: str, selector: str) -> list[str]:
+        """Read the live options for one choice control. Labels only."""
+        worker = self._pinned_worker(session_id)
+        if worker is None or not selector:
+            return []
+
+        def read() -> list[str]:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return []
+            from autofill.stepfill import ensure_blocker_options
+
+            item = {"answerType": "single_select", "options": [], "selector": selector}
+            try:
+                ensure_blocker_options(slot.page, [item])
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(session_id)
+                except Exception:
+                    worker.sessions.pop(session_id, None)
+                raise PageUnavailable(410) from None
+            return [str(option) for option in item.get("options") or []]
+
+        return worker.submit(read)
 
     def discard(self, session_id: str) -> None:
         """Close this session's context. Other sessions and the browsers stay open."""

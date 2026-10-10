@@ -295,6 +295,139 @@ def test_resume_and_login_confirmations_survive_answer_pause_and_continue():
         ]
 
 
+class _ScanRunner:
+    """Answers update the blocker in place. A full fill is the start call only."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.advances: list[tuple[bool, bool]] = []
+
+    def run(self, request):
+        self.runs += 1
+        if not request.resume_uploaded:
+            status = Status.RESUME_UPLOAD_REQUIRED
+            items: list[dict] = []
+        else:
+            status = Status.MANUAL_ANSWER_REQUIRED
+            items = [
+                {
+                    "questionHash": "school",
+                    "selector": "#school",
+                    "text": "School",
+                    "answerType": "text",
+                    "options": [],
+                    "kind": "QUESTION",
+                    "fieldKey": "school",
+                    "blocking": True,
+                }
+            ]
+        return ApplicationResult(
+            status=status,
+            ats="greenhouse",
+            current_step=status,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            open_items=items,
+            manual_questions=[{"intent": None, "text": "School"}] if items else [],
+        )
+
+    def advance_after_answer(self, request):
+        self.advances.append((request.resume_uploaded, request.human_resolved))
+        item = {
+            "questionHash": "degree",
+            "selector": "#degree",
+            "text": "Degree",
+            "answerType": "text",
+            "options": [],
+            "kind": "QUESTION",
+            "fieldKey": "degree",
+            "blocking": True,
+        }
+        return ApplicationResult(
+            status=Status.MANUAL_ANSWER_REQUIRED,
+            ats="greenhouse",
+            current_step=Status.MANUAL_ANSWER_REQUIRED,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            open_items=[item],
+            manual_questions=[{"intent": None, "text": "Degree"}],
+            progress={
+                "stage": "QUESTIONS",
+                "requiredTotal": 2,
+                "requiredDone": 1,
+                "percent": 50,
+                "currentLabel": "Questions",
+            },
+            blocking={
+                "kind": "QUESTION",
+                "questionId": None,
+                "questionHash": "degree",
+                "text": "Degree",
+                "fieldKey": "degree",
+                "answerType": "text",
+                "options": [],
+                "required": True,
+            },
+        )
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        return {"filled": True}
+
+    def discard(self, session_id: str) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_answer_scans_the_next_blocker_without_another_fill():
+    runner = _ScanRunner()
+    app = create_app(
+        token=TOKEN,
+        runner=runner,
+        run_browser=False,
+        session_ttl_seconds=1800,
+        reaper_interval_seconds=60,
+    )
+    with TestClient(app) as test_client:
+        created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        started = test_client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+        confirmed = test_client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"resumeUploaded": True},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        runs_after_confirm = runner.runs
+        answered = test_client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"questionHash": "school", "value": "Example University"},
+        )
+        assert answered.status_code == 200, answered.text
+        body = answered.json()
+        assert body["filled"] is True
+        assert isinstance(body["ms"], int)
+        assert body["ms"] >= 0
+        assert runner.runs == runs_after_confirm
+        assert runner.advances == [(True, False)]
+        status = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert status.json()["status"] != Status.RESUME_UPLOAD_REQUIRED
+        assert status.json()["blocking"]["text"] == "Degree"
+        held = app.state.store.get(session_id)
+        assert held is not None
+        assert held.resume_uploaded is True
+
+
 def test_status_returns_410_when_the_ttl_clock_passes(monkeypatch):
     clock = {"now": 1000.0}
     monkeypatch.setattr("autofill.service.app.monotonic", lambda: clock["now"])

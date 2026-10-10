@@ -10,6 +10,7 @@ import contextvars
 import os
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +284,24 @@ def install_source() -> str:
     if fast_pace():
         return script + "\nwindow.__afFast = true;\n"
     return script
+
+
+_PUMP = threading.local()
+
+
+def bind_queue_pump(pump: Callable[[], None]) -> None:
+    """Let a field boundary run calls queued on this worker, such as a screenshot."""
+    _PUMP.fn = pump
+
+
+def release_queue_pump() -> None:
+    _PUMP.fn = None
+
+
+def _pump_queue() -> None:
+    pump = getattr(_PUMP, "fn", None)
+    if pump is not None:
+        pump()
 
 
 def install(page: Any) -> None:
@@ -611,6 +630,7 @@ def remember_open_items(items: list[dict[str, Any]]) -> None:
 
 def checkpoint() -> bool:
     """Wait for resume at a field boundary. False while login or a challenge blocks writes."""
+    _pump_queue()
     state = current_run()
     if state is None:
         return True
@@ -749,6 +769,15 @@ def type_visible(page: Any, selector: str, text: str) -> bool:
     if not selector:
         return False
     focus_field(page, selector)
+    typed = _type_once(page, selector, text)
+    if not typed:
+        install(page)
+        typed = _type_once(page, selector, text)
+    _pump_queue()
+    return typed
+
+
+def _type_once(page: Any, selector: str, text: str) -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return False
@@ -870,11 +899,110 @@ def _committed(page: Any, selector: str, values: list[str], *, multi: bool, fiel
 
 def values_fit(item: dict[str, Any], values: list[str]) -> bool:
     """True when every value is an option, or the control is free text."""
+    reason, _canonical = fit_choice_values(item, values)
+    return reason == "ok"
+
+
+_CHOICE_ANSWER_TYPES = frozenset({"single_select", "multi_select"})
+
+_CHOICE_OPTIONS_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return [];
+  const labels = [];
+  function add(text) {
+    const label = String(text || "").replace(/\s+/g, " ").trim();
+    if (!label || labels.indexOf(label) !== -1) return;
+    const folded = label.toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (
+      folded === "select" ||
+      folded === "please select" ||
+      folded === "choose" ||
+      folded === "choose one" ||
+      folded === "select one"
+    ) {
+      return;
+    }
+    labels.push(label.slice(0, 200));
+  }
+  if (el.tagName === "SELECT") {
+    Array.from(el.options).forEach((option) => add(option.label || option.text || option.value));
+    return labels.slice(0, 200);
+  }
+  const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  if (type === "radio" || type === "checkbox" || role === "radio") {
+    const kind = type === "checkbox" ? "checkbox" : "radio";
+    const name = el.getAttribute("name") || "";
+    const nodes = name ? document.querySelectorAll("input[type='" + kind + "']") : [el];
+    nodes.forEach((node) => {
+      if (name && node.getAttribute("name") !== name) return;
+      const wrap = node.closest("label");
+      add(wrap ? wrap.innerText : (node.getAttribute("aria-label") || node.value || ""));
+    });
+    return labels.slice(0, 200);
+  }
+  if (role === "radiogroup" || el.tagName === "FIELDSET") {
+    el.querySelectorAll("input[type='radio'], input[type='checkbox']").forEach((node) => {
+      const wrap = node.closest("label");
+      add(wrap ? wrap.innerText : (node.getAttribute("aria-label") || node.value || ""));
+    });
+    return labels.slice(0, 200);
+  }
+  return [];
+}"""
+
+
+def read_choice_options(page: Any, selector: str) -> list[str]:
+    """Labels on a native select, radio group, or checkbox group. No menu is opened."""
+    if not selector:
+        return []
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return []
+    try:
+        raw = evaluate(_CHOICE_OPTIONS_JS, selector) or []
+    except Exception:
+        return []
+    labels: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in labels:
+            labels.append(text)
+    return labels
+
+
+def fit_choice_values(item: dict[str, Any], values: list[str]) -> tuple[str, list[str]]:
+    """Rewrite a unique choice to its option label.
+
+    ``ok`` keeps free text when the control has no options. ``option_mismatch``
+    is no match. ``ambiguous`` is more than one option at the best tier.
+    """
     options = [str(option).strip() for option in item.get("options") or [] if str(option).strip()]
-    if not options:
-        return True
-    allowed = set(options)
-    return all(value.strip() in allowed for value in values)
+    answer_type = str(item.get("answerType") or "")
+    if answer_type not in _CHOICE_ANSWER_TYPES or not options:
+        if options and not all(value.strip() in set(options) for value in values):
+            return "option_mismatch", options
+        return "ok", list(values)
+    from autofill.intents import pick_option
+    from autofill.models import Option
+
+    catalog = [Option(value=label, label=label) for label in options]
+    canonical: list[str] = []
+    saw_ambiguous = False
+    saw_none = False
+    for value in values:
+        status, option = pick_option(value, catalog)
+        if status == "ambiguous":
+            saw_ambiguous = True
+        elif status != "match" or option is None:
+            saw_none = True
+        else:
+            canonical.append(option.label or option.value)
+    if saw_ambiguous:
+        return "ambiguous", options
+    if saw_none:
+        return "option_mismatch", options
+    return "ok", canonical
 
 
 def match_open_item(

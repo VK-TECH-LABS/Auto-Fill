@@ -36,6 +36,7 @@ from autofill.dom_ui import (
 )
 from autofill.engine import ApplicationResult
 from autofill.fill import apply_mapped
+from autofill.follow import follow_answer, read_page_mark
 from autofill.models import Control, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
@@ -409,13 +410,43 @@ def test_answer_fills_and_continues_without_logging_the_value(answer_app, caplog
         json={"questionHash": "abc123", "value": SECRET},
     )
     assert replied.status_code == 200
-    assert replied.json() == {"filled": True}
+    body = replied.json()
+    assert body["filled"] is True
+    assert isinstance(body["ms"], int)
+    assert body["ms"] >= 0
     assert runner.applied[0]["value"] == SECRET
     assert runner.calls[-1] == (False, True)
     assert SECRET not in caplog.text
     assert "action=answer result=filled" in caplog.text
     follow = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
     assert follow.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+
+
+def test_answer_accepts_a_unique_option_and_rejects_an_ambiguous_one(answer_app):
+    client, runner = answer_app
+
+    def answer(options: list[str], value: str):
+        runner.item = _question(answerType="single_select", text="Choice", options=options)
+        created = client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH)
+        return client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"fieldKey": "yearsExperience", "value": value},
+        )
+
+    degree = answer(["Bachelor's Degree", "Master's Degree"], "Bachelor's")
+    assert degree.status_code == 200
+    assert degree.json()["filled"] is True
+    assert runner.applied[-1]["value"] == "Bachelor's Degree"
+    country = answer(["Canada +1", "United States +1", "United Kingdom +44"], "United States")
+    assert country.status_code == 200
+    assert runner.applied[-1]["value"] == "United States +1"
+    ambiguous = answer(["Computer Science", "Political Science"], "Science")
+    assert ambiguous.status_code == 422
+    assert ambiguous.json()["detail"]["reason"] == "ambiguous"
+    assert ambiguous.json()["detail"]["options"] == ["Computer Science", "Political Science"]
 
 
 def test_answer_rejects_unknown_targets_and_option_mismatches(answer_app):
@@ -647,6 +678,167 @@ def test_phone_commit_compares_digits_and_other_fields_fold(browser):
         page.select_option("#region", "tx")
         assert _committed(page, "#region", ["texas"], multi=False, field_key="state") is True
         assert _committed(page, "#region", ["  TEXAS "], multi=False, field_key="state") is True
+    finally:
+        page.close()
+
+
+def test_type_visible_types_into_an_inner_input(browser):
+    page = browser.new_page()
+    try:
+        page.set_content("<div id='wrap'><input id='inner'></div>")
+        page.evaluate(
+            """() => {
+              window.__writes = 0;
+              document.getElementById('inner').addEventListener('input', () => { window.__writes += 1; });
+            }"""
+        )
+        assert type_visible(page, "#wrap", "Casey") is True
+        assert page.locator("#inner").input_value() == "Casey"
+        assert page.evaluate("() => window.__writes") > 1
+    finally:
+        page.close()
+
+
+def test_resolver_fill_types_each_character(browser, monkeypatch):
+    from autofill.resolver import ResolverBinding, ResolverResponse
+    from autofill.stepfill import fill_resolved_page
+
+    def fake_resolve(binding, *, session_id, step, fields, questions):
+        del binding, session_id, step, fields, questions
+        return ResolverResponse(fields={"firstName": "Casey"})
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    try:
+        page.set_content("<label for='given'>First name</label><input id='given' autocomplete='given-name' required>")
+        page.evaluate(
+            """() => {
+              window.__writes = 0;
+              document.getElementById('given').addEventListener('input', () => { window.__writes += 1; });
+            }"""
+        )
+        expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        outcome = fill_resolved_page(
+            page,
+            ResolverBinding(
+                url="https://resolver.example.test/v1/resolve",
+                token=RESOLVER_TOKEN,
+                expires_at=expires,
+                candidate_ref="ref-a",
+                job_ref="job-a",
+            ),
+            session_id="session-a",
+            ats_name=None,
+            step="personal",
+        )
+        assert page.locator("#given").input_value() == "Casey"
+        assert page.evaluate("() => window.__writes") > 1
+        assert any(field.action == "fill" for field in outcome.fields)
+    finally:
+        page.close()
+
+
+def test_next_blocker_scan_fills_choice_options(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <label for="note">Notes</label><input id="note" required>
+            <label for="degree">Degree</label>
+            <select id="degree" required>
+              <option value="">Select</option>
+              <option>Bachelor's Degree</option>
+              <option>Master's Degree</option>
+            </select>
+            <label for="code">Phone code</label>
+            <div id="code" role="combobox" aria-required="true" aria-controls="code-list">Open</div>
+            <ul id="code-list" role="listbox" hidden>
+              <li id="us" role="option">United States +1</li>
+              <li id="uk" role="option">United Kingdom +44</li>
+            </ul>
+            <fieldset>
+              <legend>Work authorization</legend>
+              <label><input type="radio" name="auth" value="yes" required> Yes</label>
+              <label><input type="radio" name="auth" value="no"> No</label>
+            </fieldset>
+            """
+        )
+        page.evaluate(
+            """() => {
+              document.getElementById('code').addEventListener('click', () => {
+                document.getElementById('code-list').hidden = false;
+              });
+            }"""
+        )
+        profile = CandidateProfile.from_dict(
+            {"personal": {"full_name": "Casey Example", "email": "casey.example@example.com"}}
+        )
+        follow = follow_answer(page, profile=profile, job=None, held=set(), prior=[], previous=None)
+        assert follow.blocking is not None
+        assert follow.blocking["answerType"] == "text"
+        choices = [
+            item
+            for item in follow.open_items
+            if item.get("answerType") in {"single_select", "multi_select"}
+        ]
+        assert len(choices) >= 3
+        for item in choices:
+            assert item["options"]
+        degree = next(item for item in choices if item["selector"] == "#degree")
+        assert "Bachelor's Degree" in degree["options"]
+        code = next(item for item in choices if item["selector"] == "#code")
+        assert "United States +1" in code["options"]
+        radio = next(item for item in choices if "Yes" in item["options"])
+        assert "No" in radio["options"]
+    finally:
+        page.close()
+
+
+def test_screenshot_runs_between_fields_on_the_worker():
+    from autofill.service.runner import _Worker
+
+    worker = _Worker(0, headless=True, launch_args=[])
+    order: list[str] = []
+    try:
+
+        def fill() -> None:
+            deadline = time.time() + 2
+            while worker._queue.empty() and not worker._front and time.time() < deadline:
+                time.sleep(0.01)
+            checkpoint()
+            order.append("after")
+
+        def shot() -> None:
+            order.append("shot")
+
+        started = threading.Thread(target=lambda: worker.submit(fill))
+        started.start()
+        time.sleep(0.05)
+        captured = threading.Thread(target=lambda: worker.submit(shot, drainable=True))
+        captured.start()
+        started.join(timeout=5)
+        captured.join(timeout=5)
+        assert not started.is_alive()
+        assert not captured.is_alive()
+        assert order == ["shot", "after"]
+    finally:
+        worker.shutdown()
+
+
+def test_follow_answer_does_not_type_when_the_step_changes(browser):
+    page = browser.new_page()
+    try:
+        page.set_content("<h1>Questions</h1><label for='name'>Full name</label><input id='name' required>")
+        page.locator("#name").fill("Casey Example")
+        mark, _snapshot = read_page_mark(page)
+        page.set_content("<h1>Review</h1><label for='note'>Note</label><input id='note' required>")
+        profile = CandidateProfile.from_dict(
+            {"personal": {"full_name": "Casey Example", "email": "casey.example@example.com"}}
+        )
+        follow = follow_answer(page, profile=profile, job=None, held=set(), prior=[], previous=mark)
+        assert follow.changed is True
+        assert follow.typed == []
+        assert page.locator("#note").input_value() == ""
     finally:
         page.close()
 

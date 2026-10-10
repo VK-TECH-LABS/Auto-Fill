@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <body>
+    <h1>Questions</h1>
+    <form id="form">
+      <label for="name">Full name</label>
+      <input id="name" name="name" autocomplete="name" required>
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" required>
+      <label for="color">What is your favorite color?</label>
+      <input id="color" name="color" required>
+      <label for="city">City</label>
+      <input id="city" name="city" autocomplete="address-level2" required hidden>
+      <label for="animal">What is your favorite animal?</label>
+      <input id="animal" name="animal" required>
+      <button type="submit" id="submit">Submit application</button>
+    </form>
+    <script>
+      window.__submitted = false;
+      document.getElementById("color").addEventListener("input", () => {
+        document.getElementById("city").hidden = false;
+      });
+      document.getElementById("form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        window.__submitted = true;
+      });
+    </script>
+  </body>
+</html>
