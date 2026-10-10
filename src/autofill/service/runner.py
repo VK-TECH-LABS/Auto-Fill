@@ -376,6 +376,10 @@ class FillRequest:
     session_created_ms: int = 0
     max_pages: int = 8
     intent_hook: Any = None
+    pause_gate: Any = None
+    held_selectors: set[str] | None = None
+    open_items: list | None = None
+    progress: dict | None = None
 
 
 class FillRunner(Protocol):
@@ -637,6 +641,10 @@ class PlaywrightRunner:
             timings=self._timings(request, slot),
             max_pages=request.max_pages,
             intent_hook=request.intent_hook,
+            pause_gate=request.pause_gate,
+            held_selectors=request.held_selectors,
+            open_items=request.open_items,
+            progress=request.progress,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
@@ -778,6 +786,31 @@ class PlaywrightRunner:
                     worker.sessions.pop(session_id, None)
                 raise PageUnavailable(410) from None
             return True
+
+        return worker.submit(apply)
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        """Fill one field on the open page. The value is not logged."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return {"filled": False, "reason": "no_page"}
+
+        def apply() -> dict:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return {"filled": False, "reason": "no_page"}
+            from autofill.dom_ui import commit_visible
+
+            try:
+                return commit_visible(slot.page, target)
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(session_id)
+                except Exception:
+                    worker.sessions.pop(session_id, None)
+                raise PageUnavailable(410) from None
 
         return worker.submit(apply)
 

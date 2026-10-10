@@ -10,13 +10,16 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from autofill.adapters import adapter_for
 from autofill.combobox import select_combobox
 from autofill.dates import format_for_control
+from autofill.dom_ui import answer_type_name, checkpoint, selector_held, type_visible
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped, attach_resume
 from autofill.intents import (
+    DEMOGRAPHIC_INTENTS,
     UNFILLED_INTENTS,
     IntentMatch,
     classify_question,
@@ -117,7 +120,7 @@ class ResolvedPage:
     snapshot: PageSnapshot | None = None
     resume_blocked: bool = False
     manual_actions: list[str] = field(default_factory=list)
-    manual_questions: list[dict[str, str | bool | None]] = field(default_factory=list)
+    manual_questions: list[dict[str, Any]] = field(default_factory=list)
     requested_fields: list[str] = field(default_factory=list)
     requested_intents: list[str | None] = field(default_factory=list)
 
@@ -711,7 +714,14 @@ def _selected_location(page) -> str:
 
 def _manual_location(outcome: ResolvedPage, control: Control) -> None:
     text = sanitize_question(control.label or control.aria_label or "Current location")
-    _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+    _manual(
+        outcome,
+        IntentMatch(None, "unknown", "none", text),
+        blocking=True,
+        control=control,
+        kind="MISSING_PROFILE_VALUE",
+        field_key="address.city",
+    )
 
 
 def _pause(page, millis: int) -> None:
@@ -906,7 +916,8 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
     field = page.locator(control.selector)
     try:
         field.fill("")
-        field.press_sequentially(city, delay=50)
+        if not type_visible(page, control.selector, city):
+            field.press_sequentially(city, delay=50)
     except Exception as exc:
         logger.info("location left manual reason=type_error error=%s", type(exc).__name__)
         _manual_location(outcome, control)
@@ -981,6 +992,10 @@ def _apply(
     ordered = [ask for ask in requests if ask.field_key != "resume.file"]
     ordered.extend(ask for ask in requests if ask.field_key == "resume.file")
     for ask in ordered:
+        if not checkpoint():
+            break
+        if any(selector_held(control.selector) for control in ask.controls):
+            continue
         if ask.field_key == "resume.file":
             _apply_resume(page, ask, response, outcome)
             continue
@@ -1167,12 +1182,17 @@ def _apply_question(
 ) -> None:
     match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
     if match.intent in UNFILLED_INTENTS or _eeo(match.text) or _eeo(_question_text(ask.controls)):
-        _manual(outcome, match, blocking=any(item.required for item in ask.controls) or match.intent == "REFERRAL")
+        _manual(
+            outcome,
+            match,
+            blocking=any(item.required for item in ask.controls) or match.intent == "REFERRAL",
+            controls=ask.controls,
+        )
         return
     if answer is None or not (
         may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)
     ):
-        _manual(outcome, match, blocking=_question_blocks(ask.controls, answer))
+        _manual(outcome, match, blocking=_question_blocks(ask.controls, answer), controls=ask.controls)
         return
     control = ask.controls[0]
     if len(ask.controls) > 1 or (control.kind == "checkbox" and control.group and len(ask.controls) > 1):
@@ -1182,7 +1202,7 @@ def _apply_question(
         ]
         chosen = match_all_options(saved, options)
         if chosen is None:
-            _manual(outcome, match, blocking=True)
+            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
         chosen_selectors = {item.selector for item in chosen}
         for item in ask.controls:
@@ -1199,7 +1219,7 @@ def _apply_question(
         desired = answer.value or (answer.values[0] if answer.values else "")
         option = match_option_exact(desired, control.options)
         if option is None or not option.selector:
-            _manual(outcome, match, blocking=True)
+            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
         click_choice(page, option.selector, option.label)
         outcome.fields.append(
@@ -1217,7 +1237,7 @@ def _apply_question(
         desired = answer.value or (answer.values[0] if answer.values else "")
         picked = select_combobox(page, control.selector, desired)
         if picked is None:
-            _manual(outcome, match, blocking=True)
+            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
         outcome.fields.append(
             FieldOutcome(
@@ -1234,7 +1254,7 @@ def _apply_question(
         desired = answer.value or (answer.values[0] if answer.values else "")
         option = match_option_exact(desired, control.options)
         if option is None:
-            _manual(outcome, match, blocking=True)
+            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
         mapped = MappedField(
             key=match.intent,
@@ -1257,10 +1277,10 @@ def _apply_question(
             mapped = MappedField(key=match.intent, action="uncheck", field_class="APPROVED_QUESTION", confidence="high")
             outcome.fields.append(apply_mapped(page, control, mapped))
             return
-        _manual(outcome, match, blocking=True)
+        _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
         return
     if not answer.value:
-        _manual(outcome, match, blocking=True)
+        _manual(outcome, match, blocking=True, controls=ask.controls)
         return
     _write_text(page, control, answer.value, outcome, key=match.intent or "saved_answer")
 
@@ -1402,14 +1422,63 @@ def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str)
         )
     )
     if _required_question(control):
-        _manual(outcome, IntentMatch(None, "unknown", "none", _manual_label(control)), blocking=True)
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", _manual_label(control)),
+            blocking=True,
+            control=control,
+            kind="MISSING_PROFILE_VALUE",
+            field_key=key,
+        )
 
 
-def _manual(outcome: ResolvedPage, match: IntentMatch, *, blocking: bool) -> None:
+def _item_kind(intent: str | None, explicit: str | None, field_key: str | None) -> str:
+    if explicit:
+        return explicit
+    if intent in DEMOGRAPHIC_INTENTS:
+        return "DEMOGRAPHIC"
+    if field_key:
+        return "MISSING_PROFILE_VALUE"
+    return "QUESTION"
+
+
+def _manual(
+    outcome: ResolvedPage,
+    match: IntentMatch,
+    *,
+    blocking: bool,
+    control: Control | None = None,
+    controls: list[Control] | None = None,
+    kind: str | None = None,
+    field_key: str | None = None,
+) -> None:
     text = sanitize_question(match.text or "")
     if not text or _is_section_heading(text):
         return
-    entry = {"intent": match.intent, "text": text, "blocking": blocking}
+    group = list(controls or [])
+    if control is not None and control not in group:
+        group.insert(0, control)
+    primary = group[0] if group else None
+    digest = question_hash(text) or None
+    options = _option_labels(group) if group else []
+    multi = len(group) > 1 and any(item.kind == "checkbox" for item in group)
+    entry: dict[str, Any] = {
+        "intent": match.intent,
+        "text": text,
+        "blocking": blocking,
+        "questionId": digest,
+        "questionHash": digest,
+        "fieldKey": field_key,
+        "answerType": answer_type_name(
+            primary.kind if primary is not None else "text",
+            primary.input_type if primary is not None else "",
+            multi=multi,
+        ),
+        "options": options,
+        "required": any(item.required for item in group) if group else blocking,
+        "selector": primary.selector if primary is not None else "",
+        "kind": _item_kind(match.intent, kind, field_key),
+    }
     if not any(item.get("intent") == entry["intent"] and item.get("text") == text for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
@@ -1476,7 +1545,7 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
                 if folded in seen:
                     continue
                 seen.add(folded)
-                _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+                _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, controls=siblings)
                 continue
         text = sanitize_question(_manual_label(control))
         if _is_section_heading(text):
@@ -1487,7 +1556,7 @@ def _note_unfilled_required(outcome: ResolvedPage) -> None:
         if key in seen:
             continue
         seen.add(key)
-        _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True)
+        _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, control=control)
     _drop_emitted_options(outcome)
 
 

@@ -35,6 +35,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+autofill = ["dom_ui.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # The `pytest` console script does not put the checkout on sys.path.

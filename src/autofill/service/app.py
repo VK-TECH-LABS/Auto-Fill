@@ -14,6 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from autofill import __version__
 from autofill.credentials import Credentials
+from autofill.dom_ui import empty_progress, match_open_item, values_fit
 from autofill.engine import ApplicationResult, Status
 from autofill.models import JobContext
 from autofill.redact import install_redaction, redaction_filter
@@ -39,6 +40,9 @@ from autofill.service.runner import (
     elapsed_ms,
 )
 from autofill.service.schemas import (
+    AnswerIn,
+    AnswerOut,
+    BlockingOut,
     CandidateCheckIn,
     ContinueIn,
     CreateSessionIn,
@@ -49,6 +53,7 @@ from autofill.service.schemas import (
     InteractIn,
     InteractOut,
     ManualQuestionOut,
+    ProgressOut,
     RunStatusOut,
     TimingsOut,
 )
@@ -117,7 +122,7 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
     )
 
 
-def _status_out(session: ServiceSession) -> RunStatusOut:
+def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut:
     result = session.result
     body = RunStatusOut(
         sessionId=session.session_id,
@@ -129,7 +134,16 @@ def _status_out(session: ServiceSession) -> RunStatusOut:
         manualQuestions=_questions_out(session),
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
+        paused=session.paused,
     )
+    # A run still inside the worker reports live progress. The response from that
+    # run is built before the busy flag drops, so ``final`` uses the result.
+    if result is None or (session.busy and not final):
+        body.progress = ProgressOut.model_validate(dict(session.progress or empty_progress()))
+    else:
+        body.progress = ProgressOut.model_validate(dict(result.progress or session.progress or empty_progress()))
+        if result.blocking:
+            body.blocking = BlockingOut.model_validate(result.blocking)
     if result is None:
         return body
     payload = result.to_dict()
@@ -158,6 +172,9 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     session.result = result
     session.status = result.status
     session.manual_questions = [dict(item) for item in result.manual_questions]
+    session.progress = dict(result.progress) if result.progress else empty_progress()
+    session.open_items = [dict(item) for item in result.open_items]
+    session.paused = session.pause_gate.paused
     if result.timings:
         for key, value in result.timings.items():
             if key == "sessionCreatedMs" and not value and session.timings.get(key):
@@ -170,7 +187,7 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         result.ats or "",
         result.current_step,
     )
-    return _status_out(session)
+    return _status_out(session, final=True)
 
 
 def _mark_browser_crash(session: ServiceSession) -> None:
@@ -271,6 +288,10 @@ def _request_for(
         answers_updated=answers_updated,
         session_created_ms=int(session.timings.get("sessionCreatedMs", 0)),
         max_pages=12 if session.mode == "resolver" else 8,
+        pause_gate=session.pause_gate,
+        held_selectors=session.held_selectors,
+        open_items=session.open_items,
+        progress=session.progress,
     )
 
 
@@ -528,6 +549,92 @@ def create_app(
         if not body.resume_uploaded:
             raise HTTPException(status_code=409, detail="Continue only after a person has uploaded the resume.")
         return _run(session, store, active_runner, limits, resume_uploaded=True)
+
+    @router.post("/sessions/{session_id}/pause", response_model=RunStatusOut, tags=["sessions"])
+    def pause_session(session_id: str) -> RunStatusOut:
+        """Stop between fields. A second pause is a no-op and does not start a fill."""
+        session = _session_or_404(session_id)
+        session.pause_gate.pause()
+        session.paused = True
+        logger.info("session=%s action=pause", session.session_id)
+        return _status_out(session)
+
+    @router.post("/sessions/{session_id}/resume", response_model=RunStatusOut, tags=["sessions"])
+    def resume_session(session_id: str) -> RunStatusOut:
+        """Release a paused fill. This does not start a run that has already stopped."""
+        session = _session_or_404(session_id)
+        session.pause_gate.resume()
+        session.paused = False
+        logger.info("session=%s action=resume", session.session_id)
+        return _status_out(session)
+
+    @router.post(
+        "/sessions/{session_id}/answer",
+        response_model=AnswerOut,
+        response_model_exclude_none=True,
+        tags=["sessions"],
+    )
+    def answer_session(session_id: str, body: AnswerIn) -> AnswerOut:
+        """Fill one open field visibly, then continue. The value is not logged."""
+        session = _session_or_404(session_id)
+        if session.status in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED}:
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot answer while sign-in or a challenge is blocking.",
+            )
+        if session.busy:
+            raise HTTPException(status_code=409, detail="Session is already running.")
+        item = match_open_item(
+            session.open_items,
+            question_id=body.question_id,
+            question_hash=body.question_hash,
+            field_key=body.field_key,
+        )
+        if item is None:
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            raise HTTPException(status_code=409, detail="No open item matches this answer.")
+        values = [text for text in body.values if str(text).strip()]
+        if body.value.strip():
+            values = values or [body.value]
+        if not values:
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            raise HTTPException(status_code=422, detail={"reason": "empty", "options": list(item.get("options") or [])})
+        if not values_fit(item, values):
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            raise HTTPException(
+                status_code=422,
+                detail={"reason": "option_mismatch", "options": [str(option) for option in item.get("options") or []]},
+            )
+        for value in values:
+            redaction_filter().add(value)
+            session.held_answers.append(value)
+        target = dict(item)
+        target["value"] = values[0]
+        target["values"] = values
+        apply = getattr(active_runner, "apply_answer", None)
+        if apply is None:
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            return AnswerOut(filled=False, reason="no_page")
+        try:
+            filled = apply(session.session_id, target)
+        except PageUnavailable as exc:
+            _mark_browser_crash(session)
+            raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+        if not filled.get("filled"):
+            logger.info("session=%s action=answer result=rejected", session.session_id)
+            return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"))
+        selector = str(item.get("selector") or "")
+        if selector:
+            session.held_selectors.add(selector)
+        logger.info("session=%s action=answer result=filled", session.session_id)
+        session.pause_gate.resume()
+        session.paused = False
+        if session.status == Status.MANUAL_ANSWER_REQUIRED:
+            _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
+        elif session.status == Status.RESUME_UPLOAD_REQUIRED:
+            _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
+        return AnswerOut(filled=True)
 
     @router.post("/sessions/{session_id}/credentials", response_model=CredentialsOut, tags=["sessions"])
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:

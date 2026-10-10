@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
+from autofill.dom_ui import checkpoint, focus_field, selector_held, type_visible
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
@@ -106,12 +107,17 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             if current.strip() == mapped.text:
                 return _outcome(control, mapped, detail="already set")
             if control.kind in {"text", "textarea", "combobox"}:
-                locator.evaluate(_SET_NATIVE, mapped.text)
+                if not type_visible(page, control.selector, mapped.text):
+                    if hasattr(locator, "evaluate"):
+                        locator.evaluate(_SET_NATIVE, mapped.text)
+                    else:
+                        locator.fill(mapped.text)
             else:
                 locator.fill(mapped.text)
             return _outcome(control, mapped, detail="filled")
         if mapped.action == "select":
             if control.kind == "radio":
+                focus_field(page, mapped.option_selector or control.selector)
                 page.locator(mapped.option_selector).check()
             elif control.kind == "combobox":
                 from autofill.combobox import select_combobox
@@ -125,8 +131,10 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
 
                 click_choice(page, mapped.option_selector, mapped.option_label)
             elif mapped.option_value:
+                focus_field(page, control.selector)
                 locator.select_option(value=mapped.option_value)
             else:
+                focus_field(page, control.selector)
                 locator.select_option(label=mapped.option_label)
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
@@ -174,6 +182,10 @@ def fill_one_page(
         snapshot = extract_page(page)
         cursor = MapCursor(page_heading=snapshot.heading)
         for control in snapshot.controls:
+            if not checkpoint():
+                break
+            if selector_held(control.selector):
+                continue
             mapped = map_field(
                 control,
                 profile,
