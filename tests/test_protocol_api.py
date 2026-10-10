@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from autofill.credentials import Credentials, SiteContext
 from autofill.engine import ApplicationResult, Status
 from autofill.redact import configure_stdout_logging, install_redaction, redaction_filter
 from autofill.service.app import create_app
@@ -41,6 +42,9 @@ class ScriptedRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bool, bool]] = []
         self.discarded: list[str] = []
+        self.screenshots: list[str] = []
+        self.interactions: list[tuple[str, str | None]] = []
+        self.applied: list[tuple[str, object]] = []
         self.mode = "manual"
 
     def run(self, request):
@@ -53,6 +57,9 @@ class ScriptedRunner:
             questions = [{"intent": "US_WORK_AUTHORIZATION", "text": "Are you legally authorized to work?"}]
         elif self.mode == "resume":
             status = Status.RESUME_UPLOAD_REQUIRED
+            questions = []
+        elif self.mode == "expired":
+            status = Status.EXPIRED
             questions = []
         else:
             status = Status.READY_FOR_HUMAN_SUBMIT
@@ -71,6 +78,18 @@ class ScriptedRunner:
 
     def discard(self, session_id: str) -> None:
         self.discarded.append(session_id)
+
+    def screenshot(self, session_id: str):
+        self.screenshots.append(session_id)
+        return b"jpeg", "example.test"
+
+    def interact(self, session_id: str, action: dict) -> bool:
+        self.interactions.append((session_id, action.get("action")))
+        return True
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        self.applied.append((session_id, target.get("value")))
+        return {"filled": True}
 
     def shutdown(self) -> None:
         return None
@@ -178,7 +197,7 @@ def test_ttl_reaper_wipes_the_resolver_token(client):
     again = _test_client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
     assert again.status_code == 409
     status = _test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
-    assert status.json()["status"] == Status.EXPIRED
+    assert status.status_code == 410
     assert RESOLVER_TOKEN not in status.text
 
 
@@ -259,6 +278,153 @@ def test_stdout_logs_are_structured_and_redacted(capsys: pytest.CaptureFixture[s
     assert "river.example@example.com" not in captured
     assert secret not in captured
     assert "Bearer [redacted]" in captured
+
+
+_SECRET = "synthetic-password-expired-session"
+
+
+def _follow_ups(test_client: TestClient, session_id: str) -> dict[str, int]:
+    status = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+    shot = test_client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
+    interact = test_client.post(
+        f"/v1/sessions/{session_id}/interact",
+        headers=AUTH,
+        json={"action": "key", "key": "Escape"},
+    )
+    pause = test_client.post(f"/v1/sessions/{session_id}/pause", headers=AUTH)
+    resume = test_client.post(f"/v1/sessions/{session_id}/resume", headers=AUTH)
+    answer = test_client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionHash": "desk", "value": "Window"},
+    )
+    continued = test_client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"resumeUploaded": True},
+    )
+    credentials = test_client.post(
+        f"/v1/sessions/{session_id}/credentials",
+        headers=AUTH,
+        json={"email": "avery.example@example.com", "password": _SECRET},
+    )
+    assert _SECRET not in credentials.text
+    return {
+        "status": status.status_code,
+        "screenshot": shot.status_code,
+        "interact": interact.status_code,
+        "pause": pause.status_code,
+        "resume": resume.status_code,
+        "answer": answer.status_code,
+        "continue": continued.status_code,
+        "credentials": credentials.status_code,
+    }
+
+
+def test_due_session_rejects_every_follow_up_without_side_effects(client):
+    test_client, runner, app = client
+    created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+    session_id = created.json()["sessionId"]
+    held = app.state.store.get(session_id)
+    assert held is not None
+    held.credentials.put(
+        held.candidate_id,
+        "boards.greenhouse.io",
+        Credentials(site="boards.greenhouse.io", email="avery.example@example.com", password=_SECRET),
+    )
+    held.open_items = [
+        {
+            "questionHash": "desk",
+            "selector": "#desk",
+            "options": ["Window", "Aisle"],
+            "answerType": "single_select",
+            "text": "Preferred desk?",
+            "kind": "QUESTION",
+        }
+    ]
+    held.screenshot_version = 4
+    held.paused = False
+    held.expires_at = time.monotonic() - 1
+    codes = _follow_ups(test_client, session_id)
+    assert codes == {name: 410 for name in codes}
+    assert held.status == Status.EXPIRED
+    assert held.paused is False
+    assert held.pause_gate.paused is False
+    assert held.screenshot_version == 4
+    assert held.held_answers == []
+    assert held.resolver_token == ""
+    site = SiteContext(
+        url="https://boards.greenhouse.io/example/jobs/1",
+        domain="boards.greenhouse.io",
+        candidate_id=held.candidate_id,
+    )
+    assert held.credentials.get_credentials(site, held.candidate_id) is None
+    assert runner.calls == []
+    assert runner.screenshots == []
+    assert runner.interactions == []
+    assert runner.applied == []
+    assert session_id in runner.discarded
+    held.paused = True
+    held.pause_gate.pause()
+    resume = test_client.post(f"/v1/sessions/{session_id}/resume", headers=AUTH)
+    assert resume.status_code == 410
+    assert held.paused is True
+    assert held.pause_gate.paused is True
+    missing = test_client.get("/v1/sessions/missing-session/status", headers=AUTH)
+    assert missing.status_code == 404
+
+
+def test_ttl_reaper_closes_the_browser_before_the_next_call():
+    runner = ScriptedRunner()
+    app = create_app(
+        token=TOKEN,
+        runner=runner,
+        run_browser=False,
+        session_ttl_seconds=1800,
+        reaper_interval_seconds=0.05,
+    )
+    with TestClient(app) as test_client:
+        created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        held = app.state.store.get(session_id)
+        assert held is not None
+        held.expires_at = time.monotonic() - 1
+        deadline = time.monotonic() + 2
+        while session_id not in runner.discarded and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert session_id in runner.discarded
+        assert held.status == Status.EXPIRED
+        assert held.resolver_token == ""
+        closed = list(runner.discarded)
+        status = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.status_code == 410
+        assert runner.discarded == closed
+        assert runner.calls == []
+        assert runner.screenshots == []
+
+
+def test_resolver_expiry_closes_the_context_and_rejects_follow_ups(client):
+    test_client, runner, app = client
+    runner.mode = "expired"
+    created = test_client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+    session_id = created.json()["sessionId"]
+    started = test_client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    assert started.status_code == 200, started.text
+    assert started.json()["status"] == Status.EXPIRED
+    assert RESOLVER_TOKEN not in started.text
+    held = app.state.store.get(session_id)
+    assert held is not None
+    assert held.resolver_token == ""
+    assert session_id in runner.discarded
+    calls = len(runner.calls)
+    codes = _follow_ups(test_client, session_id)
+    assert codes == {name: 410 for name in codes}
+    assert len(runner.calls) == calls
+    assert runner.screenshots == []
+    assert runner.interactions == []
+    assert runner.applied == []
+    assert held.paused is False
+    assert held.held_answers == []
 
 
 def test_image_still_installs_chromium():

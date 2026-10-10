@@ -596,6 +596,29 @@ def _skill_answer(control: Control, profile: CandidateProfile) -> MappedField | 
 def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> MappedField:
     if not text:
         return MappedField(key=key, action="unanswered", reason="Profile has no value for this field.")
+    # A closed country menu has no options yet. Choose it live instead of typing into the inner input.
+    if key == "country" and control.kind == "combobox":
+        if control.options:
+            option = match_option(text, control.options)
+            if option is not None:
+                return MappedField(
+                    key=key,
+                    action="select",
+                    text=text,
+                    option_label=option.label,
+                    option_value=option.value,
+                    option_selector=option.selector,
+                    reason=reason,
+                    field_class="PROFILE_FIELD",
+                )
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Country is chosen from the menu.",
+            field_class="PROFILE_FIELD",
+        )
     if control.kind in {"select", "radio"} or (control.kind == "combobox" and control.options):
         option = match_option(text, control.options)
         if option is None:

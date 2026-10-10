@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Application</title>
+    <style>
+      .select__control {
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        width: 280px;
+        height: 48px;
+        overflow: hidden;
+        border: 1px solid #ccc;
+      }
+      .select__input {
+        width: 2px;
+        height: 2px;
+        padding: 0;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Application</h1>
+    <form id="form">
+      <label for="name">Full name</label>
+      <input id="name" name="name" autocomplete="name" required>
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" required>
+      <div class="select" id="country-box">
+        <label for="country">Country</label>
+        <div class="select__control" id="country-control">
+          <input id="country" class="select__input" role="combobox" required aria-label="Country" autocomplete="country-name">
+          <span class="select__single-value" id="country-single"></span>
+        </div>
+        <input type="hidden" id="country-hidden">
+      </div>
+      <div class="select" id="desk-box">
+        <label for="desk">Preferred desk?</label>
+        <div class="select__control" id="desk-control">
+          <input id="desk" class="select__input" role="combobox" required aria-label="Preferred desk?">
+          <span class="select__single-value" id="desk-single"></span>
+        </div>
+        <input type="hidden" id="desk-hidden">
+      </div>
+      <button type="submit" id="submit">Submit application</button>
+    </form>
+    <script>
+      window.__submitted = false;
+      document.getElementById("form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        window.__submitted = true;
+      });
+
+      function closeList(input) {
+        const list = document.getElementById(input.id + "-list");
+        if (list) list.remove();
+        input.removeAttribute("aria-controls");
+      }
+
+      function commit(input, label) {
+        const root = input.closest(".select");
+        root.querySelector("input[type='hidden']").value = label;
+        root.querySelector(".select__single-value").textContent = label;
+        input.value = "";
+        closeList(input);
+      }
+
+      function showList(input, labels) {
+        closeList(input);
+        if (!labels.length) return;
+        const list = document.createElement("ul");
+        list.id = input.id + "-list";
+        list.setAttribute("role", "listbox");
+        input.setAttribute("aria-controls", list.id);
+        labels.forEach((label, index) => {
+          const item = document.createElement("li");
+          item.id = input.id + "-opt-" + index;
+          item.setAttribute("role", "option");
+          item.setAttribute("data-value", label);
+          item.textContent = label;
+          item.addEventListener("click", () => commit(input, label));
+          list.appendChild(item);
+        });
+        input.closest(".select").appendChild(list);
+      }
+
+      const countries = ["Canada", "Mexico", "United States", "United States of America"];
+      const country = document.getElementById("country");
+      let countryGen = 0;
+      country.addEventListener("input", () => {
+        const token = ++countryGen;
+        const query = country.value.trim().toLowerCase();
+        setTimeout(() => {
+          if (token !== countryGen) return;
+          if (!query) {
+            closeList(country);
+            return;
+          }
+          showList(country, countries.filter((label) => label.toLowerCase().includes(query)));
+        }, 40);
+      });
+
+      const desk = document.getElementById("desk");
+      desk.addEventListener("click", () => {
+        showList(desk, ["Window", "Aisle"]);
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        closeList(country);
+        closeList(desk);
+      });
+    </script>
+  </body>
+</html>
