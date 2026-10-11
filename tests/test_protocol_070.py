@@ -182,6 +182,28 @@ def test_register_outranks_sign_in_and_an_application_is_neither():
     both = score_account(sign_in)
     assert both.mode == "login"
     assert both.alternate is True
+    hidden_pane = _snapshot(
+        controls=[
+            _control("password", "Password", selector="#visible"),
+            _control(
+                "password",
+                "Verify password",
+                selector="#hidden",
+                hidden=True,
+                automation_id="verifyPassword",
+                aria_label="Verify password",
+            ),
+        ],
+        buttons=[ButtonControl(name="Sign In", selector="#go", automation_id="signInSubmitButton")],
+        links=[LinkControl(name="Create Account", selector="#create", automation_id="createAccountLink")],
+        password_present=True,
+        heading="Sign in",
+        page_text="Forgot password",
+        automation_ids=["signInSubmitButton", "createAccountLink"],
+    )
+    parked = score_account(hidden_pane)
+    assert parked.mode == "login"
+    assert parked.alternate is True
 
     application = _snapshot(
         controls=[

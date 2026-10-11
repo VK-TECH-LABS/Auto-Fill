@@ -236,8 +236,11 @@ def _passwords(snapshot: PageSnapshot) -> list[Control]:
 
 
 def _automation_ids(snapshot: PageSnapshot) -> set[str]:
+    """Visible automation ids only. A hidden pane is not the active form."""
     found = {item for item in snapshot.automation_ids if item}
     for control in snapshot.controls:
+        if control.hidden:
+            continue
         if control.automation_id:
             found.add(control.automation_id)
     for button in snapshot.buttons:
@@ -267,7 +270,7 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
         register += 2
     elif len(passwords) == 1:
         login += 2
-    blobs = " ".join(_control_blob(control) for control in snapshot.controls)
+    blobs = " ".join(_control_blob(control) for control in snapshot.controls if not control.hidden)
     if _CONFIRM_RE.search(blobs):
         register += 2
     heading = snapshot.heading or ""
