@@ -21,6 +21,7 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
 
 HIGHLIGHT_KINDS = frozenset({"QUESTION", "MISSING_PROFILE_VALUE", "OPTION_MISMATCH", "DEMOGRAPHIC"})
+_CONSENT_KIND_ALIASES = frozenset({"ACKNOWLEDGMENT", "ACKNOWLEDGEMENT"})
 _FILLED_ACTIONS = frozenset({"fill", "select", "check", "uncheck", "upload"})
 _STATUS_BLOCKERS = {
     "CAPTCHA_REQUIRED": ("CAPTCHA", "Complete the challenge", None),
@@ -760,13 +761,21 @@ def choose_blocking(status: str, items: list[dict[str, Any]]) -> dict[str, Any] 
     return None
 
 
+def canonical_blocker_kind(kind: object) -> str:
+    """The public blocker kind. An acknowledgement alias is consent."""
+    name = str(kind or "")
+    if name in _CONSENT_KIND_ALIASES:
+        return "CONSENT"
+    return name
+
+
 def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if item is None:
         return None
     question_id = item.get("questionId") or None
     question_hash = item.get("questionHash") or question_id
     return {
-        "kind": str(item.get("kind") or "QUESTION"),
+        "kind": canonical_blocker_kind(item.get("kind") or "QUESTION"),
         "questionId": question_id,
         "questionHash": question_hash,
         "text": str(item.get("text") or ""),

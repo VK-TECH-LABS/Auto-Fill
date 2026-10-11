@@ -412,6 +412,7 @@ def test_answer_fills_and_continues_without_logging_the_value(answer_app, caplog
     assert replied.status_code == 200
     body = replied.json()
     assert body["filled"] is True
+    assert body["verified"] is True
     assert isinstance(body["ms"], int)
     assert body["ms"] >= 0
     assert runner.applied[0]["value"] == SECRET
@@ -1194,6 +1195,7 @@ def test_three_failed_answers_stop_for_a_person():
         first = _answer_location(client, session_id)
         assert first.status_code == 200
         assert first.json()["filled"] is False
+        assert first.json()["verified"] is False
         early = client.post(
             f"/v1/sessions/{session_id}/continue",
             headers=AUTH,

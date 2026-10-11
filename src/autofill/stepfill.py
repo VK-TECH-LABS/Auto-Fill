@@ -19,6 +19,7 @@ from autofill.combobox import list_combobox_options, select_combobox
 from autofill.dates import format_for_control
 from autofill.dom_ui import (
     answer_type_name,
+    canonical_blocker_kind,
     checkpoint,
     control_committed,
     counts_required,
@@ -2023,7 +2024,7 @@ def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str)
 
 def _item_kind(intent: str | None, explicit: str | None, field_key: str | None) -> str:
     if explicit:
-        return explicit
+        return canonical_blocker_kind(explicit)
     if intent in DEMOGRAPHIC_INTENTS:
         return "DEMOGRAPHIC"
     if field_key:
@@ -2071,6 +2072,8 @@ def _manual(
     field_key: str | None = None,
     option_labels: list[str] | None = None,
 ) -> None:
+    if kind:
+        kind = canonical_blocker_kind(kind)
     limit = 600 if kind in {"CONSENT", "CONSENT_CHOICE"} else 300
     text = sanitize_question(match.text or "", limit=limit)
     if not text or _is_section_heading(text):
