@@ -1059,9 +1059,9 @@ class PlaywrightRunner:
 
             try:
                 if is_location_answer(slot.page, target):
-                    filled = commit_location_answer(slot.page, target)
-                else:
-                    filled = commit_visible(slot.page, target)
+                    # The hidden suggestion id is the commit. A visible city is not.
+                    return commit_location_answer(slot.page, target)
+                filled = commit_visible(slot.page, target)
                 selector = str(target.get("selector") or "")
                 if filled.get("filled") and not control_committed(slot.page, selector):
                     return {"filled": False, "reason": "not_committed"}

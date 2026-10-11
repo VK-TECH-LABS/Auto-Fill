@@ -43,7 +43,7 @@ input.addEventListener("input", () => {
     item.addEventListener("mousedown", (event) => {
       event.preventDefault();
       input.value = place;
-      hidden.value = place;
+      hidden.value = JSON.stringify({name: place, id: "loc-" + index});
       results.innerHTML = "";
     });
     results.appendChild(item);

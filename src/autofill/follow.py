@@ -113,6 +113,12 @@ def follow_answer(
         )
         mark, snapshot = read_page_mark(page)
     gaps, total, done = inspect_required(page, snapshot, profile, prior, option_reads=1)
+    if not gaps:
+        # Re-read every required control before READY. The answer that just
+        # landed can change another field, and that field has to be judged too.
+        from autofill.extract import extract_page
+
+        gaps, total, done = inspect_required(page, extract_page(page), profile, prior)
     if gaps:
         status = Status.MANUAL_ANSWER_REQUIRED
         present_blocking(page, gaps[0])

@@ -576,7 +576,7 @@ def autofill_application(
                 fields.extend(page_fields)
                 manual.extend(page_manual)
                 _note_fill(page_fields, opts, run_started, inspect_state)
-                gaps = required_gaps(page, snapshot, candidate_profile)
+                gaps = required_gaps(page, extract_page(page), candidate_profile)
                 if gaps:
                     return _manual_for_gaps(
                         session,
@@ -685,7 +685,7 @@ def autofill_application(
                 messages=["No application form was found. A person can open the page and continue."],
                 submit_controls=submit_controls,
             )
-        gaps = required_gaps(page, snapshot, candidate_profile)
+        gaps = required_gaps(page, extract_page(page), candidate_profile)
         if gaps:
             return _manual_for_gaps(
                 session,
@@ -1033,7 +1033,7 @@ def _run_resolver_pages(
                         questions=blocking or outcome.manual_questions,
                     )
                 carried.extend(optional)
-                held = stop_required(snapshot, outcome.manual_questions)
+                held = stop_required(extract_page(page), outcome.manual_questions)
                 if held is not None:
                     return held
                 session.mark("REVIEW_PAGE")
@@ -1091,7 +1091,7 @@ def _run_resolver_pages(
             Status.NO_FORM_FOUND,
             ["No application form was found. A person can open the page and continue."],
         )
-    held = stop_required(snapshot)
+    held = stop_required(extract_page(page))
     if held is not None:
         return held
     session.mark(Status.READY_FOR_HUMAN_SUBMIT)

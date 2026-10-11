@@ -6,6 +6,7 @@ the ones the resolver returned for the keys and intents on this step.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -606,12 +607,7 @@ _LOCATION_OPTIONS_JS = r"""
 _SELECTED_LOCATION_JS = """
 () => {
   const named = document.querySelector("input[name='selectedLocation'], input[name='selected_location']");
-  if (named && (named.value || "").trim()) return named.value;
-  for (const node of document.querySelectorAll("input[type='hidden']")) {
-    const key = ((node.name || "") + " " + (node.id || "")).toLowerCase();
-    if (key.indexOf("location") !== -1 && (node.value || "").trim()) return node.value;
-  }
-  return "";
+  return named ? String(named.value || "") : "";
 }
 """
 
@@ -851,18 +847,38 @@ def _wait_location_network(page) -> None:
         return
 
 
+def _location_pick(page) -> dict[str, Any] | None:
+    """The picked Lever place, or None.
+
+    A resume parse writes ``{"name":""}`` into the hidden input while the box
+    is still empty. That object has no suggestion id, so it is not a commit.
+    """
+    raw = _selected_location(page).strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if not str(parsed.get("id") or "").strip():
+        return None
+    return parsed
+
+
 def _location_committed(page, control: Control, city: str) -> bool:
     """True when a suggestion was recorded, not when the city was only typed.
 
-    Lever keeps the chosen place in a hidden ``selectedLocation`` input. The
-    visible box still holds the city while that input is empty, so the typed
-    city alone is not a commit.
+    Lever keeps the chosen place in a hidden ``selectedLocation`` input as JSON
+    with an id. The visible box can hold the city, or the hidden input can hold
+    an empty name, while no suggestion has been picked.
     """
-    selected = _selected_location(page)
-    if selected and _phrase_in(normalize(selected), city):
-        return True
     if _has_selected_location(page):
-        return False
+        pick = _location_pick(page)
+        if pick is None:
+            return False
+        return bool(city) and _phrase_in(normalize(str(pick.get("name") or "")), city)
     try:
         typed = str(page.locator(control.selector).input_value() or "")
     except Exception:
@@ -1099,7 +1115,8 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
                     break
                 _pause(page, 50)
         if _location_committed(page, control, city):
-            detail = _selected_location(page) or match[0]
+            picked = _location_pick(page) or {}
+            detail = str(picked.get("name") or match[0])
             _remember_location(outcome, control, detail)
             return
     if not options:
@@ -2266,7 +2283,7 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
         return any(control_committed(page, item.selector) for item in controls)
     control = controls[0]
     if _is_current_location(control) and _has_selected_location(page):
-        return bool(_selected_location(page).strip())
+        return _location_pick(page) is not None
     return control_committed(page, control.selector)
 
 

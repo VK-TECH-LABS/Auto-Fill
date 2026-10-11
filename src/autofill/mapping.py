@@ -510,12 +510,23 @@ def is_current_company_label(control: Control) -> bool:
 
 
 def mentions_work_history(control: Control) -> bool:
-    """A work-history company or title row, not a referral or contact question."""
-    if _not_employer_question(haystack(control)):
+    """A work-history company or title row, not a referral or contact question.
+
+    A restrictive-covenant question mentions a former employer. It is not the
+    company box.
+    """
+    blob = haystack(control)
+    if _not_employer_question(blob):
+        return False
+    if re.search(r"\b(covenant|non-?compete|noncompete|non-?solicit|nonsolicit)\b", blob):
+        return False
+    if "?" in f"{control.label} {control.aria_label} {control.placeholder}":
         return False
     if is_current_company_label(control):
         return True
     label = normalize(control.label or control.aria_label or control.placeholder)
+    if len(label) > 40:
+        return False
     return bool(re.search(r"\b(employer|employment|company)\b", label))
 
 
