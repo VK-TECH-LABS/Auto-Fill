@@ -21,9 +21,9 @@ from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 from autofill.service.app import create_app
 from autofill.stepfill import (
+    _item_kind,
     commit_location_answer,
     fill_resolved_page,
-    _item_kind,
     inspect_required,
     location_shape,
     suggest_control,
