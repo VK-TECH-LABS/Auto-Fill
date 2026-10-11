@@ -734,14 +734,16 @@ def test_lever_location_portal_uses_keyboard_when_the_click_does_not_commit(brow
             "const first = document.querySelector('.dropdown-location');"
             "if (!first) return;"
             "input.value = first.textContent;"
-            "hidden.value = first.textContent;"
+            "hidden.value = JSON.stringify({name: first.textContent, id: first.id || 'picked'});"
             "});"
             "</script>"
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         picked = "Austin, TX, USA"
         assert page.locator("#location-input").input_value() == picked
-        assert page.locator("#selected-location").input_value() == picked
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == picked
+        assert stored["id"]
         assert [item.get("text") for item in result.manual_questions] == []
         assert "location left manual" not in caplog.text
     finally:
@@ -1077,7 +1079,7 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
             "li.addEventListener('mousedown', (event) => {"
             "event.preventDefault();"
             "input.value = place;"
-            "hidden.value = place;"
+            "hidden.value = JSON.stringify({name: place, id: 'loc-' + index});"
             "list.hidden = true;"
             "});"
             "list.appendChild(li);"
@@ -1100,7 +1102,9 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
         assert "address.country" in requested
         picked = "Example City, California, United States"
         assert page.locator("#current-location").input_value() == picked
-        assert page.locator("#selected-location").input_value() == picked
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == picked
+        assert stored["id"]
         assert page.locator("input[value='English']").is_checked()
         assert page.locator("input[value='Spanish']").is_checked()
         assert page.locator("input[value='French']").is_checked() is False
@@ -1193,7 +1197,7 @@ def test_lever_dropdown_location_uses_address_state(browser, resolver):
             "item.addEventListener('mousedown', (event) => {"
             "event.preventDefault();"
             "input.value = item.textContent;"
-            "hidden.value = item.textContent;"
+            "hidden.value = JSON.stringify({name: item.textContent, id: item.id || 'picked'});"
             "dropdown.hidden = true;"
             "});"
             "});"
@@ -1208,7 +1212,9 @@ def test_lever_dropdown_location_uses_address_state(browser, resolver):
         assert "address.region" in requested
         picked = "Austin, TX, USA"
         assert page.locator("#current-location").input_value() == picked
-        assert page.locator("#selected-location").input_value() == picked
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == picked
+        assert stored["id"]
         assert [item.get("text") for item in result.manual_questions] == []
     finally:
         page.close()
@@ -1249,7 +1255,7 @@ def test_lever_location_retries_a_late_list_and_ignores_city_case(browser, resol
             "item.addEventListener('mousedown', (event) => {"
             "event.preventDefault();"
             "input.value = item.textContent;"
-            "hidden.value = item.textContent;"
+            "hidden.value = JSON.stringify({name: item.textContent, id: item.id || 'picked'});"
             "dropdown.hidden = true;"
             "});"
             "});"
@@ -1258,7 +1264,9 @@ def test_lever_location_retries_a_late_list_and_ignores_city_case(browser, resol
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         picked = "austin, tx, usa"
         assert page.locator("#current-location").input_value() == picked
-        assert page.locator("#selected-location").input_value() == picked
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == picked
+        assert stored["id"]
         assert [item.get("text") for item in result.manual_questions] == []
         assert "location left manual" not in caplog.text
     finally:
@@ -1991,7 +1999,7 @@ input.addEventListener("input", () => {
     li.addEventListener("mousedown", (event) => {
       event.preventDefault();
       input.value = place;
-      hidden.value = place;
+      hidden.value = JSON.stringify({name: place, id: "loc-" + index});
       list.hidden = true;
     });
     list.appendChild(li);
@@ -2018,7 +2026,9 @@ def test_current_location_answer_commits_the_suggestion(browser):
             },
         )
         assert filled == {"filled": True}
-        assert page.locator("#selected-location").input_value() == "Example City, California, United States"
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == "Example City, California, United States"
+        assert stored["id"]
         assert "Example City" in page.locator("#current-location").input_value()
     finally:
         page.close()
@@ -2138,7 +2148,9 @@ def test_lever_location_click_sets_the_hidden_value(browser):
             },
         )
         assert filled == {"filled": True}
-        assert page.locator("#selected-location").input_value() == "Austin, TX, USA"
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == "Austin, TX, USA"
+        assert stored["id"]
         assert "Austin" in page.locator("#location-input").input_value()
         gaps, _total, _done = inspect_required(page, extract_page(page), None)
         school = next(item for item in gaps if "university" in str(item.get("text") or "").casefold())
@@ -2198,5 +2210,90 @@ def test_ashby_required_class_yes_no_blocks_until_pressed(browser, resolver):
         page.locator("#name").fill("River Example")
         ready, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert ready.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
+    finally:
+        page.close()
+
+
+def test_empty_location_json_does_not_count_and_blocks_ready(browser):
+    """A resume parse can store {"name":""}. That is not a picked suggestion."""
+    from autofill.extract import extract_page
+    from autofill.follow import follow_answer
+    from autofill.stepfill import inspect_required
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<label for='name'>Full name</label><input id='name' name='name' required>"
+            "<label for='location-input'>Current location</label>"
+            "<input id='location-input' required>"
+            "<input id='selected-location' type='hidden' name='selectedLocation' value='{\"name\":\"\"}'>"
+        )
+        empty, total, done = inspect_required(page, extract_page(page), None)
+        assert total == 2
+        assert done == 0
+        assert any(item.get("text") == "Current location" for item in empty)
+        page.locator("#name").fill("River Example")
+        filled, filled_total, filled_done = inspect_required(page, extract_page(page), None)
+        assert filled_total == 2
+        assert filled_done == 1
+        assert any(item.get("text") == "Current location" for item in filled)
+        follow = follow_answer(
+            page,
+            profile=CandidateProfile.from_dict(
+                {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+            ),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+        )
+        assert follow.status == Status.MANUAL_ANSWER_REQUIRED
+        assert follow.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert follow.blocking is not None
+        assert follow.blocking.get("text") == "Current location"
+        assert follow.progress["requiredDone"] == 1
+        assert follow.progress["requiredTotal"] == 2
+        page.locator("#selected-location").evaluate(
+            "el => { el.value = JSON.stringify({name: 'Austin, TX, USA', id: 'loc-austin'}); }"
+        )
+        page.locator("#location-input").fill("Austin, TX, USA")
+        ready = follow_answer(
+            page,
+            profile=CandidateProfile.from_dict(
+                {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+            ),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+        )
+        assert ready.status == Status.READY_FOR_HUMAN_SUBMIT
+        assert ready.progress["requiredDone"] == ready.progress["requiredTotal"] == 2
+    finally:
+        page.close()
+
+
+def test_restrictive_covenant_is_not_an_employer_field(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<label for='covenant'>Are you subject to a restrictive covenant, such as a non-compete "
+            "or a non-solicit, with a current or former employer?</label>"
+            "<select id='covenant' required>"
+            "<option value=''>Select</option><option>Yes</option><option>No</option>"
+            "</select>"
+        )
+        result, _timings = _run(page, "https://job-boards.greenhouse.io/dlrgroup/jobs/1", resolver=_binding(url))
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert result.blocking is not None
+        assert result.blocking.get("fieldKey") != "employment.company"
+        assert "employer" in str(result.blocking.get("text") or "").casefold()
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "employment[]" not in requested
     finally:
         page.close()
