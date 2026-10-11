@@ -14,6 +14,7 @@ from autofill.login import (
     _CONFIRM_RE,
     _LOGIN_RE,
     _REGISTER_RE,
+    SecretInputError,
     account_exists_text,
     account_view,
     redact_site_error,
@@ -69,15 +70,17 @@ def run_account_action(
     if terms_error:
         return _rejected(snapshot, page.url or "", ats, mode, scored.alternate, [terms_error], secrets)
     identity = _email_control(snapshot)
-    if identity is not None and not identity.read_only:
-        _type_secret(page, identity.selector, username if _username_field(identity) and username else email)
     primary, confirm_box = _password_targets(snapshot, mode)
     if primary is None:
         return {"ok": False, "reason": "not_at_account_step"}
-    _type_secret(page, primary.selector, password)
-    if mode == "register":
-        if confirm_box is not None:
+    try:
+        if identity is not None and not identity.read_only:
+            _type_secret(page, identity.selector, username if _username_field(identity) and username else email)
+        _type_secret(page, primary.selector, password)
+        if mode == "register" and confirm_box is not None:
             _type_secret(page, confirm_box.selector, confirm or password)
+    except SecretInputError:
+        return {"ok": False, "reason": "input_failed"}
     if terms is not None:
         page.locator(terms.selector).check()
     button = _primary_button(snapshot, mode)
@@ -112,7 +115,9 @@ def _username_field(control: Control) -> bool:
 def _type_secret(page, selector: str, value: str) -> None:
     if not selector or not value:
         return
-    page.locator(selector).fill(value)
+    from autofill.login import _type_secret as type_secret
+
+    type_secret(page, selector, value)
 
 
 def _password_targets(snapshot: PageSnapshot, mode: str) -> tuple[Control | None, Control | None]:
