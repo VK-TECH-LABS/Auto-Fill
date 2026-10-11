@@ -131,7 +131,10 @@ def limit_question(question: dict[str, Any]) -> dict[str, Any]:
     bounded = dict(question)
     bounded["text"] = text
     bounded["options"] = limited
-    digest = question_hash(text)
+    raw_token = question.get("fieldToken")
+    token = raw_token if isinstance(raw_token, str) else ""
+    bounded.pop("fieldToken", None)
+    digest = question_hash(text, token)
     if digest:
         bounded["id"] = digest
     return bounded

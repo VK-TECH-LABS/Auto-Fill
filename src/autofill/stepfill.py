@@ -7,6 +7,7 @@ the ones the resolver returned for the keys and intents on this step.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -240,12 +241,16 @@ class _Ask:
         kind = _control_name(self.controls, control)
         labels = _option_labels(self.controls)
         text = self.match.text if self.match is not None else sanitize_question(_question_text(self.controls))
-        return {
+        token = _control_token(control)
+        body = {
             "intent": self.match.intent if self.match is not None else None,
             "text": text,
             "options": labels,
             "control": kind,
         }
+        if token:
+            body["fieldToken"] = token
+        return body
 
 
 def _is_section_heading(text: str) -> bool:
@@ -1048,12 +1053,28 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
         _manual_location(outcome, control)
         return
     field = page.locator(control.selector)
+    delay = 20
+    raw_delay = os.environ.get("AUTOFILL_TYPE_DELAY")
+    if raw_delay is not None:
+        try:
+            delay = max(0, int(raw_delay))
+        except ValueError:
+            delay = 20
     try:
         field.fill("")
-        if not type_visible(page, control.selector, city):
-            field.press_sequentially(city, delay=50)
     except Exception as exc:
         logger.info("location left manual reason=type_error error=%s", type(exc).__name__)
+        _manual_location(outcome, control)
+        return
+    typed = False
+    try:
+        # Real keystrokes open Lever's geocoder. Setting the value alone does not.
+        field.press_sequentially(city, delay=delay)
+        typed = True
+    except Exception:
+        typed = False
+    if not typed and not type_visible(page, control.selector, city):
+        logger.info("location left manual reason=type_error error=TypeError")
         _manual_location(outcome, control)
         return
     _wait_location_network(page)
@@ -1080,15 +1101,6 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
         if _location_committed(page, control, city):
             detail = _selected_location(page) or match[0]
             _remember_location(outcome, control, detail)
-            return
-    if not options and _has_selected_location(page):
-        text = _location_free_text(city, region, country)
-        try:
-            page.evaluate(_WRITE_LOCATION_JS, {"selector": control.selector, "text": text})
-        except Exception:
-            text = ""
-        if text and _location_committed(page, control, city):
-            _remember_location(outcome, control, text)
             return
     if not options:
         reason = "no_suggestions"
@@ -1132,6 +1144,8 @@ def _apply(
             not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
         ):
             continue
+        if ask.controls and ask.controls[0].kind == "buttons" and control_committed(page, ask.controls[0].selector):
+            continue
         if ask.field_key == "resume.file":
             _apply_resume(page, ask, response, outcome)
             continue
@@ -1143,7 +1157,14 @@ def _apply(
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-            answer = _take_answer(match, by_intent, unnamed, by_key, unclassified=unclassified)
+            answer = _take_answer(
+                match,
+                by_intent,
+                unnamed,
+                by_key,
+                unclassified=unclassified,
+                question_id=_question_digest(match.text, ask.controls[0]),
+            )
             _apply_question(page, ask, answer, outcome)
             continue
         if not ask.field_key:
@@ -1361,6 +1382,14 @@ def _apply_question(
             _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
         click_choice(page, option.selector, option.label)
+        if _button_requires_selected_state(page, option.selector) and not control_committed(
+            page, option.selector
+        ):
+            # The pair advertises aria-pressed (or the same). A click that leaves
+            # every button unselected did not commit. Only a required pair stops.
+            if any(item.required for item in ask.controls):
+                _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
+            return
         outcome.fields.append(
             FieldOutcome(
                 selector=option.selector,
@@ -1597,6 +1626,35 @@ def _item_kind(intent: str | None, explicit: str | None, field_key: str | None) 
     return "QUESTION"
 
 
+def _control_token(control: Control | None) -> str:
+    """An id, name, or selector that distinguishes one field from another with the same label."""
+    if control is None:
+        return ""
+    if control.element_id.strip():
+        return control.element_id.strip()
+    if control.name.strip():
+        return control.name.strip()
+    selector = control.selector.strip()
+    if selector.startswith("#") or selector.startswith("[data-automation-id"):
+        return selector
+    return ""
+
+
+def _question_digest(text: str, control: Control | None) -> str:
+    return question_hash(text, _control_token(control))
+
+
+def _same_question(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """True when two manual items are the same field, not merely the same label."""
+    digest = str(right.get("questionHash") or "")
+    if digest and digest == str(left.get("questionHash") or ""):
+        return True
+    selector = str(right.get("selector") or "")
+    if selector and selector == str(left.get("selector") or ""):
+        return True
+    return False
+
+
 def _manual(
     outcome: ResolvedPage,
     match: IntentMatch,
@@ -1614,7 +1672,7 @@ def _manual(
     if control is not None and control not in group:
         group.insert(0, control)
     primary = group[0] if group else None
-    digest = question_hash(text) or None
+    digest = _question_digest(text, primary) or None
     options = _option_labels(group) if group else []
     multi = len(group) > 1 and any(item.kind == "checkbox" for item in group)
     entry: dict[str, Any] = {
@@ -1628,13 +1686,14 @@ def _manual(
             primary.kind if primary is not None else "text",
             primary.input_type if primary is not None else "",
             multi=multi,
+            options=options,
         ),
         "options": options,
         "required": any(item.required for item in group) if group else blocking,
         "selector": primary.selector if primary is not None else "",
         "kind": _item_kind(match.intent, kind, field_key),
     }
-    if not any(item.get("intent") == entry["intent"] and item.get("text") == text for item in outcome.manual_questions):
+    if not any(_same_question(item, entry) for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
     outcome.manual_actions.append(f"{label}: manual answer required")
@@ -1669,6 +1728,57 @@ def _checkbox_buckets(controls: list[Control]) -> dict[str, list[Control]]:
     return buckets
 
 
+def _already_asked(outcome: ResolvedPage, text: str, digest: str, selector: str) -> bool:
+    """True when this field, or the same label with no field identity, is already listed.
+
+    Two controls that share a label and both have selectors stay distinct.
+    """
+    if digest and any(str(item.get("questionHash") or "") == digest for item in outcome.manual_questions):
+        return True
+    folded = normalize_question(text)
+    if not folded:
+        return False
+    for item in outcome.manual_questions:
+        if normalize_question(str(item.get("text") or "")) != folded:
+            continue
+        prior = str(item.get("selector") or "")
+        if not prior or not selector or prior == selector:
+            return True
+    return False
+
+
+_BUTTON_SELECTION_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  function marks(node) {
+    return node.hasAttribute("aria-pressed")
+      || node.hasAttribute("aria-selected")
+      || node.hasAttribute("aria-checked");
+  }
+  let box = el;
+  for (let depth = 0; box && depth < 6; depth += 1, box = box.parentElement) {
+    const kids = box.querySelectorAll("button, [role='button']");
+    if (kids.length < 2 || kids.length > 8) continue;
+    for (const kid of kids) {
+      if (marks(kid)) return true;
+    }
+    return false;
+  }
+  return marks(el);
+}"""
+
+
+def _button_requires_selected_state(page, selector: str) -> bool:
+    """True when the Yes/No pair exposes a pressed or selected attribute."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    try:
+        return bool(evaluate(_BUTTON_SELECTION_JS, selector))
+    except Exception:
+        return False
+
+
 def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
     """Every required visible control that is still empty is a manual question.
 
@@ -1681,11 +1791,13 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
             ensure_blocker_options(page, outcome.manual_questions)
         return
     filled = {item.selector for item in outcome.fields if item.action in _FILLED_ACTIONS and item.selector}
-    seen = {normalize_question(str(item.get("text") or "")) for item in outcome.manual_questions}
+    seen = {str(item.get("questionHash") or "") for item in outcome.manual_questions if item.get("questionHash")}
     for control in snapshot.controls:
         if not _required_question(control):
             continue
         if _control_filled(control, filled) or _group_filled(control, snapshot.controls, filled):
+            continue
+        if page is not None and control.selector and _cluster_committed(page, [control]):
             continue
         if control.kind == "checkbox":
             key_name = _checkbox_key(control)
@@ -1698,10 +1810,11 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
                 text = sanitize_question(_question_text(siblings))
                 if not text or _matches_option(text, siblings) or _is_section_heading(text):
                     continue
-                folded = normalize_question(text)
-                if folded in seen:
+                digest = _question_digest(text, siblings[0])
+                if _already_asked(outcome, text, digest, siblings[0].selector):
                     continue
-                seen.add(folded)
+                if digest:
+                    seen.add(digest)
                 _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, controls=siblings)
                 continue
         text = sanitize_question(_manual_label(control))
@@ -1709,10 +1822,11 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
             continue
         if not text:
             continue
-        key = normalize_question(text)
-        if key in seen:
+        digest = _question_digest(text, control)
+        if _already_asked(outcome, text, digest, control.selector):
             continue
-        seen.add(key)
+        if digest:
+            seen.add(digest)
         _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, control=control)
     _drop_emitted_options(outcome)
     if page is not None:
@@ -1803,10 +1917,17 @@ def _take_answer(
     by_key: dict[str, ResolverAnswer],
     *,
     unclassified: int = 1,
+    question_id: str = "",
 ) -> ResolverAnswer | None:
     if match.intent:
         return by_intent.get(match.intent)
-    for key in _lookup_keys(match.text):
+    keys = [question_id.strip().lower()] if question_id.strip() else []
+    keys.extend(_lookup_keys(match.text))
+    seen: set[str] = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
         found = by_key.get(key)
         if found is not None and found in unnamed:
             unnamed.remove(found)
@@ -2025,19 +2146,28 @@ def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
         labels = read_choice_options(page, selector)
         if not labels:
             labels = list_combobox_options(page, selector)
+        labels = [label for label in labels if _keep_option(label)]
         if labels:
             item["options"] = labels
 
 
+_JUNK_OPTION = re.compile(r"click here\b.{0,80}\b(?:issue|browser|cache|cookies)\b", re.IGNORECASE)
+
+
+def _keep_option(label: str) -> bool:
+    """Drop instruction rows that are not choices, such as a browser-help link."""
+    return not _JUNK_OPTION.search(label)
+
+
 def _option_labels(controls: list[Control]) -> list[str]:
     if len(controls) > 1:
-        return [_checkbox_label(item) for item in controls][:20]
+        return [label for label in (_checkbox_label(item) for item in controls) if _keep_option(label)][:20]
     labels = []
     for option in controls[0].options:
         label = option.label or option.value
         if label and label not in labels:
             labels.append(sanitize_question(label, limit=80))
-    return labels
+    return [label for label in labels if _keep_option(label)]
 
 
 def _strip_affix(label: str, affix: str) -> str:
@@ -2134,7 +2264,10 @@ def _gap_clusters(snapshot: PageSnapshot) -> list[list[Control]]:
 def _cluster_committed(page, controls: list[Control]) -> bool:
     if len(controls) > 1 and all(item.kind == "checkbox" for item in controls):
         return any(control_committed(page, item.selector) for item in controls)
-    return control_committed(page, controls[0].selector)
+    control = controls[0]
+    if _is_current_location(control) and _has_selected_location(page):
+        return bool(_selected_location(page).strip())
+    return control_committed(page, control.selector)
 
 
 def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
@@ -2167,13 +2300,29 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         field_key = "phone.country"
     options = _option_labels(controls)
     if page is not None and primary.kind == "combobox" and not options and primary.selector:
-        options = list_combobox_options(page, primary.selector)
+        options = [label for label in list_combobox_options(page, primary.selector) if _keep_option(label)]
+        if options:
+            from autofill.models import Option
+
+            primary.options = [Option(value=label, label=label) for label in options]
+            rematched = match_field_key(primary)
+            if rematched:
+                field_key = rematched
+    if field_key == "phone_country":
+        field_key = "phone.country"
+    elif field_key == "country":
+        field_key = "address.country"
     match = classify_question(text, options)
     named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
     intent = match.intent if named else None
     if kind != "DEMOGRAPHIC" and intent in DEMOGRAPHIC_INTENTS:
         intent = None
-    digest = question_hash(text) or None
+    names = {label.casefold() for label in options}
+    if primary.kind == "buttons" and "yes" in names and "no" in names:
+        field_key = None
+        if kind == "MISSING_PROFILE_VALUE":
+            kind = "QUESTION"
+    digest = _question_digest(text, primary) or None
     multi = len(controls) > 1 and any(item.kind == "checkbox" for item in controls)
     return {
         "intent": intent,
@@ -2182,7 +2331,7 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         "questionId": digest,
         "questionHash": digest,
         "fieldKey": field_key,
-        "answerType": answer_type_name(primary.kind, primary.input_type, multi=multi),
+        "answerType": answer_type_name(primary.kind, primary.input_type, multi=multi, options=options),
         "options": options,
         "required": True,
         "selector": primary.selector,
@@ -2201,7 +2350,11 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
     for gap in gaps:
         prior = by_selector.get(str(gap.get("selector") or ""))
         if prior is None:
-            prior = by_text.get(normalize_question(str(gap.get("text") or "")))
+            textual = by_text.get(normalize_question(str(gap.get("text") or "")))
+            prior_selector = str((textual or {}).get("selector") or "")
+            gap_selector = str(gap.get("selector") or "")
+            if textual is not None and (not prior_selector or not gap_selector or prior_selector == gap_selector):
+                prior = textual
         if prior is None:
             merged.append(gap)
             continue

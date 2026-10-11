@@ -1225,6 +1225,101 @@ def test_three_failed_answers_stop_for_a_person():
         assert continued.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
 
 
+class _SplitRunner:
+    """Location and another question take turns. The location key also changes."""
+
+    def __init__(self) -> None:
+        self.applied: list[str] = []
+        self.location_answers = 0
+        self.show_location = True
+
+    def run(self, request):
+        if self.show_location:
+            key = "address.city" if self.location_answers % 2 == 0 else "location"
+            item = _question(
+                text="Current location",
+                fieldKey=key,
+                questionHash="loc-hash",
+                questionId="loc-hash",
+                selector="#location-input",
+            )
+        else:
+            item = _question(
+                text="Phone",
+                fieldKey="phone",
+                questionHash="phone-hash",
+                questionId="phone-hash",
+                selector="#phone",
+            )
+        return ApplicationResult(
+            status=Status.MANUAL_ANSWER_REQUIRED,
+            ats="lever",
+            current_step=Status.MANUAL_ANSWER_REQUIRED,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            open_items=[dict(item)],
+            blocking=public_blocking(item),
+            manual_questions=[{"intent": None, "text": item["text"]}],
+        )
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        digest = str(target.get("questionHash") or "")
+        self.applied.append(digest)
+        if digest == "loc-hash":
+            self.location_answers += 1
+            self.show_location = False
+        else:
+            self.show_location = True
+        return {"filled": True}
+
+    def advance_after_answer(self, request):
+        return self.run(request)
+
+    def interact(self, session_id: str, action: dict) -> bool:
+        return True
+
+    def discard(self, session_id: str) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+def _answer(client: TestClient, session_id: str, *, digest: str, field_key: str, value: str):
+    return client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionHash": digest, "fieldKey": field_key, "value": value},
+    )
+
+
+def test_answer_attempts_follow_the_field_across_the_session():
+    runner = _SplitRunner()
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH)
+        first = _answer(client, session_id, digest="loc-hash", field_key="address.city", value="Austin")
+        assert first.json()["filled"] is True
+        phone = _answer(client, session_id, digest="phone-hash", field_key="phone", value="5550100142")
+        assert phone.json()["filled"] is True
+        second = _answer(client, session_id, digest="loc-hash", field_key="location", value="Austin")
+        assert second.json()["filled"] is True
+        phone = _answer(client, session_id, digest="phone-hash", field_key="phone", value="5550100142")
+        assert phone.json()["filled"] is True
+        third = _answer(client, session_id, digest="loc-hash", field_key="address.city", value="Austin")
+        assert third.json()["filled"] is True
+        phone = _answer(client, session_id, digest="phone-hash", field_key="phone", value="5550100142")
+        assert phone.json()["filled"] is True
+        stopped = _answer(client, session_id, digest="loc-hash", field_key="location", value="Austin")
+        assert stopped.status_code == 409
+        assert stopped.json()["detail"]["reason"] == "needs_manual"
+        assert runner.applied.count("loc-hash") == 3
+
+
 def test_three_answers_without_progress_stop_for_a_person():
     runner = _LoopRunner(fill=True)
     app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)

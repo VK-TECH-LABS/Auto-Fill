@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<body>
+<style>input, select, button { width: 240px; height: 36px; display: block; }</style>
+<h1>Application</h1>
+<form>
+  <label for="name">Legal Name<span aria-hidden="true">*</span></label>
+  <input id="name" required>
+  <div class="_fieldEntry ashby-application-form-field-entry" data-field-path="3080cfba-13cc-4441-94b9-159da1278e66">
+    <label class="_heading _required_f7cvd_91 ashby-application-form-question-title" for="3080cfba-13cc-4441-94b9-159da1278e66">Do you have a minimum of 7 years of experience building software?&nbsp;</label>
+    <div class="_yesno_1e3gg_148 ashby-application-form-input-yesno">
+      <button type="button" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="yes">Yes</button>
+      <button type="button" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="no">No</button>
+      <input type="checkbox" class="_input_1svni_78" tabindex="-1" name="3080cfba-13cc-4441-94b9-159da1278e66">
+    </div>
+  </div>
+  <div class="_fieldEntry ashby-application-form-field-entry" data-field-path="66d3b6e2-6cef-4cf8-9193-87200193ab98">
+    <label class="_heading _required_f7cvd_91 ashby-application-form-question-title" for="66d3b6e2-6cef-4cf8-9193-87200193ab98">Do you have a minimum of 5 years of experience building in AWS (with Terraform)?&nbsp;</label>
+    <div class="_yesno_1e3gg_148 ashby-application-form-input-yesno">
+      <button type="button" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="yes">Yes</button>
+      <button type="button" class="ashby-application-form-input-yesno-option" aria-pressed="false" data-option="no">No</button>
+      <input type="checkbox" class="_input_1svni_78" tabindex="-1" name="66d3b6e2-6cef-4cf8-9193-87200193ab98">
+    </div>
+  </div>
+  <button type="submit">Submit application</button>
+</form>
+<script>
+document.querySelectorAll(".ashby-application-form-input-yesno").forEach((group) => {
+  group.querySelectorAll("button").forEach((button) => {
+    button.addEventListener("click", () => {
+      group.querySelectorAll("button").forEach((other) => other.setAttribute("aria-pressed", "false"));
+      button.setAttribute("aria-pressed", "true");
+      const box = group.querySelector("input[type='checkbox']");
+      if (box) box.checked = button.getAttribute("data-option") === "yes";
+    });
+  });
+});
+</script>
+</body>
+</html>

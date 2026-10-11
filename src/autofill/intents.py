@@ -298,12 +298,18 @@ def normalize_question(text: str) -> str:
     return re.sub(r"\s+", " ", folded).strip()
 
 
-def question_hash(text: str) -> str:
-    """Stable id for an unknown question: sha256 of its normalized text."""
+def question_hash(text: str, token: str = "") -> str:
+    """Stable id for one question: sha256 of its normalized text.
+
+    ``token`` is the field's own id, name, or selector. Two controls with the
+    same label stay distinct when each has its own token.
+    """
     normalized = normalize_question(sanitize_question(text))
-    if not normalized:
+    field = token.strip()
+    if not normalized and not field:
         return ""
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    material = f"{normalized}\n{field}" if field else normalized
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def dedupe_label(text: str) -> str:

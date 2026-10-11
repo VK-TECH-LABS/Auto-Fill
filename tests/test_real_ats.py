@@ -767,11 +767,10 @@ def test_lever_location_free_text_when_no_suggestions_appear(browser, resolver, 
             "</form>"
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
-        picked = "Austin, Texas, United States"
-        assert page.locator("#location-input").input_value() == picked
-        assert page.locator("#selected-location").input_value() == picked
-        assert [item.get("text") for item in result.manual_questions] == []
-        assert "location left manual" not in caplog.text
+        assert page.locator("#selected-location").input_value() == ""
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert "Current location" in [item.get("text") for item in result.manual_questions]
+        assert "location left manual reason=no_suggestions" in caplog.text
     finally:
         page.close()
 
@@ -2071,6 +2070,132 @@ def test_required_yes_no_buttons_block_ready_until_one_is_pressed(browser, resol
         page.locator("#years-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
         page.locator("#aws-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
         server.calls.clear()
+        ready, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert ready.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
+    finally:
+        page.close()
+
+
+def test_greenhouse_country_fields_keep_separate_ids(browser):
+    from autofill.dom_ui import match_open_item
+    from autofill.extract import extract_page
+    from autofill.intents import question_hash
+    from autofill.mapping import match_field_key
+    from autofill.stepfill import inspect_required
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "greenhouse_two_country.html").as_uri())
+        snapshot = extract_page(page)
+        countries = [
+            control
+            for control in snapshot.controls
+            if control.element_id in {"country", "question_18692948008"}
+        ]
+        assert [control.element_id for control in countries] == ["country", "question_18692948008"]
+        assert match_field_key(countries[0]) == "phone_country"
+        assert match_field_key(countries[1]) == "country"
+        phone_hash = question_hash("Country", "country")
+        address_hash = question_hash("Country", "question_18692948008")
+        assert phone_hash != address_hash
+        gaps, _total, _done = inspect_required(page, snapshot, None)
+        by_selector = {item["selector"]: item for item in gaps}
+        phone = by_selector["#country"]
+        address = by_selector["#question_18692948008"]
+        assert phone["questionHash"] == phone_hash
+        assert address["questionHash"] == address_hash
+        assert phone["questionHash"] != address["questionHash"]
+        assert phone["fieldKey"] == "phone.country"
+        assert address["fieldKey"] == "address.country"
+        school = next(item for item in gaps if item["selector"] == "#school")
+        assert all("click here" not in option.casefold() for option in school["options"])
+        assert "State University" in school["options"]
+        chosen = match_open_item(
+            gaps,
+            field_key="address.country",
+            prefer={"questionHash": address["questionHash"], "text": "Country"},
+        )
+        assert chosen is not None
+        assert chosen["selector"] == "#question_18692948008"
+    finally:
+        page.close()
+
+
+def test_lever_location_click_sets_the_hidden_value(browser):
+    from autofill.extract import extract_page
+    from autofill.stepfill import commit_location_answer, inspect_required
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "lever_location_live.html").as_uri())
+        filled = commit_location_answer(
+            page,
+            {
+                "selector": "#location-input",
+                "text": "Current location",
+                "fieldKey": "address.city",
+                "value": "Austin, Texas, United States",
+            },
+        )
+        assert filled == {"filled": True}
+        assert page.locator("#selected-location").input_value() == "Austin, TX, USA"
+        assert "Austin" in page.locator("#location-input").input_value()
+        gaps, _total, _done = inspect_required(page, extract_page(page), None)
+        school = next(item for item in gaps if "university" in str(item.get("text") or "").casefold())
+        assert all("click here" not in option.casefold() for option in school["options"])
+        assert "State University" in school["options"]
+    finally:
+        page.close()
+
+
+def test_ashby_required_class_yes_no_blocks_until_pressed(browser, resolver):
+    from autofill.dom_ui import commit_visible
+    from autofill.extract import extract_page
+    from autofill.stepfill import inspect_required
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_yes_no_live.html").as_uri())
+        snapshot = extract_page(page)
+        buttons = [control for control in snapshot.controls if control.kind == "buttons"]
+        assert len(buttons) == 2
+        assert all(control.required for control in buttons)
+        assert not any(control.kind == "checkbox" for control in snapshot.controls)
+        gaps, total, done = inspect_required(page, snapshot, None)
+        yes_no = [item for item in gaps if item.get("answerType") == "boolean"]
+        assert len(yes_no) == 2
+        assert done == 0
+        assert total >= 2
+        for item in yes_no:
+            assert item["options"] == ["Yes", "No"]
+            folded = item["text"].casefold()
+            assert "year" in folded or "aws" in folded or "terraform" in folded
+        first = commit_visible(page, {**yes_no[0], "value": "Yes", "values": ["Yes"]})
+        assert first == {"filled": True}
+        pressed = page.locator("[data-field-path='3080cfba-13cc-4441-94b9-159da1278e66'] button").first
+        assert pressed.get_attribute("aria-pressed") == "true"
+        still, _total, still_done = inspect_required(page, extract_page(page), None)
+        remaining = " ".join(str(item.get("text") or "") for item in still).casefold()
+        assert "terraform" in remaining or "aws" in remaining
+        assert still_done < _total
+    finally:
+        page.close()
+
+    server, url = resolver
+    server.custom_fields = {"legalName": "River Example", "firstName": "River", "lastName": "Example"}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_yes_no_live.html").as_uri())
+        blocked, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert blocked.status == Status.MANUAL_ANSWER_REQUIRED
+        assert blocked.status != Status.READY_FOR_HUMAN_SUBMIT
+        texts = " ".join(str(item.get("text") or "") for item in blocked.open_items).casefold()
+        assert "7 years" in texts
+        assert "terraform" in texts
+        page.locator("[data-field-path='3080cfba-13cc-4441-94b9-159da1278e66'] button").first.click()
+        page.locator("[data-field-path='66d3b6e2-6cef-4cf8-9193-87200193ab98'] button").first.click()
+        page.locator("#name").fill("River Example")
         ready, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert ready.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
     finally:

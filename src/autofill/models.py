@@ -39,6 +39,7 @@ class Control:
     prompt: str = ""
     automation_id: str = ""
     max_length: int | None = None
+    phone_adjacent: bool = False
 
 
 @dataclass

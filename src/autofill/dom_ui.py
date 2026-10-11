@@ -495,9 +495,23 @@ def stage_for(step: str, heading: str, status: str) -> str:
     return "OPENING"
 
 
-def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False) -> str:
+def _yes_no_options(options: list[Any] | None) -> bool:
+    if not options:
+        return False
+    names: set[str] = set()
+    for option in options:
+        label = option.label if hasattr(option, "label") else str(option)
+        token = label.strip().casefold()
+        if token:
+            names.add(token)
+    return "yes" in names and "no" in names
+
+
+def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False, options: list[Any] | None = None) -> str:
     if multi:
         return "multi_select"
+    if kind == "buttons" and _yes_no_options(options):
+        return "boolean"
     if kind in {"select", "radio", "combobox", "buttons"}:
         return "single_select"
     if kind == "checkbox":
@@ -916,6 +930,53 @@ def _choice(answer_type: str) -> bool:
     return answer_type in {"single_select", "multi_select", "boolean"}
 
 
+_BUTTON_CHOICE_JS = r"""({ selector, expected }) => {
+  const root = document.querySelector(selector);
+  if (!root) return "";
+  const wanted = String(expected || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!wanted) return "";
+  let box = root;
+  for (let depth = 0; box && depth < 6; depth += 1, box = box.parentElement) {
+    const kids = Array.from(box.querySelectorAll("button, [role='button']"));
+    if (kids.length < 2 || kids.length > 8) continue;
+    const names = kids.map((kid) =>
+      (kid.innerText || kid.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().toLowerCase()
+    );
+    if (names.indexOf("yes") === -1 || names.indexOf("no") === -1) continue;
+    for (const kid of kids) {
+      const text = (kid.innerText || kid.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text !== wanted) continue;
+      if (kid.id) return "#" + CSS.escape(kid.id);
+      const field = kid.closest("[data-field-path]");
+      const path = field ? field.getAttribute("data-field-path") || "" : "";
+      const option = (kid.getAttribute("data-option") || "").trim().toLowerCase();
+      if (path && option) {
+        const safe = (value) => String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        return "[data-field-path='" + safe(path) + "'] button[data-option='" + safe(option) + "']";
+      }
+      if (!kid.getAttribute("data-autofill-target")) {
+        kid.setAttribute("data-autofill-target", Math.random().toString(36).slice(2));
+      }
+      return "[data-autofill-target='" + kid.getAttribute("data-autofill-target") + "']";
+    }
+    return "";
+  }
+  return "";
+}"""
+
+
+def _button_choice_selector(page: Any, selector: str, value: str) -> str:
+    """The Yes or No button in this group, when the target is a button pair."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector or not value.strip():
+        return ""
+    try:
+        found = evaluate(_BUTTON_CHOICE_JS, {"selector": selector, "expected": value})
+    except Exception:
+        return ""
+    return str(found or "")
+
+
 def _looks_like_combobox(page: Any, selector: str) -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
@@ -940,6 +1001,18 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         return {"filled": False, "reason": "empty"}
     install(page)
     focus_field(page, selector)
+    button = _button_choice_selector(page, selector, values[0])
+    if button:
+        from autofill.safeguards import click_choice
+
+        try:
+            click_choice(page, button, values[0])
+        except Exception:
+            return {"filled": False, "reason": "not_committed"}
+        if not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
     if _looks_like_combobox(page, selector):
         from autofill.combobox import select_combobox
 
@@ -1008,7 +1081,7 @@ def values_fit(item: dict[str, Any], values: list[str]) -> bool:
     return reason == "ok"
 
 
-_CHOICE_ANSWER_TYPES = frozenset({"single_select", "multi_select"})
+_CHOICE_ANSWER_TYPES = frozenset({"single_select", "multi_select", "boolean"})
 
 _CHOICE_OPTIONS_JS = r"""(selector) => {
   const el = document.querySelector(selector);
@@ -1024,6 +1097,12 @@ _CHOICE_OPTIONS_JS = r"""(selector) => {
       folded === "choose" ||
       folded === "choose one" ||
       folded === "select one"
+    ) {
+      return;
+    }
+    if (
+      folded.indexOf("click here") !== -1 &&
+      (folded.indexOf("issue") !== -1 || folded.indexOf("browser") !== -1 || folded.indexOf("cache") !== -1)
     ) {
       return;
     }
@@ -1116,8 +1195,12 @@ def match_open_item(
     question_id: str = "",
     question_hash: str = "",
     field_key: str = "",
+    prefer: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Match one open item. Every identifier that was sent has to agree."""
+    """Match one open item. Every identifier that was sent has to agree.
+
+    When several fields share a key, the current blocker wins over the first one.
+    """
     wanted: list[tuple[str, str]] = []
     if question_id.strip():
         wanted.append(("id", question_id.strip()))
@@ -1127,6 +1210,7 @@ def match_open_item(
         wanted.append(("key", field_key.strip()))
     if not wanted:
         return None
+    matches: list[dict[str, Any]] = []
     for item in items:
         matched = True
         for kind, value in wanted:
@@ -1136,5 +1220,15 @@ def match_open_item(
             elif value not in {item.get("questionId"), item.get("questionHash")}:
                 matched = False
         if matched:
-            return item
-    return None
+            matches.append(item)
+    if not matches:
+        return None
+    if prefer and len(matches) > 1:
+        selector = str(prefer.get("selector") or "")
+        digest = str(prefer.get("questionHash") or prefer.get("questionId") or "")
+        for item in matches:
+            if selector and str(item.get("selector") or "") == selector:
+                return item
+            if digest and digest in {item.get("questionId"), item.get("questionHash")}:
+                return item
+    return matches[0]
