@@ -193,21 +193,31 @@ def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
     if session.status != Status.NO_FORM_FOUND and str(updated.get("stage") or "") in _FORM_STAGES:
         session.form_seen = True
     page_key = str(session.result.current_step or "") if session.result is not None else ""
+    total = int(updated.get("requiredTotal") or 0)
     done = int(updated.get("requiredDone") or 0)
-    if page_key and page_key == session.required_page_key:
-        done = max(done, session.required_done_high)
-    else:
-        session.required_page_key = page_key
+    if total:
+        done = min(max(done, 0), total)
+    same_set = bool(page_key) and page_key == session.required_page_key and session.required_total_mark == total
+    if same_set and total:
+        done = min(total, max(done, session.required_done_high))
+    session.required_page_key = page_key
+    session.required_total_mark = total
     session.required_done_high = done
     updated["requiredDone"] = done
+    updated["requiredTotal"] = total
     percent = int(updated.get("percent") or 0)
-    if not int(updated.get("requiredTotal") or 0):
-        percent = progress_percent(str(updated.get("stage") or "OPENING"), 0, 0)
-    if session.status == Status.NO_FORM_FOUND:
+    if total:
+        percent = progress_percent(str(updated.get("stage") or "OPENING"), total, done)
+        if same_set:
+            percent = max(percent, session.percent_high)
+            if done < total:
+                percent = min(percent, 99)
+    elif session.status == Status.NO_FORM_FOUND:
         percent = session.percent_high if session.form_seen else 0
     else:
+        percent = progress_percent(str(updated.get("stage") or "OPENING"), 0, 0)
         percent = max(percent, session.percent_high)
-        session.percent_high = percent
+    session.percent_high = percent
     updated["percent"] = percent
     session.progress = dict(updated)
     return updated
@@ -594,6 +604,18 @@ def _freeze_stuck(session: ServiceSession, item: dict, text: str | None = None) 
 def _needs_manual(session: ServiceSession, item: dict, text: str | None = None) -> None:
     _freeze_stuck(session, item, text)
     raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
+
+
+def _keep_place_options(session: ServiceSession, item: dict, filled: dict) -> None:
+    """Keep the suggestion labels the typeahead just showed on this blocker."""
+    labels = [str(option).strip() for option in filled.get("options") or [] if str(option).strip()]
+    if not labels:
+        return
+    item["options"] = labels
+    result = session.result
+    blocking = result.blocking if result is not None else None
+    if isinstance(blocking, dict) and _same_blocker(blocking, item):
+        blocking["options"] = list(labels)
 
 
 def _lever_suggestions_missing(filled: dict) -> bool:
@@ -1121,6 +1143,7 @@ def create_app(
         except PageUnavailable as exc:
             _mark_browser_crash(session)
             raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+        _keep_place_options(session, item, filled)
         if not filled.get("filled"):
             count = _bump_answer_attempt(session, item, body)
             blocked = _lever_suggestions_missing(filled)
@@ -1162,6 +1185,7 @@ def create_app(
                 raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
             if outcome is not None:
                 _accept_result(session, outcome)
+                _keep_place_options(session, item, filled)
                 return _answer_filled(session, item, body, started)
         if session.status in {Status.MANUAL_ANSWER_REQUIRED, Status.RESUME_UPLOAD_REQUIRED}:
             _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)

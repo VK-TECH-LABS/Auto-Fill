@@ -71,6 +71,7 @@ class ServiceSession:
     checkpoint: dict | None = None
     percent_high: int = 0
     required_done_high: int = 0
+    required_total_mark: int = -1
     required_page_key: str = ""
     form_seen: bool = False
     pending_resume: bool = False
