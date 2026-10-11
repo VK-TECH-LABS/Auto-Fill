@@ -524,8 +524,18 @@ EXTRACT_JS = r"""
   function requirementLabel(el) {
     const entry = el.closest && el.closest("[data-field-path], .ashby-application-form-field-entry");
     if (entry) {
-      const label = entry.querySelector("label, .ashby-application-form-question-title, legend");
-      if (label && !label.contains(el)) return label;
+      const labels = entry.querySelectorAll("label, .ashby-application-form-question-title, legend");
+      for (const label of labels) {
+        if (!label || label.contains(el)) continue;
+        // A title whose `for` points at another control, such as Phone, does not
+        // make a nested opt-in radio required.
+        const targetId = label.getAttribute("for") || "";
+        if (targetId) {
+          const target = document.getElementById(targetId);
+          if (target && target !== el) continue;
+        }
+        return label;
+      }
     }
     if (el.id) {
       const explicit = document.querySelector("label[for='" + CSS.escape(el.id) + "']");

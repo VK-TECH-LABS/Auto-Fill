@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 from autofill.dom_ui import public_blocking
 from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application
 from autofill.extract import extract_page
-from autofill.mapping import acknowledgement_kind, map_field
+from autofill.mapping import acknowledgement_kind, is_consent_choice, map_field, option_stance
 from autofill.models import Control
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
@@ -70,6 +70,10 @@ class _Runner:
         self.applied: list[dict] = []
         self.suggests: list[str] = []
         self.item = _question()
+        self.live_options = [
+            {"label": "Florida City, Florida, United States"},
+            {"label": "Miami, Florida, United States"},
+        ]
         self.hold = threading.Event()
         self.entered = threading.Event()
         self.block = False
@@ -104,11 +108,7 @@ class _Runner:
 
     def suggest(self, session_id: str, selector: str, query: str, *, clear: bool) -> dict:
         self.suggests.append(query)
-        return {
-            "found": True,
-            "source": "live",
-            "options": [{"label": "Florida City, Florida, United States"}, {"label": "Miami, Florida, United States"}],
-        }
+        return {"found": True, "source": "live", "options": list(self.live_options)}
 
     def discard(self, session_id: str) -> None:
         return None
@@ -161,6 +161,7 @@ def test_location_shape_separates_city_state_and_place():
     assert location_shape("florida") == "state"
     assert location_shape("FL") == "state"
     assert location_shape("Florida, United States") == "state"
+    assert location_shape("Florida, USA") == "state"
     assert location_shape("Austin, TX") == "place"
     assert location_shape("Florida City, Florida, United States") == "place"
 
@@ -320,7 +321,8 @@ def test_ashby_state_is_not_a_city_and_an_exact_place_commits(browser):
         assert refused["filled"] is False
         assert refused["reason"] == "needs_option"
         assert "Florida City, Florida, United States" in refused["options"]
-        assert "Florida, United States" in refused["options"]
+        assert "Florida, United States" not in refused["options"]
+        assert all(location_shape(label) != "state" for label in refused["options"])
         assert page.locator("#current-location").input_value() == ""
         payroll = "[data-field-path='_systemfield_location'] [role='combobox']"
         suggested = suggest_control(page, payroll, "florida", clear=True)
@@ -393,13 +395,30 @@ def test_consent_blocks_ready_and_marketing_stays_unchecked(browser):
             if any("consent" in (option.label or "").casefold() for option in control.options)
         )
         assert acknowledgement_kind(privacy) == "consent"
+        assert is_consent_choice(privacy) is True
         assert privacy.required is True
         assert "privacy policy" in privacy.label.casefold()
         assert map_field(privacy, _profile()).action == "skip"
         assert map_field(terms, _profile()).action == "skip"
+        optional = next(control for control in snapshot.controls if control.name == "sms-optional")
+        marked = next(control for control in snapshot.controls if control.name == "sms-required")
+        assert is_consent_choice(optional) is True
+        assert optional.required is False
+        assert is_consent_choice(marked) is True
+        assert marked.required is True
         gaps, total, done = inspect_required(page, snapshot, _profile())
         consent_text = " ".join(str(item.get("text") or "") for item in gaps if item.get("kind") == "CONSENT")
-        assert "privacy policy" in consent_text.casefold()
+        assert "terms and conditions" in consent_text.casefold()
+        choice = next(item for item in gaps if "notetakers" in str(item.get("text") or "").casefold())
+        assert choice["kind"] == "CONSENT_CHOICE"
+        assert choice["options"] == ["Yes, I consent", "No, I do not consent"]
+        required_sms = [
+            item
+            for item in gaps
+            if item.get("kind") == "CONSENT_CHOICE" and "text message" in str(item.get("text") or "").casefold()
+        ]
+        assert required_sms
+        assert all("would you like to receive" not in str(item.get("text") or "").casefold() for item in gaps)
         assert all("marketing" not in str(item.get("text") or "").casefold() for item in gaps)
         assert done < total
         assert by_selector
@@ -451,11 +470,24 @@ def test_resolver_yes_does_not_check_consent(browser):
             candidate_ref="ref-a",
             job_ref="job-a",
         )
-        fill_resolved_page(page, binding, session_id="sess-consent", ats_name="lever", step="questions")
+        outcome = fill_resolved_page(page, binding, session_id="sess-consent", ats_name="lever", step="questions")
         assert page.locator("input[value='Yes, I consent']").is_checked() is False
         assert page.locator("input[value='No, I do not consent']").is_checked() is False
+        assert page.locator("input[name='sms-optional']").first.is_checked() is False
+        assert page.locator("input[name='sms-required']").first.is_checked() is False
         assert page.locator("#terms").is_checked() is False
         assert page.locator("#news").is_checked() is False
+        kinds = {str(item.get("text") or ""): item.get("kind") for item in outcome.manual_questions}
+        privacy_kind = next(kind for text, kind in kinds.items() if "notetakers" in text.casefold())
+        assert privacy_kind == "CONSENT_CHOICE"
+        assert all("would you like to receive" not in text.casefold() for text in kinds)
+        page.locator("input[value='No, I do not consent']").evaluate(
+            "el => { el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }"
+        )
+        again = fill_resolved_page(page, binding, session_id="sess-consent", ats_name="lever", step="questions")
+        assert all("notetakers" not in str(item.get("text") or "").casefold() for item in again.manual_questions)
+        assert page.locator("input[value='No, I do not consent']").is_checked() is True
+        assert page.locator("input[value='Yes, I consent']").is_checked() is False
     finally:
         page.close()
         server.shutdown()
@@ -494,3 +526,142 @@ def test_prepared_resume_attaches_when_the_control_appears(browser):
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
     finally:
         page.close()
+
+
+def test_option_stance_separates_consent_from_a_plain_yes_no():
+    assert option_stance("Yes, I consent") == "agree"
+    assert option_stance("Yes - I consent to receive text message updates") == "agree"
+    assert option_stance("No, I do not consent") == "decline"
+    assert option_stance("No - I do not consent to receive text message updates") == "decline"
+    assert option_stance("I do not consent") == "decline"
+    assert option_stance("Opt out") == "decline"
+    assert option_stance("Opt in") == "agree"
+    assert option_stance("Yes") == ""
+    assert option_stance("No") == ""
+    plain = Control(
+        kind="radio",
+        label="Are you authorized to work?",
+        selector="#auth",
+        options=[],
+    )
+    from autofill.models import Option
+
+    plain.options = [Option(value="Yes", label="Yes"), Option(value="No", label="No")]
+    assert is_consent_choice(plain) is False
+
+
+def test_suggestions_omit_a_state_that_cannot_commit(api):
+    client, runner = api
+    runner.live_options = [
+        {"label": "Florida, USA"},
+        {"label": "Florida City, Florida, United States"},
+    ]
+    created = client.post("/v1/sessions", headers=AUTH, json=_body())
+    session_id = created.json()["sessionId"]
+    client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    suggested = client.post(
+        f"/v1/sessions/{session_id}/suggestions",
+        headers=AUTH,
+        json={"fieldKey": "location", "query": "florida"},
+    )
+    assert suggested.status_code == 200, suggested.text
+    labels = [option["label"] for option in suggested.json()["options"]]
+    assert labels == ["Florida City, Florida, United States"]
+    assert runner.applied == []
+
+
+def test_consent_choice_decline_needs_no_confirm_and_agree_does(api):
+    client, runner = api
+    runner.item = _question(
+        kind="CONSENT_CHOICE",
+        text="AI notetakers opt in or out",
+        fieldKey=None,
+        answerType="single_select",
+        options=["Yes, I consent", "No, I do not consent"],
+    )
+    created = client.post("/v1/sessions", headers=AUTH, json=_body())
+    session_id = created.json()["sessionId"]
+    client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    declined = client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionId": "loc-1", "value": "No, I do not consent"},
+    )
+    assert declined.status_code == 200, declined.text
+    assert runner.applied[-1]["value"] == "No, I do not consent"
+    assert runner.applied[-1].get("check") is not True
+    agreed = client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionId": "loc-1", "value": "Yes, I consent"},
+    )
+    assert agreed.status_code == 422
+    assert agreed.json()["detail"]["reason"] == "needs_confirm"
+    assert agreed.json()["detail"]["options"] == ["Yes, I consent", "No, I do not consent"]
+    confirmed = client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionId": "loc-1", "value": "Yes, I consent", "confirm": True},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert runner.applied[-1]["value"] == "Yes, I consent"
+    assert runner.applied[-1].get("check") is not True
+
+
+def test_consent_continue_rescans_instead_of_a_dead_end(api):
+    client, runner = api
+    runner.item = _question(
+        kind="CONSENT_CHOICE",
+        text="AI notetakers opt in or out",
+        fieldKey=None,
+        answerType="single_select",
+        options=["Yes, I consent", "No, I do not consent"],
+    )
+    created = client.post("/v1/sessions", headers=AUTH, json=_body())
+    session_id = created.json()["sessionId"]
+    client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    scanned = client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"candidateRef": "ref-a"},
+    )
+    assert scanned.status_code == 200, scanned.text
+    assert scanned.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+    resolved = client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"candidateRef": "ref-a", "humanResolved": True},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["blocking"]["kind"] == "CONSENT_CHOICE"
+
+
+def test_upload_rejections_name_a_machine_reason(api, monkeypatch):
+    monkeypatch.setenv("AUTOFILL_MAX_RESUME_BYTES", "32")
+    client, _runner = api
+    created = client.post("/v1/sessions", headers=AUTH, json=_body())
+    session_id = created.json()["sessionId"]
+    mismatch = client.post(
+        f"/v1/sessions/{session_id}/resume-file",
+        headers=AUTH,
+        data={"candidateRef": "someone-else", "prepare": "true"},
+        files={"file": ("notes.pdf", PDF, "application/pdf")},
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]["reason"] == "candidate_mismatch"
+    oversized = client.post(
+        f"/v1/sessions/{session_id}/resume-file",
+        headers=AUTH,
+        data={"candidateRef": "ref-a", "prepare": "true"},
+        files={"file": ("notes.pdf", PDF, "application/pdf")},
+    )
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"]["reason"] == "too_large"
+    wrong = client.post(
+        f"/v1/sessions/{session_id}/resume-file",
+        headers=AUTH,
+        data={"candidateRef": "ref-a", "prepare": "true"},
+        files={"file": ("notes.pdf", b"not-a-pdf", "application/pdf")},
+    )
+    assert wrong.status_code == 415
+    assert wrong.json()["detail"]["reason"] == "unsupported_type"

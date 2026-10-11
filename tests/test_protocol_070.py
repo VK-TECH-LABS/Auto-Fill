@@ -525,6 +525,7 @@ def test_resume_file_caps_magic_and_rejection_allow_retry(api):
         files={"file": ("notes.pdf", b"%PDF-" + b"x" * (10 * 1024 * 1024), "application/pdf")},
     )
     assert too_big.status_code == 413
+    assert too_big.json()["detail"]["reason"] == "too_large"
     wrong = client.post(
         f"/v1/sessions/{session_id}/resume-file",
         headers=AUTH,
@@ -532,6 +533,7 @@ def test_resume_file_caps_magic_and_rejection_allow_retry(api):
         files={"file": ("notes.pdf", b"not-a-pdf", "application/pdf")},
     )
     assert wrong.status_code == 415
+    assert wrong.json()["detail"]["reason"] == "unsupported_type"
     runner.resume_ok = False
     rejected = client.post(
         f"/v1/sessions/{session_id}/resume-file",
