@@ -1891,6 +1891,9 @@ def test_lever_location_city_without_state_is_ambiguous(browser, resolver, caplo
         assert "Current location" in [item.get("text") for item in result.manual_questions]
         assert "location left manual reason=ambiguous" in caplog.text
         assert "Austin, TX, USA" in caplog.text
+        location = next(item for item in result.open_items if item.get("text") == "Current location")
+        assert "Austin, TX, USA" in location["options"]
+        assert "Austin, MN, USA" in location["options"]
     finally:
         page.close()
 
@@ -2025,7 +2028,7 @@ def test_current_location_answer_commits_the_suggestion(browser):
                 "value": "Example City, California, United States",
             },
         )
-        assert filled == {"filled": True}
+        assert filled["filled"] is True
         stored = json.loads(page.locator("#selected-location").input_value())
         assert stored["name"] == "Example City, California, United States"
         assert stored["id"]
@@ -2147,7 +2150,7 @@ def test_lever_location_click_sets_the_hidden_value(browser):
                 "value": "Austin, Texas, United States",
             },
         )
-        assert filled == {"filled": True}
+        assert filled["filled"] is True
         stored = json.loads(page.locator("#selected-location").input_value())
         assert stored["name"] == "Austin, TX, USA"
         assert stored["id"]
@@ -2229,7 +2232,7 @@ def test_city_only_answer_keeps_the_first_ranked_suggestion(browser):
                 "value": "Austin",
             },
         )
-        assert filled == {"filled": True}
+        assert filled["filled"] is True
         stored = json.loads(page.locator("#selected-location").input_value())
         assert stored["name"] == "Austin, TX, USA"
         assert stored["id"] == "loc-0"
@@ -2314,7 +2317,7 @@ def test_ashby_location_typeahead_blocks_ready_until_a_suggestion(browser):
                 "value": "Austin, Texas, United States",
             },
         )
-        assert filled == {"filled": True}
+        assert filled["filled"] is True
         assert page.locator("#work-from").input_value() == "Austin, Texas, United States"
         ready = follow_answer(
             page,
@@ -2328,6 +2331,66 @@ def test_ashby_location_typeahead_blocks_ready_until_a_suggestion(browser):
         )
         assert ready.status == Status.READY_FOR_HUMAN_SUBMIT
         assert ready.progress["requiredDone"] == ready.progress["requiredTotal"] == 2
+    finally:
+        page.close()
+
+
+def test_ashby_rendered_place_counts_when_the_list_is_gone(browser):
+    """The chosen place can sit on a selected-value node while aria-expanded is stale."""
+    from autofill.extract import extract_page
+    from autofill.stepfill import inspect_required
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<div class='ashby-application-form-field-entry' data-field-path='_systemfield_location'>"
+            "<label class='_required_f7cvd_91 ashby-application-form-question-title'>"
+            "Where do you plan on working from (for payroll tax purposes)?</label>"
+            "<input id='work-from' role='combobox' aria-autocomplete='list' aria-expanded='true' "
+            "aria-haspopup='listbox' aria-controls='missing-list' placeholder='Start typing...' "
+            "class='ashby-application-form-input-autocomplete'>"
+            "<span class='selected-value'>Austin, Texas, United States</span>"
+            "</div></form>"
+        )
+        gaps, total, done = inspect_required(page, extract_page(page), None)
+        assert total == 1
+        assert done == 1
+        assert gaps == []
+        assert done <= total
+    finally:
+        page.close()
+
+
+def test_ashby_location_blocker_includes_typed_suggestions(browser):
+    from autofill.dom_ui import fit_choice_values
+    from autofill.extract import extract_page
+    from autofill.stepfill import inspect_required
+
+    reason, values = fit_choice_values(
+        {
+            "answerType": "single_select",
+            "fieldKey": "address.city",
+            "text": "Where do you plan on working from (for payroll tax purposes)?",
+            "options": ["Austin, Texas, United States", "Austin, Minnesota, United States"],
+        },
+        ["Austin, TX"],
+    )
+    assert reason == "ok"
+    assert values == ["Austin, TX"]
+    page = browser.new_page()
+    try:
+        page.set_content(_ASHBY_LOCATION)
+        profile = CandidateProfile.from_dict(
+            {"personal": {"full_name": "River Example", "email": "river.example@example.com", "city": "Austin"}}
+        )
+        gaps, total, done = inspect_required(page, extract_page(page), profile)
+        location = next(item for item in gaps if "working from" in str(item.get("text") or "").casefold())
+        assert "Austin, Texas, United States" in location["options"]
+        assert "Austin, Minnesota, United States" in location["options"]
+        assert page.locator("#work-from").input_value() == ""
+        assert done <= total
+        assert any(item.get("text") == "Full name" or "name" in str(item.get("text") or "").casefold() for item in gaps)
     finally:
         page.close()
 

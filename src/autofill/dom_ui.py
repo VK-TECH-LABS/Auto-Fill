@@ -620,20 +620,17 @@ def control_committed(page: Any, selector: str) -> bool:
 
 
 def sync_required_progress(committed_keys: set[str], open_keys: set[str]) -> None:
-    """Count a required field done only when its value is still on the page."""
+    """Count required fields from this scan only.
+
+    ``requiredDone`` and ``requiredTotal`` both come from the fields visible now.
+    A field that left the page is not kept in either number.
+    """
     state = current_run()
     if state is None:
         return
-    for key in committed_keys:
-        if not key:
-            continue
-        state.seen.add(key)
-        state.done.add(key)
-    for key in open_keys:
-        if not key:
-            continue
-        state.seen.add(key)
-        state.done.discard(key)
+    current = {key for key in committed_keys | open_keys if key}
+    state.seen = set(current)
+    state.done = {key for key in committed_keys if key}
     state.progress["requiredTotal"] = len(state.seen)
     state.progress["requiredDone"] = len(state.done)
     _refresh(state)
@@ -669,13 +666,14 @@ def note_snapshot(snapshot: Any) -> None:
         state.progress["stage"] = stage
     label = safe_label(heading) or STAGE_TITLES.get(stage, STAGE_TITLES["OPENING"])
     state.progress["currentLabel"] = label
+    current: set[str] = set()
     for control in getattr(snapshot, "controls", []) or []:
         if not counts_required(control):
             continue
         key = str(getattr(control, "selector", "") or getattr(control, "name", "") or getattr(control, "label", ""))
-        if not key or key in state.seen:
+        if not key:
             continue
-        state.seen.add(key)
+        current.add(key)
         selector = str(getattr(control, "selector", "") or "")
         if selector:
             state.selector_to_key[selector] = key
@@ -683,7 +681,10 @@ def note_snapshot(snapshot: Any) -> None:
             option_selector = str(getattr(option, "selector", "") or "")
             if option_selector:
                 state.selector_to_key[option_selector] = key
+    state.seen = current
+    state.done = {key for key in state.done if key in state.seen}
     state.progress["requiredTotal"] = len(state.seen)
+    state.progress["requiredDone"] = len(state.done)
     _refresh(state)
 
 
@@ -1155,14 +1156,28 @@ def read_choice_options(page: Any, selector: str) -> list[str]:
     return labels
 
 
+def _place_suggestion_answer(item: dict[str, Any]) -> bool:
+    """A location typeahead lists places. The answer can be a city and region, not one label."""
+    key = str(item.get("fieldKey") or "").strip()
+    text = str(item.get("text") or "").strip().casefold()
+    location = key in {"location", "address.city", "city"} or "working from" in text or "payroll tax" in text
+    if not location and text not in {"location", "your location", "current location", "your current location"}:
+        return False
+    return any("," in str(option) for option in item.get("options") or [])
+
+
 def fit_choice_values(item: dict[str, Any], values: list[str]) -> tuple[str, list[str]]:
     """Rewrite a unique choice to its option label.
 
     ``ok`` keeps free text when the control has no options. ``option_mismatch``
     is no match. ``ambiguous`` is more than one option at the best tier.
+    A location typeahead keeps the caller's place text so ``Austin, TX`` can
+    still choose among the live suggestions.
     """
     options = [str(option).strip() for option in item.get("options") or [] if str(option).strip()]
     answer_type = str(item.get("answerType") or "")
+    if _place_suggestion_answer(item):
+        return "ok", list(values)
     if answer_type not in _CHOICE_ANSWER_TYPES or not options:
         if options and not all(value.strip() in set(options) for value in values):
             return "option_mismatch", options

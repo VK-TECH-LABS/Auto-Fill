@@ -928,6 +928,88 @@ def fixture_origin():
         server.shutdown()
 
 
+def test_progress_uses_one_field_set():
+    """A smaller scan must not keep an older done count or percent."""
+    from autofill.service.app import _overlay_progress
+
+    session = ServiceSession(
+        session_id="sess-progress",
+        candidate_id="candidate-a",
+        job_id="job-a",
+        application_url="https://jobs.ashbyhq.com/example/application",
+        profile=CandidateProfile.from_dict(
+            {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+        ),
+        job=JobContext(),
+        cover_letter_text=None,
+        protocol_version="0.7.0",
+        status=Status.MANUAL_ANSWER_REQUIRED,
+        result=ApplicationResult(
+            status=Status.MANUAL_ANSWER_REQUIRED,
+            ats="ashby",
+            current_step=Status.MANUAL_ANSWER_REQUIRED,
+            login_status="NOT_REQUIRED",
+        ),
+    )
+    session.required_done_high = 3
+    session.percent_high = 30
+    session.required_page_key = Status.MANUAL_ANSWER_REQUIRED
+    session.required_total_mark = 10
+    session.form_seen = True
+    shrunk = _overlay_progress(
+        session,
+        {
+            "stage": "QUESTIONS",
+            "requiredTotal": 1,
+            "requiredDone": 0,
+            "percent": 0,
+            "currentLabel": "Questions",
+        },
+    )
+    assert shrunk["requiredTotal"] == 1
+    assert shrunk["requiredDone"] == 0
+    assert shrunk["requiredDone"] <= shrunk["requiredTotal"]
+    assert shrunk["percent"] == 0
+    held = _overlay_progress(
+        session,
+        {
+            "stage": "QUESTIONS",
+            "requiredTotal": 1,
+            "requiredDone": 0,
+            "percent": 0,
+            "currentLabel": "Questions",
+        },
+    )
+    assert held["requiredDone"] == 0
+    assert held["requiredDone"] <= held["requiredTotal"]
+    grown = _overlay_progress(
+        session,
+        {
+            "stage": "QUESTIONS",
+            "requiredTotal": 4,
+            "requiredDone": 4,
+            "percent": 100,
+            "currentLabel": "Questions",
+        },
+    )
+    assert grown["requiredDone"] == grown["requiredTotal"] == 4
+    assert grown["percent"] == 100
+    held_back = _overlay_progress(
+        session,
+        {
+            "stage": "QUESTIONS",
+            "requiredTotal": 4,
+            "requiredDone": 2,
+            "percent": 50,
+            "currentLabel": "Questions",
+        },
+    )
+    assert held_back["requiredTotal"] == 4
+    assert held_back["requiredDone"] == 4
+    assert held_back["requiredDone"] <= held_back["requiredTotal"]
+    assert held_back["percent"] == 100
+
+
 @pytest.fixture
 def resolver_origin():
     import json

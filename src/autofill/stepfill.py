@@ -49,7 +49,7 @@ from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnap
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
-from autofill.safeguards import click_choice
+from autofill.safeguards import click_choice, dismiss_combobox
 
 logger = logging.getLogger("autofill.stepfill")
 
@@ -769,7 +769,7 @@ def _selected_location(page) -> str:
         return ""
 
 
-def _manual_location(outcome: ResolvedPage, control: Control) -> None:
+def _manual_location(outcome: ResolvedPage, control: Control, labels: list[str] | None = None) -> None:
     text = sanitize_question(control.label or control.aria_label or "Current location")
     _manual(
         outcome,
@@ -778,6 +778,7 @@ def _manual_location(outcome: ResolvedPage, control: Control) -> None:
         control=control,
         kind="MISSING_PROFILE_VALUE",
         field_key="address.city",
+        option_labels=labels,
     )
 
 
@@ -913,18 +914,27 @@ def _location_committed(page, control: Control, city: str) -> bool:
 
     Lever keeps the chosen place in a hidden ``selectedLocation`` input as JSON
     with an id. The visible box can hold the city, or the hidden input can hold
-    an empty name, while no suggestion has been picked.
+    an empty name, while no suggestion has been picked. Ashby shows the chosen
+    place on the combobox itself and closes the list.
     """
     if _has_selected_location(page):
         pick = _location_pick(page)
         if pick is None:
             return False
         return bool(city) and _phrase_in(normalize(str(pick.get("name") or "")), city)
-    try:
-        typed = str(page.locator(control.selector).input_value() or "")
-    except Exception:
-        typed = ""
-    folded = normalize(typed)
+    if getattr(page, "evaluate", None) is None:
+        try:
+            typed = str(page.locator(control.selector).input_value() or "")
+        except Exception:
+            typed = ""
+        folded = normalize(typed)
+        if not folded or folded == normalize(city):
+            return False
+        return _phrase_in(folded, city)
+    if not _settle_rendered_place(page, control):
+        return False
+    shown = str(_read_typeahead_state(page, control.selector).get("shown") or "")
+    folded = normalize(shown)
     if not folded or folded == normalize(city):
         return False
     return _phrase_in(folded, city)
@@ -1093,13 +1103,19 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     # suggestion the geocoder ranked. A profile fill with no region still asks.
     _apply_location(page, control, fields, outcome, ranked=True, trace=trace)
     city, _region, _country = _location_parts(fields)
+    labels = [str(label) for label in trace.get("labels") or [] if str(label).strip()]
     if city and _location_committed(page, control, city):
-        return {"filled": True}
+        committed: dict[str, Any] = {"filled": True}
+        if labels:
+            committed["options"] = labels
+        return committed
     result: dict[str, Any] = {
         "filled": False,
         "reason": "not_committed",
         "suggestionCount": int(trace.get("count") or 0),
     }
+    if labels:
+        result["options"] = labels
     if trace.get("lever"):
         result["leverSearch"] = True
     if trace.get("status") is not None:
@@ -1238,6 +1254,7 @@ def _apply_location_query(
         options = []
         match = None
     trace["count"] = len(options)
+    trace["labels"] = [label for label, _selector in options]
     logger.info("location suggestions status=%s count=%s", status if status is not None else "none", len(options))
     if match is None and ranked and not region:
         hits = [item for item in options if _same_city(item[0], city)]
@@ -1277,7 +1294,7 @@ def _apply_location_query(
         field.fill("")
     except Exception:
         pass
-    _manual_location(outcome, control)
+    _manual_location(outcome, control, [label for label, _selector in options])
 
 
 def _apply(
@@ -1824,6 +1841,7 @@ def _manual(
     controls: list[Control] | None = None,
     kind: str | None = None,
     field_key: str | None = None,
+    option_labels: list[str] | None = None,
 ) -> None:
     text = sanitize_question(match.text or "")
     if not text or _is_section_heading(text):
@@ -1833,7 +1851,9 @@ def _manual(
         group.insert(0, control)
     primary = group[0] if group else None
     digest = _question_digest(text, primary) or None
-    options = _option_labels(group) if group else []
+    options = [label for label in option_labels if label.strip()] if option_labels else []
+    if not options and group:
+        options = _option_labels(group)
     multi = len(group) > 1 and any(item.kind == "checkbox" for item in group)
     entry: dict[str, Any] = {
         "intent": match.intent,
@@ -2286,6 +2306,18 @@ def _manual_label(control: Control) -> str:
 
 
 _CHOICE_ANSWER_TYPES = frozenset({"single_select", "multi_select"})
+_PLACE_KEYS = frozenset({"location", "address.city", "city"})
+
+
+def _place_blocker(item: dict[str, Any]) -> bool:
+    """A location typeahead, not a city menu of bare names."""
+    key = str(item.get("fieldKey") or "").strip()
+    text = str(item.get("text") or "").strip().casefold()
+    if key in _PLACE_KEYS:
+        return True
+    if "working from" in text or "payroll tax" in text:
+        return True
+    return text in {"location", "your location", "current location", "your current location"}
 
 
 def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
@@ -2306,6 +2338,8 @@ def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
         labels = read_choice_options(page, selector)
         if not labels:
             labels = list_combobox_options(page, selector)
+        if not labels and _place_blocker(item):
+            labels = _load_place_options(page, selector, "")
         labels = [label for label in labels if _keep_option(label)]
         if labels:
             item["options"] = labels
@@ -2421,40 +2455,113 @@ def _gap_clusters(snapshot: PageSnapshot) -> list[list[Control]]:
     return clusters
 
 
-_TYPEAHEAD_STATE_JS = """
+_TYPEAHEAD_STATE_JS = r"""
 (selector) => {
   const el = document.querySelector(selector);
-  if (!el) return { value: "", expanded: false, chip: false };
-  const scope = (el.closest && el.closest("[data-field-path], .select__control")) || el.parentElement;
-  const chip = scope ? scope.querySelector(".select__single-value, .select__multi-value") : null;
-  const chipText = chip ? String(chip.textContent || "").replace(/\\s+/g, " ").trim() : "";
-  const placeholder = /^(select\\.{0,3}|choose\\.{0,3}|please select|start typing\\.{0,3})$/i;
+  if (!el) return { value: "", expanded: false, chip: false, shown: "" };
+  function clean(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+  const placeholder = /^(select\.{0,3}|choose\.{0,3}|please select|start typing\.{0,3})$/i;
+  function usable(text) {
+    const value = clean(text);
+    if (!value || placeholder.test(value) || value.charAt(0) === "{" || value.charAt(0) === "[") return "";
+    return value;
+  }
+  const scope = (el.closest && el.closest(
+    "[data-field-path], .ashby-application-form-field-entry, .select__control"
+  )) || el.parentElement;
+  const chipSelector = [
+    ".select__single-value",
+    ".select__multi-value",
+    "[class*='selected-value']",
+    "[class*='selectedValue']",
+    "[data-selected-value]",
+  ].join(", ");
+  const chip = scope ? scope.querySelector(chipSelector) : null;
+  const hidden = scope ? scope.querySelector("input[type='hidden']") : null;
+  const direct = "value" in el ? usable(el.value) : "";
+  const chipText = usable(chip ? chip.textContent : "");
+  const hiddenText = usable(hidden ? hidden.value : "");
+  const shownText = usable(el.innerText || el.textContent);
+  const place = direct || chipText || shownText || hiddenText;
+  function visible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || node.hidden) return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+  function listOpen() {
+    if (el.getAttribute("aria-expanded") !== "true") return false;
+    const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
+    const list = listId ? document.getElementById(listId) : null;
+    if (list) return visible(list);
+    const options = document.querySelectorAll("[role='option']");
+    for (const option of options) {
+      if (visible(option)) return true;
+    }
+    return false;
+  }
   return {
-    value: "value" in el ? String(el.value || "") : "",
-    expanded: el.getAttribute("aria-expanded") === "true",
-    chip: chipText.length > 0 && !placeholder.test(chipText),
+    value: direct,
+    chip: chipText.length > 0,
+    shown: place,
+    expanded: listOpen(),
   };
 }
 """
 
 
+def _full_place(text: str) -> bool:
+    """A city plus a region, not a typed city and not a JSON blob."""
+    shown = text.strip()
+    if "," not in shown or shown.startswith("{") or shown.startswith("["):
+        return False
+    return bool(re.search(r"[A-Za-z]", shown))
+
+
+def _read_typeahead_state(page, selector: str) -> dict[str, Any]:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return {}
+    try:
+        state = evaluate(_TYPEAHEAD_STATE_JS, selector) or {}
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _settle_rendered_place(page, control: Control) -> bool:
+    """Close a leftover suggestion list once the chosen place is already showing."""
+    for _ in range(8):
+        if _typeahead_place_committed(page, control):
+            return True
+        state = _read_typeahead_state(page, control.selector)
+        shown = str(state.get("shown") or "")
+        if _full_place(shown) and state.get("expanded"):
+            try:
+                dismiss_combobox(page)
+            except Exception:
+                return False
+        _pause(page, 40)
+    return _typeahead_place_committed(page, control)
+
+
 def _typeahead_place_committed(page, control: Control) -> bool:
-    """A typeahead place is committed when a suggestion is showing, not when text was typed."""
+    """A typeahead place is committed when the page shows it and the list is closed.
+
+    The place may be the input value, the text the control displays, a selected-value
+    element, or a hidden input in the field. A bare city, or a list that is still open,
+    is not a commit.
+    """
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return True
-    try:
-        state = evaluate(_TYPEAHEAD_STATE_JS, control.selector) or {}
-    except Exception:
+    state = _read_typeahead_state(page, control.selector)
+    if not state or state.get("expanded"):
         return False
-    if not isinstance(state, dict):
-        return False
-    if state.get("chip"):
-        return True
-    if state.get("expanded"):
-        return False
-    value = str(state.get("value") or "").strip()
-    return "," in value
+    return _full_place(str(state.get("shown") or ""))
 
 
 def _cluster_committed(page, controls: list[Control]) -> bool:
@@ -2480,6 +2587,46 @@ def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     if (mapped is not None and mapped.key) or match_field_key(controls[0]):
         return "MISSING_PROFILE_VALUE"
     return "QUESTION"
+
+
+def _load_place_options(page, selector: str, query: str) -> list[str]:
+    """Read suggestion labels, typing ``query`` only when the box is empty.
+
+    The typed probe is cleared and the list is closed. A Lever page keeps its
+    own suggestion id and is not probed here.
+    """
+    if not selector or _has_selected_location(page):
+        return []
+    field = page.locator(selector)
+    try:
+        current = str(field.input_value() or "")
+    except Exception:
+        return []
+    probe = current.strip() or query.strip()
+    if not probe:
+        return []
+    typed = False
+    labels: list[str] = []
+    try:
+        if not current.strip():
+            field.press_sequentially(probe, delay=0)
+            typed = True
+        found = _poll_location_options(page, selector, 12, 100)
+        for label, _item_selector in found:
+            if label not in labels:
+                labels.append(label)
+    except Exception:
+        labels = []
+    if typed:
+        try:
+            field.fill("")
+        except Exception:
+            pass
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        pass
+    return labels
 
 
 def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=None) -> dict[str, Any]:
@@ -2510,6 +2657,11 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         field_key = "phone.country"
     elif field_key == "country":
         field_key = "address.country"
+    if page is not None and not options and primary.selector and _is_location_typeahead(primary):
+        query = profile.personal.city.strip() if profile is not None else ""
+        loaded = [label for label in _load_place_options(page, primary.selector, query) if _keep_option(label)]
+        if loaded:
+            options = [sanitize_question(label, limit=80) for label in loaded]
     match = classify_question(text, options)
     named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
     intent = match.intent if named else None
