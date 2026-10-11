@@ -9,6 +9,7 @@ touched only on their worker thread. Passwords are not logged.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
@@ -33,6 +34,8 @@ from autofill.follow import FollowUp, PageMark, follow_answer, read_page_mark
 from autofill.models import JobContext
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
+
+logger = logging.getLogger("autofill.service")
 
 _T = TypeVar("_T")
 
@@ -906,7 +909,12 @@ class PlaywrightRunner:
                     return {"ok": False, "reason": "navigating"}
                 if is_browser_crash(exc):
                     raise PageUnavailable(410) from None
-                raise
+                logger.info(
+                    "session=%s account_action=failed error_type=%s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                return {"ok": False, "reason": "input_failed"}
 
         return worker.submit(apply)
 

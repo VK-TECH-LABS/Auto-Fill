@@ -8,13 +8,26 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+from autofill.account_flow import run_account_action
+from autofill.credentials import Credentials, SiteContext
 from autofill.engine import ApplicationResult, Status
-from autofill.login import account_decision, password_policy, score_account, tenant_identity, verification_present
-from autofill.models import ButtonControl, Control, LinkControl, PageSnapshot
+from autofill.login import (
+    SecretInputError,
+    _type_secret,
+    account_decision,
+    password_policy,
+    score_account,
+    tenant_identity,
+    verification_present,
+)
+from autofill.models import ButtonControl, Control, JobContext, LinkControl, PageSnapshot
+from autofill.profile import CandidateProfile
+from autofill.redact import redaction_filter
 from autofill.safeguards import HumanSubmissionRequired, activate_account
 from autofill.service.app import create_app
 from autofill.service.runner import PageUnavailable
 from autofill.service.schemas import CredentialsIn
+from autofill.service.sessions import ServiceSession
 
 TOKEN = "synthetic-service-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -266,6 +279,98 @@ def test_credentials_repr_and_logs_omit_the_secret():
     rendered = repr(body)
     assert SECRET not in rendered
     assert "password=" not in rendered
+
+
+def test_failed_password_fill_drops_the_value_from_the_error():
+    import traceback
+
+    secret = "SuperSecretValue99"
+
+    class Locator:
+        def fill(self, value: str) -> None:
+            raise RuntimeError(f'fill("{value}")')
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return Locator()
+
+    try:
+        _type_secret(Page(), "#password", secret)
+    except SecretInputError:
+        rendered = traceback.format_exc()
+    else:
+        raise AssertionError("the fill failure should surface as SecretInputError")
+    assert secret not in rendered
+    assert "RuntimeError" in rendered
+
+    snapshot = {
+        "controls": [
+            {"kind": "text", "label": "Email", "selector": "#email", "inputType": "email"},
+            {"kind": "password", "label": "Password", "selector": "#password", "inputType": "password"},
+        ],
+        "buttons": [{"name": "Sign In", "selector": "#go", "controlType": "submit"}],
+        "password": True,
+        "heading": "Sign in",
+    }
+
+    class FormPage:
+        url = "https://boards.greenhouse.io/example/login"
+
+        def evaluate(self, script, arg=None):
+            return snapshot
+
+        def locator(self, selector: str) -> Locator:
+            return Locator()
+
+    report = run_account_action(
+        FormPage(),
+        mode="login",
+        email="person@example.com",
+        username="",
+        password=secret,
+        confirm=secret,
+        ats="greenhouse",
+    )
+    assert report == {"ok": False, "reason": "input_failed"}
+    assert secret not in str(report)
+
+
+def test_wipe_forgets_the_password_and_deletes_the_resume_file(tmp_path):
+    secret = "SuperSecretValue99"
+    profile = CandidateProfile.from_dict(
+        {"candidateId": "ref-a", "personal": {"full_name": "Synthetic Candidate", "email": "synthetic@example.com"}}
+    )
+    session = ServiceSession(
+        session_id="session-a",
+        candidate_id="ref-a",
+        job_id="job-a",
+        application_url="https://boards.greenhouse.io/example",
+        profile=profile,
+        job=JobContext(title="Example", company="Example Labs", url="https://boards.greenhouse.io/example"),
+        cover_letter_text=None,
+    )
+    session.credentials.put(
+        "ref-a",
+        "boards.greenhouse.io",
+        Credentials(site="boards.greenhouse.io", email="person@example.com", password=secret),
+    )
+    session.remember_secret(secret)
+    path = tmp_path / "slot" / "notes.pdf"
+    path.parent.mkdir()
+    path.write_bytes(b"%PDF-1.4\n")
+    session.resume_temp = str(path)
+    session.resume_bytes = b"%PDF-1.4\n"
+    assert secret not in redaction_filter().scrub(secret)
+    session.wipe_secrets()
+    found = session.credentials.get_credentials(
+        SiteContext(url="https://boards.greenhouse.io/example", domain="boards.greenhouse.io", candidate_id="ref-a")
+    )
+    assert found is None
+    assert session.secret_values == []
+    assert session.resume_bytes is None
+    assert session.resume_temp == ""
+    assert not path.exists()
+    assert secret not in redaction_filter()._secrets
 
 
 def test_older_sessions_keep_the_old_status_and_store_shape(api, caplog):

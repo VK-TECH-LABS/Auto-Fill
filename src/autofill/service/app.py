@@ -297,6 +297,8 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             )
         if reason == "not_at_account_step":
             raise HTTPException(status_code=409, detail={"reason": "not_at_account_step"})
+        if reason == "input_failed":
+            raise HTTPException(status_code=409, detail={"reason": "input_failed"})
         raise HTTPException(status_code=409, detail="No page is open for this session.")
     if report.get("account"):
         session.account = report["account"]

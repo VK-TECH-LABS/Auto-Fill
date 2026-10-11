@@ -101,9 +101,19 @@ def _continue_button(snapshot: PageSnapshot):
     return None
 
 
+class SecretInputError(Exception):
+    """A credential field could not be typed. The message is an error type, never the value."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+
+
 def _type_secret(page, selector: str, value: str) -> None:
-    """Put ``value`` into a login field. The value is not logged."""
-    page.locator(selector).fill(value)
+    """Put ``value`` into a login field. A failure does not keep the value."""
+    try:
+        page.locator(selector).fill(value)
+    except Exception as exc:
+        raise SecretInputError(type(exc).__name__) from None
 
 
 def _identity(creds: Credentials, control: Control) -> str:
