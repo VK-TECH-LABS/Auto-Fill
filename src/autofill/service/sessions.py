@@ -66,6 +66,8 @@ class ServiceSession:
     resume_temp: str = ""
     completed_keys: list[str] = field(default_factory=list)
     completed_hashes: list[str] = field(default_factory=list)
+    answer_attempts: dict[str, int] = field(default_factory=dict)
+    stuck_manual: bool = False
     checkpoint: dict | None = None
     percent_high: int = 0
     required_done_high: int = 0
