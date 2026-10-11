@@ -44,7 +44,15 @@ from autofill.intents import (
     question_hash,
     sanitize_question,
 )
-from autofill.mapping import haystack, is_honeypot, map_field, match_field_key, mentions_work_history, normalize
+from autofill.mapping import (
+    acknowledgement_kind,
+    haystack,
+    is_honeypot,
+    map_field,
+    match_field_key,
+    mentions_work_history,
+    normalize,
+)
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
@@ -236,6 +244,7 @@ class _Ask:
     resume: bool = False
     subfield: str = ""
     compose_location: bool = False
+    consent: bool = False
 
     def question_body(self) -> dict:
         control = self.controls[0]
@@ -321,8 +330,11 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     if is_honeypot(control):
         return None
     blob = haystack(control)
-    if _LEGAL_RE.search(blob):
+    role = acknowledgement_kind(control)
+    if role == "marketing":
         return None
+    if role == "consent" or _LEGAL_RE.search(blob):
+        return _Ask(controls=controls, consent=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if _is_application_resume(control):
             return _Ask(controls=controls, field_key="resume.file")
@@ -817,6 +829,84 @@ def _poll_location_options(page, selector: str, attempts: int, delay_ms: int) ->
     return options
 
 
+_CONTROL_KIND_JS = r"""
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return "";
+  const tag = String(el.tagName || "").toLowerCase();
+  const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+  if (tag === "select") return "select";
+  if (type === "radio" || type === "checkbox") return type;
+  return "combobox";
+}
+"""
+
+
+def suggest_control(page, selector: str, query: str, *, clear: bool) -> dict[str, Any]:
+    """Type ``query`` into a combobox and return the list without choosing one.
+
+    A native select, radio, or checkbox group returns its labels as ``static``
+    and is not typed into. Typed text is cleared unless the place was already
+    committed before the probe.
+    """
+    if not selector:
+        return {"found": False, "options": [], "source": "live"}
+    evaluate = getattr(page, "evaluate", None)
+    kind = ""
+    if evaluate is not None:
+        try:
+            kind = str(evaluate(_CONTROL_KIND_JS, selector) or "")
+        except Exception:
+            kind = ""
+        if not kind:
+            return {"found": False, "options": [], "source": "live"}
+    if kind in {"select", "radio", "checkbox"}:
+        from autofill.dom_ui import read_choice_options
+
+        labels = [label for label in read_choice_options(page, selector) if _keep_option(label)]
+        return {
+            "found": True,
+            "options": [{"label": label} for label in labels],
+            "source": "static",
+        }
+    control = Control(kind="combobox", label="Location", selector=selector)
+    already = False
+    if evaluate is not None:
+        try:
+            already = _typeahead_place_committed(page, control)
+        except Exception:
+            already = False
+    field = page.locator(selector)
+    typed = False
+    seen: list[str] = []
+    try:
+        if query.strip() and not already:
+            try:
+                field.fill("")
+            except Exception:
+                return {"found": False, "options": [], "source": "live"}
+            field.press_sequentially(query.strip(), delay=0)
+            typed = True
+        found = _poll_location_options(page, selector, 12, 100)
+        for label, _item_selector in found:
+            if label not in seen and _keep_option(label):
+                seen.append(label)
+    except Exception:
+        if not typed and evaluate is None:
+            return {"found": True, "options": [], "source": "live"}
+        return {"found": False, "options": [], "source": "live"}
+    if typed and (clear or not already):
+        try:
+            field.fill("")
+        except Exception:
+            pass
+        try:
+            dismiss_combobox(page)
+        except Exception:
+            pass
+    return {"found": True, "options": [{"label": label} for label in seen], "source": "live"}
+
+
 def _match_location(
     options: list[tuple[str, str]], *, city: str, region: str, country: str
 ) -> tuple[str, str] | None:
@@ -1070,6 +1160,63 @@ def _apply_phone_country(page, control: Control, fields: dict, outcome: Resolved
 
 _LOCATION_ANSWER_KEYS = frozenset({"location", "address.city", "city"})
 _LOCATION_LABELS = frozenset({"location", "your location", "current location", "your current location"})
+_STATE_NAMES = frozenset(_STATES) | frozenset(_STATES.values())
+_CITY_LOCATION_PHRASES = (
+    "currently located",
+    "where are you located",
+    "current location",
+    "working from",
+    "payroll",
+    "where do you live",
+)
+
+
+def location_shape(value: str) -> str:
+    """``city``, ``state``, or ``place`` for one location answer.
+
+    A comma and a second part is a full place. A state name or abbreviation
+    alone is a state. Anything else is a city.
+    """
+    text = value.strip()
+    if not text:
+        return "city"
+    pieces = [part.strip() for part in text.split(",") if part.strip()]
+    if len(pieces) >= 2 and any(character.isalpha() for character in pieces[1]):
+        # "Florida, United States" is a state, not a city. "Austin, TX" is a place.
+        if len(pieces) == 2 and _is_state_token(pieces[0]) and _is_country_token(pieces[1]):
+            return "state"
+        return "place"
+    token = normalize(text)
+    if token in _STATE_NAMES:
+        return "state"
+    return "city"
+
+
+def _is_state_token(value: str) -> bool:
+    return normalize(value) in _STATE_NAMES
+
+
+def _is_country_token(value: str) -> bool:
+    token = normalize(value)
+    if not token:
+        return False
+    if token in _COUNTRIES or token in set(_COUNTRIES.values()):
+        return True
+    return token in {"united states", "united kingdom", "canada", "mexico", "uruguay"}
+
+
+def location_needs_city(target: dict) -> bool:
+    """True when the control is a place typeahead, not a state menu."""
+    text = str(target.get("text") or "").strip().casefold()
+    key = str(target.get("fieldKey") or "").strip()
+    label_hit = any(phrase in text for phrase in _CITY_LOCATION_PHRASES) or text in _LOCATION_LABELS
+    options = [str(option).strip() for option in target.get("options") or [] if str(option).strip()]
+    place_menu = any("," in option for option in options)
+    if options and not place_menu and all(location_shape(option) == "state" for option in options):
+        return False
+    if label_hit or key == "location" or place_menu:
+        return True
+    return key in _LOCATION_ANSWER_KEYS and place_menu
 
 
 def is_location_answer(page, target: dict) -> bool:
@@ -1085,7 +1232,11 @@ def is_location_answer(page, target: dict) -> bool:
 
 
 def commit_location_answer(page, target: dict) -> dict[str, Any]:
-    """Type the city and keep a suggestion. A bare typed city is not a commit."""
+    """Type the city and keep a suggestion. A bare typed city is not a commit.
+
+    A state with no city is not a commit on a place field. The suggestion
+    labels are returned so the caller can ask for one of them.
+    """
     value = str(target.get("value") or "").strip()
     if not value:
         values = [str(item).strip() for item in target.get("values") or [] if str(item).strip()]
@@ -1095,12 +1246,17 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
         return {"filled": False, "reason": "no_selector"}
     if not value:
         return {"filled": False, "reason": "empty"}
+    if location_shape(value) == "state" and location_needs_city(target):
+        probed = suggest_control(page, selector, value, clear=True)
+        labels = [str(item.get("label") or "") for item in probed.get("options") or [] if str(item.get("label") or "")]
+        return {"filled": False, "reason": "needs_option", "options": labels}
     fields = {"location": value, "address.city": value.split(",")[0].strip()}
     control = Control(kind="combobox", label=str(target.get("text") or "Current location"), selector=selector)
     outcome = ResolvedPage()
     trace: dict[str, Any] = {}
     # The caller named a city. When several places share it, keep the first
     # suggestion the geocoder ranked. A profile fill with no region still asks.
+    trace["exact"] = value if location_shape(value) == "place" else ""
     _apply_location(page, control, fields, outcome, ranked=True, trace=trace)
     city, _region, _country = _location_parts(fields)
     labels = [str(label) for label in trace.get("labels") or [] if str(label).strip()]
@@ -1253,6 +1409,12 @@ def _apply_location_query(
     if isinstance(status, int) and status >= 400:
         options = []
         match = None
+    exact = str(trace.get("exact") or "").strip().casefold()
+    if exact:
+        for label, item_selector in options:
+            if label.casefold() == exact:
+                match = (label, item_selector)
+                break
     trace["count"] = len(options)
     trace["labels"] = [label for label, _selector in options]
     logger.info("location suggestions status=%s count=%s", status if status is not None else "none", len(options))
@@ -1325,6 +1487,16 @@ def _apply(
             continue
         if ask.field_key == "resume.file":
             _apply_resume(page, ask, response, outcome)
+            continue
+        if ask.consent:
+            statement = _consent_statement(ask.controls[0])
+            _manual(
+                outcome,
+                IntentMatch(None, "unknown", "none", statement),
+                blocking=True,
+                controls=ask.controls,
+                kind="CONSENT",
+            )
             continue
         if ask.compose_location:
             _apply_location(page, ask.controls[0], response.fields, outcome)
@@ -1843,7 +2015,8 @@ def _manual(
     field_key: str | None = None,
     option_labels: list[str] | None = None,
 ) -> None:
-    text = sanitize_question(match.text or "")
+    limit = 600 if kind == "CONSENT" else 300
+    text = sanitize_question(match.text or "", limit=limit)
     if not text or _is_section_heading(text):
         return
     group = list(controls or [])
@@ -2346,16 +2519,23 @@ def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
 
 
 _JUNK_OPTION = re.compile(r"click here\b.{0,80}\b(?:issue|browser|cache|cookies)\b", re.IGNORECASE)
+_PLACEHOLDER_OPTION = re.compile(
+    r"^(?:select|choose|please select|choose one|select one|start typing)\.{0,3}$",
+    re.IGNORECASE,
+)
 
 
 def _keep_option(label: str) -> bool:
-    """Drop instruction rows that are not choices, such as a browser-help link."""
-    return not _JUNK_OPTION.search(label)
+    """Drop placeholders and instruction rows that are not choices."""
+    text = label.strip()
+    if not text or _PLACEHOLDER_OPTION.match(text):
+        return False
+    return not _JUNK_OPTION.search(text)
 
 
 def _option_labels(controls: list[Control]) -> list[str]:
     if len(controls) > 1:
-        return [label for label in (_checkbox_label(item) for item in controls) if _keep_option(label)][:20]
+        return [label for label in (_checkbox_label(item) for item in controls) if _keep_option(label)]
     labels = []
     for option in controls[0].options:
         label = option.label or option.value
@@ -2575,8 +2755,16 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
     return control_committed(page, control.selector)
 
 
+def _consent_statement(control: Control) -> str:
+    """The checkbox statement a person confirms, bounded at 600 characters."""
+    raw = control.label or control.prompt or control.group or control.aria_label or "Confirmation"
+    return sanitize_question(raw, limit=600)
+
+
 def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     text = _question_text(controls) or controls[0].label
+    if acknowledgement_kind(controls[0]) == "consent":
+        return "CONSENT"
     if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
         return "DEMOGRAPHIC"
     match = classify_question(text, _option_labels(controls))
@@ -2631,9 +2819,12 @@ def _load_place_options(page, selector: str, query: str) -> list[str]:
 
 def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=None) -> dict[str, Any]:
     primary = controls[0]
-    text = sanitize_question(
-        _question_text(controls) or primary.label or primary.aria_label or "Required field"
-    )
+    if acknowledgement_kind(primary) == "consent":
+        text = _consent_statement(primary)
+    else:
+        text = sanitize_question(
+            _question_text(controls) or primary.label or primary.aria_label or "Required field"
+        )
     mapped = map_field(primary, profile) if profile is not None and len(controls) == 1 else None
     kind = _gap_kind(controls, mapped)
     field_key = None

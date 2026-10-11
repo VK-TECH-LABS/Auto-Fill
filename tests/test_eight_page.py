@@ -317,7 +317,10 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
                 max_pages=12,
             ),
         )
-        assert third.status == Status.READY_FOR_HUMAN_SUBMIT, third.messages
+        assert third.status == Status.MANUAL_ANSWER_REQUIRED, third.messages
+        assert third.blocking is not None
+        assert third.blocking["kind"] == "CONSENT"
+        assert "terms of service" in third.blocking["text"].casefold()
         assert page.evaluate("() => window.__submitCount") == 0
         clicked = page.evaluate("() => window.__clicked")
         assert "Submit application" not in clicked

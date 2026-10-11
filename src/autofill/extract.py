@@ -8,6 +8,7 @@ roots, which is why an ``#id`` selector remains usable after extraction.
 
 from __future__ import annotations
 
+from autofill.mapping import mark_required_acknowledgements
 from autofill.models import ButtonControl, Control, LinkControl, Option, PageSnapshot
 
 EXTRACT_JS = r"""
@@ -123,7 +124,7 @@ EXTRACT_JS = r"""
         if (child.contains(el)) break;
         if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
         const text = cleanPrompt(textOf(child));
-        if (!text || text.length > 200 || text === option || isSectionHeading(child, text)) continue;
+        if (!text || text.length > 600 || text === option || isSectionHeading(child, text)) continue;
         return text;
       }
     }
@@ -337,7 +338,11 @@ EXTRACT_JS = r"""
           placeholder: "",
           ariaLabel: el.getAttribute("aria-label") || "",
           autocomplete: "",
-          required: group.some((radio) => radio.required || radio.getAttribute("aria-required") === "true"),
+          required: group.some((radio) => (
+            radio.required ||
+            radio.getAttribute("aria-required") === "true" ||
+            controlMarkedRequired(radio)
+          )),
           hidden: group.every((radio) => isHidden(radio)),
           disabled: group.every((radio) => radio.disabled),
           readOnly: false,
@@ -404,6 +409,7 @@ EXTRACT_JS = r"""
           required:
             !!el.required ||
             el.getAttribute("aria-required") === "true" ||
+            (kind === "checkbox" && controlMarkedRequired(el)) ||
             (
               (role === "combobox" ||
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
@@ -634,7 +640,15 @@ EXTRACT_JS = r"""
   }
 
   function isJunkOption(text) {
-    const folded = (text || "").toLowerCase();
+    const folded = (text || "").toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (
+      folded === "select" ||
+      folded === "please select" ||
+      folded === "choose" ||
+      folded === "choose one" ||
+      folded === "select one" ||
+      folded === "start typing"
+    ) return true;
     return folded.indexOf("click here") !== -1 && (
       folded.indexOf("issue") !== -1 || folded.indexOf("browser") !== -1 || folded.indexOf("cache") !== -1
     );
@@ -1083,7 +1097,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         for raw in data.get("links", [])
         if str(raw.get("name", "")).strip()
     ]
-    return PageSnapshot(
+    snapshot = PageSnapshot(
         controls=controls,
         buttons=buttons,
         captcha_present=bool(data.get("captcha", False)),
@@ -1097,6 +1111,8 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         links=links,
         automation_ids=[str(item) for item in data.get("automationIds", []) if str(item).strip()],
     )
+    mark_required_acknowledgements(snapshot.controls)
+    return snapshot
 
 
 def _max_length(value: object) -> int | None:

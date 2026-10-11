@@ -282,6 +282,7 @@ class AnswerIn(BaseModel):
     field_key: str = Field(default="", alias="fieldKey", max_length=128)
     value: str = Field(default="", max_length=8000)
     values: list[str] = Field(default_factory=list, max_length=20)
+    confirm: bool = False
 
     @field_validator("values")
     @classmethod
@@ -299,6 +300,49 @@ class AnswerIn(BaseModel):
         if not (self.question_id.strip() or self.question_hash.strip() or self.field_key.strip()):
             raise ValueError("questionId, questionHash, or fieldKey is required")
         return self
+
+
+class SuggestOptionOut(BaseModel):
+    """One choice from a list. ``value`` is omitted when the label is enough."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    label: str
+    value: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_value(self, handler):
+        data = handler(self)
+        if not data.get("value"):
+            data.pop("value", None)
+        return data
+
+
+class SuggestIn(BaseModel):
+    """A query for the current blocker's list. Nothing is committed."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    question_id: str = Field(default="", alias="questionId", max_length=128)
+    field_key: str = Field(default="", alias="fieldKey", max_length=128)
+    query: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def _target(self) -> SuggestIn:
+        if not (self.question_id.strip() or self.field_key.strip()):
+            raise ValueError("questionId or fieldKey is required")
+        if not self.query.strip():
+            raise ValueError("query is required")
+        return self
+
+
+class SuggestOut(BaseModel):
+    """Options from the live list or from the control itself."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    options: list[SuggestOptionOut] = Field(default_factory=list)
+    source: Literal["live", "static"]
 
 
 class AnswerOut(BaseModel):

@@ -637,6 +637,8 @@ def test_openapi_has_resume_file_and_no_submit_path(api):
     schema = client.get("/openapi.json").json()
     paths = "".join(schema["paths"])
     assert "submit" not in paths
+    assert "/v1/sessions/{session_id}/suggestions" in schema["paths"]
+    assert "/v1/sessions/{session_id}/suggest" in schema["paths"]
     assert "/v1/sessions/{session_id}/resume-file" in schema["paths"]
     assert "/v1/sessions/{session_id}/resume" in schema["paths"]
 

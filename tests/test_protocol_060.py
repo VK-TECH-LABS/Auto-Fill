@@ -445,7 +445,7 @@ def test_answer_accepts_a_unique_option_and_rejects_an_ambiguous_one(answer_app)
     assert runner.applied[-1]["value"] == "United States +1"
     ambiguous = answer(["Computer Science", "Political Science"], "Science")
     assert ambiguous.status_code == 422
-    assert ambiguous.json()["detail"]["reason"] == "ambiguous"
+    assert ambiguous.json()["detail"]["reason"] == "needs_option"
     assert ambiguous.json()["detail"]["options"] == ["Computer Science", "Political Science"]
 
 
@@ -473,7 +473,7 @@ def test_answer_rejects_unknown_targets_and_option_mismatches(answer_app):
         json={"fieldKey": "yearsExperience", "value": "9"},
     )
     assert mismatch.status_code == 422
-    assert mismatch.json()["detail"]["reason"] == "option_mismatch"
+    assert mismatch.json()["detail"]["reason"] == "needs_option"
     assert mismatch.json()["detail"]["options"] == ["1", "3", "5"]
     assert runner.applied == []
     status = client.get(f"/v1/sessions/{other_id}/status", headers=AUTH)

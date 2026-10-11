@@ -10,6 +10,7 @@ The final Submit control is never clicked. CAPTCHA widgets stop the run.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
 from dataclasses import dataclass, field
@@ -101,6 +102,9 @@ class AutofillOptions:
     resume_name: str = ""
     resume_mime: str = ""
     resume_bytes: bytes | None = None
+    resume_prepared: bool = False
+    resume_verified_now: bool = False
+    resume_site_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -129,6 +133,8 @@ class ApplicationResult:
     open_items: list[dict[str, Any]] = field(default_factory=list)
     account: dict[str, Any] | None = None
     completed_keys: list[str] = field(default_factory=list)
+    resume_verified_now: bool = False
+    resume_site_errors: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -160,6 +166,12 @@ class ApplicationResult:
         }
 
 
+_ACTIVE_OPTIONS: contextvars.ContextVar[AutofillOptions | None] = contextvars.ContextVar(
+    "autofill_active_options",
+    default=None,
+)
+
+
 def _result(session, *, status: str, ats: str | None, login_status: str, **kwargs) -> ApplicationResult:
     logger.info(
         "session=%s candidate=%s domain=%s ats=%s status=%s step=%s",
@@ -172,6 +184,10 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     )
     if "timings" not in kwargs:
         kwargs["timings"] = {key: int(value) for key, value in session.timings.items()}
+    active = _ACTIVE_OPTIONS.get()
+    if active is not None:
+        kwargs.setdefault("resume_verified_now", active.resume_verified_now)
+        kwargs.setdefault("resume_site_errors", list(active.resume_site_errors))
     progress, blocking, open_items = finalize_run(status)
     state = current_run()
     if "completed_keys" not in kwargs and state is not None:
@@ -239,11 +255,35 @@ def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_nam
 
 
 def _maybe_reattach(page, opts: AutofillOptions) -> None:
+    if opts.resume_prepared and not opts.resume_uploaded:
+        return
     if not opts.resume_bytes or not opts.resume_name:
         return
     from autofill.resume_manual import reattach_verified
 
     reattach_verified(page, opts.resume_name, opts.resume_mime, opts.resume_bytes)
+
+
+def _attach_prepared(page, opts: AutofillOptions) -> str:
+    """Attach a file held before the control appeared.
+
+    ``attached`` means the same verifier accepted it. ``failed`` keeps the
+    bytes and records site errors. ``absent`` means nothing was prepared.
+    """
+    if page is None or opts.resume_uploaded or not opts.resume_prepared:
+        return "absent"
+    if not opts.resume_bytes or not opts.resume_name:
+        return "absent"
+    from autofill.resume_manual import attach_and_confirm
+
+    report = attach_and_confirm(page, name=opts.resume_name, data=opts.resume_bytes)
+    if report.get("verified"):
+        opts.resume_uploaded = True
+        opts.resume_verified_now = True
+        opts.resume_prepared = False
+        return "attached"
+    opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
+    return "failed"
 
 
 def _counts(fields) -> tuple[int, int, int]:
@@ -269,6 +309,7 @@ def autofill_application(
     opts = options or AutofillOptions()
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
+    _ACTIVE_OPTIONS.set(opts)
     run_started = time.perf_counter()
     inspect_state = {"seen": False}
     store = SessionStore()
@@ -620,20 +661,24 @@ def autofill_application(
                         submit_controls.append(button.name)
 
             if resume_blocked and not opts.resume_uploaded:
-                session.mark("RESUME_UPLOAD_REQUIRED")
-                detected, filled, skipped = _counts(fields)
-                return _result(
-                    session,
-                    status=Status.RESUME_UPLOAD_REQUIRED,
-                    ats=ats_name,
-                    login_status=login_status,
-                    fields_detected=detected,
-                    fields_filled=filled,
-                    fields_skipped=skipped,
-                    manual_actions=manual,
-                    messages=["Upload the resume that was already downloaded, then call again with resume_uploaded."],
-                    submit_controls=submit_controls,
-                )
+                prepared = _attach_prepared(page, opts)
+                if prepared != "attached":
+                    session.mark("RESUME_UPLOAD_REQUIRED")
+                    detected, filled, skipped = _counts(fields)
+                    return _result(
+                        session,
+                        status=Status.RESUME_UPLOAD_REQUIRED,
+                        ats=ats_name,
+                        login_status=login_status,
+                        fields_detected=detected,
+                        fields_filled=filled,
+                        fields_skipped=skipped,
+                        manual_actions=manual,
+                        messages=[
+                            "Upload the resume that was already downloaded, then call again with resume_uploaded."
+                        ],
+                        submit_controls=submit_controls,
+                    )
             if opts.resume_uploaded and any(item.field_class == "RESUME_FIELD" for item in page_fields):
                 resume_seen = True
                 session.mark("CONTINUE_AFTER_RESUME")
@@ -1011,19 +1056,21 @@ def _run_resolver_pages(
             blocking = [item for item in outcome.manual_questions if item.get("blocking", True)]
             optional = [item for item in outcome.manual_questions if not item.get("blocking", True)]
             if outcome.resume_blocked and not opts.resume_uploaded:
-                # The resume stop is reported with every question this step already
-                # asked. HIGH answers were written above; unanswered ones stay listed.
-                pending = blocking if opts.answers_updated else list(outcome.manual_questions)
-                carried.extend(optional)
-                messages = ["Upload the resume that was already downloaded, then continue with resumeUploaded."]
-                if pending:
-                    messages.append("A saved answer is required. Nothing below HIGH confidence was written.")
-                session.mark(Status.RESUME_UPLOAD_REQUIRED)
-                return finish(
-                    Status.RESUME_UPLOAD_REQUIRED,
-                    messages,
-                    questions=pending,
-                )
+                prepared = _attach_prepared(page, opts)
+                if prepared != "attached":
+                    # The resume stop is reported with every question this step already
+                    # asked. HIGH answers were written above; unanswered ones stay listed.
+                    pending = blocking if opts.answers_updated else list(outcome.manual_questions)
+                    carried.extend(optional)
+                    messages = ["Upload the resume that was already downloaded, then continue with resumeUploaded."]
+                    if pending:
+                        messages.append("A saved answer is required. Nothing below HIGH confidence was written.")
+                    session.mark(Status.RESUME_UPLOAD_REQUIRED)
+                    return finish(
+                        Status.RESUME_UPLOAD_REQUIRED,
+                        messages,
+                        questions=pending,
+                    )
             if on_review:
                 if blocking or (outcome.manual_questions and not opts.answers_updated):
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)
