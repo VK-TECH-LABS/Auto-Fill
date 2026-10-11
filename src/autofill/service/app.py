@@ -3,22 +3,35 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Response
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from autofill import __version__
 from autofill.credentials import Credentials
-from autofill.dom_ui import empty_progress, fit_choice_values, match_open_item
+from autofill.dom_ui import (
+    choose_blocking,
+    empty_progress,
+    fit_choice_values,
+    match_open_item,
+    progress_percent,
+    public_blocking,
+)
 from autofill.engine import ApplicationResult, Status
+from autofill.login import protocol_at_least
 from autofill.models import JobContext
 from autofill.redact import install_redaction, redaction_filter
 from autofill.resolver import ResolverBinding
+from autofill.resume_manual import ResumeRejected, max_resume_bytes, mime_for, validate_resume
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
 from autofill.service.auth import require_configured_token, tokens_match
 from autofill.service.context import (
@@ -40,6 +53,7 @@ from autofill.service.runner import (
     elapsed_ms,
 )
 from autofill.service.schemas import (
+    DEFAULT_PROTOCOL_VERSION,
     AnswerIn,
     AnswerOut,
     BlockingOut,
@@ -66,6 +80,8 @@ _STARTABLE = frozenset({Status.LOGIN_REQUIRED, Status.LOGIN_FAILED, Status.CREAT
 _HUMAN_STOP = frozenset(
     {
         Status.LOGIN_REQUIRED,
+        Status.ACCOUNT_CREATION_REQUIRED,
+        Status.EMAIL_VERIFICATION_REQUIRED,
         Status.CAPTCHA_REQUIRED,
         Status.MANUAL_ANSWER_REQUIRED,
         Status.RESUME_UPLOAD_REQUIRED,
@@ -73,15 +89,259 @@ _HUMAN_STOP = frozenset(
         Status.READY_FOR_HUMAN_SUBMIT,
     }
 )
+_VIEWPORT = "1280x800"
+_CHECKPOINT_KIND = {
+    Status.ACCOUNT_CREATION_REQUIRED: "ACCOUNT",
+    Status.LOGIN_REQUIRED: "LOGIN",
+    Status.LOGIN_FAILED: "LOGIN",
+    Status.EMAIL_VERIFICATION_REQUIRED: "VERIFICATION",
+    Status.CAPTCHA_REQUIRED: "CAPTCHA",
+    Status.RESUME_UPLOAD_REQUIRED: "RESUME",
+}
+
+
+def _is_070(session: ServiceSession) -> bool:
+    return protocol_at_least(session.protocol_version)
+
+
+def _public_status(session: ServiceSession) -> str:
+    """Older sessions keep the 0.6 status names."""
+    status = session.status
+    if _is_070(session):
+        return status
+    if status == Status.ACCOUNT_CREATION_REQUIRED:
+        return Status.LOGIN_REQUIRED
+    if status == Status.EMAIL_VERIFICATION_REQUIRED:
+        return Status.MANUAL_REVIEW_REQUIRED
+    return status
 
 
 def _limit_interact(session) -> None:
-    """At most 30 human actions per minute for one session."""
+    """30 human actions per minute before 0.7.0, and 60 after."""
+    cap = 60 if _is_070(session) else 30
     now = time.monotonic()
     session.interact_marks = [mark for mark in session.interact_marks if now - mark < 60]
-    if len(session.interact_marks) >= 30:
+    if len(session.interact_marks) >= cap:
         raise HTTPException(status_code=429, detail="Too many interactions for this session.")
     session.interact_marks.append(now)
+
+
+def _sync_checkpoint(session: ServiceSession) -> None:
+    kind = _CHECKPOINT_KIND.get(session.status)
+    if kind is None:
+        session.checkpoint = None
+        return
+    current = session.checkpoint or {}
+    if current.get("kind") != kind:
+        session.checkpoint = {"kind": kind, "since": int(time.time()), "attempts": 0}
+
+
+def _bump_attempts(session: ServiceSession) -> None:
+    _sync_checkpoint(session)
+    if session.checkpoint is None:
+        return
+    session.checkpoint["attempts"] = int(session.checkpoint.get("attempts") or 0) + 1
+
+
+def _resume_public(session: ServiceSession) -> dict:
+    required = bool(session.resume_required or session.status == Status.RESUME_UPLOAD_REQUIRED)
+    payload: dict = {"required": required, "verified": bool(session.resume_verified)}
+    if session.resume_verified and session.resume_filename:
+        payload["filename"] = session.resume_filename
+    if session.resume_verified_at:
+        payload["verifiedAt"] = session.resume_verified_at
+    if session.resume_source:
+        payload["source"] = session.resume_source
+    return payload
+
+
+def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
+    """Protocol 0.7.0 stages and a percent that does not go backwards."""
+    if not _is_070(session):
+        return progress
+    updated = dict(progress)
+    labels = {
+        Status.ACCOUNT_CREATION_REQUIRED: ("ACCOUNT", "Employer account"),
+        Status.EMAIL_VERIFICATION_REQUIRED: ("VERIFICATION", "Email verification"),
+        Status.CAPTCHA_REQUIRED: ("CAPTCHA", "Verification check"),
+    }
+    mapped = labels.get(session.status)
+    if mapped is not None:
+        updated["stage"], updated["currentLabel"] = mapped
+    if updated.get("stage") == "OPENING" and session.form_seen:
+        updated["stage"] = "QUESTIONS"
+        if updated.get("currentLabel") in {"", "Opening"}:
+            updated["currentLabel"] = "Questions"
+    if str(updated.get("stage") or "") not in {"", "OPENING"}:
+        session.form_seen = True
+    page_key = str(session.result.current_step or "") if session.result is not None else ""
+    done = int(updated.get("requiredDone") or 0)
+    if page_key and page_key == session.required_page_key:
+        done = max(done, session.required_done_high)
+    else:
+        session.required_page_key = page_key
+    session.required_done_high = done
+    updated["requiredDone"] = done
+    percent = int(updated.get("percent") or 0)
+    if not int(updated.get("requiredTotal") or 0):
+        percent = progress_percent(str(updated.get("stage") or "OPENING"), 0, 0)
+    percent = max(percent, session.percent_high)
+    session.percent_high = percent
+    updated["percent"] = percent
+    session.progress = dict(updated)
+    return updated
+
+
+def _shot_headers(session: ServiceSession, *, host: str = "", retry: bool = False) -> dict[str, str]:
+    headers = {
+        "X-Autofill-Status": _public_status(session),
+        "X-Autofill-State-Version": str(session.state_version),
+        "X-Autofill-Viewport": _VIEWPORT,
+    }
+    if host:
+        headers["X-Autofill-Url-Host"] = host
+    if retry:
+        headers["Retry-After"] = "1"
+    return headers
+
+
+def _probe_challenge(session: ServiceSession, runner: FillRunner) -> str:
+    probe = getattr(runner, "probe_challenge", None)
+    if probe is None:
+        return "clear"
+    try:
+        return str(probe(session.session_id) or "clear")
+    except PageUnavailable as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            ) from None
+        _mark_browser_crash(session)
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail="The page crashed.",
+            headers=_shot_headers(session),
+        ) from None
+
+
+def _confirm_resume_or_422(session: ServiceSession, runner: FillRunner) -> None:
+    confirm = getattr(runner, "confirm_resume", None)
+    if confirm is None:
+        return
+    try:
+        report = confirm(session.session_id)
+    except PageUnavailable as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            ) from None
+        _mark_browser_crash(session)
+        raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+    if report.get("verified"):
+        session.resume_verified = True
+        session.resume_required = True
+        session.resume_source = session.resume_source or "manual"
+        if not session.resume_verified_at:
+            session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "verified": False,
+            "reason": str(report.get("reason") or "not_confirmed"),
+            "siteErrors": [str(item) for item in report.get("siteErrors") or []],
+        },
+    )
+
+
+def _require_same_origin(session: ServiceSession, site: str) -> None:
+    if not site.strip():
+        return
+    site_host = (urlparse(site).hostname or "").lower()
+    if not site_host:
+        return
+    origin = str(((session.account or {}).get("tenant") or {}).get("loginOrigin") or "")
+    origin_host = (urlparse(origin).hostname or "").lower()
+    if not origin_host or site_host != origin_host:
+        raise HTTPException(status_code=409, detail={"reason": "origin_mismatch"})
+
+
+def _finish_account_action(session: ServiceSession, report: dict, resume_run) -> CredentialsOut:
+    """Store the classification. A paused session waits for /resume."""
+    if not report.get("ok"):
+        reason = str(report.get("reason") or "not_at_account_step")
+        if reason in {"site_rejected", "account_exists"}:
+            if report.get("account"):
+                session.account = report["account"]
+            if report.get("status"):
+                session.status = str(report["status"])
+            _sync_checkpoint(session)
+            raise HTTPException(
+                status_code=422,
+                detail={"reason": reason, "siteErrors": [str(item) for item in report.get("siteErrors") or []]},
+            )
+        if reason == "mode_mismatch":
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "mode_mismatch", "detected": str(report.get("detected") or "login")},
+            )
+        if reason == "navigating":
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            )
+        if reason == "not_at_account_step":
+            raise HTTPException(status_code=409, detail={"reason": "not_at_account_step"})
+        raise HTTPException(status_code=409, detail="No page is open for this session.")
+    if report.get("account"):
+        session.account = report["account"]
+    outcome = str(report.get("outcome") or "pending")
+    if report.get("status"):
+        session.status = str(report["status"])
+    if session.paused:
+        session.pending_resume = outcome in {"signed_in", "registered", "verification_required"}
+        _sync_checkpoint(session)
+        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=_public_status(session))
+    if outcome in {"signed_in", "registered", "verification_required"}:
+        accepted = resume_run()
+        if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED:
+            outcome = "verification_required"
+        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=accepted.status)
+    _sync_checkpoint(session)
+    return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=_public_status(session))
+
+
+def _read_upload(file: UploadFile) -> bytes:
+    limit = max_resume_bytes()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        block = file.file.read(65536)
+        if not block:
+            break
+        total += len(block)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="too_large")
+        chunks.append(block)
+    return b"".join(chunks)
+
+
+def _keep_resume_bytes(session: ServiceSession, name: str, data: bytes) -> None:
+    session.clear_resume_bytes()
+    directory = tempfile.mkdtemp(prefix="autofill-resume-")
+    os.chmod(directory, 0o700)
+    path = Path(directory) / name
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+    session.resume_temp = str(path)
+    session.resume_bytes = data
+    session.resume_filename = name
+    session.resume_mime = mime_for(name)
 
 
 _DESCRIPTION = """
@@ -126,11 +386,11 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
     result = session.result
     body = RunStatusOut(
         sessionId=session.session_id,
-        status=session.status,
+        status=_public_status(session),
         stopped_before_submit=True,
         candidateId=session.candidate_id,
         jobId=session.job_id,
-        protocolVersion=session.protocol_version.strip() or "0.6.0",
+        protocolVersion=session.protocol_version.strip() or DEFAULT_PROTOCOL_VERSION,
         manualQuestions=_questions_out(session),
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
@@ -139,11 +399,36 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
     if result is None or (session.busy and not final):
-        body.progress = ProgressOut.model_validate(dict(session.progress or empty_progress()))
+        progress = dict(session.progress or empty_progress())
     else:
-        body.progress = ProgressOut.model_validate(dict(result.progress or session.progress or empty_progress()))
+        progress = dict(result.progress or session.progress or empty_progress())
         if result.blocking:
             body.blocking = BlockingOut.model_validate(result.blocking)
+    progress = _overlay_progress(session, progress)
+    body.progress = ProgressOut.model_validate(progress)
+    if _is_070(session) and body.blocking is None:
+        synthetic = public_blocking(choose_blocking(session.status, []))
+        if synthetic is not None and synthetic["kind"] in {"ACCOUNT", "VERIFICATION", "LOGIN", "CAPTCHA", "RESUME"}:
+            body.blocking = BlockingOut.model_validate(synthetic)
+    if not _is_070(session) and body.blocking is not None:
+        if body.blocking.kind == "ACCOUNT":
+            body.blocking.kind = "LOGIN"
+            body.blocking.text = "Sign in"
+        elif body.blocking.kind == "VERIFICATION":
+            body.blocking = None
+    if _is_070(session) and body.blocking is not None and body.blocking.kind == "LOGIN":
+        host = str(((session.account or {}).get("tenant") or {}).get("host") or "")
+        body.blocking.text = f"Sign in to {host}" if host else "Sign in"
+    if _is_070(session):
+        _sync_checkpoint(session)
+        body.state_version = session.observe()
+        body.account = session.account
+        body.resume = _resume_public(session)
+        body.completed = {
+            "fieldKeys": list(session.completed_keys),
+            "questionHashes": list(session.completed_hashes),
+        }
+        body.checkpoint = session.checkpoint
     if result is None:
         return body
     payload = result.to_dict()
@@ -171,6 +456,14 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         raise HTTPException(status_code=409, detail="Job does not match this session.")
     session.result = result
     session.status = result.status
+    if result.account is not None:
+        session.account = result.account
+    for key in result.completed_keys:
+        if key and key not in session.completed_keys:
+            session.completed_keys.append(key)
+    if result.status == Status.RESUME_UPLOAD_REQUIRED:
+        session.resume_required = True
+    _sync_checkpoint(session)
     session.manual_questions = [dict(item) for item in result.manual_questions]
     session.progress = dict(result.progress) if result.progress else empty_progress()
     session.open_items = [dict(item) for item in result.open_items]
@@ -331,6 +624,10 @@ def _request_for(
         held_selectors=session.held_selectors,
         open_items=session.open_items,
         progress=session.progress,
+        protocol_version=session.protocol_version,
+        resume_name=session.resume_filename if session.resume_verified else "",
+        resume_mime=session.resume_mime if session.resume_verified else "",
+        resume_bytes=session.resume_bytes if session.resume_verified else None,
     )
 
 
@@ -518,7 +815,7 @@ def create_app(
                     job=job,
                     cover_letter_text=None,
                     mode="resolver",
-                    protocol_version=body.protocol_version.strip() or "0.6.0",
+                    protocol_version=body.protocol_version.strip() or DEFAULT_PROTOCOL_VERSION,
                     candidate_ref=binding.candidate_ref,
                     job_ref=binding.job_ref,
                     resolver_url=binding.url,
@@ -536,7 +833,7 @@ def create_app(
                     profile=profile,
                     job=job,
                     cover_letter_text=cover,
-                    protocol_version=body.protocol_version.strip() or "0.6.0",
+                    protocol_version=body.protocol_version.strip() or DEFAULT_PROTOCOL_VERSION,
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -576,7 +873,16 @@ def create_app(
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
                 return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
-            if session.status not in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}:
+            if _is_070(session) and session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
+                found = _probe_challenge(session, active_runner)
+                if found in {"captcha", "verification"}:
+                    _bump_attempts(session)
+                    reason = "challenge_present" if found == "captcha" else "verification_pending"
+                    raise HTTPException(status_code=409, detail={"reason": reason})
+            allowed = {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}
+            if _is_070(session):
+                allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
+            if session.status not in allowed:
                 raise HTTPException(
                     status_code=409,
                     detail="humanResolved continues only after login, a challenge, or a missing form.",
@@ -611,6 +917,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=f"Cannot continue a session in status {session.status}.")
         if not body.resume_uploaded:
             raise HTTPException(status_code=409, detail="Continue only after a person has uploaded the resume.")
+        if _is_070(session):
+            _confirm_resume_or_422(session, active_runner)
         return _run(session, store, active_runner, limits, resume_uploaded=True)
 
     @router.post("/sessions/{session_id}/pause", response_model=RunStatusOut, tags=["sessions"])
@@ -631,6 +939,9 @@ def create_app(
         session.pause_gate.resume()
         session.paused = False
         logger.info("session=%s action=resume", session.session_id)
+        if _is_070(session) and session.pending_resume and not session.busy:
+            session.pending_resume = False
+            return _run(session, store, active_runner, limits, resume_uploaded=session.resume_uploaded)
         return _status_out(session)
 
     @router.post(
@@ -693,6 +1004,12 @@ def create_app(
         if not filled.get("filled"):
             logger.info("session=%s action=answer result=rejected", session.session_id)
             return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"), ms=elapsed_ms(started))
+        remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
+        if remembered and remembered not in session.completed_keys:
+            session.completed_keys.append(remembered)
+        remembered_hash = body.question_hash.strip() or str(item.get("questionHash") or "")
+        if remembered_hash and remembered_hash not in session.completed_hashes:
+            session.completed_hashes.append(remembered_hash)
         selector = str(item.get("selector") or "")
         if selector:
             session.held_selectors.add(selector)
@@ -728,7 +1045,15 @@ def create_app(
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:
         session = _session_or_404(session_id)
         _reject_expired(session)
-        _check_candidate(session, body.candidate_id.strip())
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        if body.mode in {"login", "register"}:
+            if not _is_070(session) or session.status not in {
+                Status.LOGIN_REQUIRED,
+                Status.ACCOUNT_CREATION_REQUIRED,
+                Status.LOGIN_FAILED,
+            }:
+                raise HTTPException(status_code=409, detail={"reason": "not_at_account_step"})
+            _require_same_origin(session, body.site)
         try:
             require_login_name(body)
             domain = credential_domain(session.application_url, body.site)
@@ -744,11 +1069,113 @@ def create_app(
                 password=body.password,
             ),
         )
-        redaction_filter().add(body.password)
+        session.remember_secret(body.password)
+        if body.confirm_password:
+            session.remember_secret(body.confirm_password)
         if body.email.strip():
-            redaction_filter().add(body.email.strip())
-        logger.info("session=%s credentials_stored=true", session.session_id)
-        return CredentialsOut(sessionId=session.session_id)
+            session.remember_secret(body.email.strip())
+        logger.info("session=%s credentials_stored=true mode=%s", session.session_id, body.mode)
+        if body.mode == "store":
+            return CredentialsOut(sessionId=session.session_id)
+        action = getattr(active_runner, "account_action", None)
+        if action is None:
+            raise HTTPException(status_code=409, detail="No page is open for this session.")
+        try:
+            report = action(
+                session.session_id,
+                {
+                    "mode": body.mode,
+                    "email": body.email.strip(),
+                    "username": body.username.strip(),
+                    "password": body.password,
+                    "confirm": body.confirm_password or body.password,
+                },
+            )
+        except PageUnavailable as exc:
+            if exc.status_code == 503:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Page is navigating.",
+                    headers=_shot_headers(session, retry=True),
+                ) from None
+            _mark_browser_crash(session)
+            raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+        return _finish_account_action(
+            session,
+            report,
+            lambda: _run(session, store, active_runner, limits, resume_uploaded=session.resume_uploaded),
+        )
+
+    @router.post("/sessions/{session_id}/resume-file", tags=["sessions"])
+    def upload_resume_file(
+        session_id: str,
+        file: Annotated[UploadFile, File()],
+        candidateId: Annotated[str, Form()] = "",
+        candidateRef: Annotated[str, Form()] = "",
+        fieldHint: Annotated[str, Form()] = "",
+    ) -> JSONResponse:
+        """Attach one resume file and require the ATS to accept it. This is not pause/resume."""
+        session = _session_or_404(session_id)
+        _reject_expired(session)
+        if not candidateId.strip() and not candidateRef.strip():
+            raise HTTPException(status_code=422, detail="candidateId or candidateRef is required.")
+        _check_candidate(session, candidateId.strip(), candidateRef.strip())
+        if session.resume_verified:
+            raise HTTPException(status_code=409, detail={"reason": "already_verified"})
+        allowed = session.status == Status.RESUME_UPLOAD_REQUIRED or (
+            session.resume_required and not session.resume_verified and session.status in _HUMAN_STOP
+        )
+        if not allowed:
+            raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
+        raw = _read_upload(file)
+        try:
+            name = validate_resume(file.filename or "", raw)
+        except ResumeRejected as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+        attach = getattr(active_runner, "attach_resume_file", None)
+        if attach is None:
+            raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
+        try:
+            report = attach(session.session_id, name, raw, fieldHint.strip())
+        except PageUnavailable as exc:
+            if exc.status_code == 503:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Page is navigating.",
+                    headers=_shot_headers(session, retry=True),
+                ) from None
+            _mark_browser_crash(session)
+            raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+        if not report.get("verified"):
+            session.clear_resume_bytes()
+            logger.info("session=%s resume_file=rejected", session.session_id)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "verified": False,
+                    "reason": str(report.get("reason") or "not_confirmed"),
+                    "siteErrors": [str(item) for item in report.get("siteErrors") or []],
+                },
+            )
+        _keep_resume_bytes(session, name, raw)
+        session.resume_verified = True
+        session.resume_required = True
+        session.resume_source = "manual"
+        session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        session.resume_uploaded = True
+        logger.info("session=%s resume_file=verified", session.session_id)
+        if session.paused:
+            session.pending_resume = True
+            status = _status_out(session)
+            return JSONResponse(
+                status_code=200,
+                content={"verified": True, "filename": name, "status": status.status},
+            )
+        accepted = _run(session, store, active_runner, limits, resume_uploaded=True)
+        return JSONResponse(
+            status_code=200,
+            content={"verified": True, "filename": name, "status": accepted.status},
+        )
 
     @router.get("/sessions/{session_id}/screenshot", tags=["sessions"])
     def session_screenshot(session_id: str) -> Response:
@@ -758,11 +1185,17 @@ def create_app(
         try:
             image = shot(session_id) if shot is not None else None
         except PageUnavailable as exc:
+            if exc.status_code == 503:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Page is navigating.",
+                    headers=_shot_headers(session, retry=True),
+                ) from None
             _mark_browser_crash(session)
             raise HTTPException(
                 status_code=exc.status_code,
                 detail="The page crashed.",
-                headers={"X-Autofill-Status": session.status},
+                headers=_shot_headers(session),
             ) from None
         if not image:
             raise HTTPException(status_code=409, detail="No page is open for this session.")
@@ -772,10 +1205,7 @@ def create_app(
         return Response(
             content=payload,
             media_type="image/jpeg",
-            headers={
-                "X-Autofill-Status": session.status,
-                "X-Autofill-Url-Host": host,
-            },
+            headers=_shot_headers(session, host=host),
         )
 
     @router.post("/sessions/{session_id}/interact", response_model=InteractOut, tags=["sessions"])
@@ -786,28 +1216,50 @@ def create_app(
         if session.status not in _HUMAN_STOP:
             raise HTTPException(status_code=409, detail=f"Cannot interact with a session in status {session.status}.")
         _limit_interact(session)
-        action = {"action": body.action, "x": body.x, "y": body.y, "text": body.text, "key": body.key, "dy": body.dy}
+        action = {
+            "action": body.action,
+            "x": body.x,
+            "y": body.y,
+            "button": body.button,
+            "clickCount": body.click_count,
+            "text": body.text,
+            "key": body.key,
+            "dy": body.dy,
+            "dx": body.dx,
+        }
         apply = getattr(active_runner, "interact", None)
         try:
             moved = apply(session_id, action) if apply is not None else False
         except PageUnavailable as exc:
+            if exc.status_code == 503:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Page is navigating.",
+                    headers=_shot_headers(session, retry=True),
+                ) from None
             _mark_browser_crash(session)
             raise HTTPException(
                 status_code=exc.status_code,
                 detail="The page crashed.",
-                headers={"X-Autofill-Status": session.status},
+                headers=_shot_headers(session),
             ) from None
         if not moved:
             raise HTTPException(status_code=409, detail="No page is open for this session.")
         session.screenshot_version += 1
         logger.info("session=%s action=%s result=ok", session.session_id, body.action)
-        return InteractOut(status=session.status, screenshotVersion=session.screenshot_version)
+        version = session.observe() if _is_070(session) else None
+        return InteractOut(
+            status=_public_status(session),
+            screenshotVersion=session.screenshot_version,
+            stateVersion=version,
+        )
 
     @router.post("/sessions/{session_id}/human-done", response_model=RunStatusOut, tags=["sessions"])
     def human_done(session_id: str, body: HumanDoneIn) -> RunStatusOut:
         session = _session_or_404(session_id)
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
         session.human_outcome = body.outcome
+        session.wipe_secrets()
         active_runner.discard(session_id)
         logger.info("session=%s human_outcome=%s", session.session_id, body.outcome)
         return _status_out(session)

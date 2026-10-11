@@ -60,11 +60,30 @@ _BLOCKED_HOSTS = (
 
 
 class PageUnavailable(RuntimeError):
-    """The session page is missing or the tab crashed. ``status_code`` is 409 or 410."""
+    """The session page is missing, navigating, or the tab crashed.
+
+    ``status_code`` is 410 for a dead browser, or 503 while a navigation is in
+    progress. A missing page is not this error.
+    """
 
     def __init__(self, status_code: int) -> None:
         super().__init__("page unavailable")
         self.status_code = status_code
+
+
+def _page_navigating(exc: BaseException) -> bool:
+    """True when the page is mid-navigation. A closed browser is not navigation."""
+    if is_browser_crash(exc):
+        return False
+    text = f"{type(exc).__name__} {exc}".casefold()
+    needles = (
+        "execution context was destroyed",
+        "frame was detached",
+        "most likely because of a navigation",
+        "page is navigating",
+        "navigation",
+    )
+    return any(needle in text for needle in needles)
 
 
 def _read_text(path: Path) -> str | None:
@@ -383,6 +402,10 @@ class FillRequest:
     held_selectors: set[str] | None = None
     open_items: list | None = None
     progress: dict | None = None
+    protocol_version: str = ""
+    resume_name: str = ""
+    resume_mime: str = ""
+    resume_bytes: bytes | None = None
 
 
 class FillRunner(Protocol):
@@ -696,6 +719,10 @@ class PlaywrightRunner:
             held_selectors=request.held_selectors,
             open_items=request.open_items,
             progress=request.progress,
+            protocol_version=request.protocol_version,
+            resume_name=request.resume_name,
+            resume_mime=request.resume_mime,
+            resume_bytes=request.resume_bytes,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
@@ -796,6 +823,8 @@ class PlaywrightRunner:
                 host = urlparse(slot.page.url).hostname or ""
                 image = slot.page.screenshot(type="jpeg", quality=60)
             except Exception as exc:
+                if _page_navigating(exc):
+                    raise PageUnavailable(503) from None
                 if not is_browser_crash(exc):
                     raise
                 try:
@@ -821,17 +850,24 @@ class PlaywrightRunner:
             try:
                 kind = action.get("action")
                 if kind == "click":
-                    page.mouse.click(float(action["x"]), float(action["y"]))
+                    page.mouse.click(
+                        float(action["x"]),
+                        float(action["y"]),
+                        button=str(action.get("button") or "left"),
+                        click_count=int(action.get("clickCount") or 1),
+                    )
                 elif kind == "type":
                     page.keyboard.type(str(action.get("text") or ""))
                 elif kind == "key":
                     key = str(action.get("key") or "")
                     page.keyboard.press(" " if key == "Space" else key)
                 elif kind == "scroll":
-                    page.mouse.wheel(0, float(action.get("dy") or 0))
+                    page.mouse.wheel(float(action.get("dx") or 0), float(action.get("dy") or 0))
                 else:
                     return False
             except Exception as exc:
+                if _page_navigating(exc):
+                    raise PageUnavailable(503) from None
                 if not is_browser_crash(exc):
                     raise
                 try:
@@ -842,6 +878,98 @@ class PlaywrightRunner:
             return True
 
         return worker.submit(apply, drainable=True)
+
+    def account_action(self, session_id: str, payload: dict) -> dict:
+        """Fill the account form on this session's page. The payload is not logged."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return {"ok": False, "reason": "no_page"}
+
+        def apply() -> dict:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return {"ok": False, "reason": "no_page"}
+            from autofill.account_flow import run_account_action
+
+            try:
+                return run_account_action(
+                    slot.page,
+                    mode=str(payload.get("mode") or ""),
+                    email=str(payload.get("email") or ""),
+                    username=str(payload.get("username") or ""),
+                    password=str(payload.get("password") or ""),
+                    confirm=str(payload.get("confirm") or ""),
+                    ats=slot.last_ats,
+                )
+            except Exception as exc:
+                if _page_navigating(exc):
+                    return {"ok": False, "reason": "navigating"}
+                if is_browser_crash(exc):
+                    raise PageUnavailable(410) from None
+                raise
+
+        return worker.submit(apply)
+
+    def probe_challenge(self, session_id: str) -> str:
+        """Return captcha, verification, clear, or closed. Nothing is solved."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return "closed"
+
+        def look() -> str:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return "closed"
+            from autofill.extract import extract_page
+            from autofill.login import verification_present
+
+            try:
+                snapshot = extract_page(slot.page)
+            except Exception as exc:
+                if is_browser_crash(exc):
+                    raise PageUnavailable(410) from None
+                if _page_navigating(exc):
+                    return "captcha"
+                raise
+            if snapshot.captcha_present:
+                return "captcha"
+            if verification_present(snapshot):
+                return "verification"
+            return "clear"
+
+        return worker.submit(look)
+
+    def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "") -> dict:
+        """Attach resume bytes and require the ATS to accept them."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+
+        def apply() -> dict:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+            from autofill.resume_manual import attach_and_confirm
+
+            return attach_and_confirm(slot.page, name=name, data=data, hint=hint)
+
+        return worker.submit(apply)
+
+    def confirm_resume(self, session_id: str) -> dict:
+        """Check that the current page shows an accepted resume."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+
+        def apply() -> dict:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+            from autofill.resume_manual import confirm_current
+
+            return confirm_current(slot.page)
+
+        return worker.submit(apply)
 
     def _remember_mark(self, slot: _SessionContext) -> None:
         if slot.page is None:

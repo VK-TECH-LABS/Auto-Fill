@@ -55,6 +55,8 @@ class Status:
     STARTED = "STARTED"
     FILLED = "FILLED"
     LOGIN_REQUIRED = "LOGIN_REQUIRED"
+    ACCOUNT_CREATION_REQUIRED = "ACCOUNT_CREATION_REQUIRED"
+    EMAIL_VERIFICATION_REQUIRED = "EMAIL_VERIFICATION_REQUIRED"
     LOGIN_FAILED = "LOGIN_FAILED"
     APPLICATION_READY = "APPLICATION_READY"
     FORM_IN_PROGRESS = "FORM_IN_PROGRESS"
@@ -95,6 +97,10 @@ class AutofillOptions:
     held_selectors: set[str] | None = None
     open_items: list[dict[str, Any]] | None = None
     progress: dict[str, Any] | None = None
+    protocol_version: str = ""
+    resume_name: str = ""
+    resume_mime: str = ""
+    resume_bytes: bytes | None = None
 
 
 @dataclass
@@ -121,6 +127,8 @@ class ApplicationResult:
     progress: dict[str, Any] = field(default_factory=empty_progress)
     blocking: dict[str, Any] | None = None
     open_items: list[dict[str, Any]] = field(default_factory=list)
+    account: dict[str, Any] | None = None
+    completed_keys: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -165,6 +173,9 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     if "timings" not in kwargs:
         kwargs["timings"] = {key: int(value) for key, value in session.timings.items()}
     progress, blocking, open_items = finalize_run(status)
+    state = current_run()
+    if "completed_keys" not in kwargs and state is not None:
+        kwargs["completed_keys"] = list(state.filled_keys)
     result = ApplicationResult(
         status=status,
         ats=ats,
@@ -179,10 +190,55 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         open_items=open_items,
         **kwargs,
     )
-    state = current_run()
     if state is not None:
         end_run(state.token)
     return result
+
+
+def _protocol_070(opts: AutofillOptions) -> bool:
+    from autofill.login import protocol_at_least
+
+    return protocol_at_least(opts.protocol_version)
+
+
+def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
+    """Register and email-verification stops for protocol 0.7.0. Older sessions stay on the old path."""
+    if not _protocol_070(opts):
+        return None
+    from autofill.login import account_decision
+
+    decision = account_decision(snapshot, getattr(page, "url", "") or "", ats_name)
+    if decision is None:
+        return None
+    session.mark("FAILED")
+    return _result(
+        session,
+        status=decision.status,
+        ats=ats_name,
+        login_status="NOT_REQUIRED",
+        messages=[decision.message],
+        account=decision.account,
+        **extra,
+    )
+
+
+def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_name: str | None, opts: AutofillOptions):
+    if not _protocol_070(opts) or result.status != Status.LOGIN_REQUIRED:
+        return result
+    from autofill.login import login_account_view
+
+    view = login_account_view(snapshot, url, ats_name)
+    if view is not None:
+        result.account = view
+    return result
+
+
+def _maybe_reattach(page, opts: AutofillOptions) -> None:
+    if not opts.resume_bytes or not opts.resume_name:
+        return
+    from autofill.resume_manual import reattach_verified
+
+    reattach_verified(page, opts.resume_name, opts.resume_mime, opts.resume_bytes)
 
 
 def _counts(fields) -> tuple[int, int, int]:
@@ -233,6 +289,7 @@ def autofill_application(
         progress=opts.progress,
         url=application_url,
         ats=ats_name,
+        refill_cleared=_protocol_070(opts),
     )
     session.mark("DETECT_ATS")
     logger.info(
@@ -296,15 +353,24 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=[challenge_message(snapshot)],
             )
+        stopped = _account_wall(page, snapshot, session, opts, ats_name)
+        if stopped is not None:
+            return stopped
         if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
                 session.mark("LOGIN_FAILED")
-                return _result(
-                    session,
-                    status=Status.LOGIN_REQUIRED,
-                    ats=ats_name,
-                    login_status="LOGIN_REQUIRED",
-                    messages=["Sign-in is required before the application form. Nothing was typed."],
+                return _attach_login_account(
+                    _result(
+                        session,
+                        status=Status.LOGIN_REQUIRED,
+                        ats=ats_name,
+                        login_status="LOGIN_REQUIRED",
+                        messages=["Sign-in is required before the application form. Nothing was typed."],
+                    ),
+                    snapshot,
+                    getattr(page, "url", "") or application_url,
+                    ats_name,
+                    opts,
                 )
             session.mark(Status.NO_FORM_FOUND)
             return _result(
@@ -339,12 +405,18 @@ def autofill_application(
             creds = credential_provider.get_credentials(context, session.candidate_id) if credential_provider else None
             if creds is None or not creds.password or not (creds.email or creds.username):
                 session.mark("LOGIN_FAILED")
-                return _result(
-                    session,
-                    status=Status.LOGIN_REQUIRED,
-                    ats=ats_name,
-                    login_status="LOGIN_REQUIRED",
-                    messages=["No credentials for this candidate and site. Nothing was typed."],
+                return _attach_login_account(
+                    _result(
+                        session,
+                        status=Status.LOGIN_REQUIRED,
+                        ats=ats_name,
+                        login_status="LOGIN_REQUIRED",
+                        messages=["No credentials for this candidate and site. Nothing was typed."],
+                    ),
+                    snapshot,
+                    getattr(page, "url", "") or application_url,
+                    ats_name,
+                    opts,
                 )
             outcome, login_steps = run_login(page, creds)
             session.steps.extend(login_steps)
@@ -393,6 +465,7 @@ def autofill_application(
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
         for index in range(opts.max_pages):
+            _maybe_reattach(page, opts)
             snapshot = _timed_extract(page, opts, run_started, inspect_state)
             if snapshot.captcha_present:
                 session.mark("FAILED")
@@ -425,21 +498,42 @@ def autofill_application(
                     messages=[challenge_message(snapshot)],
                     submit_controls=submit_controls,
                 )
+            detected, filled, skipped = _counts(fields)
+            stopped = _account_wall(
+                page,
+                snapshot,
+                session,
+                opts,
+                ats_name,
+                login_status=login_status,
+                fields_detected=detected,
+                fields_filled=filled,
+                fields_skipped=skipped,
+                manual_actions=manual,
+                submit_controls=submit_controls,
+            )
+            if stopped is not None:
+                return stopped
             if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
-                detected, filled, skipped = _counts(fields)
                 if is_login_wall(snapshot):
                     session.mark("LOGIN_FAILED")
-                    return _result(
-                        session,
-                        status=Status.LOGIN_REQUIRED,
-                        ats=ats_name,
-                        login_status="LOGIN_REQUIRED",
-                        fields_detected=detected,
-                        fields_filled=filled,
-                        fields_skipped=skipped,
-                        manual_actions=manual,
-                        messages=["Sign-in is required before the application form. Nothing was typed."],
-                        submit_controls=submit_controls,
+                    return _attach_login_account(
+                        _result(
+                            session,
+                            status=Status.LOGIN_REQUIRED,
+                            ats=ats_name,
+                            login_status="LOGIN_REQUIRED",
+                            fields_detected=detected,
+                            fields_filled=filled,
+                            fields_skipped=skipped,
+                            manual_actions=manual,
+                            messages=["Sign-in is required before the application form. Nothing was typed."],
+                            submit_controls=submit_controls,
+                        ),
+                        snapshot,
+                        getattr(page, "url", "") or "",
+                        ats_name,
+                        opts,
                     )
                 session.mark(Status.NO_FORM_FOUND)
                 return _result(
@@ -848,6 +942,7 @@ def _run_resolver_pages(
         )
 
     for index in range(opts.max_pages):
+        _maybe_reattach(page, opts)
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if snapshot.captcha_present:
             session.mark("FAILED")
@@ -862,12 +957,21 @@ def _run_resolver_pages(
                 Status.CAPTCHA_REQUIRED,
                 [challenge_message(snapshot)],
             )
+        stopped = _account_wall(page, snapshot, session, opts, ats_name, login_status=login_status)
+        if stopped is not None:
+            return stopped
         if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
             if is_login_wall(snapshot):
                 session.mark("LOGIN_FAILED")
-                return finish(
-                    Status.LOGIN_REQUIRED,
-                    ["Sign-in is required before the application form. Nothing was typed."],
+                return _attach_login_account(
+                    finish(
+                        Status.LOGIN_REQUIRED,
+                        ["Sign-in is required before the application form. Nothing was typed."],
+                    ),
+                    snapshot,
+                    getattr(page, "url", "") or "",
+                    ats_name,
+                    opts,
                 )
             session.mark(Status.NO_FORM_FOUND)
             return finish(
