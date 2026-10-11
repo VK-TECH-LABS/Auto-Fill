@@ -539,6 +539,9 @@ def _same_blocker(blocking: dict, item: dict) -> bool:
 
 
 _STUCK_TEXT = "Auto-Fill couldn't set this field; please set it in the live view, then Continue"
+_LEVER_LOCATION_TEXT = (
+    "Lever didn't offer location suggestions; pick Current location in the live view, then Continue"
+)
 _ANSWER_ATTEMPT_LIMIT = 3
 
 
@@ -574,10 +577,10 @@ def _bump_answer_attempt(session: ServiceSession, item: dict, body: AnswerIn | N
     return count
 
 
-def _freeze_stuck(session: ServiceSession, item: dict) -> None:
+def _freeze_stuck(session: ServiceSession, item: dict, text: str | None = None) -> None:
     """Stop automatic retries. A person sets the field, then continues."""
     stuck = dict(item)
-    stuck["text"] = _STUCK_TEXT
+    stuck["text"] = text or _STUCK_TEXT
     stuck["blocking"] = True
     session.stuck_manual = True
     session.status = Status.MANUAL_ANSWER_REQUIRED
@@ -588,9 +591,19 @@ def _freeze_stuck(session: ServiceSession, item: dict) -> None:
         session.result.open_items = [dict(stuck)]
 
 
-def _needs_manual(session: ServiceSession, item: dict) -> None:
-    _freeze_stuck(session, item)
+def _needs_manual(session: ServiceSession, item: dict, text: str | None = None) -> None:
+    _freeze_stuck(session, item, text)
     raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
+
+
+def _lever_suggestions_missing(filled: dict) -> bool:
+    """Lever's geocoder returned an error or an empty list. One try is enough."""
+    if not filled.get("leverSearch"):
+        return False
+    status = filled.get("searchStatus")
+    if isinstance(status, int) and status >= 400:
+        return True
+    return filled.get("suggestionCount") == 0
 
 
 def _blocker_remains(session: ServiceSession, item: dict) -> bool:
@@ -1110,9 +1123,16 @@ def create_app(
             raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
         if not filled.get("filled"):
             count = _bump_answer_attempt(session, item, body)
-            logger.info("session=%s action=answer result=rejected attempts=%s", session.session_id, count)
-            if count >= _ANSWER_ATTEMPT_LIMIT:
-                _needs_manual(session, item)
+            blocked = _lever_suggestions_missing(filled)
+            logger.info(
+                "session=%s action=answer result=rejected attempts=%s suggestions=%s search_status=%s",
+                session.session_id,
+                count,
+                filled.get("suggestionCount", "none"),
+                filled.get("searchStatus", "none"),
+            )
+            if blocked or count >= _ANSWER_ATTEMPT_LIMIT:
+                _needs_manual(session, item, _LEVER_LOCATION_TEXT if blocked else None)
             return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"), ms=elapsed_ms(started))
         remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
         if remembered and remembered not in session.completed_keys:
