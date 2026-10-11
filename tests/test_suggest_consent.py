@@ -173,6 +173,15 @@ def test_suggest_returns_live_options_without_filling(api):
     assert "value" not in body["options"][0]
     assert runner.suggests == ["florida"]
     assert runner.applied == []
+    plural = client.post(
+        f"/v1/sessions/{session_id}/suggestions",
+        headers=AUTH,
+        json={"questionId": "loc-1", "query": "miami"},
+    )
+    assert plural.status_code == 200, plural.text
+    assert plural.json()["source"] == "live"
+    assert plural.json()["options"][1]["label"] == "Miami, Florida, United States"
+    assert runner.suggests == ["florida", "miami"]
     stale = client.post(
         f"/v1/sessions/{session_id}/suggest",
         headers=AUTH,

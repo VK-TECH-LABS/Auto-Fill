@@ -1469,10 +1469,18 @@ def create_app(
         )
 
     @router.post(
+        "/sessions/{session_id}/suggestions",
+        response_model=SuggestOut,
+        response_model_exclude_none=True,
+        tags=["sessions"],
+        operation_id="session_suggestions",
+    )
+    @router.post(
         "/sessions/{session_id}/suggest",
         response_model=SuggestOut,
         response_model_exclude_none=True,
         tags=["sessions"],
+        operation_id="session_suggest",
     )
     def suggest_session(session_id: str, body: SuggestIn) -> SuggestOut:
         """Type a query into the current blocker and return its options. Nothing is chosen."""
