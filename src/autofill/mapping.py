@@ -553,14 +553,26 @@ _DIAL_CODE = re.compile(r"\+\d{1,4}\b")
 
 
 def _is_phone_country_menu(control: Control) -> bool:
-    """A country menu whose rows carry calling codes, such as ``United States +1``."""
+    """A calling-code menu, or a Country select sitting on the phone input.
+
+    Rows such as ``United States +1`` are the menu. A closed menu has no rows
+    yet, so a Country combobox next to the phone input is the same field.
+    """
     hits = 0
     for option in control.options:
         if _DIAL_CODE.search(f"{option.label} {option.value}"):
             hits += 1
             if hits >= 2:
                 return True
-    return False
+    if control.kind not in {"select", "combobox"}:
+        return False
+    label = normalize(control.label or control.aria_label)
+    if label not in {"country", "country code", "phone country"}:
+        return False
+    if control.phone_adjacent:
+        return True
+    nearby = normalize(control.nearby)
+    return nearby in {"phone", "mobile", "telephone", "mobile phone"}
 
 
 def _match_rule(control: Control) -> str | None:
@@ -619,7 +631,7 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
     if not text:
         return MappedField(key=key, action="unanswered", reason="Profile has no value for this field.")
     # A closed country menu has no options yet. Choose it live instead of typing into the inner input.
-    if key == "country" and control.kind == "combobox":
+    if key in {"country", "phone_country"} and control.kind == "combobox":
         if control.options:
             option = match_option(text, control.options)
             if option is not None:
@@ -744,6 +756,8 @@ def map_field(
         input_type=control.input_type,
         input_mode=control.input_mode,
         role=control.role,
+        phone_adjacent=control.phone_adjacent
+        or normalize(control.nearby) in {"phone", "mobile", "telephone", "mobile phone"},
     )
     key = _match_rule(own)
     if key is None and _nearby_key(control):

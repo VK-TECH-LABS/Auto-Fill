@@ -354,6 +354,10 @@ EXTRACT_JS = r"""
       else if (tag === "select") kind = "select";
       else if (tag === "textarea") kind = "textarea";
       else if (role === "combobox") kind = "combobox";
+      if (kind === "checkbox") {
+        const yesno = el.closest("[class*='yesno'], .ashby-application-form-input-yesno");
+        if (yesno && yesno.querySelector("button, [role='button']")) continue;
+      }
       const classToken = el.getAttribute("class") || "";
       if (classToken.indexOf("select__input") !== -1 || (el.closest && el.closest(".select__control"))) {
         kind = "combobox";
@@ -365,7 +369,7 @@ EXTRACT_JS = r"""
           value: option.value,
           label: (option.textContent || "").replace(/\s+/g, " ").trim(),
           selector: "",
-        })).filter((option) => option.label || option.value);
+        })).filter((option) => (option.label || option.value) && !isJunkOption(option.label || option.value));
       } else if (kind === "combobox") {
         const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
         const list = listId ? byId(root, listId) : null;
@@ -402,6 +406,7 @@ EXTRACT_JS = r"""
         prompt: inputType === "checkbox" ? groupQuestion(el) : "",
         automationId: el.getAttribute("data-automation-id") || "",
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
+        phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
       });
     }
 
@@ -455,6 +460,7 @@ EXTRACT_JS = r"""
         nearby: "",
         group: "",
         prompt: "",
+        phoneAdjacent: phoneAdjacent(inner || el),
       });
     }
   });
@@ -494,11 +500,99 @@ EXTRACT_JS = r"""
     return "";
   }
 
+  function classMarksRequired(node) {
+    const cls = ((node.getAttribute && node.getAttribute("class")) || "").toLowerCase();
+    const tokens = cls.split(/\s+/);
+    for (const token of tokens) {
+      if (!token || token.indexOf("not-required") !== -1 || token.indexOf("optional") !== -1) continue;
+      if (
+        token === "required" ||
+        token.indexOf("_required") === 0 ||
+        token.indexOf("question-required") !== -1 ||
+        token.indexOf("required-mark") !== -1
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function hasRequirementMark(node) {
     if (!node) return false;
     if (/[*✱＊]/.test(node.textContent || "")) return true;
-    const cls = ((node.getAttribute && node.getAttribute("class")) || "").toLowerCase();
-    return cls.indexOf("question-required") !== -1 || cls.indexOf("required-mark") !== -1;
+    return classMarksRequired(node);
+  }
+
+  function controlLabel(el) {
+    const aria = ((el.getAttribute && el.getAttribute("aria-label")) || "").trim();
+    if (aria) return cleanPrompt(aria).toLowerCase();
+    const labelled = (el.getAttribute && el.getAttribute("aria-labelledby")) || "";
+    if (labelled) {
+      const node = document.getElementById(labelled.split(/\s+/)[0]);
+      if (node) return cleanPrompt(textOf(node)).toLowerCase();
+    }
+    if (el.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (explicit) return cleanPrompt(textOf(explicit)).toLowerCase();
+    }
+    return "";
+  }
+
+  function phoneAdjacent(el) {
+    // A Country menu that shares a small wrapper with the phone input.
+    // Stop at the form so a later address Country is not pulled in.
+    const label = controlLabel(el);
+    if (label && label !== "country" && label.indexOf("country ") !== 0) return false;
+    let node = el;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "form" || tag === "body" || tag === "html") break;
+      const tels = node.querySelectorAll("input[type='tel'], input[autocomplete='tel'], input[id='phone']");
+      if (!tels.length) continue;
+      let menus = 0;
+      for (const input of node.querySelectorAll("input[role='combobox'], select")) {
+        const aria = (input.getAttribute("aria-label") || "").toLowerCase();
+        const type = (input.getAttribute("type") || "").toLowerCase();
+        if (aria === "search" || type === "search") continue;
+        menus += 1;
+      }
+      if (menus <= 1) return true;
+      break;
+    }
+    return false;
+  }
+
+  function stableGroupId(container) {
+    if (container.id) return container.id;
+    const field = container.closest && container.closest("[data-field-path]");
+    if (field && field.getAttribute("data-field-path")) return field.getAttribute("data-field-path");
+    const named = container.querySelector && container.querySelector("input[name]");
+    if (named && named.getAttribute("name")) return named.getAttribute("name");
+    const label = container.previousElementSibling;
+    if (label && label.getAttribute && label.getAttribute("for")) return label.getAttribute("for");
+    return "";
+  }
+
+  function cssAttr(value) {
+    return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  }
+
+  function stableChoiceSelector(container, kid) {
+    if (kid.id) return "#" + CSS.escape(kid.id);
+    const field = container.closest && container.closest("[data-field-path]");
+    const path = field ? field.getAttribute("data-field-path") || "" : "";
+    const option = (kid.getAttribute("data-option") || "").trim().toLowerCase();
+    if (!path || !option) return selectorFor(kid);
+    const root = "[data-field-path='" + cssAttr(path) + "']";
+    const choice = "[data-option='" + cssAttr(option) + "']";
+    return root + " button" + choice;
+  }
+
+  function isJunkOption(text) {
+    const folded = (text || "").toLowerCase();
+    return folded.indexOf("click here") !== -1 && (
+      folded.indexOf("issue") !== -1 || folded.indexOf("browser") !== -1 || folded.indexOf("cache") !== -1
+    );
   }
 
   function groupRequired(container, raw) {
@@ -539,7 +633,7 @@ EXTRACT_JS = r"""
         if (!question) break;
         const options = [];
         for (const kid of kids) {
-          const optionSelector = selectorFor(kid);
+          const optionSelector = stableChoiceSelector(container, kid);
           if (!optionSelector) continue;
           const optionLabel = buttonText(kid);
           options.push({ value: optionLabel, label: optionLabel, selector: optionSelector });
@@ -549,7 +643,7 @@ EXTRACT_JS = r"""
         controls.push({
           kind: "buttons",
           name: "",
-          elementId: container.id || "",
+          elementId: stableGroupId(container),
           label: question,
           placeholder: "",
           ariaLabel: container.getAttribute("aria-label") || "",
@@ -923,6 +1017,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 prompt=str(raw.get("prompt", "")),
                 automation_id=str(raw.get("automationId", "") or ""),
                 max_length=_max_length(raw.get("maxLength")),
+                phone_adjacent=bool(raw.get("phoneAdjacent", False)),
             )
         )
     buttons = [

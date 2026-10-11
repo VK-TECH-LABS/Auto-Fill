@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<body>
+<style>input, select, button, .select__control { width: 240px; height: 36px; display: block; }</style>
+<h1>Application</h1>
+<form>
+  <div class="phone-input">
+    <label id="country-label" for="country" class="label select__label">Country<span aria-hidden="true">*</span></label>
+    <div class="select__control">
+      <input id="country" class="select__input" role="combobox" aria-labelledby="country-label" aria-required="true" required autocomplete="off">
+    </div>
+    <label id="phone-label" for="phone">Phone</label>
+    <input id="phone" type="tel" aria-label="Phone" required>
+  </div>
+  <div class="select">
+    <label id="question_18692948008-label" for="question_18692948008" class="label select__label">Country<span aria-hidden="true">*</span></label>
+    <div class="select__control">
+      <input id="question_18692948008" class="select__input" role="combobox" aria-labelledby="question_18692948008-label" aria-required="true" required autocomplete="off">
+    </div>
+  </div>
+  <label for="school">School</label>
+  <select id="school" required>
+    <option value="">Select</option>
+    <option>State University</option>
+    <option>Click Here (If you encounter an issue, make sure your browser is updated and try clearing cache &amp; cookies)</option>
+  </select>
+</form>
+<div id="phone-list" role="listbox" hidden>
+  <div role="option">United States +1</div>
+  <div role="option">Canada +1</div>
+  <div role="option">United Kingdom +44</div>
+</div>
+<div id="address-list" role="listbox" hidden>
+  <div role="option">United States</div>
+  <div role="option">Canada</div>
+  <div role="option">Mexico</div>
+</div>
+<script>
+function bind(inputId, listId, hiddenId) {
+  const input = document.getElementById(inputId);
+  const list = document.getElementById(listId);
+  const hidden = document.createElement("input");
+  hidden.type = "hidden";
+  hidden.id = hiddenId;
+  input.insertAdjacentElement("afterend", hidden);
+  input.addEventListener("focus", () => { list.hidden = false; input.setAttribute("aria-controls", listId); });
+  list.querySelectorAll("[role='option']").forEach((option) => {
+    option.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      const text = option.textContent.trim();
+      hidden.value = text;
+      const shown = input.parentElement.querySelector(".select__single-value");
+      if (shown) shown.textContent = text;
+      else {
+        const node = document.createElement("div");
+        node.className = "select__single-value";
+        node.textContent = text;
+        input.parentElement.appendChild(node);
+      }
+      input.value = "";
+      list.hidden = true;
+    });
+  });
+}
+bind("country", "phone-list", "country-value");
+bind("question_18692948008", "address-list", "address-country-value");
+</script>
+</body>
+</html>

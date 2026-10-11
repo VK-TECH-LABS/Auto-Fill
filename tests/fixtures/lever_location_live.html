@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<body>
+<style>input, select, button { width: 240px; height: 36px; display: block; }</style>
+<h1>Application</h1>
+<form>
+  <li class="application-question">
+    <label>
+      <div class="application-label">Current location <span class="required">✱</span></div>
+      <div class="application-field">
+        <input class="location-input" id="location-input" name="location" type="text" required autocomplete="off">
+        <input id="selected-location" type="hidden" name="selectedLocation">
+        <div class="dropdown-container">
+          <div class="dropdown-results"></div>
+          <div class="dropdown-no-results" style="display:none">No location found. Try entering a different location</div>
+        </div>
+      </div>
+    </label>
+  </li>
+  <label for="school">Which university are you currently attending?</label>
+  <select id="school" required>
+    <option value="">Select</option>
+    <option>State University</option>
+    <option>Click Here (If you encounter an issue, make sure your browser is updated and try clearing cache &amp; cookies)</option>
+  </select>
+</form>
+<script>
+const input = document.getElementById("location-input");
+const hidden = document.getElementById("selected-location");
+const results = document.querySelector(".dropdown-results");
+const places = ["Austin, TX, USA", "Austin, MN, USA", "Austin, IN, USA", "Austin, AR, USA"];
+input.addEventListener("input", () => {
+  hidden.value = "";
+  results.innerHTML = "";
+  const query = input.value.trim().toLowerCase();
+  if (!query) return;
+  places.forEach((place, index) => {
+    if (place.toLowerCase().indexOf(query) === -1) return;
+    const item = document.createElement("div");
+    item.className = "break-word dropdown-location width-full py1 px2";
+    item.id = "location-" + index;
+    item.textContent = place;
+    item.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      input.value = place;
+      hidden.value = place;
+      results.innerHTML = "";
+    });
+    results.appendChild(item);
+  });
+});
+</script>
+</body>
+</html>

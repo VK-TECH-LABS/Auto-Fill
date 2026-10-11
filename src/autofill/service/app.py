@@ -542,41 +542,36 @@ _STUCK_TEXT = "Auto-Fill couldn't set this field; please set it in the live view
 _ANSWER_ATTEMPT_LIMIT = 3
 
 
-def _attempt_aliases(item: dict, body: AnswerIn | None = None) -> list[str]:
-    values = [
-        str(item.get("questionHash") or ""),
-        str(item.get("fieldKey") or ""),
-        str(item.get("questionId") or ""),
-        str(item.get("selector") or ""),
-    ]
-    if body is not None:
-        values.extend([body.question_hash, body.field_key, body.question_id])
-    found: list[str] = []
-    for value in values:
+def _attempt_key(item: dict) -> str:
+    """One counter per field element for the whole session.
+
+    The key is the question hash (which includes the element id) or the
+    selector. A fieldKey is not an identity: the same control can be reported
+    as ``location`` and ``address.city``.
+    """
+    for value in (item.get("questionHash"), item.get("questionId"), item.get("selector")):
         token = str(value or "").strip()
-        if token and token not in found:
-            found.append(token)
-    return found
+        if token:
+            return token
+    return ""
 
 
 def _attempt_count(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> int:
-    aliases = _attempt_aliases(item, body)
-    if not aliases:
+    del body
+    key = _attempt_key(item)
+    if not key:
         return 0
-    return max(session.answer_attempts.get(alias, 0) for alias in aliases)
+    return session.answer_attempts.get(key, 0)
 
 
 def _bump_answer_attempt(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> int:
-    aliases = _attempt_aliases(item, body)
-    count = _attempt_count(session, item, body) + 1
-    for alias in aliases:
-        session.answer_attempts[alias] = count
+    del body
+    key = _attempt_key(item)
+    if not key:
+        return 0
+    count = session.answer_attempts.get(key, 0) + 1
+    session.answer_attempts[key] = count
     return count
-
-
-def _clear_answer_attempts(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> None:
-    for alias in _attempt_aliases(item, body):
-        session.answer_attempts.pop(alias, None)
 
 
 def _freeze_stuck(session: ServiceSession, item: dict) -> None:
@@ -607,13 +602,13 @@ def _blocker_remains(session: ServiceSession, item: dict) -> bool:
 
 def _answer_filled(session: ServiceSession, item: dict, body: AnswerIn, started: float) -> AnswerOut:
     """Report a commit, or stop when the same blocker is still the one on the page."""
+    count = _bump_answer_attempt(session, item, body)
     if _blocker_remains(session, item):
-        count = _bump_answer_attempt(session, item, body)
         logger.info("session=%s action=answer result=no_progress attempts=%s", session.session_id, count)
         if count >= _ANSWER_ATTEMPT_LIMIT:
             _needs_manual(session, item)
     else:
-        _clear_answer_attempts(session, item, body)
+        logger.info("session=%s action=answer result=counted attempts=%s", session.session_id, count)
     spent = elapsed_ms(started)
     logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
     return AnswerOut(filled=True, ms=spent)
@@ -1069,11 +1064,13 @@ def create_app(
             )
         if session.busy:
             raise HTTPException(status_code=409, detail="Session is already running.")
+        blocking = session.result.blocking if session.result is not None else None
         item = match_open_item(
             session.open_items,
             question_id=body.question_id,
             question_hash=body.question_hash,
             field_key=body.field_key,
+            prefer=blocking if isinstance(blocking, dict) else None,
         )
         if item is None:
             logger.info("session=%s action=answer result=rejected", session.session_id)
