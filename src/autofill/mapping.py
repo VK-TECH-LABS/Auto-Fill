@@ -274,7 +274,10 @@ def acknowledgement_kind(control: Control) -> str:
     """
     if control.kind not in {"checkbox", "radio"}:
         return "factual"
-    blob = haystack(control)
+    option_text = " ".join(
+        part for option in control.options for part in (option.label, option.value) if part
+    )
+    blob = normalize(f"{haystack(control)} {option_text}")
     marketing = bool(_MARKETING_RE.search(blob))
     strong = bool(_CONSENT_STRONG_RE.search(blob))
     if marketing and not strong:

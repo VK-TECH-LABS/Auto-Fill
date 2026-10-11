@@ -124,7 +124,7 @@ EXTRACT_JS = r"""
         if (child.contains(el)) break;
         if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
         const text = cleanPrompt(textOf(child));
-        if (!text || text.length > 200 || text === option || isSectionHeading(child, text)) continue;
+        if (!text || text.length > 600 || text === option || isSectionHeading(child, text)) continue;
         return text;
       }
     }

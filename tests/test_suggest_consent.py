@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -16,8 +18,15 @@ from autofill.extract import extract_page
 from autofill.mapping import acknowledgement_kind, map_field
 from autofill.models import Control
 from autofill.profile import CandidateProfile
+from autofill.resolver import ResolverBinding
 from autofill.service.app import create_app
-from autofill.stepfill import commit_location_answer, inspect_required, location_shape, suggest_control
+from autofill.stepfill import (
+    commit_location_answer,
+    fill_resolved_page,
+    inspect_required,
+    location_shape,
+    suggest_control,
+)
 
 TOKEN = "synthetic-service-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -378,13 +387,78 @@ def test_consent_blocks_ready_and_marketing_stays_unchecked(browser):
             required=True,
         )
         assert map_field(factual, _profile()).action == "check"
+        privacy = next(
+            control
+            for control in snapshot.controls
+            if any("consent" in (option.label or "").casefold() for option in control.options)
+        )
+        assert acknowledgement_kind(privacy) == "consent"
+        assert privacy.required is True
+        assert "privacy policy" in privacy.label.casefold()
+        assert map_field(privacy, _profile()).action == "skip"
+        assert map_field(terms, _profile()).action == "skip"
         gaps, total, done = inspect_required(page, snapshot, _profile())
-        assert any(item.get("kind") == "CONSENT" for item in gaps)
+        consent_text = " ".join(str(item.get("text") or "") for item in gaps if item.get("kind") == "CONSENT")
+        assert "privacy policy" in consent_text.casefold()
         assert all("marketing" not in str(item.get("text") or "").casefold() for item in gaps)
         assert done < total
         assert by_selector
+        assert page.locator("#terms").is_checked() is False
+        assert page.locator("#news").is_checked() is False
+        assert page.locator("input[value='Yes, I consent']").is_checked() is False
     finally:
         page.close()
+
+
+def test_resolver_yes_does_not_check_consent(browser):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length else b"{}"
+            incoming = json.loads(raw)
+            answers = [
+                {
+                    "id": question.get("id") or "",
+                    "text": question.get("text") or "",
+                    "value": "Yes",
+                    "confidence": "HIGH",
+                    "source": "approved_answer",
+                }
+                for question in incoming.get("questions") or []
+                if isinstance(question, dict)
+            ]
+            body = json.dumps({"fields": {}, "answers": answers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "consent_marketing_live.html").as_uri())
+        binding = ResolverBinding(
+            url=f"http://{host}:{port}/resolve",
+            token="synthetic-resolver-token-0123456789abcdef",
+            expires_at=_future(),
+            candidate_ref="ref-a",
+            job_ref="job-a",
+        )
+        fill_resolved_page(page, binding, session_id="sess-consent", ats_name="lever", step="questions")
+        assert page.locator("input[value='Yes, I consent']").is_checked() is False
+        assert page.locator("input[value='No, I do not consent']").is_checked() is False
+        assert page.locator("#terms").is_checked() is False
+        assert page.locator("#news").is_checked() is False
+    finally:
+        page.close()
+        server.shutdown()
 
 
 def test_prepared_resume_attaches_when_the_control_appears(browser):
