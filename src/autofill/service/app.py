@@ -538,6 +538,87 @@ def _same_blocker(blocking: dict, item: dict) -> bool:
     return bool(left_text) and left_text == right_text
 
 
+_STUCK_TEXT = "Auto-Fill couldn't set this field; please set it in the live view, then Continue"
+_ANSWER_ATTEMPT_LIMIT = 3
+
+
+def _attempt_aliases(item: dict, body: AnswerIn | None = None) -> list[str]:
+    values = [
+        str(item.get("questionHash") or ""),
+        str(item.get("fieldKey") or ""),
+        str(item.get("questionId") or ""),
+        str(item.get("selector") or ""),
+    ]
+    if body is not None:
+        values.extend([body.question_hash, body.field_key, body.question_id])
+    found: list[str] = []
+    for value in values:
+        token = str(value or "").strip()
+        if token and token not in found:
+            found.append(token)
+    return found
+
+
+def _attempt_count(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> int:
+    aliases = _attempt_aliases(item, body)
+    if not aliases:
+        return 0
+    return max(session.answer_attempts.get(alias, 0) for alias in aliases)
+
+
+def _bump_answer_attempt(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> int:
+    aliases = _attempt_aliases(item, body)
+    count = _attempt_count(session, item, body) + 1
+    for alias in aliases:
+        session.answer_attempts[alias] = count
+    return count
+
+
+def _clear_answer_attempts(session: ServiceSession, item: dict, body: AnswerIn | None = None) -> None:
+    for alias in _attempt_aliases(item, body):
+        session.answer_attempts.pop(alias, None)
+
+
+def _freeze_stuck(session: ServiceSession, item: dict) -> None:
+    """Stop automatic retries. A person sets the field, then continues."""
+    stuck = dict(item)
+    stuck["text"] = _STUCK_TEXT
+    stuck["blocking"] = True
+    session.stuck_manual = True
+    session.status = Status.MANUAL_ANSWER_REQUIRED
+    session.open_items = [dict(stuck)]
+    if session.result is not None:
+        session.result.status = Status.MANUAL_ANSWER_REQUIRED
+        session.result.blocking = public_blocking(stuck)
+        session.result.open_items = [dict(stuck)]
+
+
+def _needs_manual(session: ServiceSession, item: dict) -> None:
+    _freeze_stuck(session, item)
+    raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
+
+
+def _blocker_remains(session: ServiceSession, item: dict) -> bool:
+    if session.status != Status.MANUAL_ANSWER_REQUIRED or session.result is None:
+        return False
+    blocking = session.result.blocking
+    return isinstance(blocking, dict) and _same_blocker(blocking, item)
+
+
+def _answer_filled(session: ServiceSession, item: dict, body: AnswerIn, started: float) -> AnswerOut:
+    """Report a commit, or stop when the same blocker is still the one on the page."""
+    if _blocker_remains(session, item):
+        count = _bump_answer_attempt(session, item, body)
+        logger.info("session=%s action=answer result=no_progress attempts=%s", session.session_id, count)
+        if count >= _ANSWER_ATTEMPT_LIMIT:
+            _needs_manual(session, item)
+    else:
+        _clear_answer_attempts(session, item, body)
+    spent = elapsed_ms(started)
+    logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
+    return AnswerOut(filled=True, ms=spent)
+
+
 def _refresh_choice_options(session: ServiceSession, runner, item: dict) -> None:
     """Read a choice list that the scan stored empty, so a 422 can name the options."""
     answer_type = str(item.get("answerType") or "")
@@ -902,6 +983,9 @@ def create_app(
                     _bump_attempts(session)
                     reason = "challenge_present" if found == "captcha" else "verification_pending"
                     raise HTTPException(status_code=409, detail={"reason": reason})
+            if session.status == Status.MANUAL_ANSWER_REQUIRED and session.stuck_manual:
+                session.stuck_manual = False
+                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
             allowed = {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
@@ -994,6 +1078,9 @@ def create_app(
         if item is None:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(status_code=409, detail="No open item matches this answer.")
+        if _attempt_count(session, item, body) >= _ANSWER_ATTEMPT_LIMIT:
+            logger.info("session=%s action=answer result=needs_manual", session.session_id)
+            _needs_manual(session, item)
         values = [text for text in body.values if str(text).strip()]
         if body.value.strip():
             values = values or [body.value]
@@ -1025,7 +1112,10 @@ def create_app(
             _mark_browser_crash(session)
             raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
         if not filled.get("filled"):
-            logger.info("session=%s action=answer result=rejected", session.session_id)
+            count = _bump_answer_attempt(session, item, body)
+            logger.info("session=%s action=answer result=rejected attempts=%s", session.session_id, count)
+            if count >= _ANSWER_ATTEMPT_LIMIT:
+                _needs_manual(session, item)
             return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"), ms=elapsed_ms(started))
         remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
         if remembered and remembered not in session.completed_keys:
@@ -1055,14 +1145,10 @@ def create_app(
                 raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
             if outcome is not None:
                 _accept_result(session, outcome)
-                spent = elapsed_ms(started)
-                logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
-                return AnswerOut(filled=True, ms=spent)
+                return _answer_filled(session, item, body, started)
         if session.status in {Status.MANUAL_ANSWER_REQUIRED, Status.RESUME_UPLOAD_REQUIRED}:
             _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
-        spent = elapsed_ms(started)
-        logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
-        return AnswerOut(filled=True, ms=spent)
+        return _answer_filled(session, item, body, started)
 
     @router.post("/sessions/{session_id}/credentials", response_model=CredentialsOut, tags=["sessions"])
     def store_credentials(session_id: str, body: CredentialsIn) -> CredentialsOut:

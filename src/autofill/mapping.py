@@ -359,7 +359,7 @@ def _profile_text(
         return personal.city
     if key == "state":
         return personal.province_state
-    if key == "country":
+    if key in {"country", "phone_country"}:
         if personal.country.strip():
             return personal.country
         from autofill.combobox import country_from_phone
@@ -549,6 +549,20 @@ def _is_referral_question(blob: str) -> bool:
     )
 
 
+_DIAL_CODE = re.compile(r"\+\d{1,4}\b")
+
+
+def _is_phone_country_menu(control: Control) -> bool:
+    """A country menu whose rows carry calling codes, such as ``United States +1``."""
+    hits = 0
+    for option in control.options:
+        if _DIAL_CODE.search(f"{option.label} {option.value}"):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     blob = haystack(control)
@@ -556,6 +570,8 @@ def _match_rule(control: Control) -> str | None:
         return None
     if re.search(r"\bpreferred\b", blob) and re.search(r"\bname\b", blob):
         return "preferred_name"
+    if _is_phone_country_menu(control):
+        return "phone_country"
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]

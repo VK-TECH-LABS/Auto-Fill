@@ -494,11 +494,29 @@ EXTRACT_JS = r"""
     return "";
   }
 
+  function hasRequirementMark(node) {
+    if (!node) return false;
+    if (/[*✱＊]/.test(node.textContent || "")) return true;
+    const cls = ((node.getAttribute && node.getAttribute("class")) || "").toLowerCase();
+    return cls.indexOf("question-required") !== -1 || cls.indexOf("required-mark") !== -1;
+  }
+
   function groupRequired(container, raw) {
     if (/[*✱＊]/.test(raw || "")) return true;
+    if (hasRequirementMark(container)) return true;
+    const labelled = (container.getAttribute && container.getAttribute("aria-labelledby")) || "";
+    if (labelled) {
+      const title = document.getElementById(labelled.split(/\s+/)[0]);
+      if (title && !container.contains(title) && hasRequirementMark(title)) return true;
+    }
     let node = container;
-    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
       if (node.getAttribute && node.getAttribute("aria-required") === "true") return true;
+      const flag = ((node.getAttribute && node.getAttribute("data-required")) || "").toLowerCase();
+      if (flag === "true" || flag === "required") return true;
+      const prev = node.previousElementSibling;
+      if (!prev || (prev.querySelector && prev.querySelector("button, [role='button']"))) continue;
+      if (hasRequirementMark(prev)) return true;
     }
     return false;
   }
@@ -759,28 +777,71 @@ EXTRACT_JS = r"""
       if (!value || bits.indexOf(value) !== -1) return;
       bits.push(value);
     }
+    function policyId(node) {
+      const id = ((node.getAttribute && node.getAttribute("data-automation-id")) || "").toLowerCase();
+      return id.indexOf("password") !== -1 && /requirement|rule|hint|policy|criteria|instruction/.test(id);
+    }
+    function looksLikeRules(node) {
+      const text = textOf(node).toLowerCase();
+      return /character|uppercase|lowercase|numeric|special|symbol|at least \d+/.test(text);
+    }
+    function pushLists(node) {
+      if (!node || node.nodeType !== 1 || isHidden(node)) return false;
+      const lists = [];
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "ul" || tag === "ol") lists.push(node);
+      else if (node.querySelectorAll) {
+        for (const list of node.querySelectorAll("ul, ol")) {
+          if (list.querySelector && list.querySelector("input[type='password']")) continue;
+          if (!isHidden(list)) lists.push(list);
+        }
+      }
+      if (!lists.length) return false;
+      for (const list of lists) push(list);
+      return true;
+    }
+    eachRoot(document, (root) => {
+      for (const el of root.querySelectorAll("[data-automation-id]")) {
+        if (!policyId(el)) continue;
+        if (!pushLists(el)) push(el);
+      }
+    });
     for (const el of fields) {
       const described = el.getAttribute("aria-describedby") || "";
       for (const id of described.split(/\s+/)) {
-        if (id) push(document.getElementById(id));
-      }
-      let sib = el.nextElementSibling;
-      for (let index = 0; sib && index < 3; index += 1, sib = sib.nextElementSibling) {
-        if (sib.querySelector && sib.querySelector("input, select, textarea")) break;
-        push(sib);
+        if (!id) continue;
+        const node = document.getElementById(id);
+        if (!node) continue;
+        if (!pushLists(node)) push(node);
       }
       let wrap = el.parentElement;
-      for (let depth = 0; wrap && wrap !== document.body && depth < 4; depth += 1) {
-        for (const child of Array.from(wrap.children)) {
+      for (let depth = 0; wrap && wrap !== document.body && depth < 8; depth += 1) {
+        for (const child of Array.from(wrap.children || [])) {
+          if (child.contains && child.contains(el)) continue;
           const tag = child.tagName ? child.tagName.toLowerCase() : "";
-          if ((tag === "ul" || tag === "ol") && !child.contains(el)) push(child);
+          if (tag === "ul" || tag === "ol") push(child);
+          else if (policyId(child) && !pushLists(child)) push(child);
         }
-        const next = wrap.nextElementSibling;
-        if (next && !(next.querySelector && next.querySelector("input[type='password']"))) {
-          const tag = next.tagName ? next.tagName.toLowerCase() : "";
-          if (tag === "ul" || tag === "ol" || tag === "p" || tag === "div" || tag === "small") push(next);
+        let sib = wrap.nextElementSibling;
+        for (let index = 0; sib && index < 4; index += 1, sib = sib.nextElementSibling) {
+          if (sib.querySelector && sib.querySelector("input[type='password']")) continue;
+          if (policyId(sib)) {
+            if (!pushLists(sib)) push(sib);
+            continue;
+          }
+          const tag = sib.tagName ? sib.tagName.toLowerCase() : "";
+          if (tag === "ul" || tag === "ol") {
+            if (looksLikeRules(sib)) push(sib);
+            continue;
+          }
+          if ((tag === "div" || tag === "p" || tag === "small") && looksLikeRules(sib)) {
+            if (!pushLists(sib)) push(sib);
+          }
         }
-        wrap = wrap.parentElement;
+        const rootNode = wrap.getRootNode && wrap.getRootNode();
+        if (wrap.parentElement) wrap = wrap.parentElement;
+        else if (rootNode && rootNode.host) wrap = rootNode.host;
+        else break;
       }
     }
     return bits.join(" ").replace(/\s+/g, " ").trim().slice(0, 300);

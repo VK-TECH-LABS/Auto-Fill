@@ -1886,3 +1886,192 @@ def test_lever_location_city_without_state_is_ambiguous(browser, resolver, caplo
         assert "Austin, TX, USA" in caplog.text
     finally:
         page.close()
+
+
+def test_workday_password_requirements_list_is_the_policy(browser):
+    from autofill.extract import extract_page
+    from autofill.login import password_policy
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "workday_password.html").as_uri())
+        policy = password_policy(extract_page(page))
+        assert policy is not None
+        assert policy["minLength"] == 8
+        assert policy["requireUpper"] is True
+        assert policy["requireLower"] is True
+        assert policy["requireDigit"] is True
+        assert policy["requireSymbol"] is True
+        raw = policy["raw"].casefold()
+        assert "at least 8 characters" in raw
+        assert "alphabetic character" in raw
+        assert "cookie" not in raw
+    finally:
+        page.close()
+
+
+def test_phone_country_menu_is_not_an_address_blocker(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {  # type: ignore[attr-defined]
+        "address.country": "United States",
+        "phone": "+44 20 7946 0000",
+    }
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<label for='country'>Country</label>"
+            "<select id='country' required>"
+            "<option value=''>Select</option>"
+            "<option value='ca'>Canada +1</option>"
+            "<option value='us'>United States +1</option>"
+            "<option value='uk'>United Kingdom +44</option>"
+            "</select>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        assert page.locator("#country").input_value() == "us"
+        assert result.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
+        assert result.blocking is None or result.blocking.get("fieldKey") != "address.country"
+        requested = [key for call in server.calls for key in call.get("fields", [])]
+        assert "phone.country" in requested
+        assert [item.get("fieldKey") for item in result.open_items] == []
+    finally:
+        page.close()
+
+
+def test_unfilled_phone_country_blocks_as_phone_country(browser, resolver):
+    server, url = resolver
+    server.custom_answers = []  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<label for='country'>Country</label>"
+            "<select id='country' required>"
+            "<option value=''>Select</option>"
+            "<option value='ca'>Canada +1</option>"
+            "<option value='us'>United States +1</option>"
+            "<option value='uk'>United Kingdom +44</option>"
+            "</select>"
+        )
+        result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert result.blocking is not None
+        assert result.blocking.get("fieldKey") == "phone.country"
+        assert result.blocking.get("fieldKey") != "address.country"
+    finally:
+        page.close()
+
+
+_LOCATION_PAGE = """
+<h1>Application</h1>
+<label for="current-location">Current location</label>
+<input id="current-location" name="location" autocomplete="off">
+<input id="selected-location" type="hidden" name="selectedLocation">
+<ul id="loc-list" role="listbox" hidden></ul>
+<script>
+const input = document.getElementById("current-location");
+const list = document.getElementById("loc-list");
+const hidden = document.getElementById("selected-location");
+const places = [
+  "Example City, California, United States",
+  "Example City, Texas, United States"
+];
+input.addEventListener("input", () => {
+  hidden.value = "";
+  list.innerHTML = "";
+  const q = input.value.trim().toLowerCase();
+  places.forEach((place, index) => {
+    if (place.toLowerCase().indexOf(q) === -1) return;
+    const li = document.createElement("li");
+    li.setAttribute("role", "option");
+    li.id = "loc-opt-" + index;
+    li.textContent = place;
+    li.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      input.value = place;
+      hidden.value = place;
+      list.hidden = true;
+    });
+    list.appendChild(li);
+  });
+  list.hidden = list.children.length === 0;
+});
+</script>
+"""
+
+
+def test_current_location_answer_commits_the_suggestion(browser):
+    from autofill.stepfill import commit_location_answer
+
+    page = browser.new_page()
+    try:
+        page.set_content(_LOCATION_PAGE)
+        filled = commit_location_answer(
+            page,
+            {
+                "selector": "#current-location",
+                "text": "Current location",
+                "fieldKey": "address.city",
+                "value": "Example City, California, United States",
+            },
+        )
+        assert filled == {"filled": True}
+        assert page.locator("#selected-location").input_value() == "Example City, California, United States"
+        assert "Example City" in page.locator("#current-location").input_value()
+    finally:
+        page.close()
+
+
+def test_required_yes_no_buttons_block_ready_until_one_is_pressed(browser, resolver):
+    from autofill.extract import extract_page
+    from autofill.stepfill import inspect_required
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_yes_no.html").as_uri())
+        snapshot = extract_page(page)
+        required = {control.label: control.required for control in snapshot.controls if control.kind == "buttons"}
+        assert required["Want a snack?"] is False
+        assert required["Do you have 7 years of experience in this role?"] is True
+        assert required["Do you have 5 years of AWS experience?"] is True
+        gaps, total, done = inspect_required(page, snapshot, None)
+        assert total == 2
+        assert done == 0
+        assert len(gaps) == 2
+        page.locator("#years-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
+        page.locator("#aws-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
+        committed, committed_total, committed_done = inspect_required(page, extract_page(page), None)
+        assert committed == []
+        assert committed_done == committed_total == 2
+    finally:
+        page.close()
+
+    server, url = resolver
+    answers = []
+    for text in (
+        "Want a snack?",
+        "Do you have 7 years of experience in this role?",
+        "Do you have 5 years of AWS experience?",
+    ):
+        answers.append(
+            {"intent": None, "text": text, "value": "Yes", "confidence": "HIGH", "source": "saved_answer"}
+        )
+    server.custom_answers = answers  # type: ignore[attr-defined]
+    server.custom_fields = {}  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_yes_no.html").as_uri())
+        result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert result.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert result.status != Status.FILLED
+        page.locator("#years-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
+        page.locator("#aws-yes").evaluate("el => el.setAttribute('aria-pressed', 'true')")
+        server.calls.clear()
+        ready, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
+        assert ready.status in {Status.FILLED, Status.READY_FOR_HUMAN_SUBMIT}
+    finally:
+        page.close()

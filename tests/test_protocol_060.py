@@ -1124,3 +1124,155 @@ def test_blocking_question_is_centered_and_known_fields_stay_plain(browser):
         page.close()
         server.shutdown()
         thread.join(2)
+
+
+_STUCK = "Auto-Fill couldn't set this field; please set it in the live view, then Continue"
+
+
+class _LoopRunner:
+    def __init__(self, *, fill: bool) -> None:
+        self.fill = fill
+        self.applied: list[str] = []
+        self.interacts = 0
+
+    def run(self, request):
+        if request.human_resolved:
+            status = Status.READY_FOR_HUMAN_SUBMIT
+            item = None
+        else:
+            status = Status.MANUAL_ANSWER_REQUIRED
+            item = _question(text="Current location", fieldKey="address.city")
+        return ApplicationResult(
+            status=status,
+            ats="lever",
+            current_step=status,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            open_items=[dict(item)] if item else [],
+            blocking=public_blocking(item) if item else None,
+            manual_questions=[{"intent": None, "text": item["text"]}] if item else [],
+        )
+
+    def apply_answer(self, session_id: str, target: dict) -> dict:
+        self.applied.append(str(target.get("value") or ""))
+        return {"filled": self.fill}
+
+    def advance_after_answer(self, request):
+        return self.run(request)
+
+    def interact(self, session_id: str, action: dict) -> bool:
+        self.interacts += 1
+        return True
+
+    def discard(self, session_id: str) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+def _answer_location(client: TestClient, session_id: str):
+    return client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionHash": "abc123", "fieldKey": "address.city", "value": "Example City"},
+    )
+
+
+def test_three_failed_answers_stop_for_a_person():
+    runner = _LoopRunner(fill=False)
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH)
+        first = _answer_location(client, session_id)
+        assert first.status_code == 200
+        assert first.json()["filled"] is False
+        early = client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"candidateRef": "ref-a", "humanResolved": True},
+        )
+        assert early.status_code == 409
+        assert _answer_location(client, session_id).status_code == 200
+        stopped = _answer_location(client, session_id)
+        assert stopped.status_code == 409
+        assert stopped.json()["detail"]["reason"] == "needs_manual"
+        assert len(runner.applied) == 3
+        again = _answer_location(client, session_id)
+        assert again.status_code == 409
+        assert again.json()["detail"]["reason"] == "needs_manual"
+        assert len(runner.applied) == 3
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert status.json()["blocking"]["text"] == _STUCK
+        moved = client.post(
+            f"/v1/sessions/{session_id}/interact",
+            headers=AUTH,
+            json={"action": "key", "key": "Tab", "candidateRef": "ref-a"},
+        )
+        assert moved.status_code == 200
+        assert runner.interacts == 1
+        continued = client.post(
+            f"/v1/sessions/{session_id}/continue",
+            headers=AUTH,
+            json={"candidateRef": "ref-a", "humanResolved": True},
+        )
+        assert continued.status_code == 200, continued.text
+        assert continued.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+
+
+def test_three_answers_without_progress_stop_for_a_person():
+    runner = _LoopRunner(fill=True)
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH)
+        assert _answer_location(client, session_id).json()["filled"] is True
+        assert _answer_location(client, session_id).json()["filled"] is True
+        stopped = _answer_location(client, session_id)
+        assert stopped.status_code == 409
+        assert stopped.json()["detail"]["reason"] == "needs_manual"
+        assert len(runner.applied) == 3
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.json()["blocking"]["text"] == _STUCK
+
+
+def test_filled_answer_rechecks_the_scan_commit(browser):
+    from autofill.dom_ui import control_committed
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<div class='select'>"
+            "<div id='box' class='select__control' role='combobox' aria-controls='list' "
+            "style='width:220px;height:40px'></div>"
+            "<input id='hidden-country' type='hidden'>"
+            "<div id='list' role='listbox'>"
+            "<div id='us' role='option' style='height:24px'>United States +1</div>"
+            "</div></div>"
+            "<script>"
+            "document.getElementById('us').addEventListener('click', () => {"
+            "document.getElementById('hidden-country').value = 'United States +1';"
+            "});"
+            "</script>"
+        )
+        filled = commit_visible(
+            page,
+            {
+                "selector": "#box",
+                "answerType": "single_select",
+                "fieldKey": "address.country",
+                "value": "United States +1",
+                "values": ["United States +1"],
+            },
+        )
+        assert page.locator("#hidden-country").input_value() == "United States +1"
+        assert control_committed(page, "#box") is False
+        assert filled == {"filled": False, "reason": "not_committed"}
+    finally:
+        page.close()

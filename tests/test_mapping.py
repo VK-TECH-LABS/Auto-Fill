@@ -290,9 +290,19 @@ def test_phone_country_menu_uses_the_address_or_the_calling_code():
         }
     )
     chosen = map_field(control("Country", kind="select", options=options), united)
-    assert chosen.key == "country"
+    assert chosen.key == "phone_country"
     assert chosen.action == "select"
     assert chosen.option_label == "United States +1"
+    plain = map_field(
+        control(
+            "Country",
+            kind="select",
+            options=[Option("US", "United States"), Option("CA", "Canada")],
+        ),
+        united,
+    )
+    assert plain.key == "country"
+    assert plain.option_label == "United States"
     code = map_field(control("Country code", kind="combobox", options=options), united)
     assert code.option_label == "United States +1"
     uk = CandidateProfile.from_dict(

@@ -68,6 +68,7 @@ _PROFILE_FIRST = frozenset(
         "state",
         "postal_code",
         "country",
+        "phone_country",
         "linkedin_url",
         "github_url",
         "portfolio_url",
@@ -96,6 +97,7 @@ _PROTOCOL = {
     "state": "address.region",
     "postal_code": "address.postalCode",
     "country": "address.country",
+    "phone_country": "phone.country",
     "linkedin_url": "links.linkedin",
     "github_url": "links.github",
     "portfolio_url": "links.portfolio",
@@ -458,6 +460,8 @@ def _requested_field_keys(requests: list[_Ask]) -> list[str]:
             keys.extend(_LOCATION_KEYS)
         else:
             keys.append(ask.field_key)
+            if ask.field_key == "phone.country":
+                keys.extend(("phone", "address.country"))
     return _unique(keys)
 
 
@@ -910,6 +914,125 @@ def _remember_location(outcome: ResolvedPage, control: Control, detail: str) -> 
     )
 
 
+def _phone_country_value(fields: dict) -> str:
+    """Country for a calling-code menu: an explicit country, else the phone's code."""
+    for key in ("phone.country", "address.country"):
+        text = str(fields.get(key) or "").strip()
+        if text:
+            return text
+    from autofill.combobox import country_from_phone
+
+    return country_from_phone(str(fields.get("phone") or ""))
+
+
+def _apply_phone_country(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
+    """Choose the calling-code row. This is not an address country field."""
+    text = _phone_country_value(fields)
+    if not text:
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", _manual_label(control)),
+            blocking=True,
+            control=control,
+            kind="MISSING_PROFILE_VALUE",
+            field_key="phone.country",
+        )
+        return
+    from autofill.mapping import match_option
+
+    option = match_option(text, control.options) if control.options else None
+    if option is None and control.kind == "combobox":
+        picked = select_combobox(page, control.selector, text)
+        if picked is None or not control_committed(page, control.selector):
+            _manual(
+                outcome,
+                IntentMatch(None, "unknown", "none", _manual_label(control)),
+                blocking=True,
+                control=control,
+                kind="OPTION_MISMATCH",
+                field_key="phone.country",
+            )
+            return
+        outcome.fields.append(
+            FieldOutcome(
+                selector=control.selector,
+                label=control.label,
+                key="phone.country",
+                action="select",
+                detail=picked.label,
+                field_class="PROFILE_FIELD",
+            )
+        )
+        return
+    if option is None:
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", _manual_label(control)),
+            blocking=True,
+            control=control,
+            kind="OPTION_MISMATCH",
+            field_key="phone.country",
+        )
+        return
+    mapped = MappedField(
+        key="phone.country",
+        action="select",
+        text=text,
+        option_label=option.label,
+        option_value=option.value,
+        option_selector=option.selector,
+        field_class="PROFILE_FIELD",
+    )
+    written = apply_mapped(page, control, mapped)
+    outcome.fields.append(written)
+    if written.action != "select" or not control_committed(page, control.selector):
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", _manual_label(control)),
+            blocking=True,
+            control=control,
+            kind="MISSING_PROFILE_VALUE",
+            field_key="phone.country",
+        )
+
+
+_LOCATION_ANSWER_KEYS = frozenset({"location", "address.city", "city"})
+_LOCATION_LABELS = frozenset({"location", "your location", "current location", "your current location"})
+
+
+def is_location_answer(page, target: dict) -> bool:
+    """A current-location box, or a city field backed by a location suggestion input."""
+    key = str(target.get("fieldKey") or "").strip()
+    text = str(target.get("text") or "").strip().casefold()
+    label_hit = text in _LOCATION_LABELS or (
+        "current location" in text and len(text) <= 40 and "sponsor" not in text and "visa" not in text
+    )
+    if key == "location" or label_hit:
+        return True
+    return key in _LOCATION_ANSWER_KEYS and _has_selected_location(page)
+
+
+def commit_location_answer(page, target: dict) -> dict[str, Any]:
+    """Type the city and keep a suggestion. A bare typed city is not a commit."""
+    value = str(target.get("value") or "").strip()
+    if not value:
+        values = [str(item).strip() for item in target.get("values") or [] if str(item).strip()]
+        value = values[0] if values else ""
+    selector = str(target.get("selector") or "")
+    if not selector:
+        return {"filled": False, "reason": "no_selector"}
+    if not value:
+        return {"filled": False, "reason": "empty"}
+    fields = {"location": value, "address.city": value.split(",")[0].strip()}
+    control = Control(kind="combobox", label=str(target.get("text") or "Current location"), selector=selector)
+    outcome = ResolvedPage()
+    _apply_location(page, control, fields, outcome)
+    city, _region, _country = _location_parts(fields)
+    if city and _location_committed(page, control, city):
+        return {"filled": True}
+    return {"filled": False, "reason": "not_committed"}
+
+
 def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
@@ -1014,6 +1137,9 @@ def _apply(
             continue
         if ask.compose_location:
             _apply_location(page, ask.controls[0], response.fields, outcome)
+            continue
+        if ask.field_key == "phone.country":
+            _apply_phone_country(page, ask.controls[0], response.fields, outcome)
             continue
         if ask.include_question:
             match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
@@ -2037,6 +2163,8 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         field_key = (mapped.key if mapped is not None and mapped.key else None) or match_field_key(primary)
     elif mapped is not None and mapped.key and kind != "DEMOGRAPHIC":
         field_key = mapped.key
+    if field_key == "phone_country":
+        field_key = "phone.country"
     options = _option_labels(controls)
     if page is not None and primary.kind == "combobox" and not options and primary.selector:
         options = list_combobox_options(page, primary.selector)

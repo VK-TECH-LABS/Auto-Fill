@@ -1054,10 +1054,18 @@ class PlaywrightRunner:
             slot = worker.sessions.get(session_id)
             if slot is None or slot.page is None:
                 return {"filled": False, "reason": "no_page"}
-            from autofill.dom_ui import commit_visible
+            from autofill.dom_ui import commit_visible, control_committed
+            from autofill.stepfill import commit_location_answer, is_location_answer
 
             try:
-                return commit_visible(slot.page, target)
+                if is_location_answer(slot.page, target):
+                    filled = commit_location_answer(slot.page, target)
+                else:
+                    filled = commit_visible(slot.page, target)
+                selector = str(target.get("selector") or "")
+                if filled.get("filled") and not control_committed(slot.page, selector):
+                    return {"filled": False, "reason": "not_committed"}
+                return filled
             except Exception as exc:
                 if not is_browser_crash(exc):
                     raise

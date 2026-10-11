@@ -565,11 +565,12 @@ _COMMITTED_JS = r"""(selector) => {
     }
     function selected(node) {
       if (!node) return false;
-      if (node.getAttribute("aria-pressed") === "true" || node.getAttribute("aria-checked") === "true") {
+      if (node.getAttribute("aria-pressed") === "true" || node.getAttribute("aria-selected") === "true") {
         return true;
       }
+      if (node.getAttribute("aria-checked") === "true") return true;
       const cls = String(node.className || "").toLowerCase();
-      return /(^|\s)(selected|is-selected|checked)(\s|$)/.test(cls);
+      return /(^|\s)(selected|is-selected)(\s|$)/.test(cls);
     }
     let box = el.parentElement;
     for (let depth = 0; box && depth < 6; depth += 1, box = box.parentElement) {
@@ -948,6 +949,8 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
             picked = None
         if picked is None:
             return {"filled": False, "reason": "not_committed"}
+        if not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
         clear_highlight(page, selector)
         return {"filled": True}
     if _choice(answer_type):
@@ -972,6 +975,8 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         multi=answer_type == "multi_select",
         field_key=str(target.get("fieldKey") or ""),
     ):
+        return {"filled": False, "reason": "not_committed"}
+    if not control_committed(page, selector):
         return {"filled": False, "reason": "not_committed"}
     clear_highlight(page, selector)
     return {"filled": True}
