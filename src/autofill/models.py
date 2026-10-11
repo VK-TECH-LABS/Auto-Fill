@@ -73,6 +73,7 @@ class PageSnapshot:
     banner: str = ""
     alerts: list[str] = field(default_factory=list)
     page_text: str = ""
+    password_hint: str = ""
     links: list[LinkControl] = field(default_factory=list)
     automation_ids: list[str] = field(default_factory=list)
 

@@ -1,13 +1,14 @@
 <!DOCTYPE html>
 <html>
 <body>
+<div id="cookie">We use cookies. Accept cookies to continue.</div>
 <h1>Create account</h1>
-<p>Use at least 8 characters, one uppercase letter, one lowercase letter, one digit, and one symbol. Do not include your email.</p>
 <form id="register">
   <label for="email">Email</label>
   <input id="email" name="email" type="email" autocomplete="email">
   <label for="password">Password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
+  <input id="password" name="password" type="password" autocomplete="new-password" aria-describedby="policy">
+  <p id="policy">Use at least 8 characters, one uppercase letter, one lowercase letter, one digit, and one symbol. Do not include your email.</p>
   <label for="verify">Verify password</label>
   <input id="verify" name="verify" type="password" aria-label="Verify password" autocomplete="new-password">
   <label><input id="terms" type="checkbox" required> I agree to the terms and privacy policy</label>

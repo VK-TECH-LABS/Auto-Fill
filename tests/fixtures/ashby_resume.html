@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<label for="resume">Resume</label>
+<div id="row">
+  <input id="resume" name="resume" type="file">
+  <div id="file" hidden>
+    <span class="filename"></span>
+    <button type="button">Replace</button>
+    <button type="button">Remove</button>
+  </div>
+</div>
+<script>
+document.getElementById("resume").addEventListener("change", function () {
+  if (!this.files || !this.files.length) return;
+  document.querySelector(".filename").textContent = this.files[0].name;
+  document.getElementById("file").hidden = false;
+});
+</script>
+</body>
+</html>

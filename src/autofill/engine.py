@@ -225,11 +225,16 @@ def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str 
 def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_name: str | None, opts: AutofillOptions):
     if not _protocol_070(opts) or result.status != Status.LOGIN_REQUIRED:
         return result
+    from autofill.dom_ui import progress_percent
     from autofill.login import login_account_view
 
     view = login_account_view(snapshot, url, ats_name)
     if view is not None:
         result.account = view
+    result.progress["stage"] = "ACCOUNT"
+    result.progress["currentLabel"] = "Employer account"
+    if int(result.progress.get("requiredTotal") or 0) <= 0:
+        result.progress["percent"] = progress_percent("ACCOUNT", 0, 0)
     return result
 
 

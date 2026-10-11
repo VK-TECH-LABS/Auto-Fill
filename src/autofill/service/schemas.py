@@ -108,8 +108,10 @@ class CreateSessionIn(BaseModel):
                 raise ValueError("candidateRef and jobRef are required")
             if "@" in self.candidate_ref or "@" in self.job_ref:
                 raise ValueError("refs must be opaque ids")
-            if self.candidate_context is not None or self.approved_answers:
-                raise ValueError("resolver mode does not accept candidate profiles or answers")
+            # A resolver session never reads candidateContext. Older clients may
+            # still send one; it is ignored so create does not fail.
+            if self.approved_answers:
+                raise ValueError("resolver mode does not accept approved answers")
         elif self.candidate_context is None:
             raise ValueError("candidateContext is required")
         return self

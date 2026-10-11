@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<label for="resume">Resume</label>
+<input id="resume" name="resume" type="file">
+<div id="done" class="resume-upload-success" hidden>Success! <span aria-hidden="true">✓</span></div>
+<script>
+document.getElementById("resume").addEventListener("change", function () {
+  if (this.files && this.files.length) document.getElementById("done").hidden = false;
+});
+</script>
+</body>
+</html>

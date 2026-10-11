@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<div id="resume-field">
+  <label id="resume-label">Resume</label>
+  <input id="resume" name="resume" type="file">
+  <div id="chip" class="chip" hidden>
+    <span class="filename"></span>
+    <button type="button" aria-label="Remove">×</button>
+  </div>
+</div>
+<script>
+function showChip(input) {
+  if (!input.files || !input.files.length) return;
+  document.querySelector(".filename").textContent = input.files[0].name;
+  document.getElementById("chip").hidden = false;
+  var parent = input.parentElement;
+  input.remove();
+  var again = document.createElement("input");
+  again.type = "file";
+  again.name = "resume";
+  again.id = "resume-" + String(Date.now());
+  again.hidden = true;
+  again.addEventListener("change", function () { showChip(again); });
+  parent.appendChild(again);
+}
+document.getElementById("resume").addEventListener("change", function () { showChip(this); });
+</script>
+</body>
+</html>

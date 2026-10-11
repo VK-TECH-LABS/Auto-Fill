@@ -133,7 +133,11 @@ def _sync_checkpoint(session: ServiceSession) -> None:
         return
     current = session.checkpoint or {}
     if current.get("kind") != kind:
-        session.checkpoint = {"kind": kind, "since": int(time.time()), "attempts": 0}
+        session.checkpoint = {
+            "kind": kind,
+            "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "attempts": 0,
+        }
 
 
 def _bump_attempts(session: ServiceSession) -> None:
@@ -155,6 +159,11 @@ def _resume_public(session: ServiceSession) -> dict:
     return payload
 
 
+_FORM_STAGES = frozenset(
+    {"PERSONAL", "ADDRESS", "EMPLOYMENT", "EDUCATION", "QUESTIONS", "RESUME", "REVIEW", "READY"}
+)
+
+
 def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
     """Protocol 0.7.0 stages and a percent that does not go backwards."""
     if not _is_070(session):
@@ -162,17 +171,26 @@ def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
     updated = dict(progress)
     labels = {
         Status.ACCOUNT_CREATION_REQUIRED: ("ACCOUNT", "Employer account"),
+        Status.LOGIN_REQUIRED: ("ACCOUNT", "Employer account"),
+        Status.LOGIN_FAILED: ("ACCOUNT", "Employer account"),
         Status.EMAIL_VERIFICATION_REQUIRED: ("VERIFICATION", "Email verification"),
         Status.CAPTCHA_REQUIRED: ("CAPTCHA", "Verification check"),
     }
     mapped = labels.get(session.status)
     if mapped is not None:
         updated["stage"], updated["currentLabel"] = mapped
-    if updated.get("stage") == "OPENING" and session.form_seen:
+    elif updated.get("stage") == "LOGIN":
+        updated["stage"] = "ACCOUNT"
+        updated["currentLabel"] = "Employer account"
+    if (
+        session.status != Status.NO_FORM_FOUND
+        and updated.get("stage") == "OPENING"
+        and session.form_seen
+    ):
         updated["stage"] = "QUESTIONS"
         if updated.get("currentLabel") in {"", "Opening"}:
             updated["currentLabel"] = "Questions"
-    if str(updated.get("stage") or "") not in {"", "OPENING"}:
+    if session.status != Status.NO_FORM_FOUND and str(updated.get("stage") or "") in _FORM_STAGES:
         session.form_seen = True
     page_key = str(session.result.current_step or "") if session.result is not None else ""
     done = int(updated.get("requiredDone") or 0)
@@ -185,8 +203,11 @@ def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
     percent = int(updated.get("percent") or 0)
     if not int(updated.get("requiredTotal") or 0):
         percent = progress_percent(str(updated.get("stage") or "OPENING"), 0, 0)
-    percent = max(percent, session.percent_high)
-    session.percent_high = percent
+    if session.status == Status.NO_FORM_FOUND:
+        percent = session.percent_high if session.form_seen else 0
+    else:
+        percent = max(percent, session.percent_high)
+        session.percent_high = percent
     updated["percent"] = percent
     session.progress = dict(updated)
     return updated
