@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<label for="resume">Resume</label>
+<input id="resume" name="resume" type="file">
+<div id="toast" role="alert" hidden></div>
+<script>
+document.getElementById("resume").addEventListener("change", function () {
+  var toast = document.getElementById("toast");
+  toast.hidden = false;
+  toast.textContent = "failed to upload";
+});
+</script>
+</body>
+</html>

@@ -25,6 +25,8 @@ _FILLED_ACTIONS = frozenset({"fill", "select", "check", "uncheck", "upload"})
 _STATUS_BLOCKERS = {
     "CAPTCHA_REQUIRED": ("CAPTCHA", "Complete the challenge", None),
     "LOGIN_REQUIRED": ("LOGIN", "Sign in", None),
+    "ACCOUNT_CREATION_REQUIRED": ("ACCOUNT", "Create employer account", None),
+    "EMAIL_VERIFICATION_REQUIRED": ("VERIFICATION", "Email verification", None),
     "NO_FORM_FOUND": ("NO_FORM", "No application form", None),
     "RESUME_UPLOAD_REQUIRED": ("RESUME", "Resume", "resume.file"),
 }
@@ -32,7 +34,10 @@ _READY = frozenset({"READY_FOR_HUMAN_SUBMIT", "FILLED"})
 
 STAGE_PERCENT = {
     "OPENING": 5,
+    "ACCOUNT": 8,
     "LOGIN": 10,
+    "VERIFICATION": 12,
+    "CAPTCHA": 12,
     "PERSONAL": 20,
     "ADDRESS": 30,
     "EMPLOYMENT": 45,
@@ -44,7 +49,10 @@ STAGE_PERCENT = {
 }
 STAGE_TITLES = {
     "OPENING": "Opening",
+    "ACCOUNT": "Employer account",
     "LOGIN": "Sign in",
+    "VERIFICATION": "Email verification",
+    "CAPTCHA": "Verification check",
     "PERSONAL": "Personal information",
     "ADDRESS": "Address",
     "EMPLOYMENT": "Employment History",
@@ -246,6 +254,8 @@ class RunState:
     ) -> None:
         self.page = page
         self.pause_gate = pause_gate
+        self.refill_cleared = False
+        self.filled_keys: list[str] = []
         self.held_selectors = held_selectors
         self.open_items = open_items
         self.progress = progress
@@ -336,6 +346,7 @@ def begin_run(
     progress: dict[str, Any] | None = None,
     url: str = "",
     ats: str | None = None,
+    refill_cleared: bool = False,
 ) -> contextvars.Token:
     shared = progress if progress is not None else empty_progress()
     shared.clear()
@@ -351,6 +362,7 @@ def begin_run(
         url=url,
         ats=ats,
     )
+    state.refill_cleared = refill_cleared
     token = _RUN.set(state)
     state.token = token
     return token
@@ -453,8 +465,12 @@ def blocker_stage(item: dict[str, Any] | None) -> str | None:
 def stage_for(step: str, heading: str, status: str) -> str:
     if status in _READY:
         return "READY"
+    if status == "ACCOUNT_CREATION_REQUIRED":
+        return "ACCOUNT"
     if status == "LOGIN_REQUIRED":
         return "LOGIN"
+    if status == "EMAIL_VERIFICATION_REQUIRED":
+        return "VERIFICATION"
     if status == "RESUME_UPLOAD_REQUIRED" and not heading and not step:
         return "RESUME"
     blob = f"{step} {heading}".casefold()
@@ -667,6 +683,9 @@ def note_filled(fields: list) -> None:
         key = state.selector_to_key.get(selector)
         if key and key not in state.done:
             state.done.add(key)
+        named = str(getattr(field, "key", "") or "")
+        if named and named not in state.filled_keys:
+            state.filled_keys.append(named)
     state.progress["requiredDone"] = len(state.done)
     _refresh(state)
 
@@ -688,6 +707,12 @@ def checkpoint() -> bool:
     if state.pause_gate is not None:
         state.pause_gate.wait()
     return state.halted not in {"LOGIN", "CAPTCHA"}
+
+
+def refill_cleared() -> bool:
+    """Protocol 0.7.0 refills a completed field when the site has cleared it."""
+    state = current_run()
+    return bool(state is not None and state.refill_cleared)
 
 
 def selector_held(selector: str) -> bool:
@@ -740,6 +765,14 @@ def _apply_status_stage(state: RunState, status: str) -> None:
     if status in _READY:
         state.progress["stage"] = "READY"
         state.progress["currentLabel"] = STAGE_TITLES["READY"]
+        return
+    if status == "ACCOUNT_CREATION_REQUIRED":
+        state.progress["stage"] = "ACCOUNT"
+        state.progress["currentLabel"] = STAGE_TITLES["ACCOUNT"]
+        return
+    if status == "EMAIL_VERIFICATION_REQUIRED":
+        state.progress["stage"] = "VERIFICATION"
+        state.progress["currentLabel"] = STAGE_TITLES["VERIFICATION"]
         return
     if status == "LOGIN_REQUIRED":
         state.progress["stage"] = "LOGIN"

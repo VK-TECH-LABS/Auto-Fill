@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
-from autofill.dom_ui import checkpoint, focus_field, selector_held, type_visible
+from autofill.dom_ui import checkpoint, control_committed, focus_field, refill_cleared, selector_held, type_visible
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
@@ -184,7 +184,9 @@ def fill_one_page(
         for control in snapshot.controls:
             if not checkpoint():
                 break
-            if selector_held(control.selector):
+            if selector_held(control.selector) and (
+                not refill_cleared() or control_committed(page, control.selector)
+            ):
                 continue
             mapped = map_field(
                 control,

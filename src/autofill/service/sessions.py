@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from autofill.credentials import MemoryCredentialProvider
 from autofill.dom_ui import PauseGate, empty_progress
@@ -52,15 +54,78 @@ class ServiceSession:
     open_items: list[dict] = field(default_factory=list)
     held_selectors: set[str] = field(default_factory=set)
     held_answers: list[str] = field(default_factory=list)
+    state_version: int = 0
+    account: dict | None = None
+    resume_required: bool = False
+    resume_verified: bool = False
+    resume_filename: str = ""
+    resume_verified_at: str = ""
+    resume_source: str = ""
+    resume_bytes: bytes | None = None
+    resume_mime: str = ""
+    resume_temp: str = ""
+    completed_keys: list[str] = field(default_factory=list)
+    completed_hashes: list[str] = field(default_factory=list)
+    checkpoint: dict | None = None
+    percent_high: int = 0
+    required_done_high: int = 0
+    required_page_key: str = ""
+    form_seen: bool = False
+    pending_resume: bool = False
+    secret_values: list[str] = field(default_factory=list)
+    _state_marker: tuple | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return f"ServiceSession(session_id={self.session_id!r}, status={self.status!r}, mode={self.mode!r})"
 
+    def remember_secret(self, value: str) -> None:
+        """Register a secret for redaction and for deletion when the session ends."""
+        if not value:
+            return
+        from autofill.redact import redaction_filter
+
+        redaction_filter().add(value)
+        if value not in self.secret_values:
+            self.secret_values.append(value)
+
+    def observe(self) -> int:
+        """Increase the public version when status, blocking, pause, or stage changes."""
+        blocking = None
+        if self.result is not None and self.result.blocking:
+            item = self.result.blocking
+            blocking = (item.get("kind"), item.get("fieldKey"), item.get("questionHash"))
+        stage = str((self.progress or {}).get("stage") or "")
+        marker = (self.status, bool(self.paused), stage, blocking)
+        if marker != self._state_marker:
+            self.state_version += 1
+            self._state_marker = marker
+        return self.state_version
+
+    def clear_resume_bytes(self) -> None:
+        """Drop resume bytes and delete the per-session temp file."""
+        self.resume_bytes = None
+        path = self.resume_temp
+        self.resume_temp = ""
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        parent = str(Path(path).parent)
+        try:
+            os.rmdir(parent)
+        except OSError:
+            pass
+
     def wipe_secrets(self) -> None:
-        """Forget site passwords, the resolver token, and any held values."""
+        """Forget site passwords, the resolver token, resume bytes, and any held values."""
         from autofill.redact import redaction_filter
 
         redaction_filter().discard(self.resolver_token)
+        for value in self.secret_values:
+            redaction_filter().discard(value)
+        self.secret_values.clear()
         self.credentials.clear()
         self.resolver_token = ""
         self.resolver_url = ""
@@ -69,6 +134,7 @@ class ServiceSession:
             redaction_filter().discard(value)
         self.held_answers.clear()
         self.held_selectors.clear()
+        self.clear_resume_bytes()
 
 
 class ServiceSessionStore:

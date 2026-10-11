@@ -220,6 +220,30 @@ def activate_login(page, selector: str, name: str, *, control_type: str = "") ->
     perform_click(page, selector, name, control_type=control_type, purpose="login")
 
 
+def activate_account(page, selector: str, name: str, *, control_type: str = "") -> None:
+    """Click the account form's primary button. Submit Application stays forbidden."""
+    perform_click(page, selector, name, control_type=control_type, purpose="account")
+
+
+def activate_account_switch(page, selector: str, name: str, *, control_type: str = "") -> None:
+    """Open the other account pane. This is not an application submit."""
+    perform_click(page, selector, name, control_type=control_type, purpose="account_switch")
+
+
+def attach_resume_control(page, selector: str, files: list[dict]) -> None:
+    """Put files on a resume control. A drop zone click stays inside this guard."""
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    try:
+        page.locator(selector).set_input_files(files)
+        return
+    except Exception:
+        pass
+    with page.expect_file_chooser() as chooser:
+        page.locator(selector).click()
+    chooser.value.set_files(files)
+
+
 def activate_entry(page, selector: str, name: str, *, control_type: str = "") -> None:
     """Open a job description into the application. Submit on a form stays forbidden.
 
@@ -274,12 +298,36 @@ def choose_option(page, opener_selector: str, option_selector: str, option_name:
     page.locator(option_selector).click()
 
 
+_ACCOUNT_NAME_RE = re.compile(
+    r"\b(create account|register|sign\s*up|join|sign\s*in|log\s*in|login)\b",
+    re.IGNORECASE,
+)
+
+
+def _account_button_allowed(name: str, *, control_type: str = "") -> bool:
+    """Create Account, Sign In, Continue, or Next. Submit Application is not."""
+    klass = action_class(name, control_type=control_type)
+    if klass == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        return False
+    if klass == ActionClass.LOGIN_SUBMIT_ALLOWED:
+        return True
+    if semantic_action(name, control_type=control_type) == "signup":
+        return True
+    if re.search(r"\bjoin\b", name, re.IGNORECASE) and klass != ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        return True
+    if klass == ActionClass.NAVIGATION and re.search(r"\b(continue|next)\b", name, re.IGNORECASE):
+        if re.search(r"\bsave\b", name, re.IGNORECASE):
+            return False
+        return True
+    return False
+
+
 def perform_click(page, selector: str, name: str, *, control_type: str = "", purpose: str) -> None:
-    """Central click guard. ``purpose`` is ``navigation`` or ``login``.
+    """Central click guard.
 
     If the control is a final application submission, this raises
-    :class:`HumanSubmissionRequired` before any click. That is true for both
-    purposes, so an adapter cannot reach Submit by asking for a login click.
+    :class:`HumanSubmissionRequired` before any click. That is true for every
+    purpose, so an adapter cannot reach Submit by asking for a login click.
     """
     if not HUMAN_SUBMIT_ONLY:
         raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
@@ -299,6 +347,20 @@ def perform_click(page, selector: str, name: str, *, control_type: str = "", pur
         if klass != ActionClass.NAVIGATION:
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only Next, Continue, Review, or Add-row navigation is automatic."
+            )
+        page.locator(selector).click()
+        return
+    if purpose == "account":
+        if not _account_button_allowed(name, control_type=control_type):
+            raise SubmitBlockedError(
+                f"Refusing to activate {name!r}. Only the account form's primary button is allowed."
+            )
+        page.locator(selector).click()
+        return
+    if purpose == "account_switch":
+        if not _ACCOUNT_NAME_RE.search(name):
+            raise SubmitBlockedError(
+                f"Refusing to activate {name!r}. Only a Create Account or Sign In switch is allowed."
             )
         page.locator(selector).click()
         return

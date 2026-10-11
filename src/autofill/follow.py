@@ -172,7 +172,7 @@ def _progress(
     A scan must not put the stage back to OPENING after the form has been found.
     """
     stage = stage_for(step, snapshot.heading, status)
-    if stage not in {"READY", "LOGIN"}:
+    if stage not in {"READY", "LOGIN", "ACCOUNT", "VERIFICATION", "CAPTCHA"}:
         section = blocker_stage(blocker)
         if section:
             stage = section

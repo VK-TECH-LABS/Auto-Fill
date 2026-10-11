@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Create account</h1>
+<p>Use at least 8 characters, one uppercase letter, one lowercase letter, one digit, and one symbol. Do not include your email.</p>
+<form id="register">
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="email">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="new-password">
+  <label for="verify">Verify password</label>
+  <input id="verify" name="verify" type="password" aria-label="Verify password" autocomplete="new-password">
+  <label><input id="terms" type="checkbox" required> I agree to the terms and privacy policy</label>
+  <button type="button" id="create">Create Account</button>
+</form>
+<div id="error" role="alert" hidden></div>
+<script>
+document.getElementById("create").addEventListener("click", function () {
+  var password = document.getElementById("password").value;
+  var box = document.getElementById("error");
+  var ok = password.length >= 8 && /[A-Z]/.test(password) && /[a-z]/.test(password) && /[0-9]/.test(password) && /[^A-Za-z0-9]/.test(password);
+  if (!ok) {
+    box.hidden = false;
+    box.textContent = "Password does not meet the policy.";
+    return;
+  }
+  document.getElementById("register").remove();
+  box.hidden = true;
+  var note = document.createElement("p");
+  note.id = "done";
+  note.textContent = "Check your inbox to verify your email.";
+  document.body.appendChild(note);
+});
+</script>
+</body>
+</html>

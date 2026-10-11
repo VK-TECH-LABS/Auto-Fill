@@ -37,6 +37,8 @@ class Control:
     nearby: str = ""
     group: str = ""
     prompt: str = ""
+    automation_id: str = ""
+    max_length: int | None = None
 
 
 @dataclass
@@ -46,6 +48,16 @@ class ButtonControl:
     name: str
     selector: str = ""
     control_type: str = ""
+    automation_id: str = ""
+
+
+@dataclass
+class LinkControl:
+    """A visible link. Account mode switches are links, not application submits."""
+
+    name: str
+    selector: str = ""
+    automation_id: str = ""
 
 
 @dataclass
@@ -60,6 +72,9 @@ class PageSnapshot:
     heading: str = ""
     banner: str = ""
     alerts: list[str] = field(default_factory=list)
+    page_text: str = ""
+    links: list[LinkControl] = field(default_factory=list)
+    automation_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

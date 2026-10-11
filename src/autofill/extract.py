@@ -8,7 +8,7 @@ roots, which is why an ``#id`` selector remains usable after extraction.
 
 from __future__ import annotations
 
-from autofill.models import ButtonControl, Control, Option, PageSnapshot
+from autofill.models import ButtonControl, Control, LinkControl, Option, PageSnapshot
 
 EXTRACT_JS = r"""
 () => {
@@ -400,6 +400,8 @@ EXTRACT_JS = r"""
         nearby: textOf(headingNode).slice(0, 160),
         group: legendText(el),
         prompt: inputType === "checkbox" ? groupQuestion(el) : "",
+        automationId: el.getAttribute("data-automation-id") || "",
+        maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
       });
     }
 
@@ -413,6 +415,7 @@ EXTRACT_JS = r"""
         name,
         selector,
         controlType: (el.getAttribute("type") || "").toLowerCase(),
+        automationId: el.getAttribute("data-automation-id") || "",
       });
     }
   });
@@ -719,6 +722,30 @@ EXTRACT_JS = r"""
       if (challengeShown(el)) captcha = true;
     }
   });
+  const links = [];
+  eachRoot(document, (root) => {
+    for (const el of root.querySelectorAll("a[href], [role='link']")) {
+      if (links.length >= 40) break;
+      if (isHidden(el)) continue;
+      const name = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      const selector = selectorFor(el);
+      if (!name || !selector) continue;
+      links.push({
+        name: name.slice(0, 200),
+        selector,
+        automationId: el.getAttribute("data-automation-id") || "",
+      });
+    }
+  });
+  const automationIds = [];
+  eachRoot(document, (root) => {
+    for (const el of root.querySelectorAll("[data-automation-id]")) {
+      if (isHidden(el)) continue;
+      const id = el.getAttribute("data-automation-id");
+      if (id && automationIds.indexOf(id) === -1) automationIds.push(id);
+    }
+  });
+  const pageText = (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 2000);
   const password = controls.some((control) => control.kind === "password" && !control.hidden);
   let heading = "";
   for (const node of document.querySelectorAll("h1, h2")) {
@@ -741,7 +768,7 @@ EXTRACT_JS = r"""
       }
     }
   });
-  return { controls, buttons, captcha, botWall, password, heading, banner, alerts };
+  return { controls, buttons, captcha, botWall, password, heading, banner, alerts, pageText, links, automationIds };
 }
 """
 
@@ -779,6 +806,8 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 nearby=str(raw.get("nearby", "")),
                 group=str(raw.get("group", "")),
                 prompt=str(raw.get("prompt", "")),
+                automation_id=str(raw.get("automationId", "") or ""),
+                max_length=_max_length(raw.get("maxLength")),
             )
         )
     buttons = [
@@ -786,8 +815,18 @@ def parse_snapshot(data: dict) -> PageSnapshot:
             name=str(raw.get("name", "")),
             selector=str(raw.get("selector", "")),
             control_type=str(raw.get("controlType", "")),
+            automation_id=str(raw.get("automationId", "") or ""),
         )
         for raw in data.get("buttons", [])
+    ]
+    links = [
+        LinkControl(
+            name=str(raw.get("name", "")),
+            selector=str(raw.get("selector", "")),
+            automation_id=str(raw.get("automationId", "") or ""),
+        )
+        for raw in data.get("links", [])
+        if str(raw.get("name", "")).strip()
     ]
     return PageSnapshot(
         controls=controls,
@@ -798,7 +837,22 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         heading=str(data.get("heading", "")),
         banner=str(data.get("banner", "")),
         alerts=[str(item) for item in data.get("alerts", []) if str(item).strip()],
+        page_text=str(data.get("pageText", "") or "")[:2000],
+        links=links,
+        automation_ids=[str(item) for item in data.get("automationIds", []) if str(item).strip()],
     )
+
+
+def _max_length(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int) and 0 < value < 100000:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        if 0 < parsed < 100000:
+            return parsed
+    return None
 
 
 def challenge_message(snapshot: PageSnapshot) -> str:

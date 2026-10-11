@@ -20,6 +20,7 @@ from autofill.dom_ui import (
     checkpoint,
     control_committed,
     counts_required,
+    refill_cleared,
     selector_held,
     sync_required_progress,
     type_visible,
@@ -1004,7 +1005,9 @@ def _apply(
     for ask in ordered:
         if not checkpoint():
             break
-        if any(selector_held(control.selector) for control in ask.controls):
+        if any(selector_held(control.selector) for control in ask.controls) and (
+            not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
+        ):
             continue
         if ask.field_key == "resume.file":
             _apply_resume(page, ask, response, outcome)

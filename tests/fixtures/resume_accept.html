@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<label for="resume">Resume</label>
+<input id="resume" name="resume" type="file">
+<div id="chip" role="status" hidden>Uploaded</div>
+<script>
+document.getElementById("resume").addEventListener("change", function () {
+  if (this.files && this.files.length) {
+    document.getElementById("chip").hidden = false;
+  }
+});
+</script>
+</body>
+</html>

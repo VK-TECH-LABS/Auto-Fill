@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Sign in</h1>
+<form id="signin">
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="username" data-automation-id="email">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" data-automation-id="password">
+  <button type="button" id="go" data-automation-id="signInSubmitButton">Sign In</button>
+</form>
+<p><a id="create" href="#create" data-automation-id="createAccountLink">Create Account</a></p>
+<p><a id="forgot" href="#forgot">Forgot password</a></p>
+<div id="register" hidden>
+  <h1>Create account</h1>
+  <label for="new-email">Email</label>
+  <input id="new-email" type="email">
+  <label for="new-password">Password</label>
+  <input id="new-password" type="password" data-automation-id="password">
+  <label for="verify">Verify password</label>
+  <input id="verify" type="password" data-automation-id="verifyPassword" aria-label="Verify password">
+  <button type="button" id="create-submit" data-automation-id="createAccountSubmitButton">Create Account</button>
+</div>
+<script>
+document.getElementById("create-submit").addEventListener("click", function () {
+  document.getElementById("register").remove();
+  var note = document.createElement("p");
+  note.textContent = "Check your inbox to verify your email.";
+  document.body.appendChild(note);
+});
+</script>
+<script>
+document.getElementById("create").addEventListener("click", function (event) {
+  event.preventDefault();
+  document.getElementById("signin").hidden = true;
+  document.getElementById("register").hidden = false;
+});
+document.getElementById("go").addEventListener("click", function () {
+  document.getElementById("signin").remove();
+  var note = document.createElement("p");
+  note.textContent = "Welcome back";
+  document.body.appendChild(note);
+});
+</script>
+</body>
+</html>

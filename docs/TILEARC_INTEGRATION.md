@@ -63,6 +63,8 @@ Auto-Fill does not accept a database URL, a TileArc API token, or a resume files
 | Status | Meaning for the product UI |
 | --- | --- |
 | `LOGIN_REQUIRED` | No credentials for this candidate and domain. Nothing was typed. |
+| `ACCOUNT_CREATION_REQUIRED` | Protocol 0.7.0 only. A Create Account form is on the page. Nothing was typed. Older sessions see `LOGIN_REQUIRED`. |
+| `EMAIL_VERIFICATION_REQUIRED` | Protocol 0.7.0 only. The site is asking for a code or an inbox check. Auto-Fill does not read mail. Older sessions see `MANUAL_REVIEW_REQUIRED`. |
 | `LOGIN_FAILED` | The site rejected the login. Filling did not start. |
 | `CAPTCHA_REQUIRED` | A challenge widget is on the page. Auto-Fill stopped. It does not solve CAPTCHAs. |
 | `APPLICATION_READY` | Recorded as a step after auth, before filling. |
@@ -74,6 +76,8 @@ Auto-Fill does not accept a database URL, a TileArc API token, or a resume files
 | `FAILED` | The run stopped on an unexpected error. The message names the error type only. |
 
 `result.stopped_before_submit` is always true. `result.login_status` is `NOT_REQUIRED`, `LOGIN_REQUIRED`, `AUTHENTICATED`, `LOGIN_FAILED`, or `CAPTCHA_REQUIRED`.
+
+Protocol 0.7.0 keeps that contract and adds account creation, email verification, and `POST /v1/sessions/{sessionId}/resume-file`. The default `protocolVersion` is still `0.6.0`. A host opts in by sending `0.7.0`. Details are in [HTTP_SERVICE.md](HTTP_SERVICE.md).
 
 Protocol 0.4.0 adds an HTTP resolver mode, documented in [HTTP_SERVICE.md](HTTP_SERVICE.md). In that mode the create body carries opaque `candidateRef` and `jobRef` values, `jobContext.applicationUrl`, and a per-session `resolver` (`url`, `token`, `expiresAt`). Auto-Fill asks that resolver only for the field keys and question intents on the current step, holds the returned values in memory for that step, and then drops them. The resolver token is sent as a bearer header and is never written to a URL, a log line, or disk. This repository does not store a hash of that token and does not define the caller's schema.
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 MAX_URL_LENGTH = 2048
 MAX_REF_LENGTH = 128
@@ -96,11 +96,12 @@ class CreateSessionIn(BaseModel):
     @model_validator(mode="after")
     def _mode(self) -> CreateSessionIn:
         version = self.protocol_version.strip()
-        if self.resolver is not None or version in {"0.4.0", "0.5.0", "0.6.0"}:
-            if version not in {"0.4.0", "0.5.0", "0.6.0"}:
-                raise ValueError("protocolVersion must be 0.4.0, 0.5.0, or 0.6.0 when resolver is set")
+        allowed = {"0.4.0", "0.5.0", "0.6.0", "0.7.0"}
+        if self.resolver is not None or version in allowed:
+            if version not in allowed:
+                raise ValueError("protocolVersion must be 0.4.0, 0.5.0, 0.6.0, or 0.7.0 when resolver is set")
             if self.resolver is None:
-                raise ValueError("resolver is required for protocol 0.4.0, 0.5.0, and 0.6.0")
+                raise ValueError("resolver is required for protocol 0.4.0, 0.5.0, 0.6.0, and 0.7.0")
             if not self.candidate_ref.strip() or not self.job_ref.strip():
                 raise ValueError("candidateRef and jobRef are required")
             if "@" in self.candidate_ref or "@" in self.job_ref:
@@ -134,7 +135,23 @@ class ContinueIn(BaseModel):
 
 
 _INTERACT_KEYS = frozenset(
-    {"Enter", "Tab", "Backspace", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"}
+    {
+        "Enter",
+        "Tab",
+        "Backspace",
+        "Escape",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Space",
+        "Delete",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Shift+Tab",
+    }
 )
 
 
@@ -148,9 +165,12 @@ class InteractIn(BaseModel):
     candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
     x: float | None = None
     y: float | None = None
+    button: Literal["left", "middle", "right"] = "left"
+    click_count: Literal[1, 2] = Field(default=1, alias="clickCount")
     text: str = Field(default="", max_length=500)
     key: str = ""
     dy: int = 0
+    dx: int = 0
 
     @model_validator(mode="after")
     def _shape(self) -> InteractIn:
@@ -165,7 +185,7 @@ class InteractIn(BaseModel):
         elif self.action == "key":
             if self.key not in _INTERACT_KEYS:
                 raise ValueError("key is not allowed")
-        elif abs(self.dy) > 4000:
+        elif abs(self.dy) > 4000 or abs(self.dx) > 4000:
             raise ValueError("dy is out of range")
         return self
 
@@ -177,6 +197,14 @@ class InteractOut(BaseModel):
 
     status: str
     screenshot_version: int = Field(alias="screenshotVersion")
+    state_version: int | None = Field(default=None, alias="stateVersion")
+
+    @model_serializer(mode="wrap")
+    def _omit_unused(self, handler):
+        data = handler(self)
+        if data.get("stateVersion") is None:
+            data.pop("stateVersion", None)
+        return data
 
 
 class HumanDoneIn(BaseModel):
@@ -199,6 +227,18 @@ class CredentialsIn(BaseModel):
     username: str = Field(default="", max_length=320)
     site: str = Field(default="", max_length=MAX_URL_LENGTH)
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
+    candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
+    mode: Literal["store", "login", "register"] = "store"
+    confirm_password: str = Field(default="", alias="confirmPassword", max_length=256)
+
+    def __repr__(self) -> str:
+        return (
+            f"CredentialsIn(mode={self.mode!r}, email_present={bool(self.email.strip())}, "
+            f"username_present={bool(self.username.strip())}, secret_present={bool(self.password)}, "
+            f"confirm_present={bool(self.confirm_password)})"
+        )
+
+    __str__ = __repr__
 
 
 class ProgressOut(BaseModel):
@@ -316,6 +356,19 @@ class RunStatusOut(BaseModel):
     progress: ProgressOut = Field(default_factory=ProgressOut)
     paused: bool = False
     blocking: BlockingOut | None = None
+    state_version: int | None = Field(default=None, alias="stateVersion")
+    account: dict[str, Any] | None = None
+    resume: dict[str, Any] | None = None
+    completed: dict[str, Any] | None = None
+    checkpoint: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_older_protocol(self, handler):
+        data = handler(self)
+        if data.get("stateVersion") is None:
+            for key in ("stateVersion", "account", "resume", "completed", "checkpoint"):
+                data.pop(key, None)
+        return data
 
 
 class CredentialsOut(BaseModel):
@@ -325,6 +378,17 @@ class CredentialsOut(BaseModel):
 
     session_id: str = Field(alias="sessionId")
     stored: Literal[True] = True
+    outcome: str | None = None
+    status: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_store(self, handler):
+        data = handler(self)
+        if not data.get("outcome"):
+            data.pop("outcome", None)
+        if not data.get("status"):
+            data.pop("status", None)
+        return data
 
 
 class HealthOut(BaseModel):
