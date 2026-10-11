@@ -346,11 +346,15 @@ class SuggestOut(BaseModel):
 
 
 class AnswerOut(BaseModel):
-    """Whether the field committed. The value is not echoed."""
+    """Whether the field committed. The value is not echoed.
+
+    ``verified`` is the committed-value check. ``filled`` is true only when that check passed.
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
     filled: bool
+    verified: bool
     reason: str | None = None
     ms: int | None = None
 

@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from autofill import __version__
 from autofill.credentials import Credentials
 from autofill.dom_ui import (
+    canonical_blocker_kind,
     choose_blocking,
     empty_progress,
     fit_choice_values,
@@ -517,7 +518,9 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     _sync_checkpoint(session)
     session.manual_questions = [dict(item) for item in result.manual_questions]
     session.progress = dict(result.progress) if result.progress else empty_progress()
-    session.open_items = [dict(item) for item in result.open_items]
+    if isinstance(result.blocking, dict):
+        result.blocking = _canonicalize_blocker(result.blocking)
+    session.open_items = [_canonicalize_blocker(item) for item in result.open_items]
     session.paused = session.pause_gate.paused
     if result.timings:
         for key, value in result.timings.items():
@@ -659,6 +662,28 @@ def _blocker_remains(session: ServiceSession, item: dict) -> bool:
     return isinstance(blocking, dict) and _same_blocker(blocking, item)
 
 
+def _canonicalize_blocker(item: dict) -> dict:
+    """Copy one blocker and report an acknowledgement alias as consent."""
+    copied = dict(item)
+    if copied.get("kind"):
+        copied["kind"] = canonical_blocker_kind(copied.get("kind"))
+    return copied
+
+
+def _commitment(report: dict) -> tuple[bool, bool]:
+    """Whether a 200 may say the field filled, and the committed-value check.
+
+    A report without ``verified`` takes that check from ``filled``. The runner
+    sets ``filled`` only after the value is on the control. The response
+    ``filled`` flag is true only when the check passed.
+    """
+    if "verified" in report:
+        verified = bool(report.get("verified"))
+    else:
+        verified = bool(report.get("filled"))
+    return bool(report.get("filled")) and verified, verified
+
+
 def _answer_filled(session: ServiceSession, item: dict, body: AnswerIn, started: float) -> AnswerOut:
     """Report a commit, or stop when the same blocker is still the one on the page."""
     count = _bump_answer_attempt(session, item, body)
@@ -670,7 +695,7 @@ def _answer_filled(session: ServiceSession, item: dict, body: AnswerIn, started:
         logger.info("session=%s action=answer result=counted attempts=%s", session.session_id, count)
     spent = elapsed_ms(started)
     logger.info("session=%s action=answer result=filled ms=%s", session.session_id, spent)
-    return AnswerOut(filled=True, ms=spent)
+    return AnswerOut(filled=True, verified=True, ms=spent)
 
 
 def _refresh_choice_options(session: ServiceSession, runner, item: dict) -> None:
@@ -764,7 +789,7 @@ def _consent_stop(session: ServiceSession) -> bool:
     blocking = session.result.blocking
     if not isinstance(blocking, dict):
         return False
-    return str(blocking.get("kind") or "") in {"CONSENT", "CONSENT_CHOICE"}
+    return canonical_blocker_kind(blocking.get("kind")) in {"CONSENT", "CONSENT_CHOICE"}
 
 
 def _binding(session: ServiceSession, limits: dict[str, float | int]) -> ResolverBinding | None:
@@ -1188,7 +1213,7 @@ def create_app(
         values = [text for text in body.values if str(text).strip()]
         if body.value.strip():
             values = values or [body.value]
-        kind_name = str(item.get("kind") or "")
+        kind_name = canonical_blocker_kind(item.get("kind"))
         listed = [str(option) for option in item.get("options") or []]
         if kind_name == "CONSENT":
             if body.value.strip().casefold() != "confirm" or not body.confirm:
@@ -1246,7 +1271,8 @@ def create_app(
                     "options": [str(option) for option in filled.get("options") or item.get("options") or []],
                 },
             )
-        if not filled.get("filled"):
+        committed, verified = _commitment(filled)
+        if not committed:
             if str(filled.get("reason") or "") in {"no_page", "no_selector"}:
                 raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
             count = _bump_answer_attempt(session, item, body)
@@ -1260,7 +1286,12 @@ def create_app(
             )
             if blocked or count >= _ANSWER_ATTEMPT_LIMIT:
                 _needs_manual(session, item, _LEVER_LOCATION_TEXT if blocked else None)
-            return AnswerOut(filled=False, reason=str(filled.get("reason") or "not_committed"), ms=elapsed_ms(started))
+            return AnswerOut(
+                filled=False,
+                verified=verified,
+                reason=str(filled.get("reason") or "not_committed"),
+                ms=elapsed_ms(started),
+            )
         remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
         if remembered and remembered not in session.completed_keys:
             session.completed_keys.append(remembered)

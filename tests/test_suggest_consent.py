@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 
-from autofill.dom_ui import public_blocking
+from autofill.dom_ui import canonical_blocker_kind, public_blocking
 from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application
 from autofill.extract import extract_page
 from autofill.mapping import acknowledgement_kind, is_consent_choice, map_field, option_stance
@@ -23,6 +23,7 @@ from autofill.service.app import create_app
 from autofill.stepfill import (
     commit_location_answer,
     fill_resolved_page,
+    _item_kind,
     inspect_required,
     location_shape,
     suggest_control,
@@ -77,6 +78,7 @@ class _Runner:
         self.hold = threading.Event()
         self.entered = threading.Event()
         self.block = False
+        self.fill_report: dict | None = None
 
     def run(self, request):
         status = Status.MANUAL_ANSWER_REQUIRED
@@ -104,6 +106,8 @@ class _Runner:
             self.entered.set()
             self.hold.wait(2)
         self.applied.append(target)
+        if self.fill_report is not None:
+            return dict(self.fill_report)
         return {"filled": True}
 
     def suggest(self, session_id: str, selector: str, query: str, *, clear: bool) -> dict:
@@ -568,6 +572,82 @@ def test_suggestions_omit_a_state_that_cannot_commit(api):
     labels = [option["label"] for option in suggested.json()["options"]]
     assert labels == ["Florida City, Florida, United States"]
     assert runner.applied == []
+
+
+def test_answer_verified_follows_the_committed_check(api):
+    client, runner = api
+
+    def start() -> str:
+        created = client.post("/v1/sessions", headers=AUTH, json=_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+        return session_id
+
+    def answer(session_id: str):
+        return client.post(
+            f"/v1/sessions/{session_id}/answer",
+            headers=AUTH,
+            json={"fieldKey": "location", "value": "Florida City, Florida, United States"},
+        )
+
+    committed = answer(start())
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["filled"] is True
+    assert committed.json()["verified"] is True
+
+    runner.fill_report = {"filled": False, "reason": "not_committed"}
+    missed = answer(start())
+    assert missed.status_code == 200, missed.text
+    assert missed.json()["filled"] is False
+    assert missed.json()["verified"] is False
+    assert missed.json()["reason"] == "not_committed"
+
+    runner.fill_report = {"filled": True, "verified": False}
+    unchecked = answer(start())
+    assert unchecked.status_code == 200, unchecked.text
+    assert unchecked.json()["verified"] is False
+    assert unchecked.json()["filled"] is False
+
+
+def test_acknowledgment_blocker_is_answered_as_consent(api):
+    client, runner = api
+    assert canonical_blocker_kind("ACKNOWLEDGMENT") == "CONSENT"
+    assert canonical_blocker_kind("ACKNOWLEDGEMENT") == "CONSENT"
+    assert _item_kind(None, "ACKNOWLEDGMENT", None) == "CONSENT"
+    assert public_blocking(_question(kind="ACKNOWLEDGEMENT"))["kind"] == "CONSENT"
+    runner.item = _question(
+        kind="ACKNOWLEDGMENT",
+        text="I agree to the candidate privacy policy and the Terms and Conditions.",
+        fieldKey=None,
+        answerType="boolean",
+        options=[],
+    )
+    created = client.post("/v1/sessions", headers=AUTH, json=_body())
+    session_id = created.json()["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    assert started.json()["blocking"]["kind"] == "CONSENT"
+    refused = client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionId": "loc-1", "value": "confirm"},
+    )
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == {"reason": "needs_option", "options": ["confirm"]}
+    accepted = client.post(
+        f"/v1/sessions/{session_id}/answer",
+        headers=AUTH,
+        json={"questionId": "loc-1", "value": "confirm", "confirm": True},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["filled"] is True
+    assert accepted.json()["verified"] is True
+    assert runner.applied[-1]["check"] is True
+    rescanned = client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"candidateRef": "ref-a"},
+    )
+    assert rescanned.status_code == 200, rescanned.text
 
 
 def test_consent_choice_decline_needs_no_confirm_and_agree_does(api):
