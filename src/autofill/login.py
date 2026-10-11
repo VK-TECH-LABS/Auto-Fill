@@ -214,7 +214,16 @@ _EXISTS_RE = re.compile(r"already exists|account exists|already registered|email
 _EMAIL_REDACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _DIGIT_RUN_RE = re.compile(r"\d{3,}")
 _WORKDAY_HOST_RE = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
+_LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
 _POLICY_MIN_RE = re.compile(r"(?:at least|minimum(?: of)?|min(?:imum)? of)\s+(\d+)\s+character", re.IGNORECASE)
+_POLICY_DIGIT_RE = re.compile(
+    r"\b(?:digits?|numbers?|numerals?|numeric(?:\s+character)?)\b|\ba\s+numeral\b|0\s*[-–]\s*9",
+    re.IGNORECASE,
+)
+_POLICY_SYMBOL_RE = re.compile(r"\b(?:symbols?|special\s+characters?)\b", re.IGNORECASE)
+_POLICY_UPPER_RE = re.compile(r"upper\s*-?\s*case|capital\s+letters?|uppercase", re.IGNORECASE)
+_POLICY_LOWER_RE = re.compile(r"lower\s*-?\s*case|lowercase", re.IGNORECASE)
+_POLICY_ALPHA_RE = re.compile(r"\balphabetic(?:\s+character)?s?\b", re.IGNORECASE)
 _POLICY_MAX_RE = re.compile(
     r"(?:at most|maximum(?: of)?|max(?:imum)? of|no more than)\s+(\d+)\s+character",
     re.IGNORECASE,
@@ -356,7 +365,8 @@ def tenant_identity(url: str, ats: str | None) -> dict:
     parts = [part for part in (parsed.path or "").split("/") if part]
     key = host
     if _WORKDAY_HOST_RE.match(host):
-        key = f"{host}/{parts[0]}" if parts else host
+        site = next((part for part in parts if not _LOCALE_SEGMENT_RE.match(part)), "")
+        key = f"{host}/{site}" if site else host
     elif parts and (
         host.endswith("greenhouse.io")
         or host.endswith("lever.co")
@@ -368,10 +378,13 @@ def tenant_identity(url: str, ats: str | None) -> dict:
 
 
 def password_policy(snapshot: PageSnapshot) -> dict | None:
-    """Hints copied from the page. The raw text is capped and is not a secret."""
-    if not snapshot.password_present and "password" not in (snapshot.page_text or "").casefold():
+    """Hints from the requirements block next to the password field.
+
+    Page text is not used. A cookie banner at the top of the page is not a policy.
+    """
+    text = (snapshot.password_hint or "").strip()
+    if not snapshot.password_present and not text:
         return None
-    text = snapshot.page_text or ""
     policy: dict = {}
     minimum = _POLICY_MIN_RE.search(text)
     if minimum:
@@ -384,19 +397,23 @@ def password_policy(snapshot: PageSnapshot) -> dict | None:
         if lengths:
             policy["maxLength"] = min(lengths)
     folded = text.casefold()
-    if "uppercase" in folded or "capital letter" in folded:
+    if _POLICY_UPPER_RE.search(folded):
         policy["requireUpper"] = True
-    if "lowercase" in folded:
+    if _POLICY_LOWER_RE.search(folded):
         policy["requireLower"] = True
-    if re.search(r"\b(digit|number)\b", folded):
+    if _POLICY_ALPHA_RE.search(folded):
+        policy.setdefault("requireUpper", True)
+        policy.setdefault("requireLower", True)
+    if _POLICY_DIGIT_RE.search(folded):
         policy["requireDigit"] = True
-    if re.search(r"\b(symbol|special character)\b", folded):
+    if _POLICY_SYMBOL_RE.search(folded):
         policy["requireSymbol"] = True
     if re.search(r"(cannot|must not|do not|don't).{0,40}email", folded):
         policy["disallowEmail"] = True
     if not policy:
         return None
-    policy["raw"] = text[:300]
+    if text:
+        policy["raw"] = text[:300]
     return policy
 
 

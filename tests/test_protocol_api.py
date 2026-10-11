@@ -128,9 +128,13 @@ def test_resolver_rejects_profiles_tokens_in_urls_and_oversized_refs(client):
     test_client, _runner, _app = client
     mixed = _resolver_body()
     mixed["candidateContext"] = {"candidateId": "ref-a", "personal": {"full_name": "A", "email": "a@example.com"}}
-    rejected = test_client.post("/v1/sessions", headers=AUTH, json=mixed)
+    ignored = test_client.post("/v1/sessions", headers=AUTH, json=mixed)
+    assert ignored.status_code == 201, ignored.text
+    assert "a@example.com" not in ignored.text
+    answered = _resolver_body()
+    answered["approvedAnswers"] = [{"question": "Sponsor", "answer": "No"}]
+    rejected = test_client.post("/v1/sessions", headers=AUTH, json=answered)
     assert rejected.status_code == 422
-    assert "a@example.com" not in rejected.text
     leaked = _resolver_body(url=f"https://resolver.example.test/resolve?token={RESOLVER_TOKEN}")
     refused = test_client.post("/v1/sessions", headers=AUTH, json=leaked)
     assert refused.status_code == 422

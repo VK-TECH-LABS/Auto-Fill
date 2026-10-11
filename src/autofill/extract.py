@@ -745,7 +745,48 @@ EXTRACT_JS = r"""
       if (id && automationIds.indexOf(id) === -1) automationIds.push(id);
     }
   });
+  function passwordHintText() {
+    const fields = [];
+    eachRoot(document, (root) => {
+      for (const el of root.querySelectorAll("input[type='password']")) {
+        if (!isHidden(el)) fields.push(el);
+      }
+    });
+    const bits = [];
+    function push(node) {
+      if (!node || node.nodeType !== 1 || isHidden(node)) return;
+      const value = textOf(node);
+      if (!value || bits.indexOf(value) !== -1) return;
+      bits.push(value);
+    }
+    for (const el of fields) {
+      const described = el.getAttribute("aria-describedby") || "";
+      for (const id of described.split(/\s+/)) {
+        if (id) push(document.getElementById(id));
+      }
+      let sib = el.nextElementSibling;
+      for (let index = 0; sib && index < 3; index += 1, sib = sib.nextElementSibling) {
+        if (sib.querySelector && sib.querySelector("input, select, textarea")) break;
+        push(sib);
+      }
+      let wrap = el.parentElement;
+      for (let depth = 0; wrap && wrap !== document.body && depth < 4; depth += 1) {
+        for (const child of Array.from(wrap.children)) {
+          const tag = child.tagName ? child.tagName.toLowerCase() : "";
+          if ((tag === "ul" || tag === "ol") && !child.contains(el)) push(child);
+        }
+        const next = wrap.nextElementSibling;
+        if (next && !(next.querySelector && next.querySelector("input[type='password']"))) {
+          const tag = next.tagName ? next.tagName.toLowerCase() : "";
+          if (tag === "ul" || tag === "ol" || tag === "p" || tag === "div" || tag === "small") push(next);
+        }
+        wrap = wrap.parentElement;
+      }
+    }
+    return bits.join(" ").replace(/\s+/g, " ").trim().slice(0, 300);
+  }
   const pageText = (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 2000);
+  const passwordHint = passwordHintText();
   const password = controls.some((control) => control.kind === "password" && !control.hidden);
   let heading = "";
   for (const node of document.querySelectorAll("h1, h2")) {
@@ -768,7 +809,20 @@ EXTRACT_JS = r"""
       }
     }
   });
-  return { controls, buttons, captcha, botWall, password, heading, banner, alerts, pageText, links, automationIds };
+  return {
+    controls,
+    buttons,
+    captcha,
+    botWall,
+    password,
+    heading,
+    banner,
+    alerts,
+    pageText,
+    passwordHint,
+    links,
+    automationIds,
+  };
 }
 """
 
@@ -838,6 +892,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
         banner=str(data.get("banner", "")),
         alerts=[str(item) for item in data.get("alerts", []) if str(item).strip()],
         page_text=str(data.get("pageText", "") or "")[:2000],
+        password_hint=str(data.get("passwordHint", "") or "")[:300],
         links=links,
         automation_ids=[str(item) for item in data.get("automationIds", []) if str(item).strip()],
     )

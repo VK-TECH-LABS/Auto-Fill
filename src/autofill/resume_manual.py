@@ -19,18 +19,23 @@ _OLE = b"\xd0\xcf\x11\xe0"
 _ZIP = b"PK\x03\x04"
 _CONFIRM_SECONDS = 8.0
 
-_CONFIRM_JS = r"""(selector) => {
+_CONFIRM_JS = r"""({ selector, filename }) => {
   function shown(node) {
-    if (!node || node.hidden) return false;
+    if (!node || node.nodeType !== 1 || node.hidden) return false;
     const style = window.getComputedStyle(node);
     if (style.display === "none" || style.visibility === "hidden") return false;
     return true;
   }
   function text(node) {
-    return String(node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+    return String((node && (node.innerText || node.textContent)) || "").replace(/\s+/g, " ").trim();
+  }
+  function cls(node) {
+    return String((node && node.className) || "").toLowerCase();
   }
   const errors = [];
-  const alerts = document.querySelectorAll("[role='alert'], .field-error, .error, [class*='toast'], [class*='Toast']");
+  const alerts = document.querySelectorAll(
+    "[role='alert'], .field-error, .error, [class*='toast'], [class*='Toast']"
+  );
   for (const alert of alerts) {
     if (!shown(alert)) continue;
     const value = text(alert);
@@ -43,34 +48,134 @@ _CONFIRM_JS = r"""(selector) => {
   if (errors.length) return { state: "error", errors: errors.slice(0, 5) };
   const el = selector ? document.querySelector(selector) : null;
   let files = false;
-  if (el && el.files && el.files.length > 0) files = true;
+  let liveName = "";
+  if (el && el.files && el.files.length > 0) {
+    files = true;
+    liveName = String(el.files[0].name || "");
+  }
   let hidden = false;
   for (const input of document.querySelectorAll("input[type='hidden']")) {
     const name = ((input.name || "") + " " + (input.id || "")).toLowerCase();
     if (!/resume|cv|file|upload/.test(name)) continue;
     if (String(input.value || "").trim()) hidden = true;
   }
-  let indicator = false;
-  const marks = document.querySelectorAll(
-    "[role='status'], [class*='chip'], [class*='Chip'], [data-automation-id='file-upload-item']"
+  const wanted = String(filename || liveName || "").trim().toLowerCase();
+  const regions = [];
+  function addRegion(node) {
+    if (!node || node === document.body || node === document.documentElement) return;
+    if (regions.indexOf(node) !== -1) return;
+    regions.push(node);
+  }
+  let node = el;
+  for (let depth = 0; node && node !== document.body && depth < 4; depth += 1, node = node.parentElement) {
+    addRegion(node);
+  }
+  if (el && el.id) {
+    const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+    addRegion(lab);
+    if (lab) addRegion(lab.parentElement);
+  }
+  for (const lab of document.querySelectorAll("label, legend, h2, h3")) {
+    const blob = text(lab).toLowerCase();
+    if (!/resume|\bcv\b|curriculum vitae/.test(blob)) continue;
+    addRegion(lab);
+    addRegion(lab.parentElement);
+    if (lab.parentElement) addRegion(lab.parentElement.parentElement);
+  }
+  function inRegion(target) {
+    if (!target) return false;
+    if (!regions.length) return false;
+    for (const region of regions) {
+      if (region === target || (region.contains && region.contains(target))) return true;
+    }
+    return false;
+  }
+  const regionBlob = regions.map((region) => text(region)).join(" ").toLowerCase();
+  const filenameShown = !!(wanted && regionBlob.indexOf(wanted) !== -1);
+  function buttonText(button) {
+    return (
+      text(button) + " " + (button.getAttribute("aria-label") || "") + " " + (button.getAttribute("title") || "")
+    ).toLowerCase();
+  }
+  function hasControl(root, words) {
+    if (!root || !root.querySelectorAll) return false;
+    for (const button of root.querySelectorAll("button, a, [role='button']")) {
+      const value = buttonText(button).trim();
+      for (const word of words) {
+        if (word.length === 1 ? value === word : value.indexOf(word) !== -1) return true;
+      }
+    }
+    return false;
+  }
+  let ats = false;
+  for (const mark of document.querySelectorAll(".resume-upload-success")) {
+    if (shown(mark) && text(mark).toLowerCase().indexOf("success") !== -1) ats = true;
+  }
+  for (const mark of document.querySelectorAll("[data-automation-id='file-upload-item']")) {
+    if (!shown(mark) || cls(mark).indexOf("error") !== -1) continue;
+    ats = true;
+  }
+  const chips = document.querySelectorAll(
+    "[class*='chip'], [class*='Chip'], [class*='filename'], [class*='file-name'], [class*='file-upload']"
   );
-  for (const mark of marks) {
+  for (const chip of chips) {
+    if (!shown(chip) || cls(chip).indexOf("error") !== -1) continue;
+    if (regions.length && !inRegion(chip)) continue;
+    const host = chip.parentElement || chip;
+    if (hasControl(chip, ["remove", "delete", "×", "x"]) || hasControl(host, ["remove", "delete"])) ats = true;
+  }
+  for (const region of regions) {
+    const low = text(region).toLowerCase();
+    const fileRow = low.indexOf("replace") !== -1 || (filenameShown && low.indexOf("remove") !== -1);
+    if (fileRow && hasControl(region, ["replace", "remove"])) ats = true;
+  }
+  let generic = false;
+  for (const mark of document.querySelectorAll("[role='status']")) {
     if (!shown(mark)) continue;
-    const id = mark.getAttribute("data-automation-id") || "";
-    const cls = String(mark.className || "").toLowerCase();
-    if (id === "file-upload-item" && cls.indexOf("error") !== -1) continue;
     const value = text(mark).toLowerCase();
-    if (
-      id === "file-upload-item" ||
-      value.indexOf("uploaded") !== -1 ||
-      value.indexOf("success") !== -1 ||
-      value.indexOf("parsed") !== -1
-    ) {
-      indicator = true;
+    if (value.indexOf("uploaded") !== -1 || value.indexOf("success") !== -1 || value.indexOf("parsed") !== -1) {
+      generic = true;
     }
   }
-  if ((files || hidden) && indicator) return { state: "ok", errors: [] };
+  const replaced = !files && ats;
+  const partA = filenameShown || ats || generic;
+  const partC = files || hidden || replaced || ats;
+  if (partA && partC) return { state: "ok", errors: [] };
+  if (!document.querySelector("input[type='file']") && !ats && !generic) {
+    return { state: "absent", errors: [] };
+  }
   return { state: "wait", errors: [] };
+}"""
+
+_FIND_FILE_JS = r"""(hint) => {
+  function selectorFor(el) {
+    if (el.id) return "#" + CSS.escape(el.id);
+    if (el.getAttribute("name")) {
+      return "input[type='file'][name='" + CSS.escape(el.getAttribute("name")) + "']";
+    }
+    return "";
+  }
+  function blob(el) {
+    let label = el.getAttribute("aria-label") || "";
+    if (el.id) {
+      const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (lab) label += " " + (lab.innerText || "");
+    }
+    const parent = el.closest ? el.closest("label") : null;
+    if (parent) label += " " + (parent.innerText || "");
+    return (label + " " + (el.name || "") + " " + (el.id || "")).toLowerCase();
+  }
+  const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+  const folded = String(hint || "").trim().toLowerCase();
+  if (folded) {
+    for (const el of inputs) {
+      if (blob(el).indexOf(folded) !== -1 && selectorFor(el)) return selectorFor(el);
+    }
+  }
+  const resume = inputs.filter((el) => /resume|\bcv\b|curriculum/.test(blob(el)));
+  if (resume.length && selectorFor(resume[0])) return selectorFor(resume[0]);
+  if (inputs.length === 1) return selectorFor(inputs[0]);
+  return "";
 }"""
 
 
@@ -124,21 +229,47 @@ def mime_for(name: str) -> str:
     return "application/octet-stream"
 
 
-def resume_control(snapshot: PageSnapshot, hint: str = "") -> Control | None:
-    files = [control for control in snapshot.controls if control.kind == "file" and not control.hidden]
+def _resume_blob(control: Control) -> str:
+    return f"{control.label} {control.name} {control.element_id}".casefold()
+
+
+def _match_resume(controls: list[Control], hint: str) -> Control | None:
     folded_hint = hint.casefold().strip()
     if folded_hint:
-        for control in files:
-            blob = f"{control.label} {control.name} {control.element_id}".casefold()
-            if folded_hint in blob:
+        for control in controls:
+            if folded_hint in _resume_blob(control):
                 return control
-    for control in files:
-        blob = f"{control.label} {control.name} {control.element_id}".casefold()
+    for control in controls:
+        blob = _resume_blob(control)
         if "resume" in blob or blob.strip() == "cv" or " cv" in f" {blob}":
             return control
-    if len(files) == 1:
-        return files[0]
     return None
+
+
+def resume_control(snapshot: PageSnapshot, hint: str = "") -> Control | None:
+    """The resume file input, including one the ATS hid after the first attach."""
+    files = [control for control in snapshot.controls if control.kind == "file"]
+    visible = [control for control in files if not control.hidden]
+    hidden = [control for control in files if control.hidden]
+    found = _match_resume(visible, hint) or _match_resume(hidden, hint)
+    if found is not None:
+        return found
+    if len(visible) == 1:
+        return visible[0]
+    if not visible and len(hidden) == 1:
+        return hidden[0]
+    return None
+
+
+def _selector_from_page(page, hint: str) -> str:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return ""
+    try:
+        found = evaluate(_FIND_FILE_JS, hint)
+    except Exception:
+        return ""
+    return str(found or "")
 
 
 def _has_file(page, selector: str) -> bool:
@@ -155,46 +286,62 @@ def _has_file(page, selector: str) -> bool:
         return False
 
 
+def _resume_selector(page, hint: str) -> str:
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        snapshot = None
+    if snapshot is not None:
+        control = resume_control(snapshot, hint)
+        if control is not None and control.selector:
+            return control.selector
+    return _selector_from_page(page, hint)
+
+
 def attach_and_confirm(page, *, name: str, data: bytes, hint: str = "") -> dict:
-    """Attach bytes, then require an ATS indicator and no upload error."""
-    snapshot = extract_page(page)
-    control = resume_control(snapshot, hint)
-    if control is None or not control.selector:
+    """Attach bytes, then require an attached indicator and no upload error."""
+    selector = _resume_selector(page, hint)
+    if not selector:
         return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
     try:
         attach_resume_control(
             page,
-            control.selector,
+            selector,
             [{"name": name, "mimeType": mime_for(name), "buffer": data}],
         )
     except Exception:
         return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
-    return _confirm(page, control.selector)
+    return _confirm(page, selector, name)
 
 
-def confirm_current(page, hint: str = "") -> dict:
+def confirm_current(page, hint: str = "", filename: str = "") -> dict:
     """Re-check a resume already on the page. A name alone does not pass."""
-    snapshot = extract_page(page)
-    control = resume_control(snapshot, hint)
-    if control is None or not control.selector:
-        return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
-    return _confirm(page, control.selector)
+    return _confirm(page, _resume_selector(page, hint), filename)
 
 
-def _confirm(page, selector: str) -> dict:
+def _confirm_once(page, selector: str, filename: str) -> dict | None:
+    try:
+        return page.evaluate(_CONFIRM_JS, {"selector": selector, "filename": filename}) or {}
+    except Exception:
+        return None
+
+
+def _confirm(page, selector: str, filename: str = "") -> dict:
     deadline = time.monotonic() + _CONFIRM_SECONDS
     last = {"state": "wait", "errors": []}
     while True:
-        try:
-            last = page.evaluate(_CONFIRM_JS, selector) or last
-        except Exception:
+        found = _confirm_once(page, selector, filename)
+        if found is None:
             return {"verified": False, "reason": "not_confirmed", "siteErrors": []}
+        last = found or last
         state = str(last.get("state") or "wait")
         errors = [str(item)[:200] for item in last.get("errors") or [] if str(item).strip()][:5]
         if state == "error":
             return {"verified": False, "reason": "ats_rejected", "siteErrors": errors}
         if state == "ok":
             return {"verified": True, "reason": "", "siteErrors": []}
+        if state == "absent":
+            return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
         if time.monotonic() >= deadline:
             break
         time.sleep(0.25)

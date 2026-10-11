@@ -77,12 +77,22 @@ class _Runner:
     def run(self, request):
         self.page_open = True
         status = Status.RESUME_UPLOAD_REQUIRED if "resume" in request.application_url else Status.LOGIN_REQUIRED
+        progress = None
         if "account" in request.application_url:
             status = Status.ACCOUNT_CREATION_REQUIRED
         if "otp" in request.application_url:
             status = Status.EMAIL_VERIFICATION_REQUIRED
         if "captcha" in request.application_url:
             status = Status.CAPTCHA_REQUIRED
+        if "no-form" in request.application_url:
+            status = Status.NO_FORM_FOUND
+            progress = {
+                "stage": "QUESTIONS",
+                "requiredTotal": 0,
+                "requiredDone": 0,
+                "percent": 75,
+                "currentLabel": "Questions",
+            }
         return ApplicationResult(
             status=status,
             ats="greenhouse",
@@ -91,6 +101,7 @@ class _Runner:
             session_id=request.session_id,
             candidate_id=request.candidate_id,
             job_id=request.job_id,
+            progress=progress or {},
             account={
                 "mode": "register" if status == Status.ACCOUNT_CREATION_REQUIRED else "login",
                 "alternateModeAvailable": True,
@@ -251,7 +262,8 @@ def test_otp_policy_and_tenant_key_use_page_text_only():
         _snapshot(
             controls=[_control("password", "Password")],
             password_present=True,
-            page_text=(
+            page_text="We use cookies. Accept cookies to continue.",
+            password_hint=(
                 "Use at least 8 characters, one uppercase letter, one lowercase letter, "
                 "one digit, and one symbol. Do not include your email."
             ),
@@ -260,12 +272,51 @@ def test_otp_policy_and_tenant_key_use_page_text_only():
     assert policy is not None
     assert policy["minLength"] == 8
     assert policy["requireUpper"] is True
+    assert policy["requireLower"] is True
     assert policy["requireDigit"] is True
+    assert policy["requireSymbol"] is True
     assert policy["disallowEmail"] is True
+    assert "cookie" not in policy["raw"].casefold()
     assert len(policy["raw"]) <= 300
+    variants = password_policy(
+        _snapshot(
+            controls=[_control("password", "Password")],
+            password_present=True,
+            page_text="We use cookies. Accept cookies to continue.",
+            password_hint=(
+                "Include an uppercase alphabetic character, a lowercase alphabetic character, "
+                "a numeric character, a numeral, and a character from 0-9, plus a special character."
+            ),
+        )
+    )
+    assert variants is not None
+    assert variants["requireDigit"] is True
+    assert variants["requireSymbol"] is True
+    assert variants["requireUpper"] is True
+    assert variants["requireLower"] is True
+    assert "cookie" not in variants["raw"].casefold()
+    alphabetic = password_policy(
+        _snapshot(
+            controls=[_control("password", "Password")],
+            password_present=True,
+            page_text="We use cookies.",
+            password_hint="Use an alphabetic character.",
+        )
+    )
+    assert alphabetic is not None
+    assert alphabetic["requireUpper"] is True
+    assert alphabetic["requireLower"] is True
+    assert "cookie" not in alphabetic["raw"]
     tenant = tenant_identity("https://example.wd5.myworkdayjobs.com/External/job/1", "workday")
     assert tenant["tenantKey"] == "example.wd5.myworkdayjobs.com/External"
     assert tenant["loginOrigin"] == "https://example.wd5.myworkdayjobs.com"
+    locale = tenant_identity(
+        "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/1",
+        "workday",
+    )
+    assert locale["tenantKey"] == "hp.wd5.myworkdayjobs.com/ExternalCareerSite"
+    short = tenant_identity("https://hp.wd5.myworkdayjobs.com/en/ExternalCareerSite/job/1", "workday")
+    assert short["tenantKey"] == "hp.wd5.myworkdayjobs.com/ExternalCareerSite"
     assert tenant_identity("https://jobs.lever.co/example/job", "lever")["tenantKey"] == "example"
 
 
@@ -532,6 +583,9 @@ def test_human_resolved_rechecks_and_screenshot_navigation_does_not_change_statu
     status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
     assert status.json()["status"] == Status.CAPTCHA_REQUIRED
     assert status.json()["checkpoint"]["attempts"] == 1
+    since = status.json()["checkpoint"]["since"]
+    assert isinstance(since, str)
+    assert len(since) == 20 and since.endswith("Z") and "T" in since
     assert status.json()["stateVersion"] >= version
     runner.navigating = True
     shot = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
@@ -609,7 +663,10 @@ def test_local_fixtures_drive_account_verification_and_resume(caplog, fixture_or
         register = _start(client, resolver_origin, f"{fixture_origin}/account_register.html")
         assert register["status"] == Status.ACCOUNT_CREATION_REQUIRED
         assert register["account"]["mode"] == "register"
+        assert register["progress"]["stage"] == "ACCOUNT"
+        assert register["progress"]["currentLabel"] == "Employer account"
         assert register["account"]["passwordPolicy"]["minLength"] == 8
+        assert "cookie" not in register["account"]["passwordPolicy"]["raw"].casefold()
         session_id = register["sessionId"]
         rejected = _credentials(client, session_id, mode="register", password=WEAK)
         assert rejected.status_code == 422, rejected.text
@@ -625,6 +682,8 @@ def test_local_fixtures_drive_account_verification_and_resume(caplog, fixture_or
         sign_in = _start(client, resolver_origin, f"{fixture_origin}/account_signin.html")
         assert sign_in["status"] == Status.LOGIN_REQUIRED
         assert sign_in["account"]["alternateModeAvailable"] is True
+        assert sign_in["progress"]["stage"] == "ACCOUNT"
+        assert sign_in["progress"]["currentLabel"] == "Employer account"
         switched = _credentials(client, sign_in["sessionId"], mode="register", password=strong)
         assert switched.status_code == 200, switched.text
         assert switched.json()["outcome"] == "verification_required"
@@ -681,6 +740,145 @@ def test_local_fixtures_drive_account_verification_and_resume(caplog, fixture_or
         stayed = client.get(f"/v1/sessions/{rejected_file['sessionId']}/status", headers=AUTH)
         assert stayed.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
         assert stayed.json()["resume"]["verified"] is False
+
+
+def test_sign_in_reports_the_account_stage_and_no_form_does_not_jump_to_75(api):
+    client, _runner = api
+    created = client.post("/v1/sessions", headers=AUTH, json=_body("0.7.0"))
+    assert created.status_code == 201, created.text
+    session_id = created.json()["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    body = started.json()
+    assert body["status"] == Status.LOGIN_REQUIRED
+    assert body["progress"]["stage"] == "ACCOUNT"
+    assert body["progress"]["currentLabel"] == "Employer account"
+    assert body["checkpoint"]["since"].endswith("Z")
+
+    empty = client.post("/v1/sessions", headers=AUTH, json=_body("0.7.0", "https://jobs.example.test/no-form"))
+    empty_id = empty.json()["sessionId"]
+    missed = client.post(f"/v1/sessions/{empty_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    assert missed.status_code == 200, missed.text
+    assert missed.json()["status"] == Status.NO_FORM_FOUND
+    assert missed.json()["progress"]["percent"] == 0
+
+
+def test_resolver_session_ignores_candidate_context(api):
+    client, _runner = api
+    payload = _body("0.7.0")
+    payload["candidateContext"] = {
+        "candidateId": "ref-a",
+        "personal": {"full_name": "Avery Example", "email": "person@example.com"},
+    }
+    created = client.post("/v1/sessions", headers=AUTH, json=payload)
+    assert created.status_code == 201, created.text
+    assert "person@example.com" not in created.text
+    answered = _body("0.7.0")
+    answered["approvedAnswers"] = [{"question": "Sponsor", "answer": "No"}]
+    rejected = client.post("/v1/sessions", headers=AUTH, json=answered)
+    assert rejected.status_code == 422
+
+
+def test_entry_link_can_open_a_landing_page_and_a_submit_apply_is_left():
+    from autofill.pagewait import choose_entry
+
+    landing = _snapshot(
+        buttons=[ButtonControl(name="Submit application", selector="#submit", control_type="submit")],
+        links=[LinkControl(name="I'm interested", selector="#go")],
+    )
+    chosen = choose_entry(landing)
+    assert chosen is not None
+    assert chosen.selector == "#go"
+    assert choose_entry(
+        _snapshot(buttons=[ButtonControl(name="Apply", selector="#apply", control_type="submit")])
+    ) is None
+    manual = choose_entry(
+        _snapshot(buttons=[ButtonControl(name="Apply Manually", selector="#manual", control_type="button")])
+    )
+    assert manual is not None
+    assert manual.name == "Apply Manually"
+
+
+def test_workday_create_account_waits_until_the_pane_settles():
+    import time
+
+    from autofill.engine import AutofillOptions, autofill_application
+
+    shell = {
+        "controls": [],
+        "buttons": [{"name": "Sign In", "selector": "#sign", "controlType": "button"}],
+        "captcha": False,
+        "password": False,
+        "heading": "",
+        "pageText": "We use cookies. Accept cookies to continue.",
+        "passwordHint": "",
+        "links": [],
+        "automationIds": [],
+    }
+    create = {
+        "controls": [
+            {"kind": "text", "label": "Email", "selector": "#email", "inputType": "email"},
+            {"kind": "password", "label": "Password", "selector": "#password", "inputType": "password"},
+            {
+                "kind": "password",
+                "label": "Verify password",
+                "selector": "#verify",
+                "inputType": "password",
+                "ariaLabel": "Verify password",
+                "automationId": "verifyPassword",
+            },
+        ],
+        "buttons": [
+            {
+                "name": "Create Account",
+                "selector": "#create",
+                "controlType": "button",
+                "automationId": "createAccountSubmitButton",
+            }
+        ],
+        "captcha": False,
+        "password": True,
+        "heading": "Create Account",
+        "pageText": "We use cookies. Accept cookies to continue.",
+        "passwordHint": "Must include a numeric character, an uppercase letter, and a special character.",
+        "links": [],
+        "automationIds": ["createAccountSubmitButton", "verifyPassword"],
+    }
+
+    class Page:
+        url = "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/login"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait_for_load_state(self, state, timeout=0):
+            return None
+
+        def wait_for_timeout(self, millis):
+            time.sleep(millis / 1000)
+
+        def evaluate(self, script, arg=None):
+            self.calls += 1
+            if self.calls < 3:
+                return shell
+            return create
+
+    page = Page()
+    result = autofill_application(
+        page.url,
+        CandidateProfile.from_dict(
+            {"candidateId": "ref-a", "personal": {"full_name": "Avery Example", "email": "a@example.com"}}
+        ),
+        options=AutofillOptions(page=page, protocol_version="0.7.0", session_id="session-wd", candidate_id="ref-a"),
+    )
+    assert result.status == Status.ACCOUNT_CREATION_REQUIRED
+    assert result.account is not None
+    assert result.account["mode"] == "register"
+    assert result.account["tenant"]["tenantKey"] == "hp.wd5.myworkdayjobs.com/ExternalCareerSite"
+    assert "cookie" not in result.account["passwordPolicy"]["raw"].casefold()
+    assert result.account["passwordPolicy"]["requireDigit"] is True
+    assert result.progress["stage"] == "ACCOUNT"
+    assert result.progress["currentLabel"] == "Employer account"
+    assert page.calls >= 3
 
 
 def _start(client: TestClient, resolver_origin: str, url: str) -> dict:

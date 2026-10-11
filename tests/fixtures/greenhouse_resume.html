@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Application</h1>
+<div id="resume-field">
+  <label for="resume">Resume</label>
+  <input id="resume" name="resume" type="file">
+  <div id="chip" class="chip" hidden>
+    <span class="filename"></span>
+    <button type="button" aria-label="Remove">×</button>
+  </div>
+</div>
+<script>
+document.getElementById("resume").addEventListener("change", function () {
+  if (!this.files || !this.files.length) return;
+  document.querySelector(".filename").textContent = this.files[0].name;
+  document.getElementById("chip").hidden = false;
+});
+</script>
+</body>
+</html>
