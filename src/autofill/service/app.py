@@ -366,7 +366,7 @@ def _read_upload(file: UploadFile) -> bytes:
             break
         total += len(block)
         if total > limit:
-            raise HTTPException(status_code=413, detail="too_large")
+            raise HTTPException(status_code=413, detail={"reason": "too_large"})
         chunks.append(block)
     return b"".join(chunks)
 
@@ -637,13 +637,19 @@ def _keep_place_options(session: ServiceSession, item: dict, filled: dict) -> No
 
 
 def _lever_suggestions_missing(filled: dict) -> bool:
-    """Lever's geocoder returned an error or an empty list. One try is enough."""
+    """Lever's geocoder returned an error, or an empty list after the wait.
+
+    A count of zero counts only when the suggestion wait finished. A slow or
+    debounced response is not an empty list, and it does not stop on the first try.
+    """
     if not filled.get("leverSearch"):
         return False
     status = filled.get("searchStatus")
     if isinstance(status, int) and status >= 400:
         return True
-    return filled.get("suggestionCount") == 0
+    if filled.get("suggestionCount") != 0:
+        return False
+    return bool(filled.get("suggestionsWaited"))
 
 
 def _blocker_remains(session: ServiceSession, item: dict) -> bool:
@@ -727,6 +733,7 @@ def _check_candidate(
     candidate_ref: str = "",
     *,
     machine: bool = False,
+    mismatch_reason: str = "",
 ) -> None:
     presented = candidate_ref.strip() or candidate_id.strip()
     if not presented:
@@ -735,10 +742,29 @@ def _check_candidate(
     if session.candidate_ref:
         allowed.add(session.candidate_ref)
     if presented not in allowed:
-        detail: str | dict[str, str] = (
-            {"reason": "needs_manual"} if machine else "Candidate does not match this session."
-        )
+        if mismatch_reason:
+            detail: str | dict[str, str] = {"reason": mismatch_reason}
+        elif machine:
+            detail = {"reason": "needs_manual"}
+        else:
+            detail = "Candidate does not match this session."
         raise HTTPException(status_code=409, detail=detail)
+
+
+def _resume_rejected(exc: ResumeRejected) -> HTTPException:
+    """Upload failures carry a machine reason. ``already_verified`` is unchanged."""
+    reason = exc.reason if exc.reason in {"too_large", "unsupported_type"} else exc.reason
+    return HTTPException(status_code=exc.status_code, detail={"reason": reason})
+
+
+def _consent_stop(session: ServiceSession) -> bool:
+    """A consent checkbox or opt-in choice is a human stop, even before it is stuck."""
+    if session.status != Status.MANUAL_ANSWER_REQUIRED or session.result is None:
+        return False
+    blocking = session.result.blocking
+    if not isinstance(blocking, dict):
+        return False
+    return str(blocking.get("kind") or "") in {"CONSENT", "CONSENT_CHOICE"}
 
 
 def _binding(session: ServiceSession, limits: dict[str, float | int]) -> ResolverBinding | None:
@@ -1046,6 +1072,8 @@ def create_app(
             if session.status == Status.MANUAL_ANSWER_REQUIRED and session.stuck_manual:
                 session.stuck_manual = False
                 return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+            if _consent_stop(session):
+                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
             allowed = {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
@@ -1062,7 +1090,7 @@ def create_app(
         if session.status == Status.LOGIN_REQUIRED:
             raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
         if session.status == Status.MANUAL_ANSWER_REQUIRED:
-            if not body.answers_updated:
+            if not body.answers_updated and not _consent_stop(session):
                 raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
             return _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
         if session.status != Status.RESUME_UPLOAD_REQUIRED:
@@ -1160,34 +1188,44 @@ def create_app(
         values = [text for text in body.values if str(text).strip()]
         if body.value.strip():
             values = values or [body.value]
-        if str(item.get("kind") or "") == "CONSENT":
+        kind_name = str(item.get("kind") or "")
+        listed = [str(option) for option in item.get("options") or []]
+        if kind_name == "CONSENT":
             if body.value.strip().casefold() != "confirm" or not body.confirm:
                 raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": ["confirm"]})
             values = ["confirm"]
         if not values:
             logger.info("session=%s action=answer result=rejected", session.session_id)
-            raise HTTPException(
-                status_code=422,
-                detail={"reason": "needs_option", "options": [str(option) for option in item.get("options") or []]},
-            )
+            raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": listed})
         _refresh_choice_options(session, active_runner, item)
-        if str(item.get("kind") or "") != "CONSENT":
+        listed = [str(option) for option in item.get("options") or []] or listed
+        if kind_name == "CONSENT":
+            canonical = ["confirm"]
+        elif kind_name == "CONSENT_CHOICE":
+            reason, canonical = fit_choice_values(item, values)
+            if reason != "ok" or not canonical:
+                logger.info("session=%s action=answer result=rejected", session.session_id)
+                raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": listed})
+            from autofill.mapping import option_stance
+
+            stance = option_stance(canonical[0])
+            if stance == "agree" and not body.confirm:
+                raise HTTPException(status_code=422, detail={"reason": "needs_confirm", "options": listed})
+            if stance not in {"agree", "decline"}:
+                logger.info("session=%s action=answer result=rejected", session.session_id)
+                raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": listed})
+        else:
             reason, canonical = fit_choice_values(item, values)
             if reason != "ok":
                 logger.info("session=%s action=answer result=rejected", session.session_id)
-                raise HTTPException(
-                    status_code=422,
-                    detail={"reason": "needs_option", "options": [str(option) for option in item.get("options") or []]},
-                )
-        else:
-            canonical = ["confirm"]
+                raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": listed})
         for value in values:
             redaction_filter().add(value)
             session.held_answers.append(value)
         target = dict(item)
         target["value"] = canonical[0]
         target["values"] = canonical
-        if str(item.get("kind") or "") == "CONSENT":
+        if kind_name == "CONSENT":
             target["check"] = True
         apply = getattr(active_runner, "apply_answer", None)
         if apply is None:
@@ -1336,7 +1374,12 @@ def create_app(
         _reject_expired(session)
         if not candidateId.strip() and not candidateRef.strip():
             raise HTTPException(status_code=422, detail="candidateId or candidateRef is required.")
-        _check_candidate(session, candidateId.strip(), candidateRef.strip())
+        _check_candidate(
+            session,
+            candidateId.strip(),
+            candidateRef.strip(),
+            mismatch_reason="candidate_mismatch",
+        )
         if session.resume_verified:
             raise HTTPException(status_code=409, detail={"reason": "already_verified"})
         hold = prepare.strip().casefold() in {"1", "true", "yes"}
@@ -1354,7 +1397,7 @@ def create_app(
             try:
                 name = validate_resume(file.filename or "", raw)
             except ResumeRejected as exc:
-                raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+                raise _resume_rejected(exc) from exc
             _keep_resume_bytes(session, name, raw)
             session.resume_prepared = True
             session.resume_verified = False
@@ -1391,7 +1434,7 @@ def create_app(
         try:
             name = validate_resume(file.filename or "", raw)
         except ResumeRejected as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+            raise _resume_rejected(exc) from exc
         attach = getattr(active_runner, "attach_resume_file", None)
         if attach is None:
             raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
@@ -1514,6 +1557,9 @@ def create_app(
             raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
         labels = [str(option.get("label") or "").strip() for option in found.get("options") or []]
         labels = [label for label in labels if label]
+        from autofill.stepfill import pickable_location_labels
+
+        labels = pickable_location_labels(item, labels)
         if labels:
             item["options"] = labels
             if _same_blocker(blocking, item):

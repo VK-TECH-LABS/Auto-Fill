@@ -266,13 +266,53 @@ def haystack(control: Control) -> str:
     return normalize(" ".join(part for part in parts if part))
 
 
+def option_stance(label: str) -> str:
+    """``agree``, ``decline``, or empty for one opt-in or opt-out label.
+
+    ``No, I do not consent``, ``I do not consent``, and ``Opt out`` decline.
+    ``Yes, I consent`` and ``Opt in`` agree. A plain Yes or No is neither.
+    """
+    text = normalize(label)
+    if not text:
+        return ""
+    declined = (
+        "do not consent" in text
+        or "dont consent" in text
+        or "do not agree" in text
+        or "opt out" in text
+        or (text.startswith("no ") and ("consent" in text or "opt" in text))
+        or text.startswith("decline")
+    )
+    agreed = (text.startswith("yes") and ("consent" in text or "opt" in text or "agree" in text)) or (
+        "opt in" in text or ("i consent" in text and "not consent" not in text)
+    )
+    refusal = "do not" in text or "opt out" in text or text.startswith("decline") or (
+        text.startswith("no ") and ("consent" in text or "opt" in text)
+    )
+    if declined and refusal:
+        return "decline"
+    if agreed and not declined:
+        return "agree"
+    if declined:
+        return "decline"
+    return ""
+
+
+def is_consent_choice(control: Control) -> bool:
+    """A radio or select that offers both a consent option and a decline option."""
+    if control.kind not in {"radio", "select", "combobox"}:
+        return False
+    stances = {option_stance(option.label or option.value) for option in control.options}
+    return "agree" in stances and "decline" in stances
+
+
 def acknowledgement_kind(control: Control) -> str:
     """``consent``, ``marketing``, or ``factual`` for a checkbox or radio statement.
 
     Marketing is checked first so "I agree to receive marketing emails" is an
     opt-in. Terms, privacy, attestation, and e-signature stay consent.
     """
-    if control.kind not in {"checkbox", "radio"}:
+    if control.kind not in {"checkbox", "radio", "select"}:
         return "factual"
     option_text = " ".join(
         part for option in control.options for part in (option.label, option.value) if part
@@ -793,9 +833,16 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    if is_consent_choice(control):
+        return MappedField(
+            key=None,
+            action="skip",
+            field_class="LEGAL_FIELD",
+            reason="Consent choice left for a person.",
+        )
     if control.kind == "checkbox" and acknowledgement_kind(control) == "marketing":
         return MappedField(key=None, action="skip", reason="Marketing opt-in left unchecked.")
-    if control.kind in {"checkbox", "radio"} and (
+    if control.kind in {"checkbox", "radio", "select"} and (
         acknowledgement_kind(control) == "consent" or _LEGAL_RE.search(haystack(control))
     ):
         return MappedField(

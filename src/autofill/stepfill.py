@@ -47,6 +47,7 @@ from autofill.intents import (
 from autofill.mapping import (
     acknowledgement_kind,
     haystack,
+    is_consent_choice,
     is_honeypot,
     map_field,
     match_field_key,
@@ -245,6 +246,7 @@ class _Ask:
     subfield: str = ""
     compose_location: bool = False
     consent: bool = False
+    consent_choice: bool = False
 
     def question_body(self) -> dict:
         control = self.controls[0]
@@ -331,9 +333,11 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         return None
     blob = haystack(control)
     role = acknowledgement_kind(control)
+    if is_consent_choice(control):
+        return _Ask(controls=controls, consent=True, consent_choice=True)
     if role == "marketing":
         return None
-    if role == "consent" or _LEGAL_RE.search(blob):
+    if control.kind == "checkbox" and (role == "consent" or _LEGAL_RE.search(blob)):
         return _Ask(controls=controls, consent=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if _is_application_resume(control):
@@ -829,6 +833,34 @@ def _poll_location_options(page, selector: str, attempts: int, delay_ms: int) ->
     return options
 
 
+_LOCATION_SUGGESTION_WAIT_S = 5.0
+
+
+def _await_location_options(page, selector: str, trace: dict[str, Any]) -> list[tuple[str, str]]:
+    """Wait until the suggestion list is visible, or the search has failed, up to 5 seconds.
+
+    A debounced geocoder request is not an empty list. A 4xx stops the wait.
+    An empty list counts only after the deadline.
+    """
+    deadline = time.monotonic() + _LOCATION_SUGGESTION_WAIT_S
+    options: list[tuple[str, str]] = []
+    while True:
+        status = trace.get("status")
+        if isinstance(status, int) and status >= 400:
+            return []
+        options = _location_options(page, selector)
+        if options:
+            return options
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        _pause(page, min(100, max(1, int(remaining * 1000))))
+    status = trace.get("status")
+    if isinstance(status, int) and status >= 400:
+        return []
+    return _location_options(page, selector) or options
+
+
 _CONTROL_KIND_JS = r"""
 (selector) => {
   const el = document.querySelector(selector);
@@ -887,7 +919,18 @@ def suggest_control(page, selector: str, query: str, *, clear: bool) -> dict[str
                 return {"found": False, "options": [], "source": "live"}
             field.press_sequentially(query.strip(), delay=0)
             typed = True
-        found = _poll_location_options(page, selector, 12, 100)
+        trace: dict[str, Any] = {}
+        listener = _watch_location_search(page, trace)
+        try:
+            found = _await_location_options(page, selector, trace)
+        finally:
+            if listener is not None:
+                remove = getattr(page, "remove_listener", None)
+                if remove is not None:
+                    try:
+                        remove("response", listener)
+                    except Exception:
+                        pass
         for label, _item_selector in found:
             if label not in seen and _keep_option(label):
                 seen.append(label)
@@ -1205,6 +1248,14 @@ def _is_country_token(value: str) -> bool:
     return token in {"united states", "united kingdom", "canada", "mexico", "uruguay"}
 
 
+def pickable_location_labels(target: dict, labels: list[str]) -> list[str]:
+    """Labels a person can commit. A state alone is not a city on a place field."""
+    cleaned = [label.strip() for label in labels if label.strip()]
+    if not location_needs_city(target):
+        return cleaned
+    return [label for label in cleaned if location_shape(label) != "state"]
+
+
 def location_needs_city(target: dict) -> bool:
     """True when the control is a place typeahead, not a state menu."""
     text = str(target.get("text") or "").strip().casefold()
@@ -1249,7 +1300,11 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     if location_shape(value) == "state" and location_needs_city(target):
         probed = suggest_control(page, selector, value, clear=True)
         labels = [str(item.get("label") or "") for item in probed.get("options") or [] if str(item.get("label") or "")]
-        return {"filled": False, "reason": "needs_option", "options": labels}
+        return {
+            "filled": False,
+            "reason": "needs_option",
+            "options": pickable_location_labels(target, labels),
+        }
     fields = {"location": value, "address.city": value.split(",")[0].strip()}
     control = Control(kind="combobox", label=str(target.get("text") or "Current location"), selector=selector)
     outcome = ResolvedPage()
@@ -1259,7 +1314,9 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     trace["exact"] = value if location_shape(value) == "place" else ""
     _apply_location(page, control, fields, outcome, ranked=True, trace=trace)
     city, _region, _country = _location_parts(fields)
-    labels = [str(label) for label in trace.get("labels") or [] if str(label).strip()]
+    labels = pickable_location_labels(
+        target, [str(label) for label in trace.get("labels") or [] if str(label).strip()]
+    )
     if city and _location_committed(page, control, city):
         committed: dict[str, Any] = {"filled": True}
         if labels:
@@ -1274,6 +1331,7 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
         result["options"] = labels
     if trace.get("lever"):
         result["leverSearch"] = True
+        result["suggestionsWaited"] = True
     if trace.get("status") is not None:
         result["searchStatus"] = trace.get("status")
     return result
@@ -1397,14 +1455,8 @@ def _apply_location_query(
         logger.info("location left manual reason=type_error error=TypeError")
         _manual_location(outcome, control)
         return
-    _wait_location_network(page)
-    options = _poll_location_options(page, control.selector, 20, 100)
+    options = _await_location_options(page, control.selector, trace)
     match = _match_location(options, city=city, region=region, country=country)
-    if match is None:
-        # One more wait. Lever's geocoder list sometimes arrives after the first pass.
-        _pause(page, 1000)
-        options = _location_options(page, control.selector) or options
-        match = _match_location(options, city=city, region=region, country=country)
     status = trace.get("status")
     if isinstance(status, int) and status >= 400:
         options = []
@@ -1489,13 +1541,17 @@ def _apply(
             _apply_resume(page, ask, response, outcome)
             continue
         if ask.consent:
+            if not any(control.required for control in ask.controls):
+                continue
+            if _cluster_committed(page, ask.controls):
+                continue
             statement = _consent_statement(ask.controls[0])
             _manual(
                 outcome,
                 IntentMatch(None, "unknown", "none", statement),
                 blocking=True,
                 controls=ask.controls,
-                kind="CONSENT",
+                kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
             )
             continue
         if ask.compose_location:
@@ -2015,7 +2071,7 @@ def _manual(
     field_key: str | None = None,
     option_labels: list[str] | None = None,
 ) -> None:
-    limit = 600 if kind == "CONSENT" else 300
+    limit = 600 if kind in {"CONSENT", "CONSENT_CHOICE"} else 300
     text = sanitize_question(match.text or "", limit=limit)
     if not text or _is_section_heading(text):
         return
@@ -2763,7 +2819,9 @@ def _consent_statement(control: Control) -> str:
 
 def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     text = _question_text(controls) or controls[0].label
-    if acknowledgement_kind(controls[0]) == "consent":
+    if is_consent_choice(controls[0]):
+        return "CONSENT_CHOICE"
+    if controls[0].kind == "checkbox" and acknowledgement_kind(controls[0]) == "consent":
         return "CONSENT"
     if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
         return "DEMOGRAPHIC"
@@ -2819,7 +2877,7 @@ def _load_place_options(page, selector: str, query: str) -> list[str]:
 
 def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=None) -> dict[str, Any]:
     primary = controls[0]
-    if acknowledgement_kind(primary) == "consent":
+    if is_consent_choice(primary) or acknowledgement_kind(primary) == "consent":
         text = _consent_statement(primary)
     else:
         text = sanitize_question(
