@@ -295,7 +295,7 @@ def test_resume_checkpoint_and_submit_guard(client: TestClient, runner: Recordin
         json={"resumeUploaded": True},
     )
     assert blocked.status_code == 409
-    assert "does not submit" in blocked.json()["detail"]
+    assert blocked.json()["detail"]["reason"] == "not_at_human_stop"
     assert len(runner.calls) == 2
     fresh = _create(client, job_id="job-submit")
     runner.mode = "submitted"
@@ -322,7 +322,7 @@ def test_captcha_and_login_do_not_continue(client: TestClient, runner: Recording
         json={"resumeUploaded": True},
     )
     assert stopped.status_code == 409
-    assert "CAPTCHA" in stopped.json()["detail"]
+    assert stopped.json()["detail"]["reason"] == "needs_manual"
     login = _create(client, job_id="job-login")
     runner.mode = "login"
     client.post(f"/v1/sessions/{login['sessionId']}/start", headers=AUTH, json={})
@@ -332,7 +332,7 @@ def test_captcha_and_login_do_not_continue(client: TestClient, runner: Recording
         json={"resumeUploaded": True},
     )
     assert blocked.status_code == 409
-    assert "credentials" in blocked.json()["detail"]
+    assert blocked.json()["detail"]["reason"] == "needs_manual"
 
 
 def test_delete_forgets_the_session(client: TestClient, runner: RecordingRunner):

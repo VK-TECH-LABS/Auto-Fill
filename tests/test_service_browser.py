@@ -256,7 +256,7 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
             json={"resumeUploaded": True, "candidateId": "candidate-a"},
         )
         assert mismatch.status_code == 409
-        assert mismatch.json()["detail"] == "Candidate does not match this session."
+        assert mismatch.json()["detail"] == {"reason": "needs_manual"}
         still_there = client.get(f"/v1/sessions/{session_b}/status", headers=AUTH)
         assert still_there.status_code == 200
         assert still_there.json()["status"] in {Status.READY_FOR_HUMAN_SUBMIT, Status.FILLED}

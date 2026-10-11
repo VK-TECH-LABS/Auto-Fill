@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<body>
+<p>Live Ashby location field from Ramp Security Engineer, Cloud. Suggestions are the list returned for florida.</p>
+<div class="_fieldEntry_1e3gg_28 ashby-application-form-field-entry" data-field-path="_systemfield_location" data-field-entry-id="62542070-b1ea-412d-98c7-9aed22ea77d2__systemfield_location"><label class="_heading_f7cvd_52 _required_f7cvd_91 _label_1e3gg_42 ashby-application-form-question-title" for="_systemfield_location">Where do you plan on working from (for payroll tax purposes)?</label><div class="_inputContainer_d7ago_28"><input class="_input_d7ago_28 ashby-application-form-input-autocomplete" placeholder="Start typing..." aria-autocomplete="list" aria-expanded="false" aria-haspopup="listbox" role="combobox" value=""><button class="_container_pjyt6_1 _toggleButton_d7ago_32"><svg viewBox="0 0 640 640" fill="none" height="1em"><path d="M303.5 473C312.9 482.4 328.1 482.4 337.4 473L537.4 273C546.8 263.6 546.8 248.4 537.4 239.1C528 229.8 512.8 229.7 503.5 239.1L320.5 422.1L137.5 239.1C128.1 229.7 112.9 229.7 103.6 239.1C94.3 248.5 94.2 263.7 103.6 273L303.6 473z"></path></svg></button></div></div>
+<div id="places" role="listbox" hidden></div>
+<script>
+const input = document.querySelector("[role='combobox']");
+const list = document.getElementById("places");
+const places = [
+'Florida, United States',
+'Florida Keys, Florida, United States',
+'Florida Panhandle, United States',
+'Florida City, Florida, United States',
+'Florida, Florida, Uruguay'
+];
+places.forEach((label, index) => {
+  const option = document.createElement("div");
+  option.setAttribute("role", "option");
+  option.id = "place-" + index;
+  option.className = "ashby-application-form-input-autocomplete-popup-result";
+  option.textContent = label;
+  option.addEventListener("click", () => {
+    input.value = label;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-controls");
+    list.hidden = true;
+  });
+  list.appendChild(option);
+});
+input.addEventListener("input", () => {
+  const query = input.value.trim();
+  list.hidden = !query;
+  input.setAttribute("aria-expanded", query ? "true" : "false");
+  if (query) input.setAttribute("aria-controls", "places");
+});
+</script>
+<label class="_heading_f7cvd_52 _required_f7cvd_91">Where are you currently located?</label>
+<input id="current-location" class="ashby-application-form-input-autocomplete" role="combobox" aria-autocomplete="list" placeholder="Start typing...">
+<div id="current-places" role="listbox" hidden></div>
+<script>
+const current = document.getElementById("current-location");
+const currentList = document.getElementById("current-places");
+places.forEach((label, index) => {
+  const option = document.createElement("div");
+  option.setAttribute("role", "option");
+  option.id = "current-" + index;
+  option.textContent = label;
+  option.addEventListener("click", () => {
+    current.value = label;
+    current.setAttribute("aria-expanded", "false");
+    currentList.hidden = true;
+  });
+  currentList.appendChild(option);
+});
+current.addEventListener("input", () => {
+  const query = current.value.trim();
+  currentList.hidden = !query;
+  current.setAttribute("aria-expanded", query ? "true" : "false");
+});
+</script>
+</body>
+</html>

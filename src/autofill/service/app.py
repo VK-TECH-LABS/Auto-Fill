@@ -8,10 +8,10 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -69,6 +69,9 @@ from autofill.service.schemas import (
     ManualQuestionOut,
     ProgressOut,
     RunStatusOut,
+    SuggestIn,
+    SuggestOptionOut,
+    SuggestOut,
     TimingsOut,
 )
 from autofill.service.sessions import ServiceSession, ServiceSessionStore, monotonic, new_session_id
@@ -122,7 +125,7 @@ def _limit_interact(session) -> None:
     now = time.monotonic()
     session.interact_marks = [mark for mark in session.interact_marks if now - mark < 60]
     if len(session.interact_marks) >= cap:
-        raise HTTPException(status_code=429, detail="Too many interactions for this session.")
+        raise HTTPException(status_code=429, detail={"reason": "rate_limited"})
     session.interact_marks.append(now)
 
 
@@ -150,6 +153,10 @@ def _bump_attempts(session: ServiceSession) -> None:
 def _resume_public(session: ServiceSession) -> dict:
     required = bool(session.resume_required or session.status == Status.RESUME_UPLOAD_REQUIRED)
     payload: dict = {"required": required, "verified": bool(session.resume_verified)}
+    if session.resume_prepared and not session.resume_verified:
+        payload["prepared"] = True
+    if session.resume_site_errors:
+        payload["siteErrors"] = list(session.resume_site_errors)
     if session.resume_verified and session.resume_filename:
         payload["filename"] = session.resume_filename
     if session.resume_verified_at:
@@ -494,6 +501,17 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     for key in result.completed_keys:
         if key and key not in session.completed_keys:
             session.completed_keys.append(key)
+    if result.resume_verified_now:
+        session.resume_verified = True
+        session.resume_prepared = False
+        session.resume_required = True
+        session.resume_uploaded = True
+        session.resume_source = session.resume_source or "prepared"
+        session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        session.resume_site_errors = []
+    elif result.resume_site_errors:
+        session.resume_required = True
+        session.resume_site_errors = list(result.resume_site_errors)
     if result.status == Status.RESUME_UPLOAD_REQUIRED:
         session.resume_required = True
     _sync_checkpoint(session)
@@ -703,7 +721,13 @@ def _failed(session: ServiceSession, exc: BaseException) -> RunStatusOut:
     return _accept_result(session, result)
 
 
-def _check_candidate(session: ServiceSession, candidate_id: str, candidate_ref: str = "") -> None:
+def _check_candidate(
+    session: ServiceSession,
+    candidate_id: str,
+    candidate_ref: str = "",
+    *,
+    machine: bool = False,
+) -> None:
     presented = candidate_ref.strip() or candidate_id.strip()
     if not presented:
         return
@@ -711,7 +735,10 @@ def _check_candidate(session: ServiceSession, candidate_id: str, candidate_ref: 
     if session.candidate_ref:
         allowed.add(session.candidate_ref)
     if presented not in allowed:
-        raise HTTPException(status_code=409, detail="Candidate does not match this session.")
+        detail: str | dict[str, str] = (
+            {"reason": "needs_manual"} if machine else "Candidate does not match this session."
+        )
+        raise HTTPException(status_code=409, detail=detail)
 
 
 def _binding(session: ServiceSession, limits: dict[str, float | int]) -> ResolverBinding | None:
@@ -759,9 +786,10 @@ def _request_for(
         open_items=session.open_items,
         progress=session.progress,
         protocol_version=session.protocol_version,
-        resume_name=session.resume_filename if session.resume_verified else "",
-        resume_mime=session.resume_mime if session.resume_verified else "",
-        resume_bytes=session.resume_bytes if session.resume_verified else None,
+        resume_name=session.resume_filename if session.resume_verified or session.resume_prepared else "",
+        resume_mime=session.resume_mime if session.resume_verified or session.resume_prepared else "",
+        resume_bytes=session.resume_bytes if session.resume_verified or session.resume_prepared else None,
+        resume_prepared=bool(session.resume_prepared and session.resume_bytes and not session.resume_verified),
     )
 
 
@@ -780,7 +808,7 @@ def _run(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Session not found.") from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail="Session is already running.") from exc
+        raise HTTPException(status_code=409, detail={"reason": "busy"}) from exc
     # A person confirms the resume or a login once. Later answer and continue
     # calls keep that confirmation instead of asking again.
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
@@ -902,7 +930,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found.")
         return session
 
-    def _reject_expired(session: ServiceSession) -> None:
+    def _reject_expired(session: ServiceSession, *, machine: bool = False) -> None:
         """Stop a call on an expired session before it pauses, fills, or stores a secret."""
         timed_out = bool(session.expires_at) and monotonic() >= session.expires_at
         if session.status != Status.EXPIRED and not timed_out:
@@ -911,6 +939,8 @@ def create_app(
             session.status = Status.EXPIRED
             session.wipe_secrets()
             active_runner.discard(session.session_id)
+        if machine:
+            raise HTTPException(status_code=410, detail={"reason": "session_expired"})
         raise HTTPException(status_code=410, detail="Session expired.")
 
     @app.exception_handler(RequestValidationError)
@@ -1001,8 +1031,8 @@ def create_app(
     @router.post("/sessions/{session_id}/continue", response_model=RunStatusOut, tags=["sessions"])
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
-        _reject_expired(session)
-        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        _reject_expired(session, machine=True)
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip(), machine=True)
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
@@ -1020,40 +1050,25 @@ def create_app(
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
             if session.status not in allowed:
-                raise HTTPException(
-                    status_code=409,
-                    detail="humanResolved continues only after login, a challenge, or a missing form.",
-                )
+                raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
             return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
             return _run(session, store, active_runner, limits, resume_uploaded=False)
         if session.status == Status.READY_FOR_HUMAN_SUBMIT:
-            raise HTTPException(
-                status_code=409,
-                detail="A person submits the application. This service does not submit.",
-            )
+            raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
         if session.status == Status.CAPTCHA_REQUIRED:
-            raise HTTPException(
-                status_code=409,
-                detail="CAPTCHA stopped the run. This service does not solve or bypass challenges.",
-            )
+            raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
         if session.status == Status.LOGIN_REQUIRED:
-            raise HTTPException(
-                status_code=409,
-                detail="Sign-in credentials are missing. Post credentials, then start again.",
-            )
+            raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
         if session.status == Status.MANUAL_ANSWER_REQUIRED:
             if not body.answers_updated:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Continue with answersUpdated after the saved answers change.",
-                )
+                raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
             return _run(session, store, active_runner, limits, resume_uploaded=False, answers_updated=True)
         if session.status != Status.RESUME_UPLOAD_REQUIRED:
-            raise HTTPException(status_code=409, detail=f"Cannot continue a session in status {session.status}.")
+            raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
         if not body.resume_uploaded:
-            raise HTTPException(status_code=409, detail="Continue only after a person has uploaded the resume.")
+            raise HTTPException(status_code=409, detail={"reason": "needs_manual"})
         if _is_070(session):
             _confirm_resume_or_422(session, active_runner)
         return _run(session, store, active_runner, limits, resume_uploaded=True)
@@ -1087,18 +1102,47 @@ def create_app(
         response_model_exclude_none=True,
         tags=["sessions"],
     )
-    def answer_session(session_id: str, body: AnswerIn) -> AnswerOut:
+    def answer_session(
+        session_id: str,
+        body: AnswerIn,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> AnswerOut | JSONResponse:
         """Fill one open field visibly, then continue. The value is not logged."""
         session = _session_or_404(session_id)
-        _reject_expired(session)
+        _reject_expired(session, machine=True)
+        key = (idempotency_key or "").strip()
+        try:
+            kind, payload = store.claim_answer(session.session_id, key)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except RuntimeError:
+            raise HTTPException(status_code=409, detail={"reason": "busy"})
+        if kind == "replay" and isinstance(payload, tuple):
+            status_code, content = payload
+            return JSONResponse(status_code=status_code, content=content)
+        recorded = False
+        try:
+            outcome = _answer_once(session, body)
+            store.finish_answer(
+                session.session_id,
+                key,
+                200,
+                outcome.model_dump(by_alias=True, exclude_none=True),
+            )
+            recorded = True
+            return outcome
+        except HTTPException as exc:
+            store.finish_answer(session.session_id, key, exc.status_code, {"detail": exc.detail})
+            recorded = True
+            raise
+        finally:
+            if not recorded:
+                store.release_answer(session.session_id)
+
+    def _answer_once(session: ServiceSession, body: AnswerIn) -> AnswerOut:
         if session.status in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED}:
             logger.info("session=%s action=answer result=rejected", session.session_id)
-            raise HTTPException(
-                status_code=409,
-                detail="Cannot answer while sign-in or a challenge is blocking.",
-            )
-        if session.busy:
-            raise HTTPException(status_code=409, detail="Session is already running.")
+            raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
         blocking = session.result.blocking if session.result is not None else None
         item = match_open_item(
             session.open_items,
@@ -1109,42 +1153,64 @@ def create_app(
         )
         if item is None:
             logger.info("session=%s action=answer result=rejected", session.session_id)
-            raise HTTPException(status_code=409, detail="No open item matches this answer.")
+            raise HTTPException(status_code=409, detail={"reason": "stale_blocker"})
         if _attempt_count(session, item, body) >= _ANSWER_ATTEMPT_LIMIT:
             logger.info("session=%s action=answer result=needs_manual", session.session_id)
             _needs_manual(session, item)
         values = [text for text in body.values if str(text).strip()]
         if body.value.strip():
             values = values or [body.value]
+        if str(item.get("kind") or "") == "CONSENT":
+            if body.value.strip().casefold() != "confirm" or not body.confirm:
+                raise HTTPException(status_code=422, detail={"reason": "needs_option", "options": ["confirm"]})
+            values = ["confirm"]
         if not values:
-            logger.info("session=%s action=answer result=rejected", session.session_id)
-            raise HTTPException(status_code=422, detail={"reason": "empty", "options": list(item.get("options") or [])})
-        _refresh_choice_options(session, active_runner, item)
-        reason, canonical = fit_choice_values(item, values)
-        if reason != "ok":
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(
                 status_code=422,
-                detail={"reason": reason, "options": [str(option) for option in item.get("options") or []]},
+                detail={"reason": "needs_option", "options": [str(option) for option in item.get("options") or []]},
             )
+        _refresh_choice_options(session, active_runner, item)
+        if str(item.get("kind") or "") != "CONSENT":
+            reason, canonical = fit_choice_values(item, values)
+            if reason != "ok":
+                logger.info("session=%s action=answer result=rejected", session.session_id)
+                raise HTTPException(
+                    status_code=422,
+                    detail={"reason": "needs_option", "options": [str(option) for option in item.get("options") or []]},
+                )
+        else:
+            canonical = ["confirm"]
         for value in values:
             redaction_filter().add(value)
             session.held_answers.append(value)
         target = dict(item)
         target["value"] = canonical[0]
         target["values"] = canonical
+        if str(item.get("kind") or "") == "CONSENT":
+            target["check"] = True
         apply = getattr(active_runner, "apply_answer", None)
         if apply is None:
             logger.info("session=%s action=answer result=rejected", session.session_id)
-            return AnswerOut(filled=False, reason="no_page")
+            raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
         started = time.perf_counter()
         try:
             filled = apply(session.session_id, target)
         except PageUnavailable as exc:
             _mark_browser_crash(session)
-            raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+            raise HTTPException(status_code=exc.status_code, detail={"reason": "element_not_found"}) from None
         _keep_place_options(session, item, filled)
+        if filled.get("reason") == "needs_option":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": "needs_option",
+                    "options": [str(option) for option in filled.get("options") or item.get("options") or []],
+                },
+            )
         if not filled.get("filled"):
+            if str(filled.get("reason") or "") in {"no_page", "no_selector"}:
+                raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
             count = _bump_answer_attempt(session, item, body)
             blocked = _lever_suggestions_missing(filled)
             logger.info(
@@ -1182,7 +1248,7 @@ def create_app(
                 )
             except PageUnavailable as exc:
                 _mark_browser_crash(session)
-                raise HTTPException(status_code=exc.status_code, detail="The page crashed.") from None
+                raise HTTPException(status_code=exc.status_code, detail={"reason": "element_not_found"}) from None
             if outcome is not None:
                 _accept_result(session, outcome)
                 _keep_place_options(session, item, filled)
@@ -1263,6 +1329,7 @@ def create_app(
         candidateId: Annotated[str, Form()] = "",
         candidateRef: Annotated[str, Form()] = "",
         fieldHint: Annotated[str, Form()] = "",
+        prepare: Annotated[str, Form()] = "",
     ) -> JSONResponse:
         """Attach one resume file and require the ATS to accept it. This is not pause/resume."""
         session = _session_or_404(session_id)
@@ -1272,6 +1339,49 @@ def create_app(
         _check_candidate(session, candidateId.strip(), candidateRef.strip())
         if session.resume_verified:
             raise HTTPException(status_code=409, detail={"reason": "already_verified"})
+        hold = prepare.strip().casefold() in {"1", "true", "yes"}
+        if hold:
+            terminal = {
+                Status.CANCELLED,
+                Status.EXPIRED,
+                Status.FAILED,
+                Status.FAILED_FINAL,
+                Status.UNSUPPORTED,
+            }
+            if session.status in terminal:
+                raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
+            raw = _read_upload(file)
+            try:
+                name = validate_resume(file.filename or "", raw)
+            except ResumeRejected as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+            _keep_resume_bytes(session, name, raw)
+            session.resume_prepared = True
+            session.resume_verified = False
+            session.resume_uploaded = False
+            session.resume_source = ""
+            session.resume_verified_at = ""
+            session.resume_site_errors = []
+            logger.info("session=%s resume_file=prepared", session.session_id)
+            if session.status == Status.RESUME_UPLOAD_REQUIRED and not session.paused:
+                accepted = _run(session, store, active_runner, limits, resume_uploaded=False)
+                if session.resume_verified:
+                    return JSONResponse(
+                        status_code=200,
+                        content={"verified": True, "filename": name, "status": accepted.status},
+                    )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "verified": False,
+                        "reason": "not_confirmed",
+                        "siteErrors": list(session.resume_site_errors),
+                    },
+                )
+            return JSONResponse(
+                status_code=200,
+                content={"prepared": True, "verified": False, "status": _status_out(session).status},
+            )
         allowed = session.status == Status.RESUME_UPLOAD_REQUIRED or (
             session.resume_required and not session.resume_verified and session.status in _HUMAN_STOP
         )
@@ -1358,13 +1468,61 @@ def create_app(
             headers=_shot_headers(session, host=host),
         )
 
+    @router.post(
+        "/sessions/{session_id}/suggest",
+        response_model=SuggestOut,
+        response_model_exclude_none=True,
+        tags=["sessions"],
+    )
+    def suggest_session(session_id: str, body: SuggestIn) -> SuggestOut:
+        """Type a query into the current blocker and return its options. Nothing is chosen."""
+        session = _session_or_404(session_id)
+        _reject_expired(session, machine=True)
+        if session.busy or session.answer_busy:
+            raise HTTPException(status_code=409, detail={"reason": "busy"})
+        blocking = session.result.blocking if session.result is not None else None
+        if not isinstance(blocking, dict):
+            raise HTTPException(status_code=409, detail={"reason": "stale_blocker"})
+        item = match_open_item(
+            session.open_items,
+            question_id=body.question_id,
+            field_key=body.field_key,
+            prefer=blocking,
+        )
+        if item is None or not _same_blocker(blocking, item):
+            raise HTTPException(status_code=409, detail={"reason": "stale_blocker"})
+        selector = str(item.get("selector") or blocking.get("selector") or "")
+        if not selector:
+            raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
+        probe = getattr(active_runner, "suggest", None)
+        if probe is None:
+            raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
+        try:
+            found = probe(session.session_id, selector, body.query.strip(), clear=True)
+        except PageUnavailable as exc:
+            _mark_browser_crash(session)
+            raise HTTPException(status_code=exc.status_code, detail={"reason": "element_not_found"}) from None
+        if not found.get("found"):
+            raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
+        labels = [str(option.get("label") or "").strip() for option in found.get("options") or []]
+        labels = [label for label in labels if label]
+        if labels:
+            item["options"] = labels
+            if _same_blocker(blocking, item):
+                blocking["options"] = list(labels)
+        source: Literal["live", "static"] = "static" if found.get("source") == "static" else "live"
+        return SuggestOut(
+            options=[SuggestOptionOut(label=label) for label in labels],
+            source=source,
+        )
+
     @router.post("/sessions/{session_id}/interact", response_model=InteractOut, tags=["sessions"])
     def interact_session(session_id: str, body: InteractIn) -> InteractOut:
         session = _session_or_404(session_id)
-        _reject_expired(session)
-        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+        _reject_expired(session, machine=True)
+        _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip(), machine=True)
         if session.status not in _HUMAN_STOP:
-            raise HTTPException(status_code=409, detail=f"Cannot interact with a session in status {session.status}.")
+            raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
         _limit_interact(session)
         action = {
             "action": body.action,
@@ -1384,17 +1542,17 @@ def create_app(
             if exc.status_code == 503:
                 raise HTTPException(
                     status_code=503,
-                    detail="Page is navigating.",
+                    detail={"reason": "element_not_found"},
                     headers=_shot_headers(session, retry=True),
                 ) from None
             _mark_browser_crash(session)
             raise HTTPException(
                 status_code=exc.status_code,
-                detail="The page crashed.",
+                detail={"reason": "element_not_found"},
                 headers=_shot_headers(session),
             ) from None
         if not moved:
-            raise HTTPException(status_code=409, detail="No page is open for this session.")
+            raise HTTPException(status_code=409, detail={"reason": "element_not_found"})
         session.screenshot_version += 1
         logger.info("session=%s action=%s result=ok", session.session_id, body.action)
         version = session.observe() if _is_070(session) else None

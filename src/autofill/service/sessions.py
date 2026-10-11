@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from autofill.credentials import MemoryCredentialProvider
 from autofill.dom_ui import PauseGate, empty_progress
@@ -64,6 +65,10 @@ class ServiceSession:
     resume_bytes: bytes | None = None
     resume_mime: str = ""
     resume_temp: str = ""
+    resume_prepared: bool = False
+    resume_site_errors: list[str] = field(default_factory=list)
+    answer_busy: bool = False
+    idempotency: dict[str, tuple[int, dict]] = field(default_factory=dict)
     completed_keys: list[str] = field(default_factory=list)
     completed_hashes: list[str] = field(default_factory=list)
     answer_attempts: dict[str, int] = field(default_factory=dict)
@@ -107,6 +112,8 @@ class ServiceSession:
     def clear_resume_bytes(self) -> None:
         """Drop resume bytes and delete the per-session temp file."""
         self.resume_bytes = None
+        self.resume_prepared = False
+        self.resume_site_errors = []
         path = self.resume_temp
         self.resume_temp = ""
         if not path:
@@ -167,6 +174,46 @@ class ServiceSessionStore:
     def get(self, session_id: str) -> ServiceSession | None:
         with self._lock:
             return self._sessions.get(session_id)
+
+    def claim_answer(
+        self, session_id: str, key: str
+    ) -> tuple[Literal["replay"], tuple[int, dict]] | tuple[Literal["run"], ServiceSession]:
+        """Reserve one answer. A second call on the same session is busy.
+
+        A finished Idempotency-Key replays its status and body. The busy flag
+        used by a fill is separate, so this claim does not block ``begin_run``.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            token = key.strip()[:200]
+            if token and token in session.idempotency:
+                return ("replay", session.idempotency[token])
+            if session.answer_busy or session.busy:
+                raise RuntimeError("busy")
+            session.answer_busy = True
+            return ("run", session)
+
+    def finish_answer(self, session_id: str, key: str, status: int, body: dict) -> None:
+        """Store one answer result and release the session for the next answer."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            session.answer_busy = False
+            token = key.strip()[:200]
+            if not token:
+                return
+            if len(session.idempotency) >= 32:
+                session.idempotency.pop(next(iter(session.idempotency)))
+            session.idempotency[token] = (status, body)
+
+    def release_answer(self, session_id: str) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session.answer_busy = False
 
     def begin_run(self, session_id: str) -> ServiceSession:
         """Mark a session busy. A second run on the same id fails closed."""

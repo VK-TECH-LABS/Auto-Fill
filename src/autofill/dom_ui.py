@@ -1000,6 +1000,8 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         values = [single]
     if not values:
         return {"filled": False, "reason": "empty"}
+    if target.get("check"):
+        return _check_box(page, selector)
     install(page)
     focus_field(page, selector)
     button = _button_choice_selector(page, selector, values[0])
@@ -1049,6 +1051,21 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         multi=answer_type == "multi_select",
         field_key=str(target.get("fieldKey") or ""),
     ):
+        return {"filled": False, "reason": "not_committed"}
+    if not control_committed(page, selector):
+        return {"filled": False, "reason": "not_committed"}
+    clear_highlight(page, selector)
+    return {"filled": True}
+
+
+def _check_box(page: Any, selector: str) -> dict[str, Any]:
+    """Check one checkbox through the locator. This does not click a button."""
+    locator = getattr(page, "locator", None)
+    if locator is None:
+        return {"filled": False, "reason": "not_committed"}
+    try:
+        page.locator(selector).check()
+    except Exception:
         return {"filled": False, "reason": "not_committed"}
     if not control_committed(page, selector):
         return {"filled": False, "reason": "not_committed"}
@@ -1169,8 +1186,8 @@ def _place_suggestion_answer(item: dict[str, Any]) -> bool:
 def fit_choice_values(item: dict[str, Any], values: list[str]) -> tuple[str, list[str]]:
     """Rewrite a unique choice to its option label.
 
-    ``ok`` keeps free text when the control has no options. ``option_mismatch``
-    is no match. ``ambiguous`` is more than one option at the best tier.
+    ``ok`` keeps free text when the control has no options. ``needs_option``
+    is no match, or more than one option at the best tier.
     A location typeahead keeps the caller's place text so ``Austin, TX`` can
     still choose among the live suggestions.
     """
@@ -1180,7 +1197,7 @@ def fit_choice_values(item: dict[str, Any], values: list[str]) -> tuple[str, lis
         return "ok", list(values)
     if answer_type not in _CHOICE_ANSWER_TYPES or not options:
         if options and not all(value.strip() in set(options) for value in values):
-            return "option_mismatch", options
+            return "needs_option", options
         return "ok", list(values)
     from autofill.intents import pick_option
     from autofill.models import Option
@@ -1197,10 +1214,8 @@ def fit_choice_values(item: dict[str, Any], values: list[str]) -> tuple[str, lis
             saw_none = True
         else:
             canonical.append(option.label or option.value)
-    if saw_ambiguous:
-        return "ambiguous", options
-    if saw_none:
-        return "option_mismatch", options
+    if saw_ambiguous or saw_none:
+        return "needs_option", options
     return "ok", canonical
 
 

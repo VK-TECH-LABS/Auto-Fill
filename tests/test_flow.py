@@ -320,8 +320,10 @@ def test_full_application_stops_for_a_person(browser, caplog):
                 resume_uploaded=True,
             ),
         )
-        assert second.status == Status.READY_FOR_HUMAN_SUBMIT
-        assert "REVIEW_PAGE" in second.steps
+        assert second.status == Status.MANUAL_ANSWER_REQUIRED
+        assert second.blocking is not None
+        assert second.blocking["kind"] == "CONSENT"
+        assert "terms of service" in second.blocking["text"].casefold()
         assert "CONTINUE_AFTER_RESUME" in second.steps
         assert page.locator("#terms").is_checked() is False
         assert page.evaluate("() => window.__submitCount") == 0

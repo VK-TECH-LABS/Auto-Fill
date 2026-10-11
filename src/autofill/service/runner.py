@@ -409,6 +409,7 @@ class FillRequest:
     resume_name: str = ""
     resume_mime: str = ""
     resume_bytes: bytes | None = None
+    resume_prepared: bool = False
 
 
 class FillRunner(Protocol):
@@ -726,6 +727,7 @@ class PlaywrightRunner:
             resume_name=request.resume_name,
             resume_mime=request.resume_mime,
             resume_bytes=request.resume_bytes,
+            resume_prepared=request.resume_prepared,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
@@ -743,12 +745,16 @@ class PlaywrightRunner:
         page: object | None,
         slot: _SessionContext | None = None,
     ) -> ApplicationResult:
-        return autofill_application(
+        options = self._options(request, page, slot)
+        result = autofill_application(
             request.application_url,
             request.profile,
             request.credentials,
-            self._options(request, page, slot),
+            options,
         )
+        result.resume_verified_now = options.resume_verified_now
+        result.resume_site_errors = list(options.resume_site_errors)
+        return result
 
     def _retryable(self, request: FillRequest, *, category: str) -> ApplicationResult:
         """The session stays. A later start can run it again. No second session is created."""
@@ -1076,6 +1082,31 @@ class PlaywrightRunner:
                 raise PageUnavailable(410) from None
 
         return worker.submit(apply)
+
+    def suggest(self, session_id: str, selector: str, query: str, *, clear: bool) -> dict:
+        """Type a query into one control and return options without committing."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return {"found": False, "options": [], "source": "live"}
+
+        def read() -> dict:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return {"found": False, "options": [], "source": "live"}
+            from autofill.stepfill import suggest_control
+
+            try:
+                return suggest_control(slot.page, selector, query, clear=clear)
+            except Exception as exc:
+                if not is_browser_crash(exc):
+                    raise
+                try:
+                    worker._close(session_id)
+                except Exception:
+                    worker.sessions.pop(session_id, None)
+                raise PageUnavailable(410) from None
+
+        return worker.submit(read)
 
     def choice_options(self, session_id: str, selector: str) -> list[str]:
         """Read the live options for one choice control. Labels only."""

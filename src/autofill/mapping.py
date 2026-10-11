@@ -27,6 +27,15 @@ _DECLINE_HINTS = ("decline", "prefer not", "do not wish", "not to say", "not to 
 _LEGAL_RE = re.compile(
     r"\b(i agree|i certify|i acknowledge|terms of (service|use)|privacy policy|attest|e-?sign|legal attestation)\b"
 )
+_CONSENT_RE = re.compile(
+    r"\b(i agree|i certify|i acknowledge|i consent|terms|privacy|attest|e sign|esign|legal declaration)\b"
+)
+_CONSENT_STRONG_RE = re.compile(
+    r"\b(terms|privacy|attest|e sign|esign|legal declaration|certify)\b"
+)
+_MARKETING_RE = re.compile(
+    r"\b(newsletter|promotional|marketing|product updates|special offers|opt in|receive emails|receive updates)\b"
+)
 _ALIAS_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"united states", "united states of america", "usa", "us"}),
     frozenset({"canada", "ca"}),
@@ -251,8 +260,35 @@ def haystack(control: Control) -> str:
         control.placeholder,
         control.aria_label,
         control.autocomplete,
+        control.prompt,
+        control.group,
     ]
     return normalize(" ".join(part for part in parts if part))
+
+
+def acknowledgement_kind(control: Control) -> str:
+    """``consent``, ``marketing``, or ``factual`` for a checkbox or radio statement.
+
+    Marketing is checked first so "I agree to receive marketing emails" is an
+    opt-in. Terms, privacy, attestation, and e-signature stay consent.
+    """
+    if control.kind not in {"checkbox", "radio"}:
+        return "factual"
+    blob = haystack(control)
+    marketing = bool(_MARKETING_RE.search(blob))
+    strong = bool(_CONSENT_STRONG_RE.search(blob))
+    if marketing and not strong:
+        return "marketing"
+    if _CONSENT_RE.search(blob) or _LEGAL_RE.search(blob):
+        return "consent"
+    return "factual"
+
+
+def mark_required_acknowledgements(controls: list[Control]) -> None:
+    """A consent statement is required until a person confirms it."""
+    for control in controls:
+        if control.kind == "checkbox" and acknowledgement_kind(control) == "consent":
+            control.required = True
 
 
 def is_honeypot(control: Control) -> bool:
@@ -754,7 +790,11 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
-    if control.kind in {"checkbox", "radio"} and _LEGAL_RE.search(haystack(control)):
+    if control.kind == "checkbox" and acknowledgement_kind(control) == "marketing":
+        return MappedField(key=None, action="skip", reason="Marketing opt-in left unchecked.")
+    if control.kind in {"checkbox", "radio"} and (
+        acknowledgement_kind(control) == "consent" or _LEGAL_RE.search(haystack(control))
+    ):
         return MappedField(
             key=None,
             action="skip",
