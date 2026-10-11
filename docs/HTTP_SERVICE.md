@@ -57,7 +57,7 @@ Every `/v1/` route requires:
 Authorization: Bearer <AUTOFILL_SERVICE_TOKEN>
 ```
 
-Missing and wrong tokens both receive `401` and `{"detail":"Unauthorized"}`. `GET /health` does not require auth. It returns `{"status":"ok","service":"auto-fill"}` and nothing about sessions.
+Missing and wrong tokens both receive `401` and `{"detail":"Unauthorized"}`. `GET /health` does not require auth. It returns `{"status":"ok","service":"auto-fill","supportedProtocolVersions":["0.4.0","0.5.0","0.6.0","0.7.0"]}` and nothing about sessions. `supportedProtocolVersions` is the field a host reads to see that `0.7.0` is supported. Creating a session still defaults `protocolVersion` to `0.6.0` unless the caller sends `0.7.0`.
 
 Call the API from a backend you control. A browser page that holds the token is the wrong place for it.
 

@@ -18,6 +18,8 @@ MAX_TOKEN = 512
 MIN_RESOLVER_TOKEN = 32
 MAX_CONTEXT_BYTES = 100_000
 MAX_ANSWERS = 32
+SUPPORTED_PROTOCOL_VERSIONS = ("0.4.0", "0.5.0", "0.6.0", "0.7.0")
+DEFAULT_PROTOCOL_VERSION = "0.6.0"
 
 
 class JobContextIn(BaseModel):
@@ -96,7 +98,7 @@ class CreateSessionIn(BaseModel):
     @model_validator(mode="after")
     def _mode(self) -> CreateSessionIn:
         version = self.protocol_version.strip()
-        allowed = {"0.4.0", "0.5.0", "0.6.0", "0.7.0"}
+        allowed = set(SUPPORTED_PROTOCOL_VERSIONS)
         if self.resolver is not None or version in allowed:
             if version not in allowed:
                 raise ValueError("protocolVersion must be 0.4.0, 0.5.0, 0.6.0, or 0.7.0 when resolver is set")
@@ -392,7 +394,17 @@ class CredentialsOut(BaseModel):
 
 
 class HealthOut(BaseModel):
-    """Unauthenticated process check. It does not report sessions or config."""
+    """Unauthenticated process check. It does not report sessions or config.
+
+    ``supportedProtocolVersions`` is the list a caller reads before choosing a
+    protocol. Session create still defaults to 0.6.0.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     status: Literal["ok"] = "ok"
     service: Literal["auto-fill"] = "auto-fill"
+    supported_protocol_versions: list[str] = Field(
+        default_factory=lambda: list(SUPPORTED_PROTOCOL_VERSIONS),
+        alias="supportedProtocolVersions",
+    )
