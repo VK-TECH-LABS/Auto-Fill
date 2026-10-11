@@ -327,7 +327,7 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         if _is_application_resume(control):
             return _Ask(controls=controls, field_key="resume.file")
         return None
-    if kind != "multi" and _is_current_location(control):
+    if kind != "multi" and _is_location_typeahead(control):
         return _Ask(controls=controls, field_key="location", compose_location=True)
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
@@ -436,6 +436,25 @@ def _is_application_resume(control: Control) -> bool:
     if "autofill" in blob:
         return False
     return bool(re.search(r"\b(?:resume|cv|curriculum vitae)\b", blob))
+
+
+def _is_location_typeahead(control: Control) -> bool:
+    """A place box that commits only after a suggestion is chosen.
+
+    Lever's "Current location" is one. Ashby's payroll location is a combobox
+    whose label asks where you plan on working from.
+    """
+    if control.kind not in {"text", "textarea", "combobox"}:
+        return False
+    raw = " ".join(part for part in (control.label, control.aria_label, control.placeholder) if part)
+    folded = raw.casefold()
+    if any(token in folded for token in ("relocat", "sponsor", "visa")):
+        return False
+    if _is_current_location(control):
+        return True
+    if control.kind != "combobox":
+        return False
+    return bool(re.search(r"\b(working from|payroll tax)\b", normalize(raw)))
 
 
 def _is_current_location(control: Control) -> bool:
@@ -563,6 +582,26 @@ _LOCATION_OPTIONS_JS = r"""
     const id = node.id || "";
     return id.indexOf("location-") === 0;
   }
+  function pack(nodes) {
+    const found = [];
+    for (const option of nodes) {
+      if (!isSuggestion(option) || !visible(option)) continue;
+      const label = textOf(option);
+      if (!label) continue;
+      if (!option.id) option.setAttribute("data-autofill-option", String(found.length));
+      const itemSelector = option.id
+        ? "#" + CSS.escape(option.id)
+        : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
+      found.push({ label, selector: itemSelector });
+    }
+    return found;
+  }
+  const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
+  if (listId) {
+    const list = document.getElementById(listId);
+    const owned = list ? pack(list.querySelectorAll("[role='option']")) : [];
+    if (owned.length) return owned;
+  }
   let root = el.parentElement;
   for (let depth = 0; root && depth < 6; depth += 1, root = root.parentElement) {
     const candidates = [];
@@ -590,7 +629,9 @@ _LOCATION_OPTIONS_JS = r"""
   }
   // Lever renders the geocoder list on document.body, outside the field.
   const portal = [];
-  const extra = document.querySelectorAll(".dropdown-location, [role='option'][id^='location-']");
+  const extra = document.querySelectorAll(
+    ".dropdown-location, [role='option'][id^='location-'], .ashby-application-form-input-autocomplete-popup-result"
+  );
   for (const option of extra) {
     if (!isSuggestion(option) || !visible(option)) continue;
     const label = textOf(option);
@@ -1027,7 +1068,7 @@ def is_location_answer(page, target: dict) -> bool:
     text = str(target.get("text") or "").strip().casefold()
     label_hit = text in _LOCATION_LABELS or (
         "current location" in text and len(text) <= 40 and "sponsor" not in text and "visa" not in text
-    )
+    ) or ("working from" in text and "sponsor" not in text and "visa" not in text)
     if key == "location" or label_hit:
         return True
     return key in _LOCATION_ANSWER_KEYS and _has_selected_location(page)
@@ -1047,14 +1088,66 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     fields = {"location": value, "address.city": value.split(",")[0].strip()}
     control = Control(kind="combobox", label=str(target.get("text") or "Current location"), selector=selector)
     outcome = ResolvedPage()
-    _apply_location(page, control, fields, outcome)
+    trace: dict[str, Any] = {}
+    # The caller named a city. When several places share it, keep the first
+    # suggestion the geocoder ranked. A profile fill with no region still asks.
+    _apply_location(page, control, fields, outcome, ranked=True, trace=trace)
     city, _region, _country = _location_parts(fields)
     if city and _location_committed(page, control, city):
         return {"filled": True}
-    return {"filled": False, "reason": "not_committed"}
+    result: dict[str, Any] = {
+        "filled": False,
+        "reason": "not_committed",
+        "suggestionCount": int(trace.get("count") or 0),
+    }
+    if trace.get("lever"):
+        result["leverSearch"] = True
+    if trace.get("status") is not None:
+        result["searchStatus"] = trace.get("status")
+    return result
 
 
-def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
+def _watch_location_search(page, trace: dict[str, Any]):
+    """Remember the Lever suggestion response. The city text is not logged."""
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        url = ""
+    if "lever.co" in url:
+        trace["lever"] = True
+
+    def on_response(response) -> None:
+        try:
+            target = str(getattr(response, "url", "") or "")
+        except Exception:
+            return
+        if "searchLocations" not in target:
+            return
+        trace["lever"] = True
+        try:
+            trace["status"] = int(response.status)
+        except Exception:
+            return
+
+    listen = getattr(page, "on", None)
+    if listen is None:
+        return None
+    try:
+        listen("response", on_response)
+    except Exception:
+        return None
+    return on_response
+
+
+def _apply_location(
+    page,
+    control: Control,
+    fields: dict,
+    outcome: ResolvedPage,
+    *,
+    ranked: bool = False,
+    trace: dict[str, Any] | None = None,
+) -> None:
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
     if not city:
@@ -1076,6 +1169,45 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
             delay = max(0, int(raw_delay))
         except ValueError:
             delay = 20
+    if trace is None:
+        trace = {}
+    listener = _watch_location_search(page, trace)
+    try:
+        _apply_location_query(
+            page,
+            control,
+            outcome,
+            field,
+            city,
+            region,
+            country,
+            delay,
+            ranked=ranked,
+            trace=trace,
+        )
+    finally:
+        if listener is not None:
+            remove = getattr(page, "remove_listener", None)
+            if remove is not None:
+                try:
+                    remove("response", listener)
+                except Exception:
+                    pass
+
+
+def _apply_location_query(
+    page,
+    control: Control,
+    outcome: ResolvedPage,
+    field,
+    city: str,
+    region: str,
+    country: str,
+    delay: int,
+    *,
+    ranked: bool,
+    trace: dict[str, Any],
+) -> None:
     try:
         field.fill("")
     except Exception as exc:
@@ -1101,6 +1233,17 @@ def _apply_location(page, control: Control, fields: dict, outcome: ResolvedPage)
         _pause(page, 1000)
         options = _location_options(page, control.selector) or options
         match = _match_location(options, city=city, region=region, country=country)
+    status = trace.get("status")
+    if isinstance(status, int) and status >= 400:
+        options = []
+        match = None
+    trace["count"] = len(options)
+    logger.info("location suggestions status=%s count=%s", status if status is not None else "none", len(options))
+    if match is None and ranked and not region:
+        hits = [item for item in options if _same_city(item[0], city)]
+        if hits:
+            match = hits[0]
+            logger.info("location answer ranked=first count=%s", len(hits))
     if match is not None:
         click_choice(page, match[1], match[0])
         if not _location_committed(page, control, city):
@@ -2278,12 +2421,50 @@ def _gap_clusters(snapshot: PageSnapshot) -> list[list[Control]]:
     return clusters
 
 
+_TYPEAHEAD_STATE_JS = """
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return { value: "", expanded: false, chip: false };
+  const scope = (el.closest && el.closest("[data-field-path], .select__control")) || el.parentElement;
+  const chip = scope ? scope.querySelector(".select__single-value, .select__multi-value") : null;
+  const chipText = chip ? String(chip.textContent || "").replace(/\\s+/g, " ").trim() : "";
+  const placeholder = /^(select\\.{0,3}|choose\\.{0,3}|please select|start typing\\.{0,3})$/i;
+  return {
+    value: "value" in el ? String(el.value || "") : "",
+    expanded: el.getAttribute("aria-expanded") === "true",
+    chip: chipText.length > 0 && !placeholder.test(chipText),
+  };
+}
+"""
+
+
+def _typeahead_place_committed(page, control: Control) -> bool:
+    """A typeahead place is committed when a suggestion is showing, not when text was typed."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        state = evaluate(_TYPEAHEAD_STATE_JS, control.selector) or {}
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    if state.get("chip"):
+        return True
+    if state.get("expanded"):
+        return False
+    value = str(state.get("value") or "").strip()
+    return "," in value
+
+
 def _cluster_committed(page, controls: list[Control]) -> bool:
     if len(controls) > 1 and all(item.kind == "checkbox" for item in controls):
         return any(control_committed(page, item.selector) for item in controls)
     control = controls[0]
-    if _is_current_location(control) and _has_selected_location(page):
-        return _location_pick(page) is not None
+    if _is_location_typeahead(control):
+        if _has_selected_location(page):
+            return _location_pick(page) is not None
+        return _typeahead_place_committed(page, control)
     return control_committed(page, control.selector)
 
 

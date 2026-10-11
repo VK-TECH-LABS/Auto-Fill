@@ -1127,6 +1127,9 @@ def test_blocking_question_is_centered_and_known_fields_stay_plain(browser):
 
 
 _STUCK = "Auto-Fill couldn't set this field; please set it in the live view, then Continue"
+_LEVER_LOCATION = (
+    "Lever didn't offer location suggestions; pick Current location in the live view, then Continue"
+)
 
 
 class _LoopRunner:
@@ -1223,6 +1226,26 @@ def test_three_failed_answers_stop_for_a_person():
         )
         assert continued.status_code == 200, continued.text
         assert continued.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+
+
+def test_lever_without_suggestions_stops_after_one_answer():
+    class Runner(_LoopRunner):
+        def apply_answer(self, session_id: str, target: dict) -> dict:
+            self.applied.append(str(target.get("value") or ""))
+            return {"filled": False, "suggestionCount": 0, "searchStatus": 403, "leverSearch": True}
+
+    runner = Runner(fill=False)
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions", headers=AUTH, json=_resolver_body())
+        session_id = created.json()["sessionId"]
+        client.post(f"/v1/sessions/{session_id}/start", headers=AUTH)
+        stopped = _answer_location(client, session_id)
+        assert stopped.status_code == 409
+        assert stopped.json()["detail"]["reason"] == "needs_manual"
+        assert len(runner.applied) == 1
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.json()["blocking"]["text"] == _LEVER_LOCATION
 
 
 class _SplitRunner:

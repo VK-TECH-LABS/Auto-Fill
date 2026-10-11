@@ -609,6 +609,13 @@ def _match_rule(control: Control) -> str | None:
     label = normalize(control.label or control.aria_label or control.placeholder)
     if label in {"current location", "location", "your location"} and "relocat" not in label:
         return "location"
+    if (
+        re.search(r"\b(working from|payroll tax)\b", blob)
+        and "relocat" not in blob
+        and "sponsor" not in blob
+        and "visa" not in blob
+    ):
+        return "location"
     for rule in _RULES:
         if rule.kinds is not None and control.kind not in rule.kinds:
             continue

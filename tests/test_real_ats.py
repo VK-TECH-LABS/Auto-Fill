@@ -2214,6 +2214,124 @@ def test_ashby_required_class_yes_no_blocks_until_pressed(browser, resolver):
         page.close()
 
 
+def test_city_only_answer_keeps_the_first_ranked_suggestion(browser):
+    from autofill.stepfill import commit_location_answer
+
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "lever_location_live.html").as_uri())
+        filled = commit_location_answer(
+            page,
+            {
+                "selector": "#location-input",
+                "text": "Current location",
+                "fieldKey": "address.city",
+                "value": "Austin",
+            },
+        )
+        assert filled == {"filled": True}
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == "Austin, TX, USA"
+        assert stored["id"] == "loc-0"
+        assert page.locator("#location-input").input_value() == "Austin, TX, USA"
+    finally:
+        page.close()
+
+
+_ASHBY_LOCATION = (
+    "<h1>Application</h1><form>"
+    "<label for='name'>Full name</label><input id='name' name='name' required>"
+    "<div class='ashby-application-form-field-entry' data-field-path='_systemfield_location'>"
+    "<label class='_required_f7cvd_91 ashby-application-form-question-title'>"
+    "Where do you plan on working from (for payroll tax purposes)?</label>"
+    "<input id='work-from' role='combobox' aria-autocomplete='list' aria-expanded='false' "
+    "aria-haspopup='listbox' placeholder='Start typing...' "
+    "class='ashby-application-form-input-autocomplete'>"
+    "</div>"
+    "<div id='places' role='listbox' hidden></div>"
+    "</form><script>"
+    "const input = document.getElementById('work-from');"
+    "const list = document.getElementById('places');"
+    "input.addEventListener('input', () => {"
+    "input.setAttribute('aria-expanded', 'true');"
+    "input.setAttribute('aria-controls', 'places');"
+    "list.hidden = false;"
+    "list.innerHTML = '';"
+    "['Austin, Texas, United States', 'Austin, Minnesota, United States'].forEach((place, index) => {"
+    "const item = document.createElement('div');"
+    "item.id = 'place-' + index;"
+    "item.setAttribute('role', 'option');"
+    "item.className = 'ashby-application-form-input-autocomplete-popup-result';"
+    "item.textContent = place;"
+    "item.addEventListener('mousedown', (event) => {"
+    "event.preventDefault();"
+    "input.value = place;"
+    "input.setAttribute('aria-expanded', 'false');"
+    "list.hidden = true;"
+    "});"
+    "list.appendChild(item);"
+    "});"
+    "});"
+    "</script>"
+)
+
+
+def test_ashby_location_typeahead_blocks_ready_until_a_suggestion(browser):
+    from autofill.extract import extract_page
+    from autofill.follow import follow_answer
+    from autofill.stepfill import commit_location_answer, inspect_required
+
+    page = browser.new_page()
+    try:
+        page.set_content(_ASHBY_LOCATION)
+        gaps, total, done = inspect_required(page, extract_page(page), None)
+        assert total == 2
+        assert done == 0
+        location = next(item for item in gaps if "working from" in str(item.get("text") or "").casefold())
+        assert location["fieldKey"] == "location"
+        assert location["required"] is True
+        page.locator("#name").fill("River Example")
+        follow = follow_answer(
+            page,
+            profile=CandidateProfile.from_dict(
+                {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+            ),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+        )
+        assert follow.status == Status.MANUAL_ANSWER_REQUIRED
+        assert follow.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert follow.blocking is not None
+        assert "working from" in str(follow.blocking.get("text") or "").casefold()
+        filled = commit_location_answer(
+            page,
+            {
+                "selector": "#work-from",
+                "text": "Where do you plan on working from (for payroll tax purposes)?",
+                "fieldKey": "location",
+                "value": "Austin, Texas, United States",
+            },
+        )
+        assert filled == {"filled": True}
+        assert page.locator("#work-from").input_value() == "Austin, Texas, United States"
+        ready = follow_answer(
+            page,
+            profile=CandidateProfile.from_dict(
+                {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+            ),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+        )
+        assert ready.status == Status.READY_FOR_HUMAN_SUBMIT
+        assert ready.progress["requiredDone"] == ready.progress["requiredTotal"] == 2
+    finally:
+        page.close()
+
+
 def test_empty_location_json_does_not_count_and_blocks_ready(browser):
     """A resume parse can store {"name":""}. That is not a picked suggestion."""
     from autofill.extract import extract_page

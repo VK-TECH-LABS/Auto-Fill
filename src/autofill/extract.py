@@ -272,6 +272,15 @@ EXTRACT_JS = r"""
       return tag + "[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value || "") + "']";
     }
     if (name) return tag + "[name='" + CSS.escape(name) + "']";
+    const fieldPath = el.closest && el.closest("[data-field-path]");
+    const roleName = (el.getAttribute("role") || "").toLowerCase();
+    if (
+      fieldPath &&
+      (roleName === "combobox" || (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list")
+    ) {
+      const path = fieldPath.getAttribute("data-field-path") || "";
+      if (path) return "[data-field-path='" + cssAttr(path) + "'] [role='combobox']";
+    }
     const automation = el.getAttribute("data-automation-id");
     if (automation) return "[data-automation-id='" + CSS.escape(automation) + "']";
     // Unnamed submit buttons still need a selector so they can be reported
@@ -392,7 +401,15 @@ EXTRACT_JS = r"""
         placeholder: el.getAttribute("placeholder") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: el.getAttribute("autocomplete") || "",
-          required: !!el.required || el.getAttribute("aria-required") === "true",
+          required:
+            !!el.required ||
+            el.getAttribute("aria-required") === "true" ||
+            (
+              (role === "combobox" ||
+                (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
+                classToken.indexOf("autocomplete") !== -1) &&
+              controlMarkedRequired(el)
+            ),
         hidden: isHidden(el),
         disabled: !!el.disabled,
         readOnly: !!el.readOnly,
@@ -446,9 +463,7 @@ EXTRACT_JS = r"""
         placeholder: "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: "",
-        required:
-          el.getAttribute("aria-required") === "true" ||
-          !!(inner && (inner.required || inner.getAttribute("aria-required") === "true")),
+        required: controlMarkedRequired(el) || controlMarkedRequired(inner),
         hidden: false,
         disabled: !!(el.disabled || (inner && inner.disabled)),
         readOnly: false,
@@ -498,6 +513,36 @@ EXTRACT_JS = r"""
       if (text && text.length <= 200 && !isSectionHeading(prev, text)) return text;
     }
     return "";
+  }
+
+  function requirementLabel(el) {
+    const entry = el.closest && el.closest("[data-field-path], .ashby-application-form-field-entry");
+    if (entry) {
+      const label = entry.querySelector("label, .ashby-application-form-question-title, legend");
+      if (label && !label.contains(el)) return label;
+    }
+    if (el.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (explicit) return explicit;
+    }
+    const labelled = (el.getAttribute && el.getAttribute("aria-labelledby")) || "";
+    if (labelled) {
+      const node = document.getElementById(labelled.split(/\s+/)[0]);
+      if (node) return node;
+    }
+    let node = el;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const prev = node.previousElementSibling;
+      if (prev && prev.tagName && prev.tagName.toLowerCase() === "label") return prev;
+    }
+    return null;
+  }
+
+  function controlMarkedRequired(el) {
+    if (!el) return false;
+    if (el.required || el.getAttribute("aria-required") === "true") return true;
+    const label = requirementLabel(el);
+    return !!(label && hasRequirementMark(label));
   }
 
   function classMarksRequired(node) {
