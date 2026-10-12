@@ -264,7 +264,8 @@ def activate_entry(page, selector: str, name: str, *, control_type: str = "") ->
         raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
         )
-    page.locator(selector).click()
+    # Lever renders two Apply links with the same class. The first is the posting entry.
+    page.locator(selector).first.click()
 
 
 def open_combobox(page, selector: str) -> None:

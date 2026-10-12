@@ -6,13 +6,16 @@
   <div class="posting">
     <p>About the role. What you'll do and the qualifications for this job.</p>
     <a class="postings-btn" href="#apply">Apply for this job</a>
+    <a class="postings-btn" href="#apply-bottom">Apply for this job</a>
   </div>
   <button type="submit" id="send">Submit application</button>
   <script>
     window.__clicked = [];
-    document.querySelector(".postings-btn").addEventListener("click", (event) => {
-      event.preventDefault();
-      window.__clicked.push("Apply for this job");
+    document.querySelectorAll(".postings-btn").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        window.__clicked.push("Apply for this job");
+      });
     });
     document.getElementById("send").addEventListener("click", (event) => {
       event.preventDefault();

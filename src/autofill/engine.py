@@ -49,6 +49,7 @@ from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding, ResolverCallError
 from autofill.safeguards import (
     HUMAN_SUBMIT_ONLY,
+    HumanSubmissionRequired,
     activate,
     activate_entry,
     field_class_for_button,
@@ -980,7 +981,14 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
         if button is None:
             return snapshot
         logger.info("session=%s action=entry", session.session_id)
-        activate_entry(page, button.selector, button.name, control_type=button.control_type)
+        try:
+            activate_entry(page, button.selector, button.name, control_type=button.control_type)
+        except HumanSubmissionRequired:
+            raise
+        except Exception as exc:
+            if is_browser_crash(exc) or is_ats_timeout(exc):
+                raise
+            return snapshot
         snapshot = _timed_extract(page, opts, started, state)
     _observe_page(page, snapshot)
     return snapshot
