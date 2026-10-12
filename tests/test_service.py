@@ -200,6 +200,92 @@ def test_create_start_and_status(client: TestClient, runner: RecordingRunner):
     assert again.json()["stopped_before_submit"] is True
 
 
+def test_start_accepts_standard_terms_authorized(client: TestClient):
+    granted = create_body()
+    granted["standardTermsAuthorized"] = True
+    created = client.post("/v1/sessions", headers=AUTH, json=granted)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["sessionId"]
+    kept = client.post(
+        f"/v1/sessions/{session_id}/start",
+        headers=AUTH,
+        json={"standardTermsAuthorized": False},
+    )
+    assert kept.status_code == 200, kept.text
+    held = client.app.state.store.get(session_id)
+    assert held is not None
+    assert held.standard_terms_authorized is True
+    fresh = _create(client, job_id="job-terms")
+    started = client.post(
+        f"/v1/sessions/{fresh['sessionId']}/start",
+        headers=AUTH,
+        json={"standardTermsAuthorized": True},
+    )
+    assert started.status_code == 200, started.text
+    turned_on = client.app.state.store.get(fresh["sessionId"])
+    assert turned_on is not None
+    assert turned_on.standard_terms_authorized is True
+
+
+def test_rejected_start_is_retryable(client: TestClient, runner: RecordingRunner):
+    created = _create(client)
+    session_id = created["sessionId"]
+    runner.mode = "boom"
+    failed = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["status"] == Status.FAILED_RETRYABLE
+    assert failed.json()["messages"] == ["start_failed"]
+    runner.mode = "resume"
+    retried = client.post(f"/v1/sessions/{session_id}/retry", headers=AUTH)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+
+
+def test_invalid_start_body_marks_the_session_retryable(client: TestClient):
+    created = _create(client)
+    session_id = created["sessionId"]
+    rejected = client.post(
+        f"/v1/sessions/{session_id}/start",
+        headers=AUTH,
+        json={"standardTermsAuthorized": "not-a-bool"},
+    )
+    assert rejected.status_code == 422
+    held = client.app.state.store.get(session_id)
+    assert held is not None
+    assert held.status == Status.FAILED_RETRYABLE
+    assert held.result is not None
+    assert held.result.messages == ["start_failed"]
+
+
+def test_stale_created_session_expires_and_frees_its_slot():
+    runner = RecordingRunner()
+    app = create_app(
+        token=TOKEN,
+        runner=runner,
+        run_browser=False,
+        max_sessions=1,
+        reaper_interval_seconds=3600,
+    )
+    with TestClient(app) as client:
+        created = client.post("/v1/sessions", headers=AUTH, json=create_body())
+        assert created.status_code == 201, created.text
+        session_id = created.json()["sessionId"]
+        held = app.state.store.get(session_id)
+        assert held is not None
+        assert held.status == "CREATED"
+        assert app.state.store.reap(now=held.created_mono + 120) == []
+        blocked = client.post("/v1/sessions", headers=AUTH, json=create_body(job_id="job-2"))
+        assert blocked.status_code == 429
+        expired = app.state.store.reap(now=held.created_mono + 120.01)
+        assert expired == [session_id]
+        assert held.status == Status.EXPIRED
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.status_code == 410
+        again = client.post("/v1/sessions", headers=AUTH, json=create_body(job_id="job-2"))
+        assert again.status_code == 201, again.text
+        assert again.json()["status"] == "CREATED"
+
+
 def test_candidate_mismatch_fails_closed(client: TestClient, runner: RecordingRunner):
     mismatch = client.post(
         "/v1/sessions",

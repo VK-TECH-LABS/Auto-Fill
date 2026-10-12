@@ -453,6 +453,8 @@ def test_status_returns_410_when_the_ttl_clock_passes(monkeypatch):
         live = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
         assert live.status_code == 200
         assert live.json()["status"] == "CREATED"
+        started = test_client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
         clock["now"] = 2799.0
         still = test_client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
         assert still.status_code == 200
@@ -462,7 +464,7 @@ def test_status_returns_410_when_the_ttl_clock_passes(monkeypatch):
         assert held.status == Status.EXPIRED
         assert held.resolver_token == ""
         assert session_id in runner.discarded
-        assert runner.calls == []
+        assert runner.calls == [(session_id, False, False)]
         pause = test_client.post(f"/v1/sessions/{session_id}/pause", headers=AUTH)
         assert pause.status_code == 410
         assert held.paused is False

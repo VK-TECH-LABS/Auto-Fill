@@ -82,6 +82,7 @@ class ServiceSession:
     pending_resume: bool = False
     page_type: str = ""
     standard_terms_authorized: bool = False
+    created_mono: float = 0.0
     auto_consents: list[dict] = field(default_factory=list)
     phase: str = "launching"
     started_at: str | None = None
@@ -264,7 +265,8 @@ class ServiceSessionStore:
             for session in self._sessions.values():
                 if session.busy or session.status in {Status.EXPIRED, Status.CANCELLED}:
                     continue
-                if session.expires_at and moment >= session.expires_at:
+                stale_start = created_start_is_stale(session, moment)
+                if stale_start or (session.expires_at and moment >= session.expires_at):
                     session.status = Status.EXPIRED
                     session.wipe_secrets()
                     expired.append(session.session_id)
@@ -292,6 +294,18 @@ class ServiceSessionStore:
         if thread is not None:
             thread.join(timeout=2)
             self._thread = None
+
+
+CREATED_WITHOUT_START_SECONDS = 120.0
+
+
+def created_start_is_stale(session: ServiceSession, moment: float) -> bool:
+    """A session that never left CREATED after 120 seconds has no successful start."""
+    if session.status not in {Status.CREATED, "CREATED"}:
+        return False
+    if session.created_mono <= 0:
+        return False
+    return moment - session.created_mono > CREATED_WITHOUT_START_SECONDS
 
 
 def monotonic() -> float:
