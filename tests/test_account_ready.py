@@ -305,6 +305,7 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
     deny = set(STANDARD_TERMS_DENY)
     assert {
         "marketing",
+        "newsletter",
         "sms",
         "promotional",
         "recording",
@@ -320,6 +321,15 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
         "declare",
         "under penalty",
         "demographic",
+        "job alerts",
+        "email updates",
+        "talent community",
+        "talent network",
+        "calls",
+        "autodialed",
+        "phone calls",
+        "third parties",
+        "partners",
     } <= deny
 
     checked: list[str] = []
@@ -351,3 +361,39 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
     assert recorded[0]["questionHash"]
     assert "Privacy Policy" in recorded[0]["textExcerpt"]
     assert "promotional" not in recorded[0]["textExcerpt"]
+
+
+def test_compound_privacy_and_job_alerts_stay_consent():
+    statements = (
+        "I agree to the Privacy Policy and to receive job alerts",
+        "I agree to the Privacy Policy and to receive the newsletter",
+        "I agree to the Privacy Policy and to receive email updates",
+        "I agree to the Terms of Use and to join the talent community",
+        "I agree to the Terms of Use and to join our talent network",
+        "Join our talent community/network",
+        "I agree to the Privacy Policy and to receive calls",
+        "I agree to the Privacy Policy and to receive autodialed phone calls",
+        "I agree to receive auto-dialed calls",
+        "I agree to the Privacy Policy and to share my information with third parties",
+        "I agree to the Privacy Policy and to share with partners",
+    )
+    checked: list[str] = []
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def check(self) -> None:
+            checked.append(self.selector)
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    bind_standard_terms(True)
+    for statement in statements:
+        control = _control("checkbox", statement, "#compound", required=True)
+        assert terms_category(control) == "CONSENT"
+        assert _accept_standard_term(Page(), _Ask(controls=[control], consent=True)) is False
+    assert checked == []
+    assert consume_auto_consents() == []
