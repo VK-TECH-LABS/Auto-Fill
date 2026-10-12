@@ -290,7 +290,10 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     elif len(passwords) == 1:
         login += 2
     blobs = " ".join(_control_blob(control) for control in snapshot.controls if not control.hidden)
-    if _CONFIRM_RE.search(blobs):
+    page_text = snapshot.page_text or ""
+    if _CONFIRM_RE.search(blobs) or _CONFIRM_RE.search(page_text):
+        register += 2
+    if _CONFIRM_RE.search(page_text) and _REGISTER_RE.search(page_text):
         register += 2
     heading = snapshot.heading or ""
     button_names = [button.name for button in snapshot.buttons]

@@ -20,6 +20,7 @@ from autofill.dom_ui import (
     public_blocking,
     safe_label,
     stage_for,
+    workflow_percent,
 )
 from autofill.engine import Status
 from autofill.extract import extract_page
@@ -136,6 +137,26 @@ def follow_answer(
             status = Status.READY_FOR_HUMAN_SUBMIT
             present_blocking(page, None)
             messages = ["Every required field on this page is filled. A person clicks Submit."]
+        elif decision == "ACCOUNT":
+            status = Status.ACCOUNT_CREATION_REQUIRED
+            present_blocking(page, None)
+            messages = ["Create an employer account. Nothing was typed."]
+        elif decision == "LOGIN":
+            status = Status.LOGIN_REQUIRED
+            present_blocking(page, None)
+            messages = ["Sign-in is required before the application form. Nothing was typed."]
+        elif decision == "JOB":
+            status = Status.JOB_DESCRIPTION
+            present_blocking(page, None)
+            reason = "job_description" if current_page_type() == "JOB_DESCRIPTION" else "apply_entry"
+            messages = [
+                "This page is a job description. Auto-Fill did not find an application form.",
+                reason,
+            ]
+        elif decision == "CAPTCHA":
+            status = Status.CAPTCHA_REQUIRED
+            present_blocking(page, None)
+            messages = ["A challenge is on the page. Auto-Fill stopped."]
         elif decision == "NO_FORM":
             status = Status.NO_FORM_FOUND
             present_blocking(page, None)
@@ -213,11 +234,24 @@ def _progress(
     label = safe_label(snapshot.heading)
     if not label or stage != heading_stage:
         label = STAGE_TITLES.get(stage, STAGE_TITLES["QUESTIONS"])
+    percent = progress_percent(stage, total, done)
+    if status in {
+        "JOB_DESCRIPTION",
+        "ACCOUNT_CREATION_REQUIRED",
+        "LOGIN_REQUIRED",
+        "LOGIN_FAILED",
+        "EMAIL_VERIFICATION_REQUIRED",
+        "CAPTCHA_REQUIRED",
+        "RESUME_UPLOAD_REQUIRED",
+        "NO_FORM_FOUND",
+        "READY_FOR_HUMAN_SUBMIT",
+    }:
+        percent = workflow_percent(status, current_page_type(), total, done)
     return {
         "stage": stage,
         "requiredTotal": total,
         "requiredDone": done,
-        "percent": progress_percent(stage, total, done),
+        "percent": percent,
         "currentLabel": label,
     }
 

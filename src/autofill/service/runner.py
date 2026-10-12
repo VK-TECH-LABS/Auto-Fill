@@ -433,6 +433,7 @@ class FillRequest:
     resume_prepared: bool = False
     on_paint: Any = None
     on_phase: Any = None
+    standard_terms_authorized: bool = False
 
 
 class FillRunner(Protocol):
@@ -783,6 +784,7 @@ class PlaywrightRunner:
             resume_bytes=request.resume_bytes,
             resume_prepared=request.resume_prepared,
             on_paint=request.on_paint,
+            standard_terms_authorized=request.standard_terms_authorized,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:

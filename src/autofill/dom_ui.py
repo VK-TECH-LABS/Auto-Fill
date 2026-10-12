@@ -389,6 +389,48 @@ def typing_delays(text: str, randint) -> list[int]:
     return [int(randint(30, 70)) for _ in range(count)]
 
 
+def workflow_percent(status: str, page_type: str, required_total: int, required_done: int) -> int:
+    """Companion progress. This is the stage, kept apart from the field ratio.
+
+    Job description is 5. Sign-in is 10 and account creation is 15. A form
+    scales from 20 to 80. A resume checkpoint is 70 to 85. Review that is
+    ready to submit is 100. ``NO_FORM_FOUND`` stays 0.
+    """
+    if status == "READY_FOR_HUMAN_SUBMIT":
+        return 100
+    if status == "JOB_DESCRIPTION":
+        return 5
+    if status == "NO_FORM_FOUND":
+        return 5 if page_type in {"JOB_DESCRIPTION", "APPLY_ENTRY"} else 0
+    if status == "ACCOUNT_CREATION_REQUIRED":
+        return 15
+    if status in {"LOGIN_REQUIRED", "LOGIN_FAILED"}:
+        return 10
+    if status == "EMAIL_VERIFICATION_REQUIRED":
+        return 15
+    if status == "CAPTCHA_REQUIRED":
+        return 12
+    if status == "RESUME_UPLOAD_REQUIRED":
+        if required_total <= 0:
+            return 80
+        done = min(max(required_done, 0), required_total)
+        return min(85, max(70, 70 + round(15 * done / required_total)))
+    if status in {
+        "FAILED",
+        "FAILED_RETRYABLE",
+        "FAILED_FINAL",
+        "UNSUPPORTED",
+        "CANCELLED",
+        "EXPIRED",
+        "CREATED",
+    }:
+        return 0
+    if required_total <= 0:
+        return 20
+    done = min(max(required_done, 0), required_total)
+    return min(80, max(20, 20 + round(60 * done / required_total)))
+
+
 def progress_percent(stage: str, required_total: int, required_done: int) -> int:
     """Required progress when there are required fields. Otherwise a fixed stage value.
 

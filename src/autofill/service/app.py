@@ -26,6 +26,7 @@ from autofill.dom_ui import (
     match_open_item,
     progress_percent,
     public_blocking,
+    workflow_percent,
 )
 from autofill.engine import ApplicationResult, Status
 from autofill.login import protocol_at_least
@@ -91,6 +92,7 @@ _HUMAN_STOP = frozenset(
         Status.MANUAL_ANSWER_REQUIRED,
         Status.RESUME_UPLOAD_REQUIRED,
         Status.NO_FORM_FOUND,
+        Status.JOB_DESCRIPTION,
         Status.READY_FOR_HUMAN_SUBMIT,
     }
 )
@@ -119,6 +121,8 @@ def _public_status(session: ServiceSession) -> str:
         return Status.LOGIN_REQUIRED
     if status == Status.EMAIL_VERIFICATION_REQUIRED:
         return Status.MANUAL_REVIEW_REQUIRED
+    if status == Status.JOB_DESCRIPTION:
+        return Status.NO_FORM_FOUND
     return status
 
 
@@ -232,18 +236,16 @@ def _overlay_progress(session: ServiceSession, progress: dict) -> dict:
     session.required_done_high = done
     updated["requiredDone"] = done
     updated["requiredTotal"] = total
-    percent = int(updated.get("percent") or 0)
     if total:
-        percent = progress_percent(str(updated.get("stage") or "OPENING"), total, done)
-        if same_set:
-            percent = max(percent, session.percent_high)
-            if done < total:
-                percent = min(percent, 99)
-    elif session.status == Status.NO_FORM_FOUND:
+        updated["fieldPercent"] = progress_percent(str(updated.get("stage") or "OPENING"), total, done)
+    else:
+        updated["fieldPercent"] = 0
+    if session.status == Status.NO_FORM_FOUND:
         percent = session.percent_high if session.form_seen else 0
     else:
-        percent = progress_percent(str(updated.get("stage") or "OPENING"), 0, 0)
-        percent = max(percent, session.percent_high)
+        percent = workflow_percent(session.status, session.page_type, total, done)
+        if same_set:
+            percent = max(percent, session.percent_high)
     session.percent_high = percent
     updated["percent"] = percent
     session.progress = dict(updated)
@@ -357,6 +359,8 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             raise HTTPException(status_code=409, detail={"reason": "not_at_account_step"})
         if reason == "input_failed":
             raise HTTPException(status_code=409, detail={"reason": "input_failed"})
+        if reason == "password_mismatch":
+            raise HTTPException(status_code=409, detail={"reason": "password_mismatch"})
         raise HTTPException(status_code=409, detail="No page is open for this session.")
     if report.get("account"):
         session.account = report["account"]
@@ -461,6 +465,7 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
             session.phase if session.phase in {"launching", "navigating", "loaded"} else "launching",
         ),
         startedAt=session.started_at,
+        autoConsents=list(session.auto_consents) or None,
     )
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
@@ -524,6 +529,8 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     session.status = result.status
     if result.page_type:
         session.page_type = result.page_type
+    if result.auto_consents:
+        session.auto_consents = list(result.auto_consents)
     startup = {"navigation_timeout", "browser_crashed", "blocked", "capacity", "capacity_busy"}
     if not (result.status == Status.FAILED_RETRYABLE and startup.intersection(result.messages)):
         session.phase = "loaded"
@@ -900,6 +907,7 @@ def _request_for(
         resume_prepared=bool(session.resume_prepared and session.resume_bytes and not session.resume_verified),
         on_paint=_paint_frame(session),
         on_phase=_set_phase(session),
+        standard_terms_authorized=session.standard_terms_authorized,
     )
 
 
@@ -1061,6 +1069,7 @@ def create_app(
         return JSONResponse(status_code=422, content={"detail": detail})
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
+    @app.get("/v1/health", response_model=HealthOut, tags=["health"])
     def health() -> HealthOut:
         return HealthOut()
 
@@ -1103,6 +1112,7 @@ def create_app(
                     resolver_url=binding.url,
                     resolver_token=binding.token,
                     resolver_expires_at=binding.expires_at,
+                    standard_terms_authorized=body.standard_terms_authorized,
                 )
                 redaction_filter().add(binding.token)
             else:
@@ -1116,6 +1126,7 @@ def create_app(
                     job=job,
                     cover_letter_text=cover,
                     protocol_version=body.protocol_version.strip() or DEFAULT_PROTOCOL_VERSION,
+                    standard_terms_authorized=body.standard_terms_authorized,
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -1190,7 +1201,12 @@ def create_app(
                 return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
             if _consent_stop(session):
                 return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
-            allowed = {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED, Status.NO_FORM_FOUND}
+            allowed = {
+                Status.LOGIN_REQUIRED,
+                Status.CAPTCHA_REQUIRED,
+                Status.NO_FORM_FOUND,
+                Status.JOB_DESCRIPTION,
+            }
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
             if session.status not in allowed:

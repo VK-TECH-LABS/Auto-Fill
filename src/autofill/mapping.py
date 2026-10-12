@@ -14,6 +14,7 @@ skill is listed on the profile, and otherwise leaves the control unanswered.
 
 from __future__ import annotations
 
+import contextvars
 import re
 from dataclasses import dataclass, field
 
@@ -304,6 +305,134 @@ def is_consent_choice(control: Control) -> bool:
         return False
     stances = {option_stance(option.label or option.value) for option in control.options}
     return "agree" in stances and "decline" in stances
+
+
+_TERMS_FLAG: contextvars.ContextVar[bool] = contextvars.ContextVar("autofill_standard_terms", default=False)
+_AUTO_CONSENTS: contextvars.ContextVar[list | None] = contextvars.ContextVar("autofill_auto_consents", default=None)
+# Checked before the allow-list. Any hit stays CONSENT, including a sentence that
+# also mentions ordinary terms or privacy.
+STANDARD_TERMS_DENY: tuple[str, ...] = (
+    "marketing",
+    "newsletter",
+    "promotional",
+    "promotion",
+    "sms",
+    "text message",
+    "text messages",
+    "recording",
+    "notetaker",
+    "note taker",
+    "artificial intelligence",
+    "ai",
+    "arbitration",
+    "e sign",
+    "esign",
+    "signature",
+    "background check",
+    "certify",
+    "attest",
+    "attestation",
+    "declare",
+    "under penalty",
+    "perjury",
+    "demographic",
+    "gender",
+    "race",
+    "ethnicity",
+    "veteran",
+    "disability",
+    "product updates",
+    "special offers",
+    "opt in",
+    "receive emails",
+    "receive updates",
+    "job alerts",
+    "job alert",
+    "email updates",
+    "email update",
+    "talent community",
+    "talent network",
+    "calls",
+    "phone calls",
+    "phone call",
+    "autodialed",
+    "auto dialed",
+    "third parties",
+    "third party",
+    "partners",
+)
+STANDARD_TERMS_ALLOW: tuple[str, ...] = (
+    "terms of use",
+    "terms of service",
+    "terms and conditions",
+    "privacy policy",
+    "privacy notice",
+    "site terms",
+    "i agree to the terms",
+    "agree to the terms",
+    "agree to the privacy",
+)
+
+
+def _phrase_re(phrases: tuple[str, ...]) -> re.Pattern[str]:
+    body = "|".join(re.escape(phrase) for phrase in sorted(phrases, key=len, reverse=True))
+    return re.compile(rf"\b(?:{body})\b", re.IGNORECASE)
+
+
+_DENY_TERMS_RE = _phrase_re(STANDARD_TERMS_DENY)
+_ALLOW_TERMS_RE = _phrase_re(STANDARD_TERMS_ALLOW)
+
+
+def bind_standard_terms(enabled: bool) -> None:
+    """Remember the session flag for this fill. Missing or false checks nothing."""
+    _TERMS_FLAG.set(bool(enabled))
+    _AUTO_CONSENTS.set([])
+
+
+def standard_terms_enabled() -> bool:
+    return bool(_TERMS_FLAG.get())
+
+
+def consume_auto_consents() -> list[dict]:
+    """Return acceptances recorded during this fill and clear them."""
+    found = list(_AUTO_CONSENTS.get() or [])
+    _AUTO_CONSENTS.set([])
+    _TERMS_FLAG.set(False)
+    return found
+
+
+def terms_category(control: Control) -> str:
+    """``STANDARD_TERMS`` only for a plain terms or privacy checkbox.
+
+    The deny-list is applied first. The allow-list is the only way to pass.
+    A checkbox that matches neither, or that matches both, stays ``CONSENT``.
+    """
+    if control.kind != "checkbox":
+        return "CONSENT"
+    option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
+    blob = normalize(f"{haystack(control)} {control.prompt} {control.group} {option_text}")
+    if _DENY_TERMS_RE.search(blob) or _MARKETING_RE.search(blob):
+        return "CONSENT"
+    if _ALLOW_TERMS_RE.search(blob):
+        return "STANDARD_TERMS"
+    return "CONSENT"
+
+
+def record_auto_consent(control: Control) -> dict:
+    """One audit row. The excerpt is the statement, never a secret."""
+    from autofill.intents import question_hash
+
+    text = " ".join((control.label or control.prompt or control.group or control.aria_label or "").split())
+    token = control.element_id or control.name or control.selector or ""
+    entry = {
+        "questionHash": question_hash(text, token),
+        "textExcerpt": text[:160],
+        "category": "STANDARD_TERMS",
+    }
+    found = list(_AUTO_CONSENTS.get() or [])
+    found.append(entry)
+    _AUTO_CONSENTS.set(found)
+    return entry
 
 
 def acknowledgement_kind(control: Control) -> str:

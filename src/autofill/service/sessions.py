@@ -81,6 +81,8 @@ class ServiceSession:
     form_seen: bool = False
     pending_resume: bool = False
     page_type: str = ""
+    standard_terms_authorized: bool = False
+    auto_consents: list[dict] = field(default_factory=list)
     phase: str = "launching"
     started_at: str | None = None
     preview_jpeg: bytes | None = None
