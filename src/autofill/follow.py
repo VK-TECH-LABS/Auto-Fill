@@ -26,6 +26,7 @@ from autofill.extract import extract_page
 from autofill.fill import apply_mapped
 from autofill.mapping import MapCursor, is_honeypot, map_field
 from autofill.models import Control, JobContext, PageSnapshot
+from autofill.pagewait import classify_page, current_page_type, terminal_kind
 from autofill.profile import CandidateProfile
 from autofill.stepfill import inspect_required
 
@@ -112,6 +113,7 @@ def follow_answer(
             cover_letter_path=cover_letter_path,
         )
         mark, snapshot = read_page_mark(page)
+    classify_page(snapshot, url=_page_url(page))
     gaps, total, done = inspect_required(page, snapshot, profile, prior, option_reads=1)
     if not gaps:
         # Re-read every required control before READY. The answer that just
@@ -124,9 +126,32 @@ def follow_answer(
         present_blocking(page, gaps[0])
         messages = ["A required field is still empty."]
     else:
-        status = Status.READY_FOR_HUMAN_SUBMIT
-        present_blocking(page, None)
-        messages = ["Every required field on this page is filled. A person clicks Submit."]
+        decision = terminal_kind(
+            snapshot,
+            url=_page_url(page),
+            gaps=gaps,
+            required_total=total,
+        )
+        if decision == "READY":
+            status = Status.READY_FOR_HUMAN_SUBMIT
+            present_blocking(page, None)
+            messages = ["Every required field on this page is filled. A person clicks Submit."]
+        elif decision == "NO_FORM":
+            status = Status.NO_FORM_FOUND
+            present_blocking(page, None)
+            reason = {
+                "JOB_DESCRIPTION": "job_description",
+                "APPLY_ENTRY": "apply_entry",
+                "CONFIRMATION": "confirmation",
+            }.get(current_page_type(), "no_application_form")
+            messages = [
+                "No application form was found. A person can open the page and continue.",
+                reason,
+            ]
+        else:
+            status = Status.FILLED
+            present_blocking(page, None)
+            messages = ["Every required field on this page is filled. A person clicks Submit."]
     return FollowUp(
         changed=False,
         status=status,

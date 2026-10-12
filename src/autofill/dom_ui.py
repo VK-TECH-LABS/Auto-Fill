@@ -399,7 +399,11 @@ def progress_percent(stage: str, required_total: int, required_done: int) -> int
         if done >= required_total:
             return 100
         return min(99, max(0, int(round(100 * done / required_total))))
-    return STAGE_PERCENT.get(stage, STAGE_PERCENT["OPENING"])
+    percent = STAGE_PERCENT.get(stage, STAGE_PERCENT["OPENING"])
+    # A stage value of 100 with nothing counted is the false Ready the posting page produced.
+    if percent >= 100:
+        return 0
+    return percent
 
 
 def safe_label(text: str) -> str:

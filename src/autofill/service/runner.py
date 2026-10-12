@@ -377,6 +377,27 @@ class BrowserDisabled(RuntimeError):
     """``AUTOFILL_RUN_BROWSER`` is off, so this process will not launch Chromium."""
 
 
+_STARTUP_SECONDS = 45.0
+
+
+class StartupError(RuntimeError):
+    """Browser launch or the first navigation failed. ``reason`` is public."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _startup_reason(exc: BaseException) -> str:
+    """Map a launch or navigation failure onto the public retry reason."""
+    if is_browser_crash(exc):
+        return "browser_crashed"
+    text = f"{type(exc).__name__} {exc}".casefold()
+    if "blocked" in text or "err_blocked" in text or "access denied" in text:
+        return "blocked"
+    return "navigation_timeout"
+
+
 class RunnerStopped(RuntimeError):
     """The runner has shut down and will not accept more browser work."""
 
@@ -410,6 +431,8 @@ class FillRequest:
     resume_mime: str = ""
     resume_bytes: bytes | None = None
     resume_prepared: bool = False
+    on_paint: Any = None
+    on_phase: Any = None
 
 
 class FillRunner(Protocol):
@@ -474,23 +497,54 @@ class _SessionContext:
         self.mark: PageMark | None = None
         self.last_ats: str | None = None
 
-    def open(self, driver: _SharedDriver, url: str) -> Any:
+    def open(self, driver: _SharedDriver, url: str, *, on_commit=None, on_phase=None) -> Any:
+        """Launch and commit the first document. One retry, then ``StartupError``.
+
+        The budget covers browser launch and ``domcontentloaded``. The context
+        is closed when that budget is exhausted.
+        """
         if self.page is not None:
             return self.page
-        started = time.perf_counter()
-        # A fresh context every time. No user-data directory and no stored profile.
-        context = driver.browser().new_context(viewport={"width": 1280, "height": 800})
-        self.context_ready_ms = elapsed_ms(started)
-        try:
-            page = context.new_page()
-            _block_heavy(page)
-            page.goto(url)
-        except BaseException:
-            context.close()
-            raise
-        self.context = context
-        self.page = page
-        return page
+        deadline = time.monotonic() + _STARTUP_SECONDS
+        last = "navigation_timeout"
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            context = None
+            try:
+                if on_phase is not None:
+                    on_phase("launching")
+                started = time.perf_counter()
+                browser = driver.browser()
+                if on_phase is not None:
+                    on_phase("navigating")
+                # A fresh context every time. No user-data directory and no stored profile.
+                context = browser.new_context(viewport={"width": 1280, "height": 800})
+                self.context_ready_ms = elapsed_ms(started)
+                page = context.new_page()
+                _block_heavy(page)
+                page.goto(url, wait_until="domcontentloaded", timeout=max(1, int(remaining * 1000)))
+                self.context = context
+                self.page = page
+                if on_phase is not None:
+                    on_phase("loaded")
+                if on_commit is not None:
+                    on_commit(page)
+                return page
+            except BaseException as exc:
+                self.page = None
+                self.context = None
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                last = _startup_reason(exc)
+                # A dead browser is relaunched by the caller. Retrying it here loops on the same process.
+                if last in {"browser_crashed", "blocked"} or attempt == 1:
+                    raise StartupError(last) from exc
+        raise StartupError(last)
 
     def close(self) -> None:
         """Close this context only. The worker's browser stays up."""
@@ -728,6 +782,7 @@ class PlaywrightRunner:
             resume_mime=request.resume_mime,
             resume_bytes=request.resume_bytes,
             resume_prepared=request.resume_prepared,
+            on_paint=request.on_paint,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
@@ -780,7 +835,21 @@ class PlaywrightRunner:
                     if not memory_allows_session():
                         return self._retryable(request, category="capacity_busy")
                     slot = _SessionContext()
-                    slot.open(worker.driver, request.application_url)
+                    try:
+                        slot.open(
+                            worker.driver,
+                            request.application_url,
+                            on_commit=request.on_paint,
+                            on_phase=request.on_phase,
+                        )
+                    except StartupError as exc:
+                        if exc.reason == "browser_crashed" and attempts < 1:
+                            attempts += 1
+                            worker._recover_driver()
+                            continue
+                        if exc.reason == "browser_crashed":
+                            worker._recover_driver()
+                        return self._retryable(request, category=exc.reason)
                     worker.sessions[request.session_id] = slot
                 result = self._run_engine(request, slot.page, slot)
                 slot.last_ats = result.ats
@@ -994,7 +1063,9 @@ class PlaywrightRunner:
             return
 
     def _result_from_follow(self, request: FillRequest, follow: FollowUp, ats: str | None) -> ApplicationResult:
-        return ApplicationResult(
+        from autofill.pagewait import current_page_type
+
+        result = ApplicationResult(
             status=follow.status,
             ats=ats,
             current_step=follow.status,
@@ -1009,6 +1080,8 @@ class PlaywrightRunner:
             open_items=list(follow.open_items),
             manual_questions=list(follow.manual_questions),
         )
+        result.page_type = current_page_type()
+        return result
 
     def advance_after_answer(self, request: FillRequest) -> ApplicationResult | None:
         """Scan for the next blocker. A full fill runs only when the page or step changed."""

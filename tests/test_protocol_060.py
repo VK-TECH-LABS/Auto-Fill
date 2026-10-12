@@ -191,7 +191,7 @@ def browser():
 
 
 def test_progress_percent_is_computed():
-    assert progress_percent("READY", 0, 0) == 100
+    assert progress_percent("READY", 0, 0) == 0
     assert progress_percent("READY", 4, 1) == 25
     assert progress_percent("READY", 3, 2) == 67
     assert progress_percent("EMPLOYMENT", 0, 0) == 45

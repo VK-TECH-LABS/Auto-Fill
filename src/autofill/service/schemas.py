@@ -413,6 +413,9 @@ class RunStatusOut(BaseModel):
     resume: dict[str, Any] | None = None
     completed: dict[str, Any] | None = None
     checkpoint: dict[str, Any] | None = None
+    page_type: str = Field(default="UNKNOWN", alias="pageType")
+    phase: Literal["launching", "navigating", "loaded"] = "launching"
+    started_at: str | None = Field(default=None, alias="startedAt")
 
     @model_serializer(mode="wrap")
     def _omit_older_protocol(self, handler):

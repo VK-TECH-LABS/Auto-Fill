@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Example Engineer</title></head>
+<body>
+  <h1>Example Engineer</h1>
+  <p>Job description. Responsibilities and qualifications for this role.</p>
+  <a id="apply_button" href="#apply">Apply for this Job</a>
+  <button type="submit" id="send">Submit application</button>
+  <script>
+    window.__clicked = [];
+    document.getElementById("apply_button").addEventListener("click", (event) => {
+      event.preventDefault();
+      window.__clicked.push("Apply for this Job");
+    });
+    document.getElementById("send").addEventListener("click", (event) => {
+      event.preventDefault();
+      window.__clicked.push("Submit application");
+    });
+  </script>
+</body>
+</html>
