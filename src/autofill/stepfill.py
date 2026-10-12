@@ -46,6 +46,7 @@ from autofill.intents import (
     sanitize_question,
 )
 from autofill.mapping import (
+    AUTO_CONSENT_CATEGORIES,
     acknowledgement_kind,
     haystack,
     is_consent_choice,
@@ -2832,13 +2833,14 @@ def _accept_standard_term(page, ask) -> bool:
     control = ask.controls[0]
     if control.kind != "checkbox" or not control.required:
         return False
-    if terms_category(control) != "STANDARD_TERMS":
+    category = terms_category(control)
+    if category not in AUTO_CONSENT_CATEGORIES:
         return False
     try:
         page.locator(control.selector).check()
     except Exception:
         return False
-    record_auto_consent(control)
+    record_auto_consent(control, category)
     return True
 
 

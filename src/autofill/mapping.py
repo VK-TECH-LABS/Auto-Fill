@@ -15,6 +15,7 @@ skill is listed on the profile, and otherwise leaves the control unanswered.
 from __future__ import annotations
 
 import contextvars
+import logging
 import re
 from dataclasses import dataclass, field
 
@@ -372,6 +373,20 @@ STANDARD_TERMS_ALLOW: tuple[str, ...] = (
     "agree to the terms",
     "agree to the privacy",
 )
+# Exact statements only. A longer sentence is not this category.
+_SUBMISSION_EXACT: tuple[re.Pattern[str], ...] = (
+    re.compile(r"i consent to submit my information"),
+    re.compile(r"i consent to the processing of my personal data for this application"),
+)
+_SUBMISSION_SHARE = re.compile(
+    r"i agree to share my information with (?P<employer>[a-z0-9 ]{1,80}) for recruitment purposes"
+)
+_BROAD_SHARE = re.compile(
+    r"\b(?:anyone|everybody|everyone|any company|any employer|all employers|all companies|"
+    r"the public|other companies|worldwide|whomever|any party)\b"
+)
+AUTO_CONSENT_CATEGORIES = frozenset({"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT"})
+_logger = logging.getLogger("autofill.mapping")
 
 
 def _phrase_re(phrases: tuple[str, ...]) -> re.Pattern[str]:
@@ -401,11 +416,27 @@ def consume_auto_consents() -> list[dict]:
     return found
 
 
-def terms_category(control: Control) -> str:
-    """``STANDARD_TERMS`` only for a plain terms or privacy checkbox.
+def _is_submission_consent(statement: str) -> bool:
+    """True only for one of the plain data-submission sentences."""
+    text = normalize(statement)
+    if not text:
+        return False
+    if any(pattern.fullmatch(text) for pattern in _SUBMISSION_EXACT):
+        return True
+    share = _SUBMISSION_SHARE.fullmatch(text)
+    if share is None:
+        return False
+    employer = share.group("employer").strip()
+    return bool(employer) and _BROAD_SHARE.search(employer) is None
 
-    The deny-list is applied first. The allow-list is the only way to pass.
-    A checkbox that matches neither, or that matches both, stays ``CONSENT``.
+
+def terms_category(control: Control) -> str:
+    """``STANDARD_TERMS`` or ``STANDARD_SUBMISSION_CONSENT`` for a plain checkbox.
+
+    The deny-list is applied first. A terms allow-list match is
+    ``STANDARD_TERMS``. An exact data-submission sentence is
+    ``STANDARD_SUBMISSION_CONSENT``. Anything else, including a sentence that
+    also matches the deny-list, stays ``CONSENT``.
     """
     if control.kind != "checkbox":
         return "CONSENT"
@@ -415,20 +446,26 @@ def terms_category(control: Control) -> str:
         return "CONSENT"
     if _ALLOW_TERMS_RE.search(blob):
         return "STANDARD_TERMS"
+    for part in (control.label, control.prompt, control.group, control.aria_label):
+        if part and _is_submission_consent(part):
+            return "STANDARD_SUBMISSION_CONSENT"
     return "CONSENT"
 
 
-def record_auto_consent(control: Control) -> dict:
+def record_auto_consent(control: Control, category: str = "STANDARD_TERMS") -> dict:
     """One audit row. The excerpt is the statement, never a secret."""
     from autofill.intents import question_hash
 
+    if category not in AUTO_CONSENT_CATEGORIES:
+        category = "STANDARD_TERMS"
     text = " ".join((control.label or control.prompt or control.group or control.aria_label or "").split())
     token = control.element_id or control.name or control.selector or ""
     entry = {
         "questionHash": question_hash(text, token),
         "textExcerpt": text[:160],
-        "category": "STANDARD_TERMS",
+        "category": category,
     }
+    _logger.info("auto_consent category=%s result=checked", category)
     found = list(_AUTO_CONSENTS.get() or [])
     found.append(entry)
     _AUTO_CONSENTS.set(found)

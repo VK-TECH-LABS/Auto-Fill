@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from autofill.account_flow import run_account_action
 from autofill.dom_ui import progress_percent, workflow_percent
 from autofill.engine import AutofillOptions, Status, autofill_application
@@ -382,6 +384,125 @@ def test_ai_deny_matches_a_whole_word_only():
     assert terms_category(privacy) == "STANDARD_TERMS"
     assert terms_category(embedded) == "STANDARD_TERMS"
     assert terms_category(whole) == "CONSENT"
+
+
+def test_plain_submission_consent_is_its_own_category():
+    allowed = (
+        "I consent to submit my information",
+        "I consent to the processing of my personal data for this application",
+        "I agree to share my information with Snap Finance for recruitment purposes",
+    )
+    for label in allowed:
+        assert terms_category(_control("checkbox", label, "#submit", required=True)) == "STANDARD_SUBMISSION_CONSENT"
+    blocked = (
+        "I consent",
+        "I consent to submit my information for any future use",
+        "I agree to share my information",
+        "I agree to share my information with anyone worldwide for recruitment purposes",
+        "I consent to submit my information and receive job alerts",
+        "I consent to the processing of my personal data for this application and SMS",
+        "I agree to share my information with Snap Finance for recruitment purposes and AI screening",
+        "I certify that I consent to submit my information",
+        "I consent to a background check and to submit my information",
+    )
+    for label in blocked:
+        assert terms_category(_control("checkbox", label, "#other", required=True)) == "CONSENT", label
+
+
+def test_register_checks_submission_consent_and_logs_only_the_category(caplog):
+    secret = "Correct-Horse-1!"
+    email = "river.example@example.com"
+    checked: list[str] = []
+    clicked: list[str] = []
+    values = {"#email": "", "#password": "", "#verify": ""}
+    form = {
+        "controls": [
+            {"kind": "text", "label": "Email Address", "selector": "#email", "inputType": "email"},
+            {"kind": "password", "label": "Password", "selector": "#password", "inputType": "password"},
+            {"kind": "password", "label": "Verify New Password", "selector": "#verify", "inputType": "password"},
+            {
+                "kind": "checkbox",
+                "label": "I consent to submit my information",
+                "selector": "#submit-info",
+                "inputType": "checkbox",
+                "required": True,
+            },
+            {
+                "kind": "checkbox",
+                "label": "I agree to receive promotional SMS",
+                "selector": "#promo",
+                "inputType": "checkbox",
+                "required": True,
+            },
+        ],
+        "buttons": [{"name": "Create Account", "selector": "#create", "controlType": "button"}],
+        "captcha": False,
+        "password": True,
+        "heading": "Create Account",
+        "pageText": "Email Address Password Verify New Password Create Account",
+        "links": [],
+        "automationIds": [],
+    }
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def fill(self, value: str) -> None:
+            values[self.selector] = value
+
+        def input_value(self) -> str:
+            return values.get(self.selector, "")
+
+        def check(self) -> None:
+            checked.append(self.selector)
+
+        def click(self) -> None:
+            clicked.append(self.selector)
+
+    class Page:
+        url = "https://example.test/register"
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+        def evaluate(self, script, arg=None):
+            if clicked:
+                return {
+                    "controls": [],
+                    "buttons": [],
+                    "captcha": False,
+                    "password": False,
+                    "heading": "Check your inbox",
+                    "pageText": "Verify your email address",
+                    "links": [],
+                    "automationIds": [],
+                }
+            return form
+
+    caplog.set_level(logging.INFO, logger="autofill.mapping")
+    accepted = run_account_action(
+        Page(),
+        mode="register",
+        email=email,
+        username="",
+        password=secret,
+        confirm=secret,
+        ats="workday",
+        standard_terms=True,
+    )
+    assert checked == ["#submit-info"]
+    assert clicked == ["#create"]
+    assert accepted["status"] == "EMAIL_VERIFICATION_REQUIRED"
+    assert accepted["autoConsents"][0]["category"] == "STANDARD_SUBMISSION_CONSENT"
+    assert accepted["autoConsents"][0]["textExcerpt"] == "I consent to submit my information"
+    promo = next(row for row in accepted["consentRows"] if row["textExcerpt"].startswith("I agree to receive"))
+    assert promo["category"] == "CONSENT"
+    assert promo["checked"] is False
+    assert secret not in caplog.text
+    assert email not in caplog.text
+    assert "submit my information" not in caplog.text
+    assert "auto_consent category=STANDARD_SUBMISSION_CONSENT result=checked" in caplog.text
 
 
 def test_register_checks_standard_terms_and_leaves_other_boxes():
