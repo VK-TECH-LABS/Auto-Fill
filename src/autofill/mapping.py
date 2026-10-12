@@ -361,6 +361,23 @@ STANDARD_TERMS_DENY: tuple[str, ...] = (
     "third parties",
     "third party",
     "partners",
+    "sensitive",
+    "biometric",
+    "health",
+    "medical",
+    "criminal",
+    "social security",
+    "ssn",
+    "contacted",
+    "contact me",
+    "drug test",
+    "waive",
+    "waiver",
+    "jury",
+    "transfer",
+    "interview analysis",
+    "video analysis",
+    "salary",
 )
 STANDARD_TERMS_ALLOW: tuple[str, ...] = (
     "terms of use",
@@ -373,17 +390,14 @@ STANDARD_TERMS_ALLOW: tuple[str, ...] = (
     "agree to the terms",
     "agree to the privacy",
 )
-# Exact statements only. A longer sentence is not this category.
-_SUBMISSION_EXACT: tuple[re.Pattern[str], ...] = (
-    re.compile(r"i consent to submit my information"),
-    re.compile(r"i consent to the processing of my personal data for this application"),
-)
-_SUBMISSION_SHARE = re.compile(
-    r"i agree to share my information with (?P<employer>[a-z0-9 ]{1,80}) for recruitment purposes"
-)
-_BROAD_SHARE = re.compile(
-    r"\b(?:anyone|everybody|everyone|any company|any employer|all employers|all companies|"
-    r"the public|other companies|worldwide|whomever|any party)\b"
+# The whole statement, with no free-word gap:
+# I (consent|agree) to (submit|the submission of|the processing of)
+# my (personal )?(information|data)
+# ( for this (job )?application | for the purposes of this (application|recruitment process))?
+_SUBMISSION_CONSENT = re.compile(
+    r"i (?:consent|agree) to (?:submit|the submission of|the processing of) "
+    r"my (?:personal )?(?:information|data)"
+    r"(?: for this (?:job )?application| for the purposes of this (?:application|recruitment process))?"
 )
 AUTO_CONSENT_CATEGORIES = frozenset({"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT"})
 _logger = logging.getLogger("autofill.mapping")
@@ -417,26 +431,17 @@ def consume_auto_consents() -> list[dict]:
 
 
 def _is_submission_consent(statement: str) -> bool:
-    """True only for one of the plain data-submission sentences."""
+    """True only when the whole statement is the fixed submission wording."""
     text = normalize(statement)
-    if not text:
-        return False
-    if any(pattern.fullmatch(text) for pattern in _SUBMISSION_EXACT):
-        return True
-    share = _SUBMISSION_SHARE.fullmatch(text)
-    if share is None:
-        return False
-    employer = share.group("employer").strip()
-    return bool(employer) and _BROAD_SHARE.search(employer) is None
+    return bool(text) and _SUBMISSION_CONSENT.fullmatch(text) is not None
 
 
 def terms_category(control: Control) -> str:
     """``STANDARD_TERMS`` or ``STANDARD_SUBMISSION_CONSENT`` for a plain checkbox.
 
     The deny-list is applied first. A terms allow-list match is
-    ``STANDARD_TERMS``. An exact data-submission sentence is
-    ``STANDARD_SUBMISSION_CONSENT``. Anything else, including a sentence that
-    also matches the deny-list, stays ``CONSENT``.
+    ``STANDARD_TERMS``. Fixed data-submission wording, with no free-word gap,
+    is ``STANDARD_SUBMISSION_CONSENT``. Anything else stays ``CONSENT``.
     """
     if control.kind != "checkbox":
         return "CONSENT"
