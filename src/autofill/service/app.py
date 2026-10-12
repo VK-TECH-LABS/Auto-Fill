@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -77,7 +77,13 @@ from autofill.service.schemas import (
     SuggestOut,
     TimingsOut,
 )
-from autofill.service.sessions import ServiceSession, ServiceSessionStore, monotonic, new_session_id
+from autofill.service.sessions import (
+    ServiceSession,
+    ServiceSessionStore,
+    created_start_is_stale,
+    monotonic,
+    new_session_id,
+)
 
 logger = logging.getLogger("autofill.service")
 
@@ -612,6 +618,25 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     return _status_out(session, final=True)
 
 
+_START_FAILED = "start_failed"
+
+
+def _mark_start_failed(session: ServiceSession) -> None:
+    """A start that did not run can be retried. The reason is not candidate data."""
+    session.status = Status.FAILED_RETRYABLE
+    session.result = ApplicationResult(
+        status=Status.FAILED_RETRYABLE,
+        ats=None,
+        current_step=Status.FAILED_RETRYABLE,
+        login_status="NOT_REQUIRED",
+        session_id=session.session_id,
+        candidate_id=session.candidate_id,
+        job_id=session.job_id,
+        messages=[_START_FAILED],
+    )
+    logger.info("session=%s status=%s result=%s", session.session_id, session.status, _START_FAILED)
+
+
 def _mark_browser_crash(session: ServiceSession) -> None:
     """A dead tab is a retryable crash, not the status the run had before it died."""
     session.status = Status.FAILED_RETRYABLE
@@ -805,7 +830,7 @@ def _allow_browser_restart(session: ServiceSession) -> None:
     A capacity refusal is retryable on its own and does not spend this budget.
     """
     messages = session.result.messages if session.result is not None else []
-    if "capacity_busy" in messages:
+    if "capacity_busy" in messages or _START_FAILED in messages:
         return
     if session.browser_restarts >= 2:
         raise HTTPException(status_code=409, detail="Browser crash retry limit reached.")
@@ -1091,7 +1116,8 @@ def create_app(
     def _reject_expired(session: ServiceSession, *, machine: bool = False) -> None:
         """Stop a call on an expired session before it pauses, fills, or stores a secret."""
         timed_out = bool(session.expires_at) and monotonic() >= session.expires_at
-        if session.status != Status.EXPIRED and not timed_out:
+        stale_start = created_start_is_stale(session, monotonic())
+        if session.status != Status.EXPIRED and not timed_out and not stale_start:
             return
         if not session.busy and session.status != Status.EXPIRED:
             session.status = Status.EXPIRED
@@ -1102,8 +1128,13 @@ def create_app(
         raise HTTPException(status_code=410, detail="Session expired.")
 
     @app.exception_handler(RequestValidationError)
-    async def _hide_rejected_input(_request, exc: RequestValidationError) -> JSONResponse:
+    async def _hide_rejected_input(request: Request, exc: RequestValidationError) -> JSONResponse:
         detail = [{key: value for key, value in error.items() if key not in {"input", "ctx"}} for error in exc.errors()]
+        if request.method == "POST" and request.url.path.rstrip("/").endswith("/start"):
+            session_id = str(request.path_params.get("session_id") or "")
+            session = store.get(session_id) if session_id else None
+            if session is not None and session.status in {Status.CREATED, "CREATED"} and not session.busy:
+                _mark_start_failed(session)
         return JSONResponse(status_code=422, content={"detail": detail})
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
@@ -1169,6 +1200,7 @@ def create_app(
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         session.expires_at = monotonic() + session_ttl_seconds
+        session.created_mono = monotonic()
         session.timings["sessionCreatedMs"] = elapsed_ms(started)
         try:
             store.create(session)
@@ -1181,13 +1213,29 @@ def create_app(
     @router.post("/sessions/{session_id}/start", response_model=RunStatusOut, tags=["sessions"])
     def start_session(session_id: str, body: CandidateCheckIn | None = None) -> RunStatusOut:
         session = _session_or_404(session_id)
+        if created_start_is_stale(session, monotonic()):
+            session.status = Status.EXPIRED
+            session.wipe_secrets()
+            active_runner.discard(session.session_id)
+            raise HTTPException(status_code=410, detail={"reason": "session_expired"})
         if body is not None:
             _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip())
+            # True turns the flag on. False leaves a create-time grant in place.
+            # The deny-list still runs first inside the classifier.
+            if body.standard_terms_authorized:
+                session.standard_terms_authorized = True
         if session.status not in _STARTABLE:
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
-        return _run(session, store, active_runner, limits, resume_uploaded=False)
+        try:
+            outcome = _run(session, store, active_runner, limits, resume_uploaded=False)
+        except HTTPException:
+            raise
+        if session.status == Status.FAILED:
+            _mark_start_failed(session)
+            return _status_out(session)
+        return outcome
 
     @router.post("/sessions/{session_id}/retry", response_model=RunStatusOut, tags=["sessions"])
     def retry_session(session_id: str) -> RunStatusOut:

@@ -126,6 +126,7 @@ class CandidateCheckIn(BaseModel):
 
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
     candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
+    standard_terms_authorized: bool = Field(default=False, alias="standardTermsAuthorized")
 
 
 class ContinueIn(BaseModel):

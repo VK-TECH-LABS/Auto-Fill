@@ -131,7 +131,7 @@ Store a site login for this session only. Send it before `start` when the applic
 
 ### `POST /v1/sessions/{sessionId}/start`
 
-Open the application URL and fill until the engine stops. Optional body: `{"candidateId":"candidate-example"}`. Allowed from `CREATED`, `LOGIN_REQUIRED`, and `LOGIN_FAILED`.
+Open the application URL and fill until the engine stops. Optional body: `{"candidateId":"candidate-example","standardTermsAuthorized":true}`. `standardTermsAuthorized` is stored only when it is true, so a false value does not clear a grant from create, and the deny-list is unchanged. Allowed from `CREATED`, `LOGIN_REQUIRED`, and `LOGIN_FAILED`. A start that does not run leaves the session `FAILED_RETRYABLE` with message `start_failed`, and `POST /retry` runs it again. A session that is still `CREATED` more than 120 seconds after create, with no successful start, is expired and no longer counts toward the session cap.
 
 ### `GET /v1/sessions/{sessionId}/status`
 
