@@ -6,6 +6,7 @@ Password values are passed through and are not logged.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 
@@ -22,6 +23,7 @@ from autofill.login import (
     verification_present,
 )
 from autofill.mapping import (
+    AUTO_CONSENT_CATEGORIES,
     bind_standard_terms,
     consume_auto_consents,
     record_auto_consent,
@@ -31,6 +33,7 @@ from autofill.mapping import (
 from autofill.models import Control, PageSnapshot
 from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch
 
+_logger = logging.getLogger("autofill.account")
 _EEO_RE = re.compile(r"\b(eeo|equal employment|self-identif|voluntary|work authorization)\b", re.IGNORECASE)
 _TERMS_RE = re.compile(r"\b(terms|privacy)\b", re.IGNORECASE)
 _WAIT_SECONDS = 15.0
@@ -198,13 +201,14 @@ def _accept_account_terms(page, snapshot: PageSnapshot) -> list[dict]:
             continue
         category = terms_category(control)
         checked = False
-        if category == "STANDARD_TERMS" and control.required:
+        if category in AUTO_CONSENT_CATEGORIES and control.required:
             try:
                 page.locator(control.selector).check()
             except Exception:
+                _logger.info("auto_consent category=%s result=failed", category)
                 category = "CONSENT"
             else:
-                record_auto_consent(control)
+                record_auto_consent(control, category)
                 checked = True
         else:
             category = "CONSENT"
