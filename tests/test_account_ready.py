@@ -393,14 +393,61 @@ def test_ai_deny_matches_a_whole_word_only():
     privacy = _control("checkbox", "I agree to the privacy policy", "#privacy", required=True)
     embedded = _control(
         "checkbox",
-        "I agree to the terms and will maintain this email",
+        "I agree to the Privacy Policy",
         "#keep",
         required=True,
+        name="email",
+        placeholder="maintain",
     )
-    whole = _control("checkbox", "I agree to the terms and to the use of AI", "#ai", required=True)
+    whole = _control("checkbox", "I agree to the Privacy Policy", "#ai", required=True, group="use of AI")
+    loose = _control(
+        "checkbox",
+        "I agree to the terms and will maintain this email",
+        "#loose",
+        required=True,
+    )
     assert terms_category(privacy) == "STANDARD_TERMS"
     assert terms_category(embedded) == "STANDARD_TERMS"
     assert terms_category(whole) == "CONSENT"
+    assert terms_category(loose) == "CONSENT"
+
+
+def test_standard_terms_allow_is_a_fixed_sentence():
+    allowed = (
+        "I agree to the Terms of Service",
+        "I agree to the Terms of Service.",
+        "I accept the Terms and Conditions",
+        "I accept the Terms of Use.",
+        "I have read and agree to the Privacy Policy",
+        "I have read and agree to the Privacy Notice.",
+        "I agree to the Terms of Use and Privacy Policy",
+        "I agree to the Terms of Service and the Privacy Policy",
+        "I accept the Terms of Use and the Privacy Notice.",
+    )
+    for label in allowed:
+        assert terms_category(_control("checkbox", label, "#terms", required=True)) == "STANDARD_TERMS", label
+    assert (
+        terms_category(
+            _control(
+                "checkbox",
+                "I agree to the Terms of Service and I agree to anything at all",
+                "#broad",
+                required=True,
+            )
+        )
+        == "CONSENT"
+    )
+    assert (
+        terms_category(
+            _control(
+                "checkbox",
+                "I agree to the Terms of Service and I agree to anything at all.",
+                "#broad-period",
+                required=True,
+            )
+        )
+        == "CONSENT"
+    )
 
 
 def test_plain_submission_consent_is_its_own_category():
