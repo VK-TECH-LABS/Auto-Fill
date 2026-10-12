@@ -162,17 +162,23 @@ def test_auth_rejects_missing_and_wrong_tokens(client: TestClient):
     assert PASSWORD not in missing.text
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json() == {
+    expected_health = {
         "status": "ok",
         "service": "auto-fill",
         "supportedProtocolVersions": ["0.4.0", "0.5.0", "0.6.0", "0.7.0"],
+        "features": ["standardTerms"],
     }
+    assert health.json() == expected_health
+    versioned = client.get("/v1/health")
+    assert versioned.status_code == 200
+    assert versioned.json() == expected_health
 
 
 def test_create_start_and_status(client: TestClient, runner: RecordingRunner):
     created = _create(client)
     assert created["status"] == "CREATED"
     assert created["protocolVersion"] == "0.6.0"
+    assert created["features"] == ["standardTerms"]
     assert created["stopped_before_submit"] is True
     assert created["candidateId"] == "candidate-a"
     assert EMAIL not in str(created)

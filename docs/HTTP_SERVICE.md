@@ -57,7 +57,7 @@ Every `/v1/` route requires:
 Authorization: Bearer <AUTOFILL_SERVICE_TOKEN>
 ```
 
-Missing and wrong tokens both receive `401` and `{"detail":"Unauthorized"}`. `GET /health` does not require auth. It returns `{"status":"ok","service":"auto-fill","supportedProtocolVersions":["0.4.0","0.5.0","0.6.0","0.7.0"]}` and nothing about sessions. `supportedProtocolVersions` is the field a host reads to see that `0.7.0` is supported. Creating a session still defaults `protocolVersion` to `0.6.0` unless the caller sends `0.7.0`.
+Missing and wrong tokens both receive `401` and `{"detail":"Unauthorized"}`. `GET /health` and `GET /v1/health` do not require auth. Both return `{"status":"ok","service":"auto-fill","supportedProtocolVersions":["0.4.0","0.5.0","0.6.0","0.7.0"],"features":["standardTerms"]}` and nothing about sessions. `supportedProtocolVersions` is the field a host reads to see that `0.7.0` is supported. `features` lists `standardTerms` when this build will honor `standardTermsAuthorized`. Creating a session still defaults `protocolVersion` to `0.6.0` unless the caller sends `0.7.0`. The `201` create body repeats `features`.
 
 Call the API from a backend you control. A browser page that holds the token is the wrong place for it.
 
@@ -173,7 +173,7 @@ Drop the session, close its browser, and forget its site password. `204` on succ
 }
 ```
 
-`standardTermsAuthorized` is an optional boolean on create (default false). It is the candidate's preference for plain site terms. When it is true, a required checkbox that is only a terms-of-use or privacy statement is checked, and each acceptance is reported as `autoConsents`: `{questionHash, textExcerpt, category}` with `category` `STANDARD_TERMS`. Marketing, SMS, promotional mail, AI or recording consent, arbitration, e-sign or signature, background check, certify/attest/declare under penalty, demographic questions, and any other unusual attestation stay `CONSENT` blockers. When the flag is false or omitted, those boxes stay unchecked.
+`standardTermsAuthorized` is an optional boolean on create (default false). Send it only when `features` includes `standardTerms` on `GET /v1/health` or on the create response. It is the candidate's preference for plain site terms. When it is true, a required checkbox is checked only after a deny-list and then a short allow-list: marketing, SMS, promotional mail, AI or recording consent, arbitration, e-sign or signature, background check, certify/attest/declare under penalty, and demographic questions stay `CONSENT`, and so does anything that does not match the allow-list. Each acceptance is reported as `autoConsents`: `{questionHash, textExcerpt, category}` with `category` `STANDARD_TERMS`. When the flag is false or omitted, those boxes stay unchecked.
 
 `201` returns `{sessionId, status: CREATED, stopped_before_submit: true, ...}`. The resolver token is not echoed. A resolver URL that contains the token, a userinfo password, or a `token` / `access_token` / `authorization` query key is rejected. `candidateContext` sent together with `resolver` is ignored. `approvedAnswers` are rejected when `resolver` is set. The 0.3.0 profile body above still works when `resolver` is omitted.
 

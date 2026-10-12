@@ -20,6 +20,7 @@ MAX_CONTEXT_BYTES = 100_000
 MAX_ANSWERS = 32
 SUPPORTED_PROTOCOL_VERSIONS = ("0.4.0", "0.5.0", "0.6.0", "0.7.0")
 DEFAULT_PROTOCOL_VERSION = "0.6.0"
+ADVERTISED_FEATURES = ("standardTerms",)
 
 
 class JobContextIn(BaseModel):
@@ -426,6 +427,7 @@ class RunStatusOut(BaseModel):
     phase: Literal["launching", "navigating", "loaded"] = "launching"
     started_at: str | None = Field(default=None, alias="startedAt")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
+    features: list[str] = Field(default_factory=lambda: list(ADVERTISED_FEATURES))
 
     @model_serializer(mode="wrap")
     def _omit_older_protocol(self, handler):
@@ -473,3 +475,4 @@ class HealthOut(BaseModel):
         default_factory=lambda: list(SUPPORTED_PROTOCOL_VERSIONS),
         alias="supportedProtocolVersions",
     )
+    features: list[str] = Field(default_factory=lambda: list(ADVERTISED_FEATURES))

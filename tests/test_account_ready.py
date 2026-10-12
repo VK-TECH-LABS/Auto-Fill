@@ -5,7 +5,7 @@ from __future__ import annotations
 from autofill.account_flow import run_account_action
 from autofill.dom_ui import progress_percent, workflow_percent
 from autofill.engine import AutofillOptions, Status, autofill_application
-from autofill.mapping import bind_standard_terms, consume_auto_consents, terms_category
+from autofill.mapping import STANDARD_TERMS_DENY, bind_standard_terms, consume_auto_consents, terms_category
 from autofill.models import ButtonControl, Control, PageSnapshot
 from autofill.pagewait import classify_page, ready_to_submit, register_pane, sign_in_pane, terminal_kind
 from autofill.profile import CandidateProfile
@@ -293,6 +293,34 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
     assert terms_category(terms) == "STANDARD_TERMS"
     for control in (promo, certify, arbitration, esign, background, demographic):
         assert terms_category(control) == "CONSENT"
+    ambiguous = _control("checkbox", "I agree", "#plain", required=True)
+    mixed = _control(
+        "checkbox",
+        "I agree to the Terms of Use and to receive promotional SMS",
+        "#mixed",
+        required=True,
+    )
+    assert terms_category(ambiguous) == "CONSENT"
+    assert terms_category(mixed) == "CONSENT"
+    deny = set(STANDARD_TERMS_DENY)
+    assert {
+        "marketing",
+        "sms",
+        "promotional",
+        "recording",
+        "notetaker",
+        "note taker",
+        "artificial intelligence",
+        "ai",
+        "arbitration",
+        "signature",
+        "background check",
+        "certify",
+        "attest",
+        "declare",
+        "under penalty",
+        "demographic",
+    } <= deny
 
     checked: list[str] = []
 
