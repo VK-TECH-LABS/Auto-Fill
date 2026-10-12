@@ -21,6 +21,13 @@ from autofill.login import (
     score_account,
     verification_present,
 )
+from autofill.mapping import (
+    bind_standard_terms,
+    consume_auto_consents,
+    record_auto_consent,
+    standard_terms_enabled,
+    terms_category,
+)
 from autofill.models import Control, PageSnapshot
 from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch
 
@@ -38,8 +45,37 @@ def run_account_action(
     password: str,
     confirm: str,
     ats: str | None,
+    standard_terms: bool = False,
 ) -> dict:
     """Fill the current account form and classify what the site did next."""
+    bind_standard_terms(bool(standard_terms))
+    try:
+        return _perform_account_action(
+            page,
+            mode=mode,
+            email=email,
+            username=username,
+            password=password,
+            confirm=confirm,
+            ats=ats,
+            standard_terms=standard_terms,
+        )
+    finally:
+        if standard_terms_enabled():
+            consume_auto_consents()
+
+
+def _perform_account_action(
+    page,
+    *,
+    mode: str,
+    email: str,
+    username: str,
+    password: str,
+    confirm: str,
+    ats: str | None,
+    standard_terms: bool = False,
+) -> dict:
     secrets = [value for value in (email, username, password, confirm) if value]
     snapshot = extract_page(page)
     if snapshot.captcha_present:
@@ -66,9 +102,11 @@ def run_account_action(
         return {"ok": False, "reason": "mode_mismatch", "detected": "register"}
     if scored.mode != mode:
         return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "login"}
-    terms, terms_error = _terms_checkbox(snapshot)
-    if terms_error:
-        return _rejected(snapshot, page.url or "", ats, mode, scored.alternate, [terms_error], secrets)
+    terms = None
+    if not standard_terms:
+        terms, terms_error = _terms_checkbox(snapshot)
+        if terms_error:
+            return _rejected(snapshot, page.url or "", ats, mode, scored.alternate, [terms_error], secrets)
     identity = _email_control(snapshot)
     primary, confirm_box = _password_targets(snapshot, mode)
     if primary is None:
@@ -81,9 +119,13 @@ def run_account_action(
             _type_secret(page, confirm_box.selector, confirm or password)
     except SecretInputError:
         return {"ok": False, "reason": "input_failed"}
-    if mode == "register" and not _passwords_match(page, primary, confirm_box, password, confirm):
-        return {"ok": False, "reason": "password_mismatch"}
-    if terms is not None:
+    proof = _field_proof(page, identity, primary, confirm_box, password, confirm, email, username)
+    if mode == "register" and not proof["passwordsMatch"]:
+        return {"ok": False, "reason": "password_mismatch", "fieldProof": proof}
+    rows: list[dict] = []
+    if standard_terms:
+        rows = _accept_account_terms(page, snapshot)
+    elif terms is not None:
         page.locator(terms.selector).check()
     button = _primary_button(snapshot, mode)
     if button is None:
@@ -91,7 +133,7 @@ def run_account_action(
     try:
         activate_account(page, button.selector, button.name, control_type=button.control_type)
     except SubmitBlockedError:
-        return _rejected(
+        rejected = _rejected(
             snapshot,
             page.url or "",
             ats,
@@ -100,25 +142,85 @@ def run_account_action(
             ["The account button could not be used."],
             secrets,
         )
-    return _wait_for_outcome(page, mode=mode, ats=ats, alternate=scored.alternate, secrets=secrets)
+        return _attach_proof(rejected, proof, rows, standard_terms=standard_terms)
+    outcome = _wait_for_outcome(page, mode=mode, ats=ats, alternate=scored.alternate, secrets=secrets)
+    return _attach_proof(outcome, proof, rows, standard_terms=standard_terms)
 
 
-def _passwords_match(page, primary: Control, confirm_box: Control | None, password: str, confirm: str) -> bool:
-    """True when both password fields hold the same value as the one provided.
-
-    The values are compared and dropped. They are not logged or returned.
-    """
-    if confirm_box is None or not primary.selector or not confirm_box.selector:
-        return False
+def _field_proof(
+    page,
+    identity: Control | None,
+    primary: Control | None,
+    confirm_box: Control | None,
+    password: str,
+    confirm: str,
+    email: str,
+    username: str,
+) -> dict:
+    """Lengths and equality only. The typed values are dropped and not returned."""
+    email_value = ""
+    left = ""
+    right = ""
     try:
-        left = page.locator(primary.selector).input_value()
-        right = page.locator(confirm_box.selector).input_value()
+        if identity is not None and identity.selector:
+            email_value = page.locator(identity.selector).input_value() or ""
+        if primary is not None and primary.selector:
+            left = page.locator(primary.selector).input_value() or ""
+        if confirm_box is not None and confirm_box.selector:
+            right = page.locator(confirm_box.selector).input_value() or ""
     except Exception:
-        return False
-    expected = confirm or password
-    matched = bool(left) and left == right and left == password and right == expected
-    del left, right
-    return matched
+        email_value = ""
+        left = ""
+        right = ""
+    expected_email = username if identity is not None and _username_field(identity) and username else email
+    expected_password = confirm or password
+    proof = {
+        "emailFilled": bool(email_value),
+        "emailLength": len(email_value),
+        "emailMatches": bool(email_value) and email_value == expected_email,
+        "passwordLength": len(left),
+        "verifyLength": len(right),
+        "passwordsMatch": bool(left) and left == right and left == password and right == expected_password,
+    }
+    del email_value, left, right, expected_email, expected_password
+    return proof
+
+
+def _statement(control: Control) -> str:
+    return " ".join((control.label or control.prompt or control.group or control.aria_label or "").split())[:160]
+
+
+def _accept_account_terms(page, snapshot: PageSnapshot) -> list[dict]:
+    """Check required plain terms. Every other checkbox stays unchecked."""
+    rows: list[dict] = []
+    for control in snapshot.controls:
+        if control.hidden or control.kind != "checkbox" or not control.selector:
+            continue
+        category = terms_category(control)
+        checked = False
+        if category == "STANDARD_TERMS" and control.required:
+            try:
+                page.locator(control.selector).check()
+            except Exception:
+                category = "CONSENT"
+            else:
+                record_auto_consent(control)
+                checked = True
+        else:
+            category = "CONSENT"
+        rows.append({"textExcerpt": _statement(control), "category": category, "checked": checked})
+    return rows
+
+
+def _attach_proof(result: dict, proof: dict, rows: list[dict], *, standard_terms: bool) -> dict:
+    body = dict(result)
+    body["fieldProof"] = proof
+    if standard_terms:
+        body["autoConsents"] = consume_auto_consents()
+        body["consentRows"] = rows
+    if body.get("status") == "READY_FOR_HUMAN_SUBMIT":
+        body["status"] = "ACCOUNT_CREATION_REQUIRED"
+    return body
 
 
 def _email_control(snapshot: PageSnapshot) -> Control | None:
