@@ -339,6 +339,23 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
         "phone calls",
         "third parties",
         "partners",
+        "sensitive",
+        "biometric",
+        "health",
+        "medical",
+        "criminal",
+        "social security",
+        "ssn",
+        "contacted",
+        "contact me",
+        "drug test",
+        "waive",
+        "waiver",
+        "jury",
+        "transfer",
+        "interview analysis",
+        "video analysis",
+        "salary",
     } <= deny
 
     checked: list[str] = []
@@ -376,37 +393,111 @@ def test_ai_deny_matches_a_whole_word_only():
     privacy = _control("checkbox", "I agree to the privacy policy", "#privacy", required=True)
     embedded = _control(
         "checkbox",
-        "I agree to the terms and will maintain this email",
+        "I agree to the Privacy Policy",
         "#keep",
         required=True,
+        name="email",
+        placeholder="maintain",
     )
-    whole = _control("checkbox", "I agree to the terms and to the use of AI", "#ai", required=True)
+    whole = _control("checkbox", "I agree to the Privacy Policy", "#ai", required=True, group="use of AI")
+    loose = _control(
+        "checkbox",
+        "I agree to the terms and will maintain this email",
+        "#loose",
+        required=True,
+    )
     assert terms_category(privacy) == "STANDARD_TERMS"
     assert terms_category(embedded) == "STANDARD_TERMS"
     assert terms_category(whole) == "CONSENT"
+    assert terms_category(loose) == "CONSENT"
+
+
+def test_standard_terms_allow_is_a_fixed_sentence():
+    allowed = (
+        "I agree to the Terms of Service",
+        "I agree to the Terms of Service.",
+        "I accept the Terms and Conditions",
+        "I accept the Terms of Use.",
+        "I have read and agree to the Privacy Policy",
+        "I have read and agree to the Privacy Notice.",
+        "I agree to the Terms of Use and Privacy Policy",
+        "I agree to the Terms of Service and the Privacy Policy",
+        "I accept the Terms of Use and the Privacy Notice.",
+    )
+    for label in allowed:
+        assert terms_category(_control("checkbox", label, "#terms", required=True)) == "STANDARD_TERMS", label
+    assert (
+        terms_category(
+            _control(
+                "checkbox",
+                "I agree to the Terms of Service and I agree to anything at all",
+                "#broad",
+                required=True,
+            )
+        )
+        == "CONSENT"
+    )
+    assert (
+        terms_category(
+            _control(
+                "checkbox",
+                "I agree to the Terms of Service and I agree to anything at all.",
+                "#broad-period",
+                required=True,
+            )
+        )
+        == "CONSENT"
+    )
 
 
 def test_plain_submission_consent_is_its_own_category():
     allowed = (
         "I consent to submit my information",
+        "I consent to submit my information.",
+        "I agree to the processing of my personal data for this application",
+        "I agree to the processing of my personal data for this application.",
         "I consent to the processing of my personal data for this application",
-        "I agree to share my information with Snap Finance for recruitment purposes",
+        "I consent to the submission of my data",
+        "I agree to submit my personal information for this job application",
+        "I consent to the processing of my data for the purposes of this recruitment process",
     )
     for label in allowed:
         assert terms_category(_control("checkbox", label, "#submit", required=True)) == "STANDARD_SUBMISSION_CONSENT"
     blocked = (
         "I consent",
+        "I consent to be contacted",
+        "I consent to submit my biometric information",
+        "I consent to submit my health information",
+        "I consent to submit my criminal history information",
+        "I consent to submit my SSN information",
+        "I consent to submit my salary information",
+        "consent to submit my biometric information",
+        "I consent to the processing of my sensitive personal data",
+        "processing of my sensitive personal data",
+        "I consent to submit my information and transfer to the US",
+        "I consent to submit my information to recruiters who may contact me",
+        "I consent to submit my information for AI interview analysis",
+        "I agree to anything at all",
+        "I consent to submit my medical information",
+        "I consent to submit my social security information",
+        "I consent to a drug test and to submit my information",
+        "I waive the right and consent to submit my information",
+        "I consent to submit my information subject to waiver",
+        "I consent to submit my information to a jury",
+        "I consent to submit my information for video analysis",
         "I consent to submit my information for any future use",
         "I agree to share my information",
+        "I agree to share my information with Snap Finance for recruitment purposes",
         "I agree to share my information with anyone worldwide for recruitment purposes",
         "I consent to submit my information and receive job alerts",
         "I consent to the processing of my personal data for this application and SMS",
-        "I agree to share my information with Snap Finance for recruitment purposes and AI screening",
         "I certify that I consent to submit my information",
         "I consent to a background check and to submit my information",
     )
     for label in blocked:
         assert terms_category(_control("checkbox", label, "#other", required=True)) == "CONSENT", label
+    denied_nearby = _control("checkbox", "I consent to submit my information", "#nearby", required=True, group="salary")
+    assert terms_category(denied_nearby) == "CONSENT"
 
 
 def test_register_checks_submission_consent_and_logs_only_the_category(caplog):
