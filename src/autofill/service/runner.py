@@ -980,6 +980,7 @@ class PlaywrightRunner:
                     password=str(payload.get("password") or ""),
                     confirm=str(payload.get("confirm") or ""),
                     ats=slot.last_ats,
+                    standard_terms=bool(payload.get("standardTerms")),
                 )
             except Exception as exc:
                 if _page_navigating(exc):

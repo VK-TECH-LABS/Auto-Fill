@@ -8,7 +8,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
@@ -330,8 +330,26 @@ def _require_same_origin(session: ServiceSession, site: str) -> None:
         raise HTTPException(status_code=409, detail={"reason": "origin_mismatch"})
 
 
+def _account_proof(report: dict) -> dict[str, Any]:
+    """Lengths, equality, and consent excerpts. Password values are not copied."""
+    extra: dict[str, Any] = {}
+    proof = report.get("fieldProof")
+    if isinstance(proof, dict) and proof:
+        extra["field_proof"] = proof
+    consents = report.get("autoConsents") or []
+    if consents:
+        extra["auto_consents"] = list(consents)
+    rows = report.get("consentRows") or []
+    if rows:
+        extra["consent_rows"] = list(rows)
+    return extra
+
+
 def _finish_account_action(session: ServiceSession, report: dict, resume_run) -> CredentialsOut:
     """Store the classification. A paused session waits for /resume."""
+    if report.get("autoConsents"):
+        session.auto_consents = list(report["autoConsents"])
+    proof = _account_proof(report)
     if not report.get("ok"):
         reason = str(report.get("reason") or "not_at_account_step")
         if reason in {"site_rejected", "account_exists"}:
@@ -340,10 +358,17 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             if report.get("status"):
                 session.status = str(report["status"])
             _sync_checkpoint(session)
-            raise HTTPException(
-                status_code=422,
-                detail={"reason": reason, "siteErrors": [str(item) for item in report.get("siteErrors") or []]},
-            )
+            detail: dict[str, Any] = {
+                "reason": reason,
+                "siteErrors": [str(item) for item in report.get("siteErrors") or []],
+            }
+            if proof.get("field_proof"):
+                detail["fieldProof"] = proof["field_proof"]
+            if proof.get("auto_consents"):
+                detail["autoConsents"] = proof["auto_consents"]
+            if proof.get("consent_rows"):
+                detail["consentRows"] = proof["consent_rows"]
+            raise HTTPException(status_code=422, detail=detail)
         if reason == "mode_mismatch":
             raise HTTPException(
                 status_code=409,
@@ -360,7 +385,10 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
         if reason == "input_failed":
             raise HTTPException(status_code=409, detail={"reason": "input_failed"})
         if reason == "password_mismatch":
-            raise HTTPException(status_code=409, detail={"reason": "password_mismatch"})
+            detail = {"reason": "password_mismatch"}
+            if proof.get("field_proof"):
+                detail["fieldProof"] = proof["field_proof"]
+            raise HTTPException(status_code=409, detail=detail)
         raise HTTPException(status_code=409, detail="No page is open for this session.")
     if report.get("account"):
         session.account = report["account"]
@@ -370,14 +398,24 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
     if session.paused:
         session.pending_resume = outcome in {"signed_in", "registered", "verification_required"}
         _sync_checkpoint(session)
-        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=_public_status(session))
+        return CredentialsOut(
+            sessionId=session.session_id,
+            outcome=outcome,
+            status=_public_status(session),
+            **proof,
+        )
     if outcome in {"signed_in", "registered", "verification_required"}:
         accepted = resume_run()
         if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED:
             outcome = "verification_required"
-        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=accepted.status)
+        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=accepted.status, **proof)
     _sync_checkpoint(session)
-    return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=_public_status(session))
+    return CredentialsOut(
+        sessionId=session.session_id,
+        outcome=outcome,
+        status=_public_status(session),
+        **proof,
+    )
 
 
 def _read_upload(file: UploadFile) -> bytes:
@@ -1481,6 +1519,7 @@ def create_app(
                     "username": body.username.strip(),
                     "password": body.password,
                     "confirm": body.confirm_password or body.password,
+                    "standardTerms": session.standard_terms_authorized,
                 },
             )
         except PageUnavailable as exc:

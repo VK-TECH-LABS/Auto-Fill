@@ -449,6 +449,9 @@ class CredentialsOut(BaseModel):
     stored: Literal[True] = True
     outcome: str | None = None
     status: str | None = None
+    field_proof: dict[str, Any] | None = Field(default=None, alias="fieldProof")
+    auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
+    consent_rows: list[dict[str, Any]] | None = Field(default=None, alias="consentRows")
 
     @model_serializer(mode="wrap")
     def _omit_store(self, handler):
@@ -457,6 +460,12 @@ class CredentialsOut(BaseModel):
             data.pop("outcome", None)
         if not data.get("status"):
             data.pop("status", None)
+        if not data.get("fieldProof"):
+            data.pop("fieldProof", None)
+        if not data.get("autoConsents"):
+            data.pop("autoConsents", None)
+        if not data.get("consentRows"):
+            data.pop("consentRows", None)
         return data
 
 

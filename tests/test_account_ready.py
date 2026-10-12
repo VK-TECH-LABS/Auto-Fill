@@ -249,7 +249,9 @@ def test_register_reads_both_passwords_and_stops_on_a_mismatch():
         confirm=other,
         ats="workday",
     )
-    assert mismatch == {"ok": False, "reason": "password_mismatch"}
+    assert mismatch["ok"] is False
+    assert mismatch["reason"] == "password_mismatch"
+    assert mismatch["fieldProof"]["passwordsMatch"] is False
     assert clicked == []
     assert secret not in str(mismatch)
     assert other not in str(mismatch)
@@ -273,7 +275,12 @@ def test_register_reads_both_passwords_and_stops_on_a_mismatch():
     )
     assert clicked == ["#create"]
     assert matched["status"] == "EMAIL_VERIFICATION_REQUIRED"
+    assert matched["status"] != "READY_FOR_HUMAN_SUBMIT"
     assert secret not in str(matched)
+    assert matched["fieldProof"]["passwordsMatch"] is True
+    assert matched["fieldProof"]["passwordLength"] == matched["fieldProof"]["verifyLength"] == len(secret)
+    assert matched["fieldProof"]["emailFilled"] is True
+    assert matched["fieldProof"]["emailMatches"] is True
     assert values["#password"] == values["#verify"] == secret
 
 
@@ -361,6 +368,145 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
     assert recorded[0]["questionHash"]
     assert "Privacy Policy" in recorded[0]["textExcerpt"]
     assert "promotional" not in recorded[0]["textExcerpt"]
+
+
+def test_ai_deny_matches_a_whole_word_only():
+    privacy = _control("checkbox", "I agree to the privacy policy", "#privacy", required=True)
+    embedded = _control(
+        "checkbox",
+        "I agree to the terms and will maintain this email",
+        "#keep",
+        required=True,
+    )
+    whole = _control("checkbox", "I agree to the terms and to the use of AI", "#ai", required=True)
+    assert terms_category(privacy) == "STANDARD_TERMS"
+    assert terms_category(embedded) == "STANDARD_TERMS"
+    assert terms_category(whole) == "CONSENT"
+
+
+def test_register_checks_standard_terms_and_leaves_other_boxes():
+    secret = "Correct-Horse-1!"
+    values = {"#email": "", "#password": "", "#verify": ""}
+    checked: list[str] = []
+    clicked: list[str] = []
+    form = {
+        "controls": [
+            {"kind": "text", "label": "Email Address", "selector": "#email", "inputType": "email"},
+            {"kind": "password", "label": "Password", "selector": "#password", "inputType": "password"},
+            {"kind": "password", "label": "Verify New Password", "selector": "#verify", "inputType": "password"},
+            {
+                "kind": "checkbox",
+                "label": "I agree to the Terms of Use and Privacy Policy",
+                "selector": "#terms",
+                "inputType": "checkbox",
+                "required": True,
+            },
+            {
+                "kind": "checkbox",
+                "label": "I agree to receive promotional SMS and job alerts",
+                "selector": "#promo",
+                "inputType": "checkbox",
+                "required": True,
+            },
+        ],
+        "buttons": [{"name": "Create Account", "selector": "#create", "controlType": "button"}],
+        "captcha": False,
+        "password": True,
+        "heading": "Create Account",
+        "pageText": "Email Address Password Verify New Password Create Account",
+        "links": [],
+        "automationIds": [],
+    }
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def fill(self, value: str) -> None:
+            values[self.selector] = value
+
+        def input_value(self) -> str:
+            return values.get(self.selector, "")
+
+        def check(self) -> None:
+            checked.append(self.selector)
+
+        def click(self) -> None:
+            clicked.append(self.selector)
+
+    class Page:
+        url = "https://example.test/register"
+
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+        def evaluate(self, script, arg=None):
+            if clicked:
+                return {
+                    "controls": [
+                        {
+                            "kind": "text",
+                            "label": "Verification code",
+                            "selector": "#otp",
+                            "inputType": "text",
+                            "maxLength": 6,
+                        }
+                    ],
+                    "buttons": [],
+                    "captcha": False,
+                    "password": False,
+                    "heading": "Verify your email",
+                    "pageText": "Check your inbox. We sent a code.",
+                    "links": [],
+                    "automationIds": [],
+                }
+            return form
+
+    blocked = run_account_action(
+        Page(),
+        mode="register",
+        email="river.example@example.com",
+        username="",
+        password=secret,
+        confirm=secret,
+        ats="workday",
+    )
+    assert blocked["reason"] == "site_rejected"
+    assert values["#email"] == ""
+    assert checked == []
+    assert clicked == []
+
+    checked.clear()
+    clicked.clear()
+    accepted = run_account_action(
+        Page(),
+        mode="register",
+        email="river.example@example.com",
+        username="",
+        password=secret,
+        confirm=secret,
+        ats="workday",
+        standard_terms=True,
+    )
+    assert checked == ["#terms"]
+    assert clicked == ["#create"]
+    assert accepted["status"] == "EMAIL_VERIFICATION_REQUIRED"
+    assert accepted["status"] != "READY_FOR_HUMAN_SUBMIT"
+    proof = accepted["fieldProof"]
+    assert proof["emailFilled"] is True
+    assert proof["emailMatches"] is True
+    assert proof["passwordsMatch"] is True
+    assert proof["passwordLength"] == proof["verifyLength"] == len(secret)
+    assert secret not in str(accepted)
+    assert "river.example@example.com" not in str(proof)
+    excerpts = {row["textExcerpt"]: row for row in accepted["consentRows"]}
+    assert excerpts["I agree to the Terms of Use and Privacy Policy"]["checked"] is True
+    assert excerpts["I agree to the Terms of Use and Privacy Policy"]["category"] == "STANDARD_TERMS"
+    assert excerpts["I agree to receive promotional SMS and job alerts"]["checked"] is False
+    assert excerpts["I agree to receive promotional SMS and job alerts"]["category"] == "CONSENT"
+    assert accepted["autoConsents"][0]["category"] == "STANDARD_TERMS"
+    assert "Privacy Policy" in accepted["autoConsents"][0]["textExcerpt"]
+    assert "promotional" not in accepted["autoConsents"][0]["textExcerpt"]
 
 
 def test_compound_privacy_and_job_alerts_stay_consent():
