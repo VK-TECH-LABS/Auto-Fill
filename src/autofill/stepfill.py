@@ -54,6 +54,9 @@ from autofill.mapping import (
     match_field_key,
     mentions_work_history,
     normalize,
+    record_auto_consent,
+    standard_terms_enabled,
+    terms_category,
 )
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
@@ -1546,6 +1549,8 @@ def _apply(
                 continue
             if _cluster_committed(page, ask.controls):
                 continue
+            if _accept_standard_term(page, ask):
+                continue
             statement = _consent_statement(ask.controls[0])
             _manual(
                 outcome,
@@ -2812,6 +2817,29 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
             return _location_pick(page) is not None
         return _typeahead_place_committed(page, control)
     return control_committed(page, control.selector)
+
+
+def _accept_standard_term(page, ask) -> bool:
+    """Check one required terms box when the session flag allows it.
+
+    Consent choices, marketing, and every unusual attestation stay blockers.
+    The check is ``locator.check``, not a click.
+    """
+    if ask.consent_choice or not standard_terms_enabled():
+        return False
+    if len(ask.controls) != 1:
+        return False
+    control = ask.controls[0]
+    if control.kind != "checkbox" or not control.required:
+        return False
+    if terms_category(control) != "STANDARD_TERMS":
+        return False
+    try:
+        page.locator(control.selector).check()
+    except Exception:
+        return False
+    record_auto_consent(control)
+    return True
 
 
 def _consent_statement(control: Control) -> str:

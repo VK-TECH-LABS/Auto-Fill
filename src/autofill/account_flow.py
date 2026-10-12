@@ -81,6 +81,8 @@ def run_account_action(
             _type_secret(page, confirm_box.selector, confirm or password)
     except SecretInputError:
         return {"ok": False, "reason": "input_failed"}
+    if mode == "register" and not _passwords_match(page, primary, confirm_box, password, confirm):
+        return {"ok": False, "reason": "password_mismatch"}
     if terms is not None:
         page.locator(terms.selector).check()
     button = _primary_button(snapshot, mode)
@@ -99,6 +101,24 @@ def run_account_action(
             secrets,
         )
     return _wait_for_outcome(page, mode=mode, ats=ats, alternate=scored.alternate, secrets=secrets)
+
+
+def _passwords_match(page, primary: Control, confirm_box: Control | None, password: str, confirm: str) -> bool:
+    """True when both password fields hold the same value as the one provided.
+
+    The values are compared and dropped. They are not logged or returned.
+    """
+    if confirm_box is None or not primary.selector or not confirm_box.selector:
+        return False
+    try:
+        left = page.locator(primary.selector).input_value()
+        right = page.locator(confirm_box.selector).input_value()
+    except Exception:
+        return False
+    expected = confirm or password
+    matched = bool(left) and left == right and left == password and right == expected
+    del left, right
+    return matched
 
 
 def _email_control(snapshot: PageSnapshot) -> Control | None:

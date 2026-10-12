@@ -79,6 +79,7 @@ class CreateSessionIn(BaseModel):
         max_length=MAX_ANSWERS,
     )
     resolver: ResolverIn | None = None
+    standard_terms_authorized: bool = Field(default=False, alias="standardTermsAuthorized")
 
     @field_validator("candidate_context")
     @classmethod
@@ -255,6 +256,14 @@ class ProgressOut(BaseModel):
     required_done: int = Field(default=0, alias="requiredDone")
     percent: int = 5
     current_label: str = Field(default="Opening", alias="currentLabel")
+    field_percent: int | None = Field(default=None, alias="fieldPercent")
+
+    @model_serializer(mode="wrap")
+    def _omit_field_percent(self, handler):
+        data = handler(self)
+        if data.get("fieldPercent") is None:
+            data.pop("fieldPercent", None)
+        return data
 
 
 class BlockingOut(BaseModel):
@@ -416,6 +425,7 @@ class RunStatusOut(BaseModel):
     page_type: str = Field(default="UNKNOWN", alias="pageType")
     phase: Literal["launching", "navigating", "loaded"] = "launching"
     started_at: str | None = Field(default=None, alias="startedAt")
+    auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
 
     @model_serializer(mode="wrap")
     def _omit_older_protocol(self, handler):
@@ -423,6 +433,8 @@ class RunStatusOut(BaseModel):
         if data.get("stateVersion") is None:
             for key in ("stateVersion", "account", "resume", "completed", "checkpoint"):
                 data.pop(key, None)
+        if not data.get("autoConsents"):
+            data.pop("autoConsents", None)
         return data
 
 

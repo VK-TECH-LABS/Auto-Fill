@@ -70,7 +70,7 @@ def test_a_posting_apply_control_is_not_ready_and_a_bare_submit_apply_is_left():
         controls=[Control(kind="text", label="Search", selector="#search", input_type="search")],
     )
     assert classify_page(posting) == "APPLY_ENTRY"
-    assert terminal_kind(posting, gaps=[], required_total=0) == "NO_FORM"
+    assert terminal_kind(posting, gaps=[], required_total=0) == "JOB"
     chosen = find_entry_control(
         _snapshot(buttons=[ButtonControl(name="Apply", selector="#apply_button", control_type="submit")])
     )
@@ -91,10 +91,16 @@ def test_a_posting_apply_control_is_not_ready_and_a_bare_submit_apply_is_left():
 def test_a_review_step_with_a_submit_can_be_ready_and_a_blank_page_cannot():
     review = _snapshot(
         heading="Review your application",
+        controls=[Control(kind="text", label="Email", selector="#email", input_type="email")],
         buttons=[ButtonControl(name="Submit application", selector="#submit", control_type="submit")],
     )
     assert classify_page(review) == "REVIEW"
-    assert terminal_kind(review, gaps=[], required_total=0) == "READY"
+    assert terminal_kind(review, gaps=[], required_total=1) == "READY"
+    empty_review = _snapshot(
+        heading="Review your application",
+        buttons=[ButtonControl(name="Submit application", selector="#submit", control_type="submit")],
+    )
+    assert terminal_kind(empty_review, gaps=[], required_total=0) != "READY"
     blank = _snapshot(heading="Example", page_text="Nothing here.")
     assert terminal_kind(blank, gaps=[], required_total=0) == "NO_FORM"
     form = _snapshot(
@@ -123,9 +129,9 @@ def test_real_posting_shapes_click_apply_and_stay_not_ready(browser, fixture, ur
         page.goto((FIXTURES / fixture).as_uri())
         result = _run(page, url)
         clicked = page.evaluate("() => window.__clicked")
-        assert result.status == Status.NO_FORM_FOUND, result.messages
+        assert result.status == Status.JOB_DESCRIPTION, result.messages
         assert result.status != Status.READY_FOR_HUMAN_SUBMIT
-        assert result.progress["percent"] == 0
+        assert result.progress["percent"] == 5
         assert result.page_type in {"APPLY_ENTRY", "JOB_DESCRIPTION"}
         assert clicked
         assert len(clicked) <= 2

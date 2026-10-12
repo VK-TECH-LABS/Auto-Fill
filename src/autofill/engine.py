@@ -29,10 +29,12 @@ from autofill.dom_ui import (
     note_filled,
     note_snapshot,
     remember_open_items,
+    workflow_percent,
 )
 from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
-from autofill.login import LoginDetector, run_login
+from autofill.login import LoginDetector, account_decision, account_view, run_login, score_account, verification_present
+from autofill.mapping import bind_standard_terms, consume_auto_consents
 from autofill.models import FillResult, JobContext
 from autofill.pagewait import (
     classify_page,
@@ -40,7 +42,10 @@ from autofill.pagewait import (
     find_entry_control,
     is_login_wall,
     is_review,
+    register_pane,
     reset_page_type,
+    resettle_account,
+    sign_in_pane,
     terminal_kind,
     visible_fields,
     wait_for_render,
@@ -88,6 +93,7 @@ class Status:
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_FINAL = "FAILED_FINAL"
     CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    JOB_DESCRIPTION = "JOB_DESCRIPTION"
     NO_FORM_FOUND = "NO_FORM_FOUND"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
@@ -124,6 +130,7 @@ class AutofillOptions:
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
     on_paint: Any = None
+    standard_terms_authorized: bool = False
 
 
 @dataclass
@@ -155,6 +162,7 @@ class ApplicationResult:
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
     page_type: str = ""
+    auto_consents: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -227,9 +235,24 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         **kwargs,
     )
     result.page_type = current_page_type()
-    if status == Status.NO_FORM_FOUND and int(result.progress.get("requiredTotal") or 0) <= 0:
+    result.auto_consents = consume_auto_consents()
+    total = int(result.progress.get("requiredTotal") or 0)
+    done = int(result.progress.get("requiredDone") or 0)
+    if status in {
+        Status.JOB_DESCRIPTION,
+        Status.ACCOUNT_CREATION_REQUIRED,
+        Status.LOGIN_REQUIRED,
+        Status.LOGIN_FAILED,
+        Status.EMAIL_VERIFICATION_REQUIRED,
+        Status.CAPTCHA_REQUIRED,
+        Status.RESUME_UPLOAD_REQUIRED,
+        Status.NO_FORM_FOUND,
+        Status.READY_FOR_HUMAN_SUBMIT,
+    }:
+        result.progress["percent"] = workflow_percent(status, result.page_type, total, done)
+    if status == Status.NO_FORM_FOUND and total <= 0 and result.page_type not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
         result.progress["percent"] = 0
-    elif status == Status.READY_FOR_HUMAN_SUBMIT and int(result.progress.get("requiredTotal") or 0) <= 0:
+    elif status == Status.READY_FOR_HUMAN_SUBMIT and total <= 0:
         if int(result.progress.get("percent") or 0) >= 100:
             result.progress["percent"] = 0
     if state is not None:
@@ -241,6 +264,109 @@ def _protocol_070(opts: AutofillOptions) -> bool:
     from autofill.login import protocol_at_least
 
     return protocol_at_least(opts.protocol_version)
+
+
+def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
+    """Score account, sign-in, job, and empty pages before a zero-field NO_FORM.
+
+    Returns the snapshot to keep filling, and a result when the run stops.
+    Account text is scored even when the inputs have not been extracted yet.
+    """
+    if resettle_account(page, snapshot):
+        snapshot = extract_page(page)
+        note_snapshot(snapshot)
+    url = _page_url(page)
+    extra.setdefault("fields_detected", len(visible_fields(snapshot)))
+    login_status = str(extra.pop("login_status", "NOT_REQUIRED"))
+    if snapshot.captcha_present:
+        session.mark("FAILED")
+        return snapshot, _result(
+            session,
+            status=Status.CAPTCHA_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=[challenge_message(snapshot)],
+            **extra,
+        )
+    kind = classify_page(snapshot, url=url)
+    if not opts.human_resolved and (register_pane(snapshot) or kind == "ACCOUNT"):
+        decision = account_decision(snapshot, url, ats_name)
+        if decision is not None and decision.status == Status.ACCOUNT_CREATION_REQUIRED:
+            message = decision.message
+            account = decision.account
+        else:
+            scored = score_account(snapshot, url)
+            message = "Create an employer account. Nothing was typed."
+            account = account_view(snapshot, url, ats_name, mode="register", alternate=scored.alternate)
+        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+        return snapshot, _result(
+            session,
+            status=Status.ACCOUNT_CREATION_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=[message],
+            account=account,
+            **extra,
+        )
+    if _protocol_070(opts) and verification_present(snapshot) and not opts.human_resolved:
+        session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+        return snapshot, _result(
+            session,
+            status=Status.EMAIL_VERIFICATION_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=["Email verification is required. Auto-Fill does not read mail."],
+            **extra,
+        )
+    password_fields = any(control.kind == "password" and not control.hidden for control in snapshot.controls)
+    # A password form stays on the credential path. Text-only and empty sign-in panes stop here.
+    if not opts.human_resolved and (sign_in_pane(snapshot) or kind == "LOGIN" or is_login_wall(snapshot)) and not (
+        snapshot.password_present or password_fields
+    ):
+        session.mark("LOGIN_FAILED")
+        return snapshot, _attach_login_account(
+            _result(
+                session,
+                status=Status.LOGIN_REQUIRED,
+                ats=ats_name,
+                login_status="LOGIN_REQUIRED",
+                messages=["Sign-in is required before the application form. Nothing was typed."],
+                **extra,
+            ),
+            snapshot,
+            url,
+            ats_name,
+            opts,
+        )
+    if not opts.human_resolved and kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
+        session.mark(Status.JOB_DESCRIPTION)
+        return snapshot, _result(
+            session,
+            status=Status.JOB_DESCRIPTION,
+            ats=ats_name,
+            login_status=login_status,
+            messages=[
+                "This page is a job description. Auto-Fill did not find an application form.",
+                "job_description" if kind == "JOB_DESCRIPTION" else "apply_entry",
+            ],
+            **extra,
+        )
+    if kind == "CONFIRMATION" or (
+        not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot) and kind not in {
+            "APPLICATION_FORM",
+            "REVIEW",
+        }
+    ):
+        session.mark(Status.NO_FORM_FOUND)
+        return snapshot, _result(
+            session,
+            status=Status.NO_FORM_FOUND,
+            ats=ats_name,
+            login_status=login_status,
+            messages=_no_form_messages(),
+            **extra,
+        )
+    return snapshot, None
 
 
 def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
@@ -267,7 +393,6 @@ def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str 
 def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_name: str | None, opts: AutofillOptions):
     if not _protocol_070(opts) or result.status != Status.LOGIN_REQUIRED:
         return result
-    from autofill.dom_ui import progress_percent
     from autofill.login import login_account_view
 
     view = login_account_view(snapshot, url, ats_name)
@@ -276,7 +401,7 @@ def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_nam
     result.progress["stage"] = "ACCOUNT"
     result.progress["currentLabel"] = "Employer account"
     if int(result.progress.get("requiredTotal") or 0) <= 0:
-        result.progress["percent"] = progress_percent("ACCOUNT", 0, 0)
+        result.progress["percent"] = workflow_percent(Status.LOGIN_REQUIRED, "LOGIN", 0, 0)
     return result
 
 
@@ -334,6 +459,7 @@ def autofill_application(
     """
     opts = options or AutofillOptions()
     reset_page_type()
+    bind_standard_terms(opts.standard_terms_authorized)
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
     _ACTIVE_OPTIONS.set(opts)
@@ -417,42 +543,9 @@ def autofill_application(
                 messages=[challenge_message(snapshot)],
             )
         snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
-        if snapshot.captcha_present:
-            session.mark("FAILED")
-            return _result(
-                session,
-                status=Status.CAPTCHA_REQUIRED,
-                ats=ats_name,
-                login_status="NOT_REQUIRED",
-                messages=[challenge_message(snapshot)],
-            )
-        stopped = _account_wall(page, snapshot, session, opts, ats_name)
+        snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name)
         if stopped is not None:
             return stopped
-        if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
-            if is_login_wall(snapshot):
-                session.mark("LOGIN_FAILED")
-                return _attach_login_account(
-                    _result(
-                        session,
-                        status=Status.LOGIN_REQUIRED,
-                        ats=ats_name,
-                        login_status="LOGIN_REQUIRED",
-                        messages=["Sign-in is required before the application form. Nothing was typed."],
-                    ),
-                    snapshot,
-                    getattr(page, "url", "") or application_url,
-                    ats_name,
-                    opts,
-                )
-            session.mark(Status.NO_FORM_FOUND)
-            return _result(
-                session,
-                status=Status.NO_FORM_FOUND,
-                ats=ats_name,
-                login_status="NOT_REQUIRED",
-                messages=_no_form_messages(),
-            )
 
         session.mark("CHECK_AUTH")
         detector = LoginDetector()
@@ -572,7 +665,7 @@ def autofill_application(
                     submit_controls=submit_controls,
                 )
             detected, filled, skipped = _counts(fields)
-            stopped = _account_wall(
+            snapshot, stopped = _pane_stop(
                 page,
                 snapshot,
                 session,
@@ -587,40 +680,6 @@ def autofill_application(
             )
             if stopped is not None:
                 return stopped
-            if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
-                if is_login_wall(snapshot):
-                    session.mark("LOGIN_FAILED")
-                    return _attach_login_account(
-                        _result(
-                            session,
-                            status=Status.LOGIN_REQUIRED,
-                            ats=ats_name,
-                            login_status="LOGIN_REQUIRED",
-                            fields_detected=detected,
-                            fields_filled=filled,
-                            fields_skipped=skipped,
-                            manual_actions=manual,
-                            messages=["Sign-in is required before the application form. Nothing was typed."],
-                            submit_controls=submit_controls,
-                        ),
-                        snapshot,
-                        getattr(page, "url", "") or "",
-                        ats_name,
-                        opts,
-                    )
-                session.mark(Status.NO_FORM_FOUND)
-                return _result(
-                    session,
-                    status=Status.NO_FORM_FOUND,
-                    ats=ats_name,
-                    login_status=login_status,
-                    fields_detected=detected,
-                    fields_filled=filled,
-                    fields_skipped=skipped,
-                    manual_actions=manual,
-                    messages=_no_form_messages(),
-                    submit_controls=submit_controls,
-                )
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
             if visible in seen:
                 break
@@ -949,7 +1008,7 @@ def _terminal_status(
     submit_names: list[str],
     review: bool = False,
 ) -> tuple[str, list[str]]:
-    """READY only on a real form or review step. A posting stays NO_FORM_FOUND."""
+    """READY only when the shared predicate agrees. A posting is not a form."""
     _observe_page(page, snapshot)
     decision = terminal_kind(
         snapshot,
@@ -958,6 +1017,18 @@ def _terminal_status(
         required_total=required_total,
         submit_names=submit_names,
     )
+    if decision == "ACCOUNT":
+        return Status.ACCOUNT_CREATION_REQUIRED, ["Create an employer account. Nothing was typed."]
+    if decision == "LOGIN":
+        return Status.LOGIN_REQUIRED, ["Sign-in is required before the application form. Nothing was typed."]
+    if decision == "JOB":
+        reason = "job_description" if current_page_type() == "JOB_DESCRIPTION" else "apply_entry"
+        return Status.JOB_DESCRIPTION, [
+            "This page is a job description. Auto-Fill did not find an application form.",
+            reason,
+        ]
+    if decision == "CAPTCHA":
+        return Status.CAPTCHA_REQUIRED, [challenge_message(snapshot)]
     if decision == "MANUAL":
         return Status.MANUAL_ANSWER_REQUIRED, ["A required field is still empty."]
     if decision == "NO_FORM":
@@ -1107,31 +1178,9 @@ def _run_resolver_pages(
                 [challenge_message(snapshot)],
             )
         snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
-        if snapshot.captcha_present:
-            session.mark("FAILED")
-            return finish(
-                Status.CAPTCHA_REQUIRED,
-                [challenge_message(snapshot)],
-            )
-        stopped = _account_wall(page, snapshot, session, opts, ats_name, login_status=login_status)
+        snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name, login_status=login_status)
         if stopped is not None:
             return stopped
-        if not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot):
-            if is_login_wall(snapshot):
-                session.mark("LOGIN_FAILED")
-                return _attach_login_account(
-                    finish(
-                        Status.LOGIN_REQUIRED,
-                        ["Sign-in is required before the application form. Nothing was typed."],
-                    ),
-                    snapshot,
-                    getattr(page, "url", "") or "",
-                    ats_name,
-                    opts,
-                )
-            _observe_page(page, snapshot)
-            session.mark(Status.NO_FORM_FOUND)
-            return finish(Status.NO_FORM_FOUND, _no_form_messages())
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
             break

@@ -973,7 +973,8 @@ def test_progress_uses_one_field_set():
     assert shrunk["requiredTotal"] == 1
     assert shrunk["requiredDone"] == 0
     assert shrunk["requiredDone"] <= shrunk["requiredTotal"]
-    assert shrunk["percent"] == 0
+    assert shrunk["percent"] == 20
+    assert shrunk["fieldPercent"] == 0
     held = _overlay_progress(
         session,
         {
@@ -997,7 +998,8 @@ def test_progress_uses_one_field_set():
         },
     )
     assert grown["requiredDone"] == grown["requiredTotal"] == 4
-    assert grown["percent"] == 100
+    assert grown["percent"] == 80
+    assert grown["fieldPercent"] == 100
     held_back = _overlay_progress(
         session,
         {
@@ -1011,7 +1013,8 @@ def test_progress_uses_one_field_set():
     assert held_back["requiredTotal"] == 4
     assert held_back["requiredDone"] == 4
     assert held_back["requiredDone"] <= held_back["requiredTotal"]
-    assert held_back["percent"] == 100
+    assert held_back["percent"] == 80
+    assert held_back["fieldPercent"] == 100
 
 
 @pytest.fixture

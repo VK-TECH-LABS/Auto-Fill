@@ -12,8 +12,10 @@ import time
 from urllib.parse import urlparse
 
 from autofill.extract import extract_page
+from autofill.login import _CONFIRM_RE as _VERIFY_RE
+from autofill.login import _LOGIN_RE, _REGISTER_RE
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import classify_control, is_entry_label
+from autofill.safeguards import classify_control, is_entry_label, semantic_action
 
 _WORKDAY_HOST = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
 _DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
@@ -87,13 +89,15 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     if _CONFIRM_RE.search(text):
         note_page_type("CONFIRMATION")
         return "CONFIRMATION"
+    if register_pane(snapshot):
+        note_page_type("ACCOUNT")
+        return "ACCOUNT"
+    if sign_in_pane(snapshot):
+        note_page_type("LOGIN")
+        return "LOGIN"
     if is_review(snapshot):
         note_page_type("REVIEW")
         return "REVIEW"
-    if snapshot.password_present and _account_chrome(snapshot):
-        kind = "ACCOUNT" if "create account" in text.casefold() else "LOGIN"
-        note_page_type(kind)
-        return kind
     fields = application_controls(snapshot)
     entry = find_entry_control(snapshot)
     formish = [
@@ -150,29 +154,148 @@ def terminal_kind(
     gaps: list,
     required_total: int,
     submit_names: list[str] | None = None,
+    required_done: int | None = None,
+    fields_detected: int | None = None,
+    blocked: str = "",
 ) -> str:
-    """``READY``, ``NO_FORM``, ``FILLED``, or ``MANUAL``.
+    """Page decision. READY only when :func:`ready_to_submit` agrees.
 
-    Zero application fields never become READY. A posting with an Apply
-    button stays ``NO_FORM`` until the application itself is on the page.
+    Account, sign-in, and job pages are scored before a zero-field
+    ``NO_FORM``. ``NO_FORM`` is only a page that is none of those.
     """
-    if gaps:
-        return "MANUAL"
+    if snapshot.captcha_present or blocked == "captcha":
+        classify_page(snapshot, url=url)
+        return "CAPTCHA"
+    if register_pane(snapshot):
+        note_page_type("ACCOUNT")
+        return "ACCOUNT"
+    if sign_in_pane(snapshot):
+        note_page_type("LOGIN")
+        return "LOGIN"
     kind = classify_page(snapshot, url=url)
-    fields = application_controls(snapshot)
-    submit = has_final_submit(snapshot, submit_names)
-    if kind == "REVIEW" and submit:
+    if kind == "ACCOUNT":
+        return "ACCOUNT"
+    if kind == "LOGIN":
+        return "LOGIN"
+    if kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
+        return "JOB"
+    if gaps or blocked == "resume":
+        return "MANUAL"
+    detected = fields_detected if fields_detected is not None else len(application_controls(snapshot))
+    done = required_done if required_done is not None else (required_total if not gaps else 0)
+    if ready_to_submit(
+        page_type=kind,
+        fields_detected=detected,
+        required_total=required_total,
+        required_done=done,
+        unresolved=len(gaps),
+        blocked=blocked,
+        has_submit=has_submit_or_review(snapshot, submit_names),
+    ):
         return "READY"
-    if kind == "APPLICATION_FORM" and fields and not gaps and submit:
-        return "READY"
-    if kind in {"JOB_DESCRIPTION", "APPLY_ENTRY", "CONFIRMATION", "LOGIN", "ACCOUNT", "UNKNOWN"} or not fields:
-        return "NO_FORM"
-    return "FILLED"
+    if kind in {"APPLICATION_FORM", "REVIEW"}:
+        return "FILLED"
+    return "NO_FORM"
+
+
+def _password_controls(snapshot: PageSnapshot) -> list[Control]:
+    return [control for control in snapshot.controls if control.kind == "password" and not control.hidden]
+
+
+def _pane_text(snapshot: PageSnapshot) -> str:
+    names = " ".join(button.name for button in snapshot.buttons)
+    labels = " ".join(
+        " ".join(
+            part
+            for part in (control.label, control.placeholder, control.aria_label, control.name)
+            if part
+        )
+        for control in snapshot.controls
+        if not control.hidden
+    )
+    return " ".join(part for part in (snapshot.heading, snapshot.page_text, names, labels) if part)
+
+
+def register_pane(snapshot: PageSnapshot) -> bool:
+    """Email / password / verify password / Create Account, including page text.
+
+    Scored before a zero-field or ``NO_FORM`` decision. A job posting that
+    merely mentions an account is not this pane.
+    """
+    if snapshot.captcha_present:
+        return False
+    text = _pane_text(snapshot)
+    passwords = _password_controls(snapshot)
+    verify = len(passwords) >= 2 or bool(_VERIFY_RE.search(text))
+    create = bool(_REGISTER_RE.search(snapshot.heading or "")) or any(
+        _REGISTER_RE.search(button.name) for button in snapshot.buttons
+    )
+    if not create and _REGISTER_RE.search(snapshot.page_text or ""):
+        create = verify
+    passwordish = bool(passwords) or snapshot.password_present or bool(re.search(r"\bpassword\b", text, re.IGNORECASE))
+    return bool(verify and create and passwordish)
+
+
+def sign_in_pane(snapshot: PageSnapshot) -> bool:
+    """A sign-in form. A create-account pane, a posting, or an application is not one."""
+    if snapshot.captcha_present or is_review(snapshot) or register_pane(snapshot):
+        return False
+    if find_entry_control(snapshot) is not None or _application_fields(snapshot):
+        return False
+    passwords = _password_controls(snapshot)
+    login_button = any(_LOGIN_RE.search(button.name) for button in snapshot.buttons)
+    login_heading = bool(_LOGIN_RE.search(snapshot.heading or ""))
+    if passwords or snapshot.password_present:
+        return bool(login_button or login_heading or _account_chrome(snapshot))
+    if application_controls(snapshot):
+        return False
+    return bool(login_button or login_heading)
+
+
+def has_submit_or_review(snapshot: PageSnapshot, remembered: list[str] | None = None) -> bool:
+    """A final submit or a review control on this page."""
+    if has_final_submit(snapshot, remembered):
+        return True
+    for button in snapshot.buttons:
+        if semantic_action(button.name, control_type=button.control_type or "") == "review":
+            return True
+    return False
+
+
+def ready_to_submit(
+    *,
+    page_type: str,
+    fields_detected: int,
+    required_total: int,
+    required_done: int,
+    unresolved: int,
+    blocked: str = "",
+    has_submit: bool,
+) -> bool:
+    """The only READY decision. Every caller uses this predicate.
+
+    READY requires an application or review page, at least one detected field,
+    every required field committed, no unresolved blocker, no account, login,
+    captcha, or resume checkpoint, and a submit or review control.
+    """
+    if page_type not in {"APPLICATION_FORM", "REVIEW"}:
+        return False
+    if fields_detected <= 0:
+        return False
+    if required_total > 0 and required_done < required_total:
+        return False
+    if unresolved:
+        return False
+    if (blocked or "") in {"account", "login", "captcha", "resume"}:
+        return False
+    return bool(has_submit)
 
 
 def render_ready(snapshot: PageSnapshot) -> bool:
     """True when inspection would see a form, a wall, or an entry/login choice."""
     if snapshot.captcha_present or visible_fields(snapshot):
+        return True
+    if register_pane(snapshot) or sign_in_pane(snapshot):
         return True
     names = " ".join(button.name.casefold() for button in snapshot.buttons)
     markers = ("apply", "sign in", "log in", "create account")
@@ -357,6 +480,14 @@ def _pause(page, millis: int) -> None:
     except Exception as exc:
         if _closed(exc) or _timeout(exc):
             raise
+
+
+def resettle_account(page, snapshot: PageSnapshot) -> bool:
+    """Wait out an account shell. Returns true when a second extract is warranted."""
+    if not _should_settle(page, snapshot):
+        return False
+    _settle_account_pane(page, snapshot)
+    return True
 
 
 def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
