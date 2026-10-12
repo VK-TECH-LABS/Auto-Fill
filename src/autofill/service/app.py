@@ -8,7 +8,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
@@ -52,6 +52,7 @@ from autofill.service.runner import (
     PageUnavailable,
     PlaywrightRunner,
     elapsed_ms,
+    memory_allows_session,
 )
 from autofill.service.schemas import (
     DEFAULT_PROTOCOL_VERSION,
@@ -101,6 +102,7 @@ _CHECKPOINT_KIND = {
     Status.EMAIL_VERIFICATION_REQUIRED: "VERIFICATION",
     Status.CAPTCHA_REQUIRED: "CAPTCHA",
     Status.RESUME_UPLOAD_REQUIRED: "RESUME",
+    Status.NO_FORM_FOUND: "NO_FORM",
 }
 
 
@@ -130,18 +132,35 @@ def _limit_interact(session) -> None:
     session.interact_marks.append(now)
 
 
+def _no_form_reason(session: ServiceSession) -> str:
+    """Why a run stopped before an application form."""
+    messages = list(session.result.messages) if session.result is not None else []
+    for token in ("job_description", "apply_entry", "confirmation", "no_application_form"):
+        if token in messages:
+            return token
+    mapped = {
+        "JOB_DESCRIPTION": "job_description",
+        "APPLY_ENTRY": "apply_entry",
+        "CONFIRMATION": "confirmation",
+    }
+    return mapped.get(session.page_type, "no_application_form")
+
+
 def _sync_checkpoint(session: ServiceSession) -> None:
     kind = _CHECKPOINT_KIND.get(session.status)
     if kind is None:
         session.checkpoint = None
         return
-    current = session.checkpoint or {}
+    current = dict(session.checkpoint or {})
     if current.get("kind") != kind:
-        session.checkpoint = {
+        current = {
             "kind": kind,
             "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "attempts": 0,
         }
+    if kind == "NO_FORM":
+        current["reason"] = _no_form_reason(session)
+    session.checkpoint = current
 
 
 def _bump_attempts(session: ServiceSession) -> None:
@@ -436,6 +455,12 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
         paused=session.paused,
+        pageType=session.page_type or "UNKNOWN",
+        phase=cast(
+            Literal["launching", "navigating", "loaded"],
+            session.phase if session.phase in {"launching", "navigating", "loaded"} else "launching",
+        ),
+        startedAt=session.started_at,
     )
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
@@ -497,6 +522,11 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         raise HTTPException(status_code=409, detail="Job does not match this session.")
     session.result = result
     session.status = result.status
+    if result.page_type:
+        session.page_type = result.page_type
+    startup = {"navigation_timeout", "browser_crashed", "blocked", "capacity", "capacity_busy"}
+    if not (result.status == Status.FAILED_RETRYABLE and startup.intersection(result.messages)):
+        session.phase = "loaded"
     if result.account is not None:
         session.account = result.account
     for key in result.completed_keys:
@@ -809,6 +839,33 @@ def _binding(session: ServiceSession, limits: dict[str, float | int]) -> Resolve
     )
 
 
+def _set_phase(session: ServiceSession):
+    """Record launching, navigating, or loaded for the companion."""
+
+    def phase(value: str) -> None:
+        if value in {"launching", "navigating", "loaded"}:
+            session.phase = value
+
+    return phase
+
+
+def _paint_frame(session: ServiceSession):
+    """Store a JPEG as soon as the page can be captured. A crash propagates."""
+
+    def paint(page) -> None:
+        image = page.screenshot(type="jpeg", quality=60)
+        host = ""
+        try:
+            host = urlparse(str(getattr(page, "url", "") or "")).hostname or ""
+        except Exception:
+            host = ""
+        session.preview_jpeg = image
+        session.preview_host = host
+        session.phase = "loaded"
+
+    return paint
+
+
 def _request_for(
     session: ServiceSession,
     limits: dict[str, float | int],
@@ -841,6 +898,8 @@ def _request_for(
         resume_mime=session.resume_mime if session.resume_verified or session.resume_prepared else "",
         resume_bytes=session.resume_bytes if session.resume_verified or session.resume_prepared else None,
         resume_prepared=bool(session.resume_prepared and session.resume_bytes and not session.resume_verified),
+        on_paint=_paint_frame(session),
+        on_phase=_set_phase(session),
     )
 
 
@@ -866,6 +925,8 @@ def _run(
     session.human_resolved = session.human_resolved or human_resolved
     previous = session.status
     session.status = Status.STARTED
+    session.phase = "launching"
+    session.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
         try:
             result = runner.run(
@@ -1005,6 +1066,12 @@ def create_app(
 
     @router.post("/sessions", response_model=RunStatusOut, status_code=201, tags=["sessions"])
     def create_session(body: CreateSessionIn) -> RunStatusOut:
+        if not memory_allows_session():
+            raise HTTPException(
+                status_code=503,
+                detail={"reason": "capacity"},
+                headers={"Retry-After": "30"},
+            )
         started = time.perf_counter()
         try:
             if body.resolver is not None:
@@ -1072,6 +1139,30 @@ def create_app(
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
         return _run(session, store, active_runner, limits, resume_uploaded=False)
+
+    @router.post("/sessions/{session_id}/retry", response_model=RunStatusOut, tags=["sessions"])
+    def retry_session(session_id: str) -> RunStatusOut:
+        """Navigate again in this session. The bindings stay. This is not a submit."""
+        session = _session_or_404(session_id)
+        _reject_expired(session, machine=True)
+        if session.busy:
+            raise HTTPException(status_code=409, detail={"reason": "busy"})
+        if session.status != Status.FAILED_RETRYABLE:
+            raise HTTPException(status_code=409, detail={"reason": "not_retryable"})
+        messages = session.result.messages if session.result is not None else []
+        if "browser_crash" in messages or "browser_crashed" in messages:
+            _allow_browser_restart(session)
+        active_runner.discard(session.session_id)
+        session.preview_jpeg = None
+        session.preview_host = ""
+        return _run(
+            session,
+            store,
+            active_runner,
+            limits,
+            resume_uploaded=session.resume_uploaded,
+            human_resolved=session.human_resolved,
+        )
 
     @router.get("/sessions/{session_id}/status", response_model=RunStatusOut, tags=["sessions"])
     def session_status(session_id: str) -> RunStatusOut:
@@ -1511,14 +1602,27 @@ def create_app(
             content={"verified": True, "filename": name, "status": accepted.status},
         )
 
+    def _jpeg(session: ServiceSession) -> Response:
+        session.screenshot_version += 1
+        logger.info("session=%s action=screenshot result=ok", session.session_id)
+        return Response(
+            content=session.preview_jpeg,
+            media_type="image/jpeg",
+            headers=_shot_headers(session, host=session.preview_host),
+        )
+
     @router.get("/sessions/{session_id}/screenshot", tags=["sessions"])
     def session_screenshot(session_id: str) -> Response:
         session = _session_or_404(session_id)
         _reject_expired(session)
+        if session.busy and session.preview_jpeg:
+            return _jpeg(session)
         shot = getattr(active_runner, "screenshot", None)
         try:
             image = shot(session_id) if shot is not None else None
         except PageUnavailable as exc:
+            if exc.status_code == 503 and session.preview_jpeg:
+                return _jpeg(session)
             if exc.status_code == 503:
                 raise HTTPException(
                     status_code=503,
@@ -1534,6 +1638,8 @@ def create_app(
         if not image:
             raise HTTPException(status_code=409, detail="No page is open for this session.")
         payload, host = image
+        session.preview_jpeg = payload
+        session.preview_host = host
         session.screenshot_version += 1
         logger.info("session=%s action=screenshot result=ok", session.session_id)
         return Response(

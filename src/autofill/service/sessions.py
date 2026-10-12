@@ -80,6 +80,11 @@ class ServiceSession:
     required_page_key: str = ""
     form_seen: bool = False
     pending_resume: bool = False
+    page_type: str = ""
+    phase: str = "launching"
+    started_at: str | None = None
+    preview_jpeg: bytes | None = None
+    preview_host: str = ""
     secret_values: list[str] = field(default_factory=list)
     _state_marker: tuple | None = field(default=None, repr=False)
 

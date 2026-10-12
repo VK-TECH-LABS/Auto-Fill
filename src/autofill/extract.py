@@ -284,6 +284,7 @@ EXTRACT_JS = r"""
     }
     const automation = el.getAttribute("data-automation-id");
     if (automation) return "[data-automation-id='" + CSS.escape(automation) + "']";
+    if (el.classList && el.classList.contains("postings-btn")) return tag + ".postings-btn";
     // Unnamed submit buttons still need a selector so they can be reported
     // and so the fill routine can refuse them. The attribute is not a secret.
     if (!el.getAttribute("data-autofill-target")) {

@@ -2252,6 +2252,7 @@ _ASHBY_LOCATION = (
     "class='ashby-application-form-input-autocomplete'>"
     "</div>"
     "<div id='places' role='listbox' hidden></div>"
+    "<button type='submit'>Submit application</button>"
     "</form><script>"
     "const input = document.getElementById('work-from');"
     "const list = document.getElementById('places');"
@@ -2409,6 +2410,7 @@ def test_empty_location_json_does_not_count_and_blocks_ready(browser):
             "<label for='location-input'>Current location</label>"
             "<input id='location-input' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation' value='{\"name\":\"\"}'>"
+            "<button type='submit'>Submit application</button>"
         )
         empty, total, done = inspect_required(page, extract_page(page), None)
         assert total == 2

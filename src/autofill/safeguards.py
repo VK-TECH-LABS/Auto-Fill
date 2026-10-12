@@ -148,11 +148,19 @@ def is_entry_label(name: str) -> bool:
 
     ``Apply`` on a posting with no application form is an entry. ``Submit``
     and ``Submit application`` are not, and stay on the final-submit path.
+    A longer label that starts with ``Apply for this job`` or ``Apply now``
+    is the same entry control.
     """
-    label = " ".join(name.split()).casefold().replace("\u2019", "'")
-    if "submit" in label:
+    label = " ".join(name.split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
+    if re.search(r"\b(submit|send(\s+my)?\s+application)\b", label):
         return False
-    return label in _ENTRY_LABELS
+    if label in _ENTRY_LABELS:
+        return True
+    if label.startswith("apply for this job") or label.startswith("apply now"):
+        return True
+    if label.startswith("i'm interested") or label.startswith("im interested"):
+        return True
+    return False
 
 
 def field_class_for_button(name: str, *, control_type: str = "") -> str:
@@ -256,7 +264,8 @@ def activate_entry(page, selector: str, name: str, *, control_type: str = "") ->
         raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
         )
-    page.locator(selector).click()
+    # Lever renders two Apply links with the same class. The first is the posting entry.
+    page.locator(selector).first.click()
 
 
 def open_combobox(page, selector: str) -> None:

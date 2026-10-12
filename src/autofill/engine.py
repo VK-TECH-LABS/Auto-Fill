@@ -34,11 +34,22 @@ from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
 from autofill.login import LoginDetector, run_login
 from autofill.models import FillResult, JobContext
-from autofill.pagewait import choose_entry, is_login_wall, is_review, visible_fields, wait_for_render
+from autofill.pagewait import (
+    classify_page,
+    current_page_type,
+    find_entry_control,
+    is_login_wall,
+    is_review,
+    reset_page_type,
+    terminal_kind,
+    visible_fields,
+    wait_for_render,
+)
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding, ResolverCallError
 from autofill.safeguards import (
     HUMAN_SUBMIT_ONLY,
+    HumanSubmissionRequired,
     activate,
     activate_entry,
     field_class_for_button,
@@ -46,7 +57,14 @@ from autofill.safeguards import (
     is_forward_navigation,
 )
 from autofill.session import SessionStore
-from autofill.stepfill import FillFlags, fill_resolved_page, flags_for_alerts, required_gaps, validation_blob
+from autofill.stepfill import (
+    FillFlags,
+    fill_resolved_page,
+    flags_for_alerts,
+    inspect_required,
+    required_gaps,
+    validation_blob,
+)
 
 logger = logging.getLogger("autofill.engine")
 
@@ -105,6 +123,7 @@ class AutofillOptions:
     resume_prepared: bool = False
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    on_paint: Any = None
 
 
 @dataclass
@@ -135,6 +154,7 @@ class ApplicationResult:
     completed_keys: list[str] = field(default_factory=list)
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    page_type: str = ""
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -206,6 +226,12 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         open_items=open_items,
         **kwargs,
     )
+    result.page_type = current_page_type()
+    if status == Status.NO_FORM_FOUND and int(result.progress.get("requiredTotal") or 0) <= 0:
+        result.progress["percent"] = 0
+    elif status == Status.READY_FOR_HUMAN_SUBMIT and int(result.progress.get("requiredTotal") or 0) <= 0:
+        if int(result.progress.get("percent") or 0) >= 100:
+            result.progress["percent"] = 0
     if state is not None:
         end_run(state.token)
     return result
@@ -307,6 +333,7 @@ def autofill_application(
     not solved.
     """
     opts = options or AutofillOptions()
+    reset_page_type()
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
     _ACTIVE_OPTIONS.set(opts)
@@ -424,7 +451,7 @@ def autofill_application(
                 status=Status.NO_FORM_FOUND,
                 ats=ats_name,
                 login_status="NOT_REQUIRED",
-                messages=["No application form was found. A person can open the page and continue."],
+                messages=_no_form_messages(),
             )
 
         session.mark("CHECK_AUTH")
@@ -591,7 +618,7 @@ def autofill_application(
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["No application form was found. A person can open the page and continue."],
+                    messages=_no_form_messages(),
                     submit_controls=submit_controls,
                 )
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
@@ -617,7 +644,8 @@ def autofill_application(
                 fields.extend(page_fields)
                 manual.extend(page_manual)
                 _note_fill(page_fields, opts, run_started, inspect_state)
-                gaps = required_gaps(page, extract_page(page), candidate_profile)
+                fresh = extract_page(page)
+                gaps, total, _done = inspect_required(page, fresh, candidate_profile)
                 if gaps:
                     return _manual_for_gaps(
                         session,
@@ -628,19 +656,27 @@ def autofill_application(
                         manual=manual,
                         submit_controls=submit_controls,
                     )
+                status, messages = _terminal_status(
+                    page,
+                    fresh,
+                    gaps=gaps,
+                    required_total=total,
+                    submit_names=submit_controls,
+                    review=True,
+                )
                 session.mark("REVIEW_PAGE")
-                session.mark("READY_FOR_HUMAN_SUBMIT")
+                session.mark(status)
                 detected, filled, skipped = _counts(fields)
                 return _result(
                     session,
-                    status=Status.READY_FOR_HUMAN_SUBMIT,
+                    status=status,
                     ats=ats_name,
                     login_status=login_status,
                     fields_detected=detected,
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["Review page reached. A person clicks Submit."],
+                    messages=messages,
                     submit_controls=submit_controls,
                 )
 
@@ -712,25 +748,10 @@ def autofill_application(
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
-        if "review" in (snapshot.heading or "").casefold():
-            session.mark("REVIEW_PAGE")
-        detected, filled, skipped = _counts(fields)
         on_review = "review" in (snapshot.heading or "").casefold()
-        if not visible_fields(snapshot) and not on_review:
-            session.mark(Status.NO_FORM_FOUND)
-            return _result(
-                session,
-                status=Status.NO_FORM_FOUND,
-                ats=ats_name,
-                login_status=login_status,
-                fields_detected=detected,
-                fields_filled=filled,
-                fields_skipped=skipped,
-                manual_actions=manual,
-                messages=["No application form was found. A person can open the page and continue."],
-                submit_controls=submit_controls,
-            )
-        gaps = required_gaps(page, extract_page(page), candidate_profile)
+        if on_review:
+            session.mark("REVIEW_PAGE")
+        gaps, total, _done = inspect_required(page, snapshot, candidate_profile)
         if gaps:
             return _manual_for_gaps(
                 session,
@@ -741,18 +762,26 @@ def autofill_application(
                 manual=manual,
                 submit_controls=submit_controls,
             )
-        session.mark("READY_FOR_HUMAN_SUBMIT")
-        terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
+        status, messages = _terminal_status(
+            page,
+            snapshot,
+            gaps=gaps,
+            required_total=total,
+            submit_names=submit_controls,
+            review=on_review,
+        )
+        session.mark(status)
+        detected, filled, skipped = _counts(fields)
         return _result(
             session,
-            status=terminal,
+            status=status,
             ats=ats_name,
             login_status=login_status,
             fields_detected=detected,
             fields_filled=filled,
             fields_skipped=skipped,
             manual_actions=manual,
-            messages=["Filled what it could. A person clicks Submit or Apply."],
+            messages=messages,
             submit_controls=submit_controls,
         )
     except ResolverCallError as exc:
@@ -864,27 +893,104 @@ def _note_fill(fields, opts: AutofillOptions, started: float, state: dict) -> No
         _mark_ms(opts, "firstFillMs", started)
 
 
+def _paint(page, opts: AutofillOptions) -> None:
+    """Store a frame for the preview. A crash is reported by the caller."""
+    paint = getattr(opts, "on_paint", None)
+    if paint is None or page is None:
+        return
+    try:
+        paint(page)
+    except Exception as exc:
+        if is_browser_crash(exc):
+            raise
+
+
 def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
     wait_for_render(page)
     snapshot = extract_page(page)
     note_snapshot(snapshot)
+    _paint(page, opts)
     if not state.get("seen"):
         state["seen"] = True
         _mark_ms(opts, "firstFormInspectedMs", started)
     return snapshot
 
 
+def _page_url(page) -> str:
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def _observe_page(page, snapshot) -> str:
+    return classify_page(snapshot, url=_page_url(page))
+
+
+def _no_form_messages() -> list[str]:
+    kind = current_page_type()
+    reason = {
+        "JOB_DESCRIPTION": "job_description",
+        "APPLY_ENTRY": "apply_entry",
+        "CONFIRMATION": "confirmation",
+    }.get(kind, "no_application_form")
+    return [
+        "No application form was found. A person can open the page and continue.",
+        reason,
+    ]
+
+
+def _terminal_status(
+    page,
+    snapshot,
+    *,
+    gaps: list,
+    required_total: int,
+    submit_names: list[str],
+    review: bool = False,
+) -> tuple[str, list[str]]:
+    """READY only on a real form or review step. A posting stays NO_FORM_FOUND."""
+    _observe_page(page, snapshot)
+    decision = terminal_kind(
+        snapshot,
+        url=_page_url(page),
+        gaps=gaps,
+        required_total=required_total,
+        submit_names=submit_names,
+    )
+    if decision == "MANUAL":
+        return Status.MANUAL_ANSWER_REQUIRED, ["A required field is still empty."]
+    if decision == "NO_FORM":
+        return Status.NO_FORM_FOUND, _no_form_messages()
+    if decision == "READY":
+        if review or current_page_type() == "REVIEW":
+            return Status.READY_FOR_HUMAN_SUBMIT, ["Review page reached. A person clicks Submit."]
+        return Status.READY_FOR_HUMAN_SUBMIT, ["Filled what it could. A person clicks Submit or Apply."]
+    return Status.FILLED, ["Filled what it could. A person clicks Submit or Apply."]
+
+
 def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float, state: dict):
-    """Click at most two entry controls while the page still has no form."""
+    """Click at most two entry controls while the page is still a posting."""
     for _ in range(2):
-        if snapshot.captcha_present or visible_fields(snapshot):
+        if snapshot.captcha_present:
             return snapshot
-        button = choose_entry(snapshot)
+        kind = _observe_page(page, snapshot)
+        if kind not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
+            return snapshot
+        button = find_entry_control(snapshot)
         if button is None:
             return snapshot
         logger.info("session=%s action=entry", session.session_id)
-        activate_entry(page, button.selector, button.name, control_type=button.control_type)
+        try:
+            activate_entry(page, button.selector, button.name, control_type=button.control_type)
+        except HumanSubmissionRequired:
+            raise
+        except Exception as exc:
+            if is_browser_crash(exc) or is_ats_timeout(exc):
+                raise
+            return snapshot
         snapshot = _timed_extract(page, opts, started, state)
+    _observe_page(page, snapshot)
     return snapshot
 
 
@@ -1023,11 +1129,9 @@ def _run_resolver_pages(
                     ats_name,
                     opts,
                 )
+            _observe_page(page, snapshot)
             session.mark(Status.NO_FORM_FOUND)
-            return finish(
-                Status.NO_FORM_FOUND,
-                ["No application form was found. A person can open the page and continue."],
-            )
+            return finish(Status.NO_FORM_FOUND, _no_form_messages())
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
             break
@@ -1080,12 +1184,26 @@ def _run_resolver_pages(
                         questions=blocking or outcome.manual_questions,
                     )
                 carried.extend(optional)
-                held = stop_required(extract_page(page), outcome.manual_questions)
-                if held is not None:
-                    return held
+                fresh = extract_page(page)
+                gaps, total, _done = inspect_required(page, fresh, None, outcome.manual_questions)
+                if gaps:
+                    session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                    return finish(
+                        Status.MANUAL_ANSWER_REQUIRED,
+                        ["A required field is still empty."],
+                        questions=gaps,
+                    )
+                status, messages = _terminal_status(
+                    page,
+                    fresh,
+                    gaps=gaps,
+                    required_total=total,
+                    submit_names=submit_controls,
+                    review=True,
+                )
                 session.mark("REVIEW_PAGE")
-                session.mark(Status.READY_FOR_HUMAN_SUBMIT)
-                return finish(Status.READY_FOR_HUMAN_SUBMIT, ["Review page reached. A person clicks Submit."])
+                session.mark(status)
+                return finish(status, messages)
             if blocking or (outcome.manual_questions and not opts.answers_updated):
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 pending = blocking if opts.answers_updated else outcome.manual_questions
@@ -1129,21 +1247,27 @@ def _run_resolver_pages(
 
     snapshot = _timed_extract(page, opts, run_started, inspect_state)
     _remember_submit(snapshot, submit_controls)
-    if "review" in (snapshot.heading or "").casefold():
-        session.mark("REVIEW_PAGE")
     on_review = "review" in (snapshot.heading or "").casefold()
-    if not visible_fields(snapshot) and not on_review:
-        session.mark(Status.NO_FORM_FOUND)
+    if on_review:
+        session.mark("REVIEW_PAGE")
+    gaps, total, _done = inspect_required(page, snapshot, None)
+    if gaps:
+        session.mark(Status.MANUAL_ANSWER_REQUIRED)
         return finish(
-            Status.NO_FORM_FOUND,
-            ["No application form was found. A person can open the page and continue."],
+            Status.MANUAL_ANSWER_REQUIRED,
+            ["A required field is still empty."],
+            questions=gaps,
         )
-    held = stop_required(extract_page(page))
-    if held is not None:
-        return held
-    session.mark(Status.READY_FOR_HUMAN_SUBMIT)
-    terminal = Status.READY_FOR_HUMAN_SUBMIT if submit_controls or on_review else Status.FILLED
-    return finish(terminal, ["Filled what it could. A person clicks Submit or Apply."])
+    status, messages = _terminal_status(
+        page,
+        snapshot,
+        gaps=gaps,
+        required_total=total,
+        submit_names=submit_controls,
+        review=on_review,
+    )
+    session.mark(status)
+    return finish(status, messages)
 
 
 def autofill_from_fill_result(result: FillResult) -> str:

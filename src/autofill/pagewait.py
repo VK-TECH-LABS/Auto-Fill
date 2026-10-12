@@ -6,13 +6,14 @@ is bounded. An invisible reCAPTCHA or hCaptcha widget is not a wall.
 
 from __future__ import annotations
 
+import contextvars
 import re
 import time
 from urllib.parse import urlparse
 
 from autofill.extract import extract_page
-from autofill.models import ButtonControl, PageSnapshot
-from autofill.safeguards import is_entry_label
+from autofill.models import ButtonControl, Control, PageSnapshot
+from autofill.safeguards import classify_control, is_entry_label
 
 _WORKDAY_HOST = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
 _DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
@@ -26,6 +27,147 @@ def visible_fields(snapshot: PageSnapshot) -> list:
 def is_review(snapshot: PageSnapshot) -> bool:
     """True when the heading says this is the review step."""
     return "review" in (snapshot.heading or "").casefold()
+
+
+_PAGE_TYPE: contextvars.ContextVar[str] = contextvars.ContextVar("autofill_page_type", default="")
+_CONFIRM_RE = re.compile(
+    r"\b(thank you for applying|thanks for applying|application (has been |was )?submitted|"
+    r"we (have )?received your application|application received)\b",
+    re.IGNORECASE,
+)
+_JOB_RE = re.compile(
+    r"\b(job description|responsibilities|qualifications|about the role|about this (job|role)|"
+    r"what you'?ll do|apply for this job)\b",
+    re.IGNORECASE,
+)
+_SEARCH_RE = re.compile(r"\b(search|query|filter jobs|keyword)\b", re.IGNORECASE)
+
+
+def note_page_type(kind: str) -> None:
+    """Remember the page classification for the status payload."""
+    _PAGE_TYPE.set(kind or "")
+
+
+def reset_page_type() -> None:
+    """Drop a classification left by an earlier run on this thread."""
+    _PAGE_TYPE.set("")
+
+
+def current_page_type() -> str:
+    return _PAGE_TYPE.get() or "UNKNOWN"
+
+
+def application_controls(snapshot: PageSnapshot) -> list[Control]:
+    """Controls that belong to an application. A site search box is not one."""
+    found: list[Control] = []
+    for control in snapshot.controls:
+        if control.hidden or control.kind in {"hidden", "password", "button"}:
+            continue
+        blob = " ".join(
+            part
+            for part in (control.label, control.name, control.placeholder, control.aria_label, control.input_type)
+            if part
+        )
+        if control.input_type == "search" or _SEARCH_RE.search(blob):
+            continue
+        if control.kind in {"file", "textarea", "select", "radio", "checkbox", "combobox", "buttons"}:
+            found.append(control)
+            continue
+        if control.kind == "text" or control.input_type in {"email", "tel", "text", "url", "number"}:
+            found.append(control)
+    return found
+
+
+def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
+    """One of the public page types. A posting is not an application form."""
+    if snapshot.captcha_present:
+        note_page_type("UNKNOWN")
+        return "UNKNOWN"
+    text = f"{snapshot.heading} {snapshot.page_text}"
+    if _CONFIRM_RE.search(text):
+        note_page_type("CONFIRMATION")
+        return "CONFIRMATION"
+    if is_review(snapshot):
+        note_page_type("REVIEW")
+        return "REVIEW"
+    if snapshot.password_present and _account_chrome(snapshot):
+        kind = "ACCOUNT" if "create account" in text.casefold() else "LOGIN"
+        note_page_type(kind)
+        return kind
+    fields = application_controls(snapshot)
+    entry = find_entry_control(snapshot)
+    formish = [
+        control
+        for control in fields
+        if control.kind in {"file", "textarea", "select", "radio", "combobox"}
+        or control.input_type in {"email", "tel"}
+    ]
+    # A search box is not an application. One real field with no Apply control is.
+    if formish or (fields and entry is None):
+        note_page_type("APPLICATION_FORM")
+        return "APPLICATION_FORM"
+    if entry is not None:
+        note_page_type("APPLY_ENTRY")
+        return "APPLY_ENTRY"
+    if not fields and any(
+        "create account" in button.name.casefold() or "register" in button.name.casefold()
+        for button in snapshot.buttons
+    ):
+        note_page_type("ACCOUNT")
+        return "ACCOUNT"
+    if not fields and (_account_chrome(snapshot) or is_login_wall(snapshot)):
+        kind = "ACCOUNT" if "create account" in text.casefold() else "LOGIN"
+        note_page_type(kind)
+        return kind
+    if _JOB_RE.search(text):
+        note_page_type("JOB_DESCRIPTION")
+        return "JOB_DESCRIPTION"
+    note_page_type("UNKNOWN")
+    return "UNKNOWN"
+
+
+def has_final_submit(snapshot: PageSnapshot, remembered: list[str] | None = None) -> bool:
+    """True when this page shows a control a person would use to send the application.
+
+    A remembered name counts only when that same control is still on the page.
+    An Apply button that is only the posting's entry control is not enough on
+    its own: the page type decides whether the run may become ready.
+    """
+    visible = {_entry_name(button.name) for button in snapshot.buttons}
+    for button in snapshot.buttons:
+        if classify_control(button.name, control_type=button.control_type or "") == "submit":
+            return True
+    for name in remembered or []:
+        if _entry_name(str(name)) in visible and classify_control(str(name)) == "submit":
+            return True
+    return False
+
+
+def terminal_kind(
+    snapshot: PageSnapshot,
+    *,
+    url: str = "",
+    gaps: list,
+    required_total: int,
+    submit_names: list[str] | None = None,
+) -> str:
+    """``READY``, ``NO_FORM``, ``FILLED``, or ``MANUAL``.
+
+    Zero application fields never become READY. A posting with an Apply
+    button stays ``NO_FORM`` until the application itself is on the page.
+    """
+    if gaps:
+        return "MANUAL"
+    kind = classify_page(snapshot, url=url)
+    fields = application_controls(snapshot)
+    submit = has_final_submit(snapshot, submit_names)
+    if kind == "REVIEW" and submit:
+        return "READY"
+    if kind == "APPLICATION_FORM" and fields and not gaps and submit:
+        return "READY"
+    if kind in {"JOB_DESCRIPTION", "APPLY_ENTRY", "CONFIRMATION", "LOGIN", "ACCOUNT", "UNKNOWN"} or not fields:
+        return "NO_FORM"
+    return "FILLED"
 
 
 def render_ready(snapshot: PageSnapshot) -> bool:
@@ -87,6 +229,57 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
             return
 
 
+def _entry_name(name: str) -> str:
+    return " ".join(name.split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
+
+
+def _known_entry(name: str, selector: str, control_type: str = "") -> bool:
+    """An employer entry control. Submit application is never one.
+
+    A bare ``Apply`` whose type is submit stays on the final-submit path.
+    Greenhouse ``#apply_button``, a Lever apply posting button, and the
+    labeled entry phrases are entry controls.
+    """
+    label = _entry_name(name)
+    if re.search(r"\b(submit|send(\s+my)?\s+application)\b", label):
+        return False
+    selector_text = (selector or "").casefold()
+    if selector_text in {"#apply_button"} or selector_text.endswith("#apply_button"):
+        return True
+    if "postings-btn" in selector_text and "apply" in label:
+        return True
+    # A bare Apply whose type is submit stays on the final-submit path.
+    if (control_type or "").casefold() == "submit" and label == "apply":
+        return False
+    if is_entry_label(name):
+        return True
+    if label.startswith("apply for this job") or label.startswith("apply now"):
+        return True
+    if label.startswith("i'm interested") or label.startswith("im interested"):
+        return True
+    return False
+
+
+def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
+    """The employer's Apply control, including on a posting that also has a search box.
+
+    ``Apply Manually`` wins over a generic ``Apply``. Submit application is never chosen.
+    """
+    if snapshot.captcha_present or is_review(snapshot):
+        return None
+    candidates: list[ButtonControl] = []
+    for button in snapshot.buttons:
+        if _known_entry(button.name, button.selector, button.control_type):
+            candidates.append(button)
+    for link in snapshot.links:
+        if link.selector and _known_entry(link.name, link.selector):
+            candidates.append(ButtonControl(name=link.name, selector=link.selector))
+    manual = [button for button in candidates if _entry_name(button.name) == "apply manually"]
+    if manual:
+        return manual[0]
+    return candidates[0] if candidates else None
+
+
 def choose_entry(snapshot: PageSnapshot) -> ButtonControl | None:
     """The entry button on a page that has no application form yet.
 
@@ -94,22 +287,7 @@ def choose_entry(snapshot: PageSnapshot) -> ButtonControl | None:
     """
     if snapshot.captcha_present or visible_fields(snapshot) or is_review(snapshot):
         return None
-    manual = [
-        button
-        for button in snapshot.buttons
-        if is_entry_label(button.name) and button.name.casefold().strip() == "apply manually"
-    ]
-    if manual:
-        return manual[0]
-    for button in snapshot.buttons:
-        if (button.control_type or "").casefold() == "submit":
-            continue
-        if is_entry_label(button.name):
-            return button
-    for link in snapshot.links:
-        if is_entry_label(link.name) and link.selector:
-            return ButtonControl(name=link.name, selector=link.selector)
-    return None
+    return find_entry_control(snapshot)
 
 
 def _host(page) -> str:
