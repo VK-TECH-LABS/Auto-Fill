@@ -262,7 +262,7 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
             by_step.setdefault(body["step"], []).append(body)
             assert body["candidateRef"] == "ref-a"
             assert body["jobRef"] == "job-a"
-        assert set(by_step["identity"][0]["fields"]) == {"firstName", "lastName"}
+        assert set(by_step["identity"][0]["fields"]) == {"firstName", "fullName", "lastName"}
         assert by_step["identity"][0]["questions"] == []
         assert set(by_step["contact"][0]["fields"]) == {"email", "phone", "links.website", "links.linkedin"}
         assert by_step["contact"][0]["questions"] == []

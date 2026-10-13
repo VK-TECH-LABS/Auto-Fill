@@ -81,6 +81,7 @@ from autofill.service.schemas import (
 from autofill.service.sessions import (
     ServiceSession,
     ServiceSessionStore,
+    _same_confirmed,
     created_start_is_stale,
     monotonic,
     new_session_id,
@@ -584,6 +585,12 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         raise HTTPException(status_code=409, detail="Candidate does not match this session.")
     if result.job_id and result.job_id != session.job_id:
         raise HTTPException(status_code=409, detail="Job does not match this session.")
+    # A resume follow-up scans only the fields still in front of it. Keep the
+    # whole-form totals when that pass reports a smaller count.
+    previous = session.result
+    if previous is not None and session.resume_uploaded and previous is not result:
+        result.fields_detected = max(int(previous.fields_detected), int(result.fields_detected))
+        result.fields_filled = max(int(previous.fields_filled), int(result.fields_filled))
     session.result = result
     session.status = result.status
     if result.page_type:
@@ -1010,6 +1017,46 @@ def _request_for(
         confirmed_values=session.confirmed_values,
         standard_terms_authorized=session.standard_terms_authorized,
     )
+
+
+def _follow_verified_resume(
+    session: ServiceSession,
+    store: ServiceSessionStore,
+    runner: FillRunner,
+    limits: dict[str, float | int],
+    records: list[dict],
+    report: dict,
+) -> None:
+    """Restore confirmed fills, then continue the form. The upload call has returned."""
+
+    def follow() -> None:
+        refill = getattr(runner, "refill_confirmed", None)
+        try:
+            if callable(refill):
+                refill(session.session_id, records)
+                for item in records:
+                    if not isinstance(item, dict):
+                        continue
+                    if any(_same_confirmed(existing, item) for existing in session.confirmed_values):
+                        continue
+                    session.remember_confirmed_value(item)
+            elif "restored" in report:
+                logger.info(
+                    "session=%s action=post_upload_refill restored=%s",
+                    session.session_id,
+                    int(report.get("restored") or 0),
+                )
+            _run(session, store, runner, limits, resume_uploaded=True)
+        except HTTPException as exc:
+            logger.info(
+                "session=%s action=resume_follow status=%s",
+                session.session_id,
+                exc.status_code,
+            )
+        except Exception as exc:
+            _failed(session, exc)
+
+    threading.Thread(target=follow, name=f"resume-follow-{session.session_id[:8]}", daemon=True).start()
 
 
 def _run(
@@ -1775,11 +1822,6 @@ def create_app(
         session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         session.resume_uploaded = True
         logger.info("session=%s resume_file=verified", session.session_id)
-        logger.info(
-            "session=%s action=post_upload_refill restored=%s",
-            session.session_id,
-            int(report.get("restored") or 0),
-        )
         if session.paused:
             session.pending_resume = True
             status = _status_out(session)
@@ -1787,10 +1829,17 @@ def create_app(
                 status_code=200,
                 content={"verified": True, "filename": name, "status": status.status},
             )
-        accepted = _run(session, store, active_runner, limits, resume_uploaded=True)
+        records = [dict(item) for item in session.confirmed_values if isinstance(item, dict)]
+        # The verifier already returned. Refill and the next fill pass publish
+        # status while this response goes back, so the upload stays inside the
+        # caller's budget. Do not mark the session busy here: the follow-up
+        # run takes that lock itself.
+        session.status = Status.STARTED
+        session.phase = "loaded"
+        _follow_verified_resume(session, store, active_runner, limits, records, report)
         return JSONResponse(
             status_code=200,
-            content={"verified": True, "filename": name, "status": accepted.status},
+            content={"verified": True, "filename": name, "status": Status.STARTED},
         )
 
     def _jpeg(session: ServiceSession) -> Response:

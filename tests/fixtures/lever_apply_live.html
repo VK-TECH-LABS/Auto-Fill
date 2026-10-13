@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Apply</title>
+  <style>
+    .application .application-field { width: 489px; }
+    .invisible-resume-upload { opacity: 0; position: absolute; left: 0; height: 1px; }
+  </style>
+</head>
+<body>
+  <h1>Application</h1>
+  <form class="application">
+    <ul>
+      <li class="application-question">
+        <label>
+          <div class="application-label">Full name<span class="required">✱</span></div>
+          <div class="application-field">
+            <input type="text" data-qa="name-input" name="name" required>
+          </div>
+        </label>
+      </li>
+      <li class="application-question">
+        <label>
+          <div class="application-label">Email<span class="required">✱</span></div>
+          <div class="application-field">
+            <input type="email" data-qa="email-input" name="email" required>
+          </div>
+        </label>
+      </li>
+      <li class="application-question">
+        <label>
+          <div class="application-label">Phone</div>
+          <div class="application-field">
+            <input type="text" data-qa="phone-input" name="phone">
+          </div>
+        </label>
+      </li>
+    </ul>
+    <input class="invisible-resume-upload" type="file" name="resume" id="resume">
+    <div id="chip" hidden>Success!</div>
+  </form>
+</body>
+</html>
