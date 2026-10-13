@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -69,7 +70,7 @@ def test_a_posting_apply_control_is_not_ready_and_a_bare_submit_apply_is_left():
         buttons=[ButtonControl(name="Apply for this Job", selector="#apply_button", control_type="submit")],
         controls=[Control(kind="text", label="Search", selector="#search", input_type="search")],
     )
-    assert classify_page(posting) == "APPLY_ENTRY"
+    assert classify_page(posting) == "JOB_DESCRIPTION"
     assert terminal_kind(posting, gaps=[], required_total=0) == "JOB"
     chosen = find_entry_control(
         _snapshot(buttons=[ButtonControl(name="Apply", selector="#apply_button", control_type="submit")])
@@ -129,13 +130,11 @@ def test_real_posting_shapes_click_apply_and_stay_not_ready(browser, fixture, ur
         page.goto((FIXTURES / fixture).as_uri())
         result = _run(page, url)
         clicked = page.evaluate("() => window.__clicked")
-        assert result.status == Status.JOB_DESCRIPTION, result.messages
+        assert result.status == Status.NAVIGATION_STALLED, result.messages
+        assert "navigation_stalled" in result.messages
         assert result.status != Status.READY_FOR_HUMAN_SUBMIT
-        assert result.progress["percent"] == 5
-        assert result.page_type in {"APPLY_ENTRY", "JOB_DESCRIPTION"}
-        assert clicked
-        assert len(clicked) <= 2
-        assert all(name == entry for name in clicked)
+        assert result.stopped_before_submit is True
+        assert clicked == [entry]
         assert "Submit application" not in clicked
         assert "Send application" not in clicked
     finally:
@@ -290,19 +289,29 @@ def test_preview_phase_and_retry_use_the_same_session():
     box: dict = {}
 
     def start() -> None:
+        began = time.monotonic()
         box["response"] = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+        box["elapsed"] = time.monotonic() - began
 
     thread = threading.Thread(target=start)
     thread.start()
     assert runner.painted.wait(timeout=5)
+    thread.join(timeout=5)
+    started = box["response"]
+    assert started.status_code == 200, started.text
+    opening = started.json()
+    assert box["elapsed"] < 5
+    assert opening["status"] == Status.STARTED
+    assert opening["phase"] in {"navigating", "loaded"}
     shot = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
     assert shot.status_code == 200, shot.text
     assert shot.content.startswith(b"\xff\xd8")
     runner.release.set()
-    thread.join(timeout=5)
-    started = box["response"]
-    assert started.status_code == 200, started.text
-    failed = started.json()
+    deadline = time.monotonic() + 5
+    failed = opening
+    while failed["status"] == Status.STARTED and time.monotonic() < deadline:
+        time.sleep(0.05)
+        failed = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH).json()
     assert failed["status"] == Status.FAILED_RETRYABLE
     assert failed["messages"] == ["navigation_timeout"]
     assert failed["phase"] == "loaded"

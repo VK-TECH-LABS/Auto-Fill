@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Example Engineer</title></head>
+<body>
+  <header><a href="/login">Sign in</a></header>
+  <main>
+    <h1>Example Engineer</h1>
+    <p>Job description. Responsibilities and qualifications for this role.</p>
+    <a id="apply" href="apply_popup_form.html" target="_blank">Apply</a>
+  </main>
+  <script>
+    window.__clicked = [];
+    document.getElementById("apply").addEventListener("click", () => {
+      window.__clicked.push("Apply");
+    });
+  </script>
+</body>
+</html>

@@ -24,6 +24,11 @@ from autofill.safeguards import HUMAN_SUBMIT_ONLY, SubmitBlockedError, assert_sa
         ("Sign up", "submit", "auth"),
         ("Create account", "button", "auth"),
         ("Back", "button", "other"),
+        ("Send", "button", "submit"),
+        ("Complete application", "button", "submit"),
+        ("Continue application", "button", "continue"),
+        ("Next step", "button", "continue"),
+        ("Proceed", "button", "continue"),
     ],
 )
 def test_classify_control(name, control_type, expected):

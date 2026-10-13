@@ -16,6 +16,7 @@ from autofill.dom_ui import checkpoint, control_committed, focus_field, refill_c
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
+from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
 from autofill.safeguards import activate, classify_control, is_add_row
 
@@ -306,11 +307,19 @@ def _fill_pages(
         if not advance_pages:
             break
 
+        alert = validation_message(snapshot)
+        if alert:
+            messages.append(alert)
+            break
         nxt = next(
             (
                 button
                 for button in snapshot.buttons
                 if button.selector not in clicked
+                and not button.disabled
+                and button.in_main
+                and not button.in_ad
+                and not button.in_header
                 and not is_add_row(button.name)
                 and classify_control(button.name, control_type=button.control_type) == "continue"
             ),
@@ -318,8 +327,13 @@ def _fill_pages(
         )
         if nxt is None:
             break
-        activate(page, nxt.selector, nxt.name, control_type=nxt.control_type)
+        before = navigation_signature(page, snapshot)
+        activate(page, nxt.selector, nxt.name, control_type=nxt.control_type, frame_url=nxt.frame_url)
         clicked.add(nxt.selector)
+        advanced, _moved = wait_for_navigation(page, before)
+        if not advanced:
+            messages.append("navigation_stalled")
+            break
         continued.append(nxt.name)
 
     unanswered = sum(1 for item in fields if item.action == "unanswered")

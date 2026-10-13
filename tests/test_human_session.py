@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -209,6 +210,19 @@ def test_human_done_and_human_resolved_continue(api):
     assert not any("submit" in path.casefold() for path in schema["paths"])
 
 
+def _await_run(client: TestClient, session_id: str, response):
+    """Real starts return once navigation begins. Wait for the fill to finish."""
+    assert response.status_code == 200, response.text
+    body = response.json()
+    deadline = time.monotonic() + 40
+    while body.get("status") == Status.STARTED and time.monotonic() < deadline:
+        time.sleep(0.05)
+        polled = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert polled.status_code == 200, polled.text
+        body = polled.json()
+    return body
+
+
 def _chromium_or_skip() -> None:
     try:
         with sync_playwright() as playwright:
@@ -238,8 +252,7 @@ def test_live_screenshot_and_human_click_can_reach_submit(tmp_path):
             assert created.status_code == 201, created.text
             session_id = created.json()["sessionId"]
             started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-            assert started.status_code == 200, started.text
-            assert started.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+            assert _await_run(client, session_id, started)["status"] == Status.READY_FOR_HUMAN_SUBMIT
             shot = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
             assert shot.status_code == 200
             assert shot.content.startswith(b"\xff\xd8")
@@ -299,7 +312,7 @@ def test_crashed_page_is_retryable_and_can_restart(tmp_path):
             )
             session_id = created.json()["sessionId"]
             started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-            assert started.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+            assert _await_run(client, session_id, started)["status"] == Status.READY_FOR_HUMAN_SUBMIT
 
             def crash_shot() -> None:
                 page = runner._sessions[session_id].page

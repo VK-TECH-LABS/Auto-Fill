@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -88,7 +89,17 @@ from autofill.service.sessions import (
 logger = logging.getLogger("autofill.service")
 
 _REFUSED_STATUSES = frozenset({"SUBMITTED", "APPLIED", "SUBMIT_CLICKED", "APPLICATION_SUBMITTED"})
-_STARTABLE = frozenset({Status.LOGIN_REQUIRED, Status.LOGIN_FAILED, Status.CREATED, "CREATED", Status.FAILED_RETRYABLE})
+_STARTABLE = frozenset(
+    {
+        Status.LOGIN_REQUIRED,
+        Status.LOGIN_FAILED,
+        Status.CREATED,
+        "CREATED",
+        Status.FAILED_RETRYABLE,
+        Status.NAVIGATION_STALLED,
+    }
+)
+_START_RETURN_S = 4.5
 _HUMAN_STOP = frozenset(
     {
         Status.LOGIN_REQUIRED,
@@ -830,7 +841,7 @@ def _allow_browser_restart(session: ServiceSession) -> None:
     A capacity refusal is retryable on its own and does not spend this budget.
     """
     messages = session.result.messages if session.result is not None else []
-    if "capacity_busy" in messages or _START_FAILED in messages:
+    if "capacity_busy" in messages or _START_FAILED in messages or "navigation_stalled" in messages:
         return
     if session.browser_restarts >= 2:
         raise HTTPException(status_code=409, detail="Browser crash retry limit reached.")
@@ -1033,6 +1044,50 @@ def _run(
         store.finish_run(session)
 
 
+def _start_in_background(session, store, runner, limits) -> RunStatusOut:
+    """Return once navigation has started. The fill keeps running for status and screenshots.
+
+    A run that finishes inside the cap still returns its outcome, so a fast
+    session does not look like it is still opening. The cap stays under the
+    caller's start timeout.
+    """
+    box: dict = {}
+
+    def worker() -> None:
+        try:
+            outcome = _run(session, store, runner, limits, resume_uploaded=False)
+        except HTTPException as exc:
+            box["http"] = exc
+            return
+        except Exception as exc:
+            box["error"] = exc
+            return
+        if session.status == Status.FAILED:
+            _mark_start_failed(session)
+            outcome = _status_out(session)
+        box["outcome"] = outcome
+
+    threading.Thread(target=worker, name="autofill-start", daemon=True).start()
+    deadline = time.monotonic() + _START_RETURN_S
+    while time.monotonic() < deadline:
+        if "http" in box:
+            raise box["http"]
+        if "error" in box:
+            return _failed(session, box["error"])
+        if "outcome" in box:
+            return box["outcome"]
+        if session.busy and session.phase in {"navigating", "loaded"}:
+            return _status_out(session)
+        time.sleep(0.02)
+    if "http" in box:
+        raise box["http"]
+    if "error" in box:
+        return _failed(session, box["error"])
+    if "outcome" in box:
+        return box["outcome"]
+    return _status_out(session)
+
+
 def create_app(
     *,
     token: str,
@@ -1228,14 +1283,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
-        try:
-            outcome = _run(session, store, active_runner, limits, resume_uploaded=False)
-        except HTTPException:
-            raise
-        if session.status == Status.FAILED:
-            _mark_start_failed(session)
-            return _status_out(session)
-        return outcome
+        return _start_in_background(session, store, active_runner, limits)
 
     @router.post("/sessions/{session_id}/retry", response_model=RunStatusOut, tags=["sessions"])
     def retry_session(session_id: str) -> RunStatusOut:
@@ -1244,10 +1292,10 @@ def create_app(
         _reject_expired(session, machine=True)
         if session.busy:
             raise HTTPException(status_code=409, detail={"reason": "busy"})
-        if session.status != Status.FAILED_RETRYABLE:
+        if session.status not in {Status.FAILED_RETRYABLE, Status.NAVIGATION_STALLED}:
             raise HTTPException(status_code=409, detail={"reason": "not_retryable"})
         messages = session.result.messages if session.result is not None else []
-        if "browser_crash" in messages or "browser_crashed" in messages:
+        if session.status == Status.FAILED_RETRYABLE and ("browser_crash" in messages or "browser_crashed" in messages):
             _allow_browser_restart(session)
         active_runner.discard(session.session_id)
         session.preview_jpeg = None

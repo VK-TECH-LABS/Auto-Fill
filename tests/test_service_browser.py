@@ -74,8 +74,7 @@ def test_http_service_fills_local_form_and_stops_before_submit(fixture_origin: s
         assert created.status_code == 201, created.text
         session_id = created.json()["sessionId"]
         started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-        assert started.status_code == 200, started.text
-        body = started.json()
+        body = _settle(client, session_id, started)
         assert body["status"] == Status.RESUME_UPLOAD_REQUIRED
         assert body["stopped_before_submit"] is True
         assert "Submit application" in body["submitControls"]
@@ -127,10 +126,22 @@ def _create_session(client: TestClient, origin: str, profile: dict, job_id: str)
     return created.json()["sessionId"]
 
 
+def _settle(client: TestClient, session_id: str, started) -> dict:
+    """Start returns when navigation begins. These tests want the finished status."""
+    assert started.status_code == 200, started.text
+    body = started.json()
+    deadline = time.monotonic() + 40
+    while body.get("status") == Status.STARTED and time.monotonic() < deadline:
+        time.sleep(0.05)
+        polled = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert polled.status_code == 200, polled.text
+        body = polled.json()
+    return body
+
+
 def _start(client: TestClient, session_id: str) -> dict:
     started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-    assert started.status_code == 200, started.text
-    return started.json()
+    return _settle(client, session_id, started)
 
 
 def _eval(runner: PlaywrightRunner, session_id: str, expression: str, argument: object | None = None) -> object:
@@ -303,8 +314,7 @@ def test_unanswered_required_question_blocks_until_answer(fixture_origin: str):
         assert created.json()["protocolVersion"] == "0.6.0"
         session_id = created.json()["sessionId"]
         started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-        assert started.status_code == 200, started.text
-        body = started.json()
+        body = _settle(client, session_id, started)
         assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
         blocking = body["blocking"]
         assert blocking["kind"] == "QUESTION"
@@ -395,8 +405,7 @@ def test_answer_does_not_refill_committed_fields(fixture_origin: str, monkeypatc
         assert created.status_code == 201, created.text
         session_id = created.json()["sessionId"]
         started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-        assert started.status_code == 200, started.text
-        body = started.json()
+        body = _settle(client, session_id, started)
         assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
         assert "color" in body["blocking"]["text"].lower()
         assert fills["count"] >= 1
@@ -482,8 +491,7 @@ def test_react_select_outline_answer_and_country_alias(fixture_origin: str):
         assert created.status_code == 201, created.text
         session_id = created.json()["sessionId"]
         started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-        assert started.status_code == 200, started.text
-        body = started.json()
+        body = _settle(client, session_id, started)
         assert body["status"] == Status.MANUAL_ANSWER_REQUIRED, body.get("messages")
         blocking = body["blocking"]
         assert blocking["kind"] == "QUESTION"
@@ -558,8 +566,7 @@ def test_ttl_reaper_closes_the_live_browser_context(fixture_origin: str):
         assert created.status_code == 201, created.text
         session_id = created.json()["sessionId"]
         started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
-        assert started.status_code == 200, started.text
-        assert started.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert _settle(client, session_id, started)["status"] == Status.MANUAL_ANSWER_REQUIRED
         assert session_id in runner._sessions
         held = app.state.store.get(session_id)
         assert held is not None

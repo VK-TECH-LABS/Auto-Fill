@@ -8,8 +8,16 @@ roots, which is why an ``#id`` selector remains usable after extraction.
 
 from __future__ import annotations
 
+import re
+from urllib.parse import urlparse
+
 from autofill.mapping import mark_required_acknowledgements
 from autofill.models import ButtonControl, Control, LinkControl, Option, PageSnapshot
+
+_ATS_FRAME = re.compile(
+    r"(greenhouse|lever\.co|ashbyhq|myworkday|smartrecruiters|adp\.com|icims|jobvite|workday)",
+    re.IGNORECASE,
+)
 
 EXTRACT_JS = r"""
 () => {
@@ -300,6 +308,31 @@ EXTRACT_JS = r"""
     }
   }
 
+  function placementOf(el) {
+    const main = el.closest("main, [role='main']");
+    const header = el.closest("header, [role='banner']");
+    const nav = el.closest("nav, [role='navigation']");
+    const footer = el.closest("footer, [role='contentinfo']");
+    const ad = el.closest("aside, [role='complementary'], [data-ad], [data-advertisement], .ad, .advertisement");
+    const inHeader = !!(header && (!main || !main.contains(header)));
+    const inAd = !!ad;
+    const outside = (node) => !!(node && (!main || !main.contains(node)));
+    const inChrome = outside(nav) || outside(footer);
+    const inMain = main ? !inAd : !(inHeader || inAd || inChrome);
+    return { inHeader, inAd, inMain };
+  }
+
+  function isDisabled(el) {
+    return !!(el.disabled || el.getAttribute("aria-disabled") === "true");
+  }
+
+  function controlRole(el) {
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    if (role) return role;
+    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+    return tag === "a" ? "link" : "button";
+  }
+
   const controls = [];
   const seenRadios = new Set();
   const buttons = [];
@@ -436,15 +469,25 @@ EXTRACT_JS = r"""
 
     for (const el of root.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")) {
       if (isHidden(el)) continue;
-      const name = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      const href = el.getAttribute("href") || "";
+      let name = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (!name && /apply/i.test(href)) name = "Apply";
       const selector = selectorFor(el);
       if (!name || !selector || seenButtons.has(selector)) continue;
       seenButtons.add(selector);
+      const place = placementOf(el);
       buttons.push({
         name,
         selector,
         controlType: (el.getAttribute("type") || "").toLowerCase(),
         automationId: el.getAttribute("data-automation-id") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        role: controlRole(el),
+        href,
+        inHeader: place.inHeader,
+        inAd: place.inAd,
+        inMain: place.inMain,
+        disabled: isDisabled(el),
       });
     }
   });
@@ -909,13 +952,23 @@ EXTRACT_JS = r"""
     for (const el of root.querySelectorAll("a[href], [role='link']")) {
       if (links.length >= 40) break;
       if (isHidden(el)) continue;
-      const name = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      const href = el.getAttribute("href") || "";
+      let name = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (!name && /apply/i.test(href)) name = "Apply";
       const selector = selectorFor(el);
       if (!name || !selector) continue;
+      const place = placementOf(el);
       links.push({
         name: name.slice(0, 200),
         selector,
         automationId: el.getAttribute("data-automation-id") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        role: controlRole(el),
+        href,
+        inHeader: place.inHeader,
+        inAd: place.inAd,
+        inMain: place.inMain,
+        disabled: isDisabled(el),
       });
     }
   });
@@ -1096,6 +1149,13 @@ def parse_snapshot(data: dict) -> PageSnapshot:
             selector=str(raw.get("selector", "")),
             control_type=str(raw.get("controlType", "")),
             automation_id=str(raw.get("automationId", "") or ""),
+            aria_label=str(raw.get("ariaLabel", "") or ""),
+            role=str(raw.get("role", "") or ""),
+            href=str(raw.get("href", "") or ""),
+            in_header=bool(raw.get("inHeader", False)),
+            in_ad=bool(raw.get("inAd", False)),
+            in_main=bool(raw.get("inMain", True)),
+            disabled=bool(raw.get("disabled", False)),
         )
         for raw in data.get("buttons", [])
     ]
@@ -1104,6 +1164,13 @@ def parse_snapshot(data: dict) -> PageSnapshot:
             name=str(raw.get("name", "")),
             selector=str(raw.get("selector", "")),
             automation_id=str(raw.get("automationId", "") or ""),
+            aria_label=str(raw.get("ariaLabel", "") or ""),
+            role=str(raw.get("role", "") or ""),
+            href=str(raw.get("href", "") or ""),
+            in_header=bool(raw.get("inHeader", False)),
+            in_ad=bool(raw.get("inAd", False)),
+            in_main=bool(raw.get("inMain", True)),
+            disabled=bool(raw.get("disabled", False)),
         )
         for raw in data.get("links", [])
         if str(raw.get("name", "")).strip()
@@ -1145,9 +1212,81 @@ def challenge_message(snapshot: PageSnapshot) -> str:
     return "CAPTCHA or challenge widget detected. Auto-Fill does not solve CAPTCHAs."
 
 
+def _frame_url(frame) -> str:
+    try:
+        return str(getattr(frame, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def _usable_frame(page, frame) -> bool:
+    """Same-origin frames and known ATS embeds. The main frame is already read."""
+    main = getattr(page, "main_frame", None)
+    if main is not None and frame is main:
+        return False
+    url = _frame_url(frame)
+    if not url or url.startswith("about:"):
+        return True
+    try:
+        page_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        page_url = ""
+    host = (urlparse(url).hostname or "").lower()
+    parent = (urlparse(page_url).hostname or "").lower()
+    if not host or host == parent:
+        return True
+    return bool(_ATS_FRAME.search(host))
+
+
+def _tag_frame(snapshot: PageSnapshot, frame_url: str) -> None:
+    for control in snapshot.controls:
+        control.frame_url = frame_url
+    for button in snapshot.buttons:
+        button.frame_url = frame_url
+    for link in snapshot.links:
+        link.frame_url = frame_url
+
+
+def _merge_snapshot(base: PageSnapshot, extra: PageSnapshot) -> None:
+    base.controls.extend(extra.controls)
+    base.buttons.extend(extra.buttons)
+    base.links.extend(extra.links)
+    for alert in extra.alerts:
+        if alert not in base.alerts:
+            base.alerts.append(alert)
+    for item in extra.automation_ids:
+        if item not in base.automation_ids:
+            base.automation_ids.append(item)
+    base.captcha_present = base.captcha_present or extra.captcha_present
+    base.bot_wall = base.bot_wall or extra.bot_wall
+    base.password_present = base.password_present or extra.password_present
+    if not base.heading and extra.heading:
+        base.heading = extra.heading
+    if extra.page_text and extra.page_text not in base.page_text:
+        base.page_text = f"{base.page_text} {extra.page_text}".strip()[:2000]
+    if not base.banner and extra.banner:
+        base.banner = extra.banner
+    if not base.password_hint and extra.password_hint:
+        base.password_hint = extra.password_hint
+
+
 def extract_page(page) -> PageSnapshot:
-    """Evaluate the extractor in ``page`` and return a snapshot."""
+    """Evaluate the extractor in ``page`` and in same-origin or ATS iframes."""
     # Call the arrow function as an expression. Playwright also accepts a bare
     # function string, but invoking it keeps the contract obvious.
     data = page.evaluate("(" + EXTRACT_JS + ")()")
-    return parse_snapshot(data)
+    snapshot = parse_snapshot(data)
+    frames = getattr(page, "frames", None)
+    if not frames:
+        return snapshot
+    for frame in list(frames):
+        if not _usable_frame(page, frame):
+            continue
+        try:
+            extra_data = frame.evaluate("(" + EXTRACT_JS + ")()")
+        except Exception:
+            continue
+        extra = parse_snapshot(extra_data)
+        _tag_frame(extra, _frame_url(frame))
+        _merge_snapshot(snapshot, extra)
+    return snapshot

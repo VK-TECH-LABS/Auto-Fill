@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <h1>Application</h1>
+  <label for="email">Email</label>
+  <input id="email" type="email" name="email">
+  <div role="alert">This field is required</div>
+  <button id="next" type="button">Next</button>
+  <script>
+    window.__clicked = [];
+    document.getElementById("next").addEventListener("click", () => {
+      window.__clicked.push("Next");
+    });
+  </script>
+</body>
+</html>

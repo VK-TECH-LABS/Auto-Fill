@@ -97,6 +97,9 @@ class RecordingRunner:
         elif self.mode == "login":
             status = Status.LOGIN_REQUIRED
             step = "LOGIN_FAILED"
+        elif self.mode == "stalled":
+            status = Status.NAVIGATION_STALLED
+            step = Status.NAVIGATION_STALLED
         elif request.resume_uploaded:
             status = Status.READY_FOR_HUMAN_SUBMIT
             step = "READY_FOR_HUMAN_SUBMIT"
@@ -111,7 +114,7 @@ class RecordingRunner:
             session_id=request.session_id,
             candidate_id=candidate_id,
             job_id=request.job_id,
-            messages=["synthetic run"],
+            messages=["navigation_stalled" if self.mode == "stalled" else "synthetic run"],
             submit_controls=["Submit application"],
         )
 
@@ -592,6 +595,21 @@ def test_library_imports_without_a_host_checkout():
     assert refused.returncode == 2
     assert "AUTOFILL_SERVICE_TOKEN" in refused.stderr
     assert "postgres://" not in refused.stderr
+
+
+def test_navigation_stalled_is_retryable_without_a_crash_budget(client: TestClient, runner: RecordingRunner):
+    runner.mode = "stalled"
+    created = _create(client)
+    session_id = created["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    assert started.status_code == 200, started.text
+    assert started.json()["status"] == Status.NAVIGATION_STALLED
+    assert started.json()["messages"] == ["navigation_stalled"]
+    runner.mode = "resume"
+    retried = client.post(f"/v1/sessions/{session_id}/retry", headers=AUTH)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+    assert runner.calls == [(session_id, False), (session_id, False)]
 
 
 def test_service_source_has_no_host_application():

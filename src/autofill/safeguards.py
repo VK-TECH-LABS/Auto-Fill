@@ -22,6 +22,7 @@ _SUBMIT_RE = re.compile(
     r"submit(\s+application)?"
     r"|apply(\s+now)?"
     r"|send(\s+my)?\s+application"
+    r"|send"
     r"|finish(\s+application)?"
     r"|complete\s+application"
     r")\b",
@@ -139,28 +140,118 @@ _ENTRY_LABELS = frozenset(
         "apply for this job",
         "apply manually",
         "i'm interested",
+        "start application",
+        "continue to application",
+        "apply to job",
+        "apply online",
+        "apply for this position",
+        "apply for this role",
+        "easy apply",
+        "apply here",
     }
 )
+_ENTRY_PREFIXES = (
+    "apply for this job",
+    "apply now",
+    "apply for this position",
+    "apply for this role",
+    "apply to job",
+    "apply online",
+    "apply here",
+    "easy apply",
+    "start application",
+    "continue to application",
+    "i'm interested",
+    "im interested",
+)
+_UNRELATED_ENTRY = re.compile(
+    r"\b(privacy|cookie|cookies|terms|sign in|log in|login|create account|sponsor|sponsored|"
+    r"advertisement|learn more|share|facebook|linkedin|twitter|instagram)\b",
+    re.IGNORECASE,
+)
+_ENTRY_POPUP_MS = 1000
+
+
+def _fold_label(name: str) -> str:
+    return " ".join((name or "").split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
+
+
+def _fold_token(value: str) -> str:
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", value or "")
+    spaced = spaced.replace("-", " ").replace("_", " ").replace("/", " ")
+    return _fold_label(spaced)
 
 
 def is_entry_label(name: str) -> bool:
     """True for a job-description entry control, never for Submit on a form.
 
-    ``Apply`` on a posting with no application form is an entry. ``Submit``
-    and ``Submit application`` are not, and stay on the final-submit path.
-    A longer label that starts with ``Apply for this job`` or ``Apply now``
-    is the same entry control.
+    ``Apply`` on a posting with no application form is an entry. ``Submit``,
+    ``Send``, and ``Complete application`` are not, and stay on the final-submit
+    path. A longer label that starts with a known entry phrase is the same control.
     """
-    label = " ".join(name.split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
-    if re.search(r"\b(submit|send(\s+my)?\s+application)\b", label):
+    label = _fold_label(name)
+    if not label:
+        return False
+    if re.search(r"\b(submit|send(\s+my)?\s+application|complete\s+application)\b", label):
         return False
     if label in _ENTRY_LABELS:
         return True
-    if label.startswith("apply for this job") or label.startswith("apply now"):
+    return any(label.startswith(prefix) for prefix in _ENTRY_PREFIXES)
+
+
+def is_entry_control(
+    name: str,
+    *,
+    selector: str = "",
+    control_type: str = "",
+    aria_label: str = "",
+    automation_id: str = "",
+    href: str = "",
+    role: str = "",
+    disabled: bool = False,
+    in_header: bool = False,
+    in_ad: bool = False,
+    in_main: bool = True,
+) -> bool:
+    """A visible, enabled Apply control in the main content.
+
+    Header sign-in, ads, and unrelated links are not entries. A bare ``Apply``
+    whose type is submit stays on the final-submit path unless the selector is
+    the known Greenhouse or Lever entry control.
+    """
+    if disabled or in_header or in_ad or not in_main:
+        return False
+    role_text = (role or "").casefold()
+    if role_text and role_text not in {"button", "link"}:
+        return False
+    label = _fold_label(name)
+    if re.search(r"\b(submit|send(\s+my)?\s+application|complete\s+application)\b", label):
+        return False
+    selector_text = (selector or "").casefold()
+    if selector_text == "#apply_button" or selector_text.endswith("#apply_button"):
         return True
-    if label.startswith("i'm interested") or label.startswith("im interested"):
+    if "postings-btn" in selector_text and "apply" in label:
         return True
-    return False
+    if (control_type or "").casefold() == "submit" and label == "apply":
+        return False
+    token = _fold_token(automation_id)
+    if is_entry_label(name) or is_entry_label(aria_label) or is_entry_label(token):
+        return True
+    if token and re.search(r"\bapply\b", token) and not _UNRELATED_ENTRY.search(token):
+        return True
+    href_text = (href or "").casefold()
+    if "apply" not in href_text:
+        return False
+    if (
+        _UNRELATED_ENTRY.search(href_text)
+        or _UNRELATED_ENTRY.search(label)
+        or _UNRELATED_ENTRY.search(_fold_label(aria_label))
+    ):
+        return False
+    visible = label or _fold_label(aria_label)
+    if visible and "apply" not in visible:
+        return False
+    return True
 
 
 def field_class_for_button(name: str, *, control_type: str = "") -> str:
@@ -214,13 +305,13 @@ def assert_safe_to_activate(name: str, *, control_type: str = "") -> str:
     return kind
 
 
-def activate(page, selector: str, name: str, *, control_type: str = "") -> None:
+def activate(page, selector: str, name: str, *, control_type: str = "", frame_url: str = "") -> None:
     """Click a continue control after the safeguard check.
 
     ``page`` is a Playwright ``Page``. The click lives in this module so the
     rest of the package cannot press a button without the check.
     """
-    perform_click(page, selector, name, control_type=control_type, purpose="navigation")
+    perform_click(page, selector, name, control_type=control_type, purpose="navigation", frame_url=frame_url)
 
 
 def activate_login(page, selector: str, name: str, *, control_type: str = "") -> None:
@@ -252,20 +343,104 @@ def attach_resume_control(page, selector: str, files: list[dict]) -> None:
     chooser.value.set_files(files)
 
 
-def activate_entry(page, selector: str, name: str, *, control_type: str = "") -> None:
+def _bound_target(page, frame_url: str):
+    """The frame that owns ``frame_url``, or the page when the control is on top."""
+    if not frame_url:
+        return page
+    for frame in list(getattr(page, "frames", []) or []):
+        try:
+            if str(getattr(frame, "url", "") or "") == frame_url:
+                return frame
+        except Exception:
+            continue
+    return page
+
+
+def _popup_timeout(exc: BaseException) -> bool:
+    return "timeout" in type(exc).__name__.casefold()
+
+
+def _click_for_popup(page, selector: str, frame_url: str = ""):
+    """Click and return a page opened by that click.
+
+    A click that stays on this tab returns ``None``. The popup wait is short
+    so a same-tab Apply is not held for a full navigation timeout.
+    """
+    target = _bound_target(page, frame_url)
+    locator = target.locator(selector).first
+    context = getattr(page, "context", None)
+    expect = getattr(context, "expect_page", None) if context is not None else None
+    opened: list = []
+
+    def _remember(new_page) -> None:
+        if new_page is not None and new_page not in opened:
+            opened.append(new_page)
+
+    listening = False
+    if context is not None and getattr(context, "on", None) is not None:
+        try:
+            context.on("page", _remember)
+            listening = True
+        except Exception:
+            listening = False
+    try:
+        if expect is None:
+            locator.click()
+            return opened[-1] if opened else None
+        clicked = False
+        try:
+            with expect(timeout=_ENTRY_POPUP_MS) as incoming:
+                locator.click()
+                clicked = True
+            _remember(getattr(incoming, "value", None))
+        except Exception as exc:
+            if not clicked or not _popup_timeout(exc):
+                raise
+        return opened[-1] if opened else None
+    finally:
+        if listening:
+            remove = getattr(context, "remove_listener", None)
+            if remove is not None:
+                try:
+                    remove("page", _remember)
+                except Exception:
+                    pass
+
+
+def activate_entry(
+    page,
+    selector: str,
+    name: str,
+    *,
+    control_type: str = "",
+    aria_label: str = "",
+    automation_id: str = "",
+    href: str = "",
+    role: str = "",
+    frame_url: str = "",
+):
     """Open a job description into the application. Submit on a form stays forbidden.
 
     The caller must already know the page has no application form. This does
-    not classify ``Apply`` as safe navigation for later pages.
+    not classify ``Apply`` as safe navigation for later pages. A new tab or
+    popup opened by the click is returned so the same session can follow it.
     """
     if not HUMAN_SUBMIT_ONLY:
         raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
-    if not is_entry_label(name):
+    if not is_entry_control(
+        name,
+        selector=selector,
+        control_type=control_type,
+        aria_label=aria_label,
+        automation_id=automation_id,
+        href=href,
+        role=role,
+    ):
         raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
         )
     # Lever renders two Apply links with the same class. The first is the posting entry.
-    page.locator(selector).first.click()
+    return _click_for_popup(page, selector, frame_url)
 
 
 def open_combobox(page, selector: str) -> None:
@@ -331,7 +506,15 @@ def _account_button_allowed(name: str, *, control_type: str = "") -> bool:
     return False
 
 
-def perform_click(page, selector: str, name: str, *, control_type: str = "", purpose: str) -> None:
+def perform_click(
+    page,
+    selector: str,
+    name: str,
+    *,
+    control_type: str = "",
+    purpose: str,
+    frame_url: str = "",
+) -> None:
     """Central click guard.
 
     If the control is a final application submission, this raises
@@ -350,27 +533,27 @@ def perform_click(page, selector: str, name: str, *, control_type: str = "", pur
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only an existing-account Log in or Sign in is allowed."
             )
-        page.locator(selector).click()
+        _bound_target(page, frame_url).locator(selector).click()
         return
     if purpose == "navigation":
         if klass != ActionClass.NAVIGATION:
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only Next, Continue, Review, or Add-row navigation is automatic."
             )
-        page.locator(selector).click()
+        _bound_target(page, frame_url).locator(selector).click()
         return
     if purpose == "account":
         if not _account_button_allowed(name, control_type=control_type):
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only the account form's primary button is allowed."
             )
-        page.locator(selector).click()
+        _bound_target(page, frame_url).locator(selector).click()
         return
     if purpose == "account_switch":
         if not _ACCOUNT_NAME_RE.search(name):
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only a Create Account or Sign In switch is allowed."
             )
-        page.locator(selector).click()
+        _bound_target(page, frame_url).locator(selector).click()
         return
     raise SubmitBlockedError(f"Unknown click purpose {purpose!r}.")
