@@ -153,6 +153,10 @@ def follow_answer(
                 "This page is a job description. Auto-Fill did not find an application form.",
                 reason,
             ]
+        elif decision == "SITE_ERROR":
+            status = Status.FAILED_RETRYABLE
+            present_blocking(page, None)
+            messages = ["site_error"]
         elif decision == "CAPTCHA":
             status = Status.CAPTCHA_REQUIRED
             present_blocking(page, None)

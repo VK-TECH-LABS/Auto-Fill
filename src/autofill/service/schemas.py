@@ -425,6 +425,10 @@ class RunStatusOut(BaseModel):
     completed: dict[str, Any] | None = None
     checkpoint: dict[str, Any] | None = None
     page_type: str = Field(default="UNKNOWN", alias="pageType")
+    entry_clicks: int = Field(default=0, alias="entryClicks")
+    next_clicks: int = Field(default=0, alias="nextClicks")
+    pages_advanced: int = Field(default=0, alias="pagesAdvanced")
+    last_navigation: dict[str, str] | None = Field(default=None, alias="lastNavigation")
     phase: Literal["launching", "navigating", "loaded"] = "launching"
     started_at: str | None = Field(default=None, alias="startedAt")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")

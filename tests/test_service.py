@@ -116,6 +116,9 @@ class RecordingRunner:
             job_id=request.job_id,
             messages=["navigation_stalled" if self.mode == "stalled" else "synthetic run"],
             submit_controls=["Submit application"],
+            entry_clicks=1 if self.mode == "stalled" else 0,
+            pages_advanced=0,
+            last_navigation={"action": "entry", "result": "stalled"} if self.mode == "stalled" else None,
         )
 
     def discard(self, session_id: str) -> None:
@@ -605,6 +608,10 @@ def test_navigation_stalled_is_retryable_without_a_crash_budget(client: TestClie
     assert started.status_code == 200, started.text
     assert started.json()["status"] == Status.NAVIGATION_STALLED
     assert started.json()["messages"] == ["navigation_stalled"]
+    assert started.json()["entryClicks"] == 1
+    assert started.json()["nextClicks"] == 0
+    assert started.json()["pagesAdvanced"] == 0
+    assert started.json()["lastNavigation"] == {"action": "entry", "result": "stalled"}
     runner.mode = "resume"
     retried = client.post(f"/v1/sessions/{session_id}/retry", headers=AUTH)
     assert retried.status_code == 200, retried.text

@@ -1526,95 +1526,212 @@ def _apply(
 ) -> None:
     by_intent, unnamed, by_key = _index_answers(response)
     unclassified = _unclassified_count(requests)
-    employment_rows = _rows(response.fields.get("employment[]"))
-    education_rows = _rows(response.fields.get("education[]"))
-    project_rows = _rows(response.fields.get("projects[]"))
-    employment_index = -1
+    rows = {
+        "employment": _rows(response.fields.get("employment[]")),
+        "education": _rows(response.fields.get("education[]")),
+        "projects": _rows(response.fields.get("projects[]")),
+    }
+    employment_index = [-1]
     # A missing resume is recorded after the other controls. It must not skip them.
     ordered = [ask for ask in requests if ask.field_key != "resume.file"]
     ordered.extend(ask for ask in requests if ask.field_key == "resume.file")
+    shared = (by_intent, unnamed, by_key, unclassified, rows, employment_index)
     for ask in ordered:
         if not checkpoint():
             break
-        if any(selector_held(control.selector) for control in ask.controls) and (
-            not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
-        ):
+        _apply_ask(page, ask, response, flags, outcome, heading, shared)
+    if _resume_was_attached(outcome):
+        settle_after_resume(page)
+        _refill_cleared_fields(page, ordered, response, flags, outcome, heading, shared)
+        try:
+            outcome.snapshot = extract_page(page)
+        except Exception:
+            pass
+
+
+def _apply_ask(
+    page,
+    ask: _Ask,
+    response: ResolverResponse,
+    flags: FillFlags,
+    outcome: ResolvedPage,
+    heading: str,
+    shared: tuple,
+) -> None:
+    """Write one ask. ``shared`` carries the step's answer index and repeater cursor."""
+    by_intent, unnamed, by_key, unclassified, rows, employment_index = shared
+    if any(selector_held(control.selector) for control in ask.controls) and (
+        not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
+    ):
+        return
+    if ask.controls and ask.controls[0].kind == "buttons" and control_committed(page, ask.controls[0].selector):
+        return
+    if ask.field_key == "resume.file":
+        _apply_resume(page, ask, response, outcome)
+        return
+    if ask.consent:
+        if not any(control.required for control in ask.controls):
+            return
+        if _cluster_committed(page, ask.controls):
+            return
+        if _accept_standard_term(page, ask):
+            return
+        statement = _consent_statement(ask.controls[0])
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", statement),
+            blocking=True,
+            controls=ask.controls,
+            kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
+        )
+        return
+    if ask.compose_location:
+        _apply_location(page, ask.controls[0], response.fields, outcome)
+        return
+    if ask.field_key == "phone.country":
+        _apply_phone_country(page, ask.controls[0], response.fields, outcome)
+        return
+    if ask.include_question:
+        match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
+        answer = _take_answer(
+            match,
+            by_intent,
+            unnamed,
+            by_key,
+            unclassified=unclassified,
+            question_id=_question_digest(match.text, ask.controls[0]),
+        )
+        _apply_question(page, ask, answer, outcome)
+        return
+    if not ask.field_key:
+        return
+    if ask.field_key == "employment[]":
+        sub = ask.subfield or _subfield(ask.controls[0], heading)
+        employment_rows = rows["employment"]
+        if sub == "employment.company":
+            employment_index[0] += 1
+        index = employment_index[0]
+        row = employment_rows[index] if 0 <= index < len(employment_rows) else None
+        if row is None and employment_rows:
+            row = employment_rows[0]
+        _apply_row_field(page, ask.controls[0], row, sub, flags, outcome)
+        return
+    if ask.field_key == "education[]":
+        row = rows["education"][0] if rows["education"] else None
+        subfield = ask.subfield or _subfield(ask.controls[0], heading)
+        _apply_row_field(page, ask.controls[0], row, subfield, flags, outcome)
+        return
+    if ask.field_key == "projects[]":
+        row = rows["projects"][0] if rows["projects"] else None
+        subfield = ask.subfield or _subfield(ask.controls[0], heading)
+        _apply_row_field(page, ask.controls[0], row, subfield, flags, outcome)
+        return
+    if ask.field_key == "skills":
+        raw = response.fields.get("skills", "")
+        text = ", ".join(raw) if isinstance(raw, list) else str(raw or "")
+        _write_text(page, ask.controls[0], text, outcome, key=ask.field_key)
+        return
+    if ask.field_key not in response.fields and ask.field_key not in response.unresolved:
+        _skip(ask.controls[0], outcome, ask.field_key, "Resolver did not return this key.")
+        return
+    raw_value = response.fields.get(ask.field_key, "")
+    text = "" if raw_value is None else str(raw_value)
+    if ask.field_key == "phone" and flags.digits_phone:
+        text = "".join(character for character in text if character.isdigit())
+    if flags.us_dates and _looks_iso(text):
+        text = _force_us_date(text)
+    _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
+
+
+def _resume_was_attached(outcome: ResolvedPage) -> bool:
+    return any(item.action == "upload" and item.key == "resume.file" for item in outcome.fields)
+
+
+_FIELD_SIG_JS = r"""
+() => {
+  const parts = [];
+  for (const el of document.querySelectorAll("input, textarea, select")) {
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "file" || type === "hidden") continue;
+    const id = el.id || el.getAttribute("name") || "";
+    parts.push(id + "=" + ("value" in el ? el.value : ""));
+  }
+  return parts.join("\n");
+}
+"""
+
+
+def settle_after_resume(page, *, timeout_s: float = 3.0) -> None:
+    """Wait until a resume parse stops rewriting fields, then return.
+
+    A page that does not change settles in about a second. A rewrite is
+    followed until two reads match. The budget is a ceiling.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        started = str(evaluate(_FIELD_SIG_JS) or "")
+    except Exception:
+        return
+    previous = started
+    stable = 0
+    saw_change = False
+    quiet_after = time.monotonic() + 1.2
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        _pause(page, 150)
+        try:
+            signature = str(evaluate(_FIELD_SIG_JS) or "")
+        except Exception:
+            return
+        if signature != started:
+            saw_change = True
+        if signature == previous:
+            stable += 1
+        else:
+            stable = 0
+            previous = signature
+        if saw_change and stable >= 2:
+            return
+        if not saw_change and time.monotonic() >= quiet_after and stable >= 2:
+            return
+
+
+def _refill_cleared_fields(
+    page,
+    requests: list[_Ask],
+    response: ResolverResponse,
+    flags: FillFlags,
+    outcome: ResolvedPage,
+    heading: str,
+    shared: tuple,
+) -> None:
+    """Write approved values again when a resume parse cleared them.
+
+    A value that is still on the control stays, including one a person typed.
+    A held control is left alone even when the parse emptied it.
+    """
+    written = {
+        item.selector
+        for item in outcome.fields
+        if item.selector and item.action in _FILLED_ACTIONS and item.key != "resume.file"
+    }
+    if not written:
+        return
+    by_intent, unnamed, by_key, unclassified, rows, _index = shared
+    refill_shared = (by_intent, unnamed, by_key, unclassified, rows, [-1])
+    for ask in requests:
+        if ask.field_key == "resume.file" or not ask.controls:
             continue
-        if ask.controls and ask.controls[0].kind == "buttons" and control_committed(page, ask.controls[0].selector):
+        selector = ask.controls[0].selector
+        if not selector or selector not in written:
             continue
-        if ask.field_key == "resume.file":
-            _apply_resume(page, ask, response, outcome)
+        if any(selector_held(control.selector) for control in ask.controls):
             continue
-        if ask.consent:
-            if not any(control.required for control in ask.controls):
-                continue
-            if _cluster_committed(page, ask.controls):
-                continue
-            if _accept_standard_term(page, ask):
-                continue
-            statement = _consent_statement(ask.controls[0])
-            _manual(
-                outcome,
-                IntentMatch(None, "unknown", "none", statement),
-                blocking=True,
-                controls=ask.controls,
-                kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
-            )
+        if _cluster_committed(page, ask.controls):
             continue
-        if ask.compose_location:
-            _apply_location(page, ask.controls[0], response.fields, outcome)
-            continue
-        if ask.field_key == "phone.country":
-            _apply_phone_country(page, ask.controls[0], response.fields, outcome)
-            continue
-        if ask.include_question:
-            match = ask.match or IntentMatch(None, "unknown", "none", sanitize_question(_question_text(ask.controls)))
-            answer = _take_answer(
-                match,
-                by_intent,
-                unnamed,
-                by_key,
-                unclassified=unclassified,
-                question_id=_question_digest(match.text, ask.controls[0]),
-            )
-            _apply_question(page, ask, answer, outcome)
-            continue
-        if not ask.field_key:
-            continue
-        if ask.field_key == "employment[]":
-            sub = ask.subfield or _subfield(ask.controls[0], heading)
-            if sub == "employment.company":
-                employment_index += 1
-            row = employment_rows[employment_index] if 0 <= employment_index < len(employment_rows) else None
-            if row is None and employment_rows:
-                row = employment_rows[0]
-            _apply_row_field(page, ask.controls[0], row, sub, flags, outcome)
-            continue
-        if ask.field_key == "education[]":
-            row = education_rows[0] if education_rows else None
-            subfield = ask.subfield or _subfield(ask.controls[0], heading)
-            _apply_row_field(page, ask.controls[0], row, subfield, flags, outcome)
-            continue
-        if ask.field_key == "projects[]":
-            row = project_rows[0] if project_rows else None
-            subfield = ask.subfield or _subfield(ask.controls[0], heading)
-            _apply_row_field(page, ask.controls[0], row, subfield, flags, outcome)
-            continue
-        if ask.field_key == "skills":
-            raw = response.fields.get("skills", "")
-            text = ", ".join(raw) if isinstance(raw, list) else str(raw or "")
-            _write_text(page, ask.controls[0], text, outcome, key=ask.field_key)
-            continue
-        if ask.field_key not in response.fields and ask.field_key not in response.unresolved:
-            _skip(ask.controls[0], outcome, ask.field_key, "Resolver did not return this key.")
-            continue
-        raw_value = response.fields.get(ask.field_key, "")
-        text = "" if raw_value is None else str(raw_value)
-        if ask.field_key == "phone" and flags.digits_phone:
-            text = "".join(character for character in text if character.isdigit())
-        if flags.us_dates and _looks_iso(text):
-            text = _force_us_date(text)
-        _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
+        _apply_ask(page, ask, response, flags, outcome, heading, refill_shared)
 
 
 _EEO_RE = re.compile(
@@ -1629,6 +1746,7 @@ def _eeo(text: str) -> bool:
 
 
 _RESUME_VERIFY_SECONDS = 4.0
+_RESUME_SHOWN_HOLD = 0.7
 _RESUME_STATUS_JS = """
 ({ selector, name }) => {
   function shown(node) {
@@ -1676,9 +1794,12 @@ _RESUME_STATUS_JS = """
     const note = rawText(local);
     if (note.trim() && !isSuccess(note)) return "error";
   }
-  const body = rawText(box);
-  if (mentionsFile(body, needles)) return "shown";
-  if (isSuccess(body)) return "shown";
+  let node = el;
+  for (let depth = 0; node && node !== document.body && depth < 6; depth += 1, node = node.parentElement) {
+    const body = rawText(node);
+    if (mentionsFile(body, needles)) return "shown";
+    if (isSuccess(body)) return "shown";
+  }
   const marks = document.querySelectorAll("[role='status'], [class*='success'], [class*='Success']");
   for (const mark of marks) {
     if (shown(mark) && isSuccess(rawText(mark))) return "shown";
@@ -1689,19 +1810,31 @@ _RESUME_STATUS_JS = """
 
 
 def _resume_accepted(page, selector: str, name: str) -> bool:
-    """Wait a few seconds. An upload-error toast fails the attach; otherwise the name must show."""
+    """Poll until the file stays shown. An error toast fails the attach.
+
+    A chip that is already visible does not hold the rest of the ceiling.
+    The short hold still catches a toast that arrives just after the name.
+    """
     deadline = time.monotonic() + _RESUME_VERIFY_SECONDS
-    status = "missing"
+    shown_since: float | None = None
     while True:
         try:
             status = str(page.evaluate(_RESUME_STATUS_JS, {"selector": selector, "name": name}) or "missing")
         except Exception:
             return False
+        now = time.monotonic()
         if status == "error":
             return False
-        if time.monotonic() >= deadline:
+        if status == "shown":
+            if shown_since is None:
+                shown_since = now
+            elif now - shown_since >= _RESUME_SHOWN_HOLD:
+                return True
+        else:
+            shown_since = None
+        if now >= deadline:
             return status == "shown"
-        time.sleep(0.25)
+        time.sleep(0.1)
 
 
 def _apply_resume(
@@ -2203,11 +2336,12 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
     Options of a checkbox group stay on that one question. A section heading
     is not a question.
     """
-    snapshot = outcome.snapshot
+    snapshot = _live_snapshot(page, outcome.snapshot) if outcome.snapshot is not None else None
     if snapshot is None:
         if page is not None:
             ensure_blocker_options(page, outcome.manual_questions)
         return
+    outcome.snapshot = snapshot
     filled = {item.selector for item in outcome.fields if item.action in _FILLED_ACTIONS and item.selector}
     seen = {str(item.get("questionHash") or "") for item in outcome.manual_questions if item.get("questionHash")}
     for control in snapshot.controls:
@@ -3002,6 +3136,17 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
     return merged
 
 
+def _live_snapshot(page, snapshot: PageSnapshot) -> PageSnapshot:
+    """Re-read the page so a gap check does not use values from before a rewrite."""
+    if page is None or getattr(page, "evaluate", None) is None:
+        return snapshot
+    try:
+        fresh = extract_page(page)
+    except Exception:
+        return snapshot
+    return fresh if fresh is not None else snapshot
+
+
 def inspect_required(
     page,
     snapshot: PageSnapshot,
@@ -3012,10 +3157,12 @@ def inspect_required(
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Empty required controls, plus how many required clusters are committed.
 
+    The live field values are read again before the clusters are built.
     ``option_reads`` caps how many gaps open a menu while they are built.
     Choice items that are still missing a list are read afterwards. A full
     fill leaves the cap unset.
     """
+    snapshot = _live_snapshot(page, snapshot)
     clusters = _gap_clusters(snapshot)
     committed: set[str] = set()
     open_keys: set[str] = set()

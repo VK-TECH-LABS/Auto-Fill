@@ -43,6 +43,21 @@ _JOB_RE = re.compile(
     re.IGNORECASE,
 )
 _SEARCH_RE = re.compile(r"\b(search|query|filter jobs|keyword)\b", re.IGNORECASE)
+_SITE_ERROR_STRONG = re.compile(
+    r"\b("
+    r"problem with the service"
+    r"|something went wrong"
+    r"|temporarily unavailable"
+    r"|internal server error"
+    r"|bad gateway"
+    r"|service unavailable"
+    r"|gateway time-?out"
+    r"|(?:error|http)\s*5\d\d"
+    r"|5\d\d\s+error"
+    r")\b",
+    re.IGNORECASE,
+)
+_SITE_ERROR_SOFT = re.compile(r"\bplease try again\b", re.IGNORECASE)
 
 
 def note_page_type(kind: str) -> None:
@@ -80,11 +95,26 @@ def application_controls(snapshot: PageSnapshot) -> list[Control]:
     return found
 
 
+def is_site_error(snapshot: PageSnapshot) -> bool:
+    """True when the page is the site's own failure, not a login wall.
+
+    A header Sign in link does not change that. ``please try again`` on a page
+    that already has application fields is left to validation handling.
+    """
+    text = f"{snapshot.heading} {snapshot.page_text}"
+    if _SITE_ERROR_STRONG.search(text):
+        return True
+    return bool(_SITE_ERROR_SOFT.search(text) and not application_controls(snapshot))
+
+
 def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     """One of the public page types. A posting is not an application form."""
     if snapshot.captcha_present:
         note_page_type("UNKNOWN")
         return "UNKNOWN"
+    if is_site_error(snapshot):
+        note_page_type("SITE_ERROR")
+        return "SITE_ERROR"
     text = f"{snapshot.heading} {snapshot.page_text}"
     if _CONFIRM_RE.search(text):
         note_page_type("CONFIRMATION")
@@ -173,6 +203,9 @@ def terminal_kind(
     if snapshot.captcha_present or blocked == "captcha":
         classify_page(snapshot, url=url)
         return "CAPTCHA"
+    if is_site_error(snapshot):
+        note_page_type("SITE_ERROR")
+        return "SITE_ERROR"
     if register_pane(snapshot):
         note_page_type("ACCOUNT")
         return "ACCOUNT"
@@ -180,6 +213,8 @@ def terminal_kind(
         note_page_type("LOGIN")
         return "LOGIN"
     kind = classify_page(snapshot, url=url)
+    if kind == "SITE_ERROR":
+        return "SITE_ERROR"
     if kind == "ACCOUNT":
         return "ACCOUNT"
     if kind == "LOGIN":
@@ -325,9 +360,16 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     """Network idle, then poll until a form or a known marker appears.
 
     ``timeout_s`` caps the poll. A page that already has controls returns
-    on the first look. Timeouts from the idle wait are ignored. A dead
-    browser or a timeout while reading the page is raised.
+    on the first look, without waiting out network idle. Timeouts from the
+    idle wait are ignored. A dead browser or a timeout while reading the
+    page is raised.
     """
+    try:
+        if render_ready(extract_page(page)):
+            return
+    except Exception as exc:
+        if _closed(exc) or _timeout(exc):
+            raise
     load = getattr(page, "wait_for_load_state", None)
     if load is not None:
         for state, budget in (("domcontentloaded", 2000), ("networkidle", 1500)):

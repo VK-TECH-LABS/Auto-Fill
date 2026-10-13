@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Problem with the service</title></head>
+<body>
+  <header>
+    <a href="/login">Sign in</a>
+    <a href="/register">Create account</a>
+    <a href="/auth">Log in</a>
+  </header>
+  <main>
+    <h1>Problem with the service</h1>
+    <p>We're sorry. Something went wrong. Please try again.</p>
+    <p>The service is temporarily unavailable.</p>
+    <button id="apply" type="button">Apply</button>
+  </main>
+  <script>
+    window.__clicked = [];
+    document.getElementById("apply").addEventListener("click", () => {
+      window.__clicked.push("Apply");
+    });
+  </script>
+</body>
+</html>

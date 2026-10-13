@@ -515,6 +515,10 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         humanOutcome=session.human_outcome,
         paused=session.paused,
         pageType=session.page_type or "UNKNOWN",
+        entryClicks=session.entry_clicks,
+        nextClicks=session.next_clicks,
+        pagesAdvanced=session.pages_advanced,
+        lastNavigation=dict(session.last_navigation) if session.last_navigation else None,
         phase=cast(
             Literal["launching", "navigating", "loaded"],
             session.phase if session.phase in {"launching", "navigating", "loaded"} else "launching",
@@ -586,6 +590,10 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         session.page_type = result.page_type
     if result.auto_consents:
         session.auto_consents = list(result.auto_consents)
+    session.entry_clicks = int(result.entry_clicks)
+    session.next_clicks = int(result.next_clicks)
+    session.pages_advanced = int(result.pages_advanced)
+    session.last_navigation = dict(result.last_navigation) if result.last_navigation else None
     startup = {"navigation_timeout", "browser_crashed", "blocked", "capacity", "capacity_busy"}
     if not (result.status == Status.FAILED_RETRYABLE and startup.intersection(result.messages)):
         session.phase = "loaded"
@@ -841,7 +849,8 @@ def _allow_browser_restart(session: ServiceSession) -> None:
     A capacity refusal is retryable on its own and does not spend this budget.
     """
     messages = session.result.messages if session.result is not None else []
-    if "capacity_busy" in messages or _START_FAILED in messages or "navigation_stalled" in messages:
+    spared = {"capacity_busy", _START_FAILED, "navigation_stalled", "site_error"}
+    if spared.intersection(messages):
         return
     if session.browser_restarts >= 2:
         raise HTTPException(status_code=409, detail="Browser crash retry limit reached.")
@@ -930,6 +939,19 @@ def _set_phase(session: ServiceSession):
     return phase
 
 
+def _note_navigation(session: ServiceSession):
+    """Copy click counters onto the session. The payload has no labels or values."""
+
+    def note(record: dict) -> None:
+        session.entry_clicks = int(record.get("entryClicks") or 0)
+        session.next_clicks = int(record.get("nextClicks") or 0)
+        session.pages_advanced = int(record.get("pagesAdvanced") or 0)
+        last = record.get("lastNavigation")
+        session.last_navigation = dict(last) if isinstance(last, dict) else None
+
+    return note
+
+
 def _paint_frame(session: ServiceSession):
     """Store a JPEG as soon as the page can be captured. A crash propagates."""
 
@@ -981,6 +1003,7 @@ def _request_for(
         resume_prepared=bool(session.resume_prepared and session.resume_bytes and not session.resume_verified),
         on_paint=_paint_frame(session),
         on_phase=_set_phase(session),
+        on_navigation=_note_navigation(session),
         standard_terms_authorized=session.standard_terms_authorized,
     )
 
@@ -1006,6 +1029,10 @@ def _run(
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
     session.human_resolved = session.human_resolved or human_resolved
     previous = session.status
+    session.entry_clicks = 0
+    session.next_clicks = 0
+    session.pages_advanced = 0
+    session.last_navigation = None
     session.status = Status.STARTED
     session.phase = "launching"
     session.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1076,7 +1103,9 @@ def _start_in_background(session, store, runner, limits) -> RunStatusOut:
             return _failed(session, box["error"])
         if "outcome" in box:
             return box["outcome"]
-        if session.busy and session.phase in {"navigating", "loaded"}:
+        # A finished run sets phase to loaded before the worker publishes the
+        # outcome. Only an in-progress start returns on that phase.
+        if session.busy and session.status == Status.STARTED and session.phase in {"navigating", "loaded"}:
             return _status_out(session)
         time.sleep(0.02)
     if "http" in box:
