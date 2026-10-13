@@ -356,7 +356,9 @@ def created_start_is_stale(session: ServiceSession, moment: float) -> bool:
         return False
     if session.created_mono <= 0:
         return False
-    return moment - session.created_mono > CREATED_WITHOUT_START_SECONDS
+    # Compare against the sum. Subtracting the start from a later reading can
+    # land a hair over 120 for some monotonic samples and expire the session early.
+    return moment > session.created_mono + CREATED_WITHOUT_START_SECONDS
 
 
 def monotonic() -> float:

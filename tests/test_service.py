@@ -263,6 +263,16 @@ def test_invalid_start_body_marks_the_session_retryable(client: TestClient):
     assert held.result.messages == ["start_failed"]
 
 
+def test_created_start_boundary_ignores_float_noise():
+    from types import SimpleNamespace
+
+    from autofill.service.sessions import created_start_is_stale
+
+    session = SimpleNamespace(status="CREATED", created_mono=405.461677144)
+    assert created_start_is_stale(session, session.created_mono + 120) is False
+    assert created_start_is_stale(session, session.created_mono + 120.01) is True
+
+
 def test_stale_created_session_expires_and_frees_its_slot():
     runner = RecordingRunner()
     app = create_app(
