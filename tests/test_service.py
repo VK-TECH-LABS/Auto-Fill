@@ -619,6 +619,71 @@ def test_navigation_stalled_is_retryable_without_a_crash_budget(client: TestClie
     assert runner.calls == [(session_id, False), (session_id, False)]
 
 
+def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
+    """The resume-file endpoint refills after the upload and does not zero navigation."""
+
+    class Runner:
+        def run(self, request: FillRequest) -> ApplicationResult:
+            if request.resume_uploaded:
+                return ApplicationResult(
+                    status=Status.READY_FOR_HUMAN_SUBMIT,
+                    ats="ashby",
+                    current_step=Status.READY_FOR_HUMAN_SUBMIT,
+                    login_status="NOT_REQUIRED",
+                    session_id=request.session_id,
+                    candidate_id=request.candidate_id,
+                    job_id=request.job_id,
+                    messages=["synthetic run"],
+                )
+            return ApplicationResult(
+                status=Status.RESUME_UPLOAD_REQUIRED,
+                ats="ashby",
+                current_step=Status.RESUME_UPLOAD_REQUIRED,
+                login_status="NOT_REQUIRED",
+                session_id=request.session_id,
+                candidate_id=request.candidate_id,
+                job_id=request.job_id,
+                messages=["Upload the resume that was already downloaded, then continue with resumeUploaded."],
+                entry_clicks=1,
+                pages_advanced=1,
+                last_navigation={"action": "entry", "result": "advanced"},
+            )
+
+        def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "") -> dict:
+            return {"verified": True, "reason": "", "siteErrors": [], "restored": 2}
+
+        def discard(self, session_id: str) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    app = create_app(token=TOKEN, runner=Runner(), run_browser=False, reaper_interval_seconds=60)
+    caplog.set_level(logging.INFO)
+    with TestClient(app) as client:
+        created = _create(client)
+        session_id = created["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        assert started.json()["entryClicks"] == 1
+        assert started.json()["pagesAdvanced"] == 1
+        uploaded = client.post(
+            f"/v1/sessions/{session_id}/resume-file",
+            headers=AUTH,
+            data={"candidateId": "candidate-a"},
+            files={"file": ("notes.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        assert uploaded.json()["verified"] is True
+        assert "action=post_upload_refill restored=2" in caplog.text
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        body = status.json()
+        assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
+        assert body["entryClicks"] == 1
+        assert body["pagesAdvanced"] == 1
+        assert body["lastNavigation"] == {"action": "entry", "result": "advanced"}
+
+
 def test_service_source_has_no_host_application():
     service = Path("src/autofill/service")
     text = "\n".join(path.read_text(encoding="utf-8") for path in service.rglob("*.py"))

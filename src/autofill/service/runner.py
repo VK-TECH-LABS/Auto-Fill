@@ -1049,8 +1049,16 @@ class PlaywrightRunner:
             if slot is None or slot.page is None:
                 return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
             from autofill.resume_manual import attach_and_confirm
+            from autofill.stepfill import post_upload_refill, snapshot_text_values
 
-            return attach_and_confirm(slot.page, name=name, data=data, hint=hint)
+            saved = snapshot_text_values(slot.page)
+            report = attach_and_confirm(slot.page, name=name, data=data, hint=hint)
+            if not report.get("verified"):
+                return report
+            restored = post_upload_refill(slot.page, saved, session_id=session_id, log=False)
+            accepted = dict(report)
+            accepted["restored"] = restored
+            return accepted
 
         return worker.submit(apply)
 

@@ -11,7 +11,14 @@ from playwright.sync_api import sync_playwright
 from autofill.extract import extract_page
 from autofill.resolver import ResolverBinding, ResolverResponse
 from autofill.resume_fetch import ResumePayload
-from autofill.stepfill import _resume_accepted, fill_resolved_page, required_gaps
+from autofill.resume_manual import reattach_verified
+from autofill.stepfill import (
+    _resume_accepted,
+    fill_resolved_page,
+    post_upload_refill,
+    required_gaps,
+    snapshot_text_values,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
@@ -88,6 +95,37 @@ def test_lever_gap_rereads_a_filled_name_after_upload(browser):
         texts = " ".join(str(item.get("text") or "") for item in gaps).casefold()
         assert "full name" not in texts
         assert page.locator("#name").input_value() == "River Example"
+    finally:
+        page.close()
+
+
+def test_resume_file_refill_restores_cleared_fields_and_keeps_a_parsed_email(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "ashby_resume_rewrite.html").as_uri())
+        page.locator("#name").fill("River Example")
+        page.locator("#email").fill("river.example@example.com")
+        page.locator("#phone").fill("5550100199")
+        saved = snapshot_text_values(page)
+        page.locator("#resume").set_input_files(
+            [{"name": "notes.pdf", "mimeType": "application/pdf", "buffer": PDF}]
+        )
+        restored = post_upload_refill(page, saved, session_id="sess-ashby")
+        assert restored == 2
+        assert page.locator("#name").input_value() == "River Example"
+        assert page.locator("#phone").input_value() == "5550100199"
+        assert page.locator("#email").input_value() == "parsed@example.com"
+        assert page.locator("#referral").input_value() == "FRIEND"
+    finally:
+        page.close()
+
+
+def test_reattach_does_not_upload_again_when_the_chip_is_already_accepted(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "greenhouse_replaced.html").as_uri())
+        reattach_verified(page, "notes.pdf", "application/pdf", PDF)
+        assert page.locator("#resume-next").evaluate("el => el.files.length") == 0
     finally:
         page.close()
 

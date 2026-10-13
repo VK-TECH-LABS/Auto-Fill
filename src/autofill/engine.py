@@ -469,12 +469,15 @@ def _attach_prepared(page, opts: AutofillOptions) -> str:
     if not opts.resume_bytes or not opts.resume_name:
         return "absent"
     from autofill.resume_manual import attach_and_confirm
+    from autofill.stepfill import post_upload_refill, snapshot_text_values
 
+    saved = snapshot_text_values(page)
     report = attach_and_confirm(page, name=opts.resume_name, data=opts.resume_bytes)
     if report.get("verified"):
         opts.resume_uploaded = True
         opts.resume_verified_now = True
         opts.resume_prepared = False
+        post_upload_refill(page, saved, session_id=opts.session_id)
         return "attached"
     opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
     return "failed"
@@ -839,9 +842,6 @@ def autofill_application(
             if resume_blocked and not opts.resume_uploaded:
                 prepared = _attach_prepared(page, opts)
                 if prepared == "attached":
-                    from autofill.stepfill import settle_after_resume
-
-                    settle_after_resume(page)
                     refilled, snapshot, resume_blocked, refill_manual = fill_one_page(
                         page,
                         candidate_profile,
@@ -1472,6 +1472,7 @@ def _run_resolver_pages(
                 step=step_name,
                 flags=flags,
                 hook=opts.intent_hook,
+                resume_uploaded=opts.resume_uploaded,
             )
             fields.extend(outcome.fields)
             manual.extend(outcome.manual_actions)
