@@ -54,6 +54,7 @@ from autofill.service.runner import (
     PageUnavailable,
     PlaywrightRunner,
     elapsed_ms,
+    log_capacity_refusal,
     memory_allows_session,
 )
 from autofill.service.schemas import (
@@ -1182,11 +1183,16 @@ def create_app(
     resolver_retries: int = 2,
     resolver_max_bytes: int = 65536,
     browser_workers: int = 2,
+    idle_ttl_seconds: float = 300,
+    dead_end_browser_seconds: float = 120,
+    one_session_per_owner: bool = True,
 ) -> FastAPI:
     """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
     expected = require_configured_token(token)
     install_redaction()
     store = ServiceSessionStore(max_sessions=max_sessions)
+    store.idle_ttl_seconds = idle_ttl_seconds
+    store.dead_end_browser_seconds = dead_end_browser_seconds
     launch_args = list(DEFAULT_LAUNCH_ARGS)
     if browser_no_sandbox:
         launch_args.append("--no-sandbox")
@@ -1247,6 +1253,7 @@ def create_app(
         session = store.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found.")
+        session.note_activity()
         return session
 
     def _reject_expired(session: ServiceSession, *, machine: bool = False) -> None:
@@ -1281,6 +1288,7 @@ def create_app(
     @router.post("/sessions", response_model=RunStatusOut, status_code=201, tags=["sessions"])
     def create_session(body: CreateSessionIn) -> RunStatusOut:
         if not memory_allows_session():
+            log_capacity_refusal(store.open_count())
             raise HTTPException(
                 status_code=503,
                 detail={"reason": "capacity"},
@@ -1338,7 +1346,13 @@ def create_app(
         opened = monotonic()
         session.expires_at = opened + session_ttl_seconds
         session.created_mono = opened
+        session.note_activity()
         session.timings["sessionCreatedMs"] = elapsed_ms(started)
+        if one_session_per_owner:
+            owner = session.candidate_id or session.candidate_ref
+            for previous in store.expire_owner(owner):
+                active_runner.discard(previous.session_id)
+                logger.info("session=%s status=EXPIRED reason=replaced_owner", previous.session_id)
         try:
             store.create(session)
         except RuntimeError as exc:

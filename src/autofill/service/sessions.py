@@ -107,6 +107,8 @@ class ServiceSession:
     confirmed_values: list[dict] = field(default_factory=list)
     standard_terms_authorized: bool = False
     created_mono: float = 0.0
+    last_activity_mono: float = 0.0
+    browser_released: bool = False
     auto_consents: list[dict] = field(default_factory=list)
     phase: str = "launching"
     started_at: str | None = None
@@ -117,6 +119,10 @@ class ServiceSession:
 
     def __repr__(self) -> str:
         return f"ServiceSession(session_id={self.session_id!r}, status={self.status!r}, mode={self.mode!r})"
+
+    def note_activity(self) -> None:
+        """A status poll, screenshot, or input resets the idle clock. The absolute TTL stays."""
+        self.last_activity_mono = monotonic()
 
     def remember_confirmed_value(self, record: dict) -> None:
         """Keep a value this engine wrote, so a later resume parse can restore it.
@@ -217,6 +223,8 @@ class ServiceSessionStore:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.idle_ttl_seconds = 300.0
+        self.dead_end_browser_seconds = 120.0
 
     def _active_count(self) -> int:
         return sum(1 for session in self._sessions.values() if session.status != Status.EXPIRED)
@@ -283,10 +291,12 @@ class ServiceSessionStore:
             if session.busy:
                 raise RuntimeError("Session is already running.")
             session.busy = True
+            session.browser_released = False
             return session
 
     def finish_run(self, session: ServiceSession) -> None:
         """Clear the busy flag, or drop secrets when a delete already removed the session."""
+        session.note_activity()
         with self._lock:
             if self._sessions.get(session.session_id) is None:
                 session.wipe_secrets()
@@ -308,8 +318,42 @@ class ServiceSessionStore:
         with self._lock:
             return list(self._sessions)
 
+    def open_count(self) -> int:
+        """Sessions that still occupy a slot. Expired and cancelled sessions do not."""
+        with self._lock:
+            return sum(
+                1
+                for session in self._sessions.values()
+                if session.status not in {Status.EXPIRED, Status.CANCELLED}
+            )
+
+    def expire_owner(self, owner_id: str) -> list[ServiceSession]:
+        """Expire other live sessions for this candidate. A running fill is left alone."""
+        token = owner_id.strip()
+        if not token:
+            return []
+        found: list[ServiceSession] = []
+        with self._lock:
+            for session in self._sessions.values():
+                if session.busy or session.status in {Status.EXPIRED, Status.CANCELLED}:
+                    continue
+                owners = {session.candidate_id.strip(), session.candidate_ref.strip()}
+                owners.discard("")
+                if token not in owners:
+                    continue
+                session.status = Status.EXPIRED
+                session.browser_released = True
+                found.append(session)
+        for session in found:
+            session.wipe_secrets()
+        return found
+
     def reap(self, now: float | None = None) -> list[str]:
-        """Mark due sessions EXPIRED and wipe secrets. Returns the ids."""
+        """Mark due sessions EXPIRED and wipe secrets. Returns the ids.
+
+        The absolute ``expires_at`` still applies. A session with no API
+        activity for ``idle_ttl_seconds`` expires the same way.
+        """
         moment = monotonic() if now is None else now
         expired: list[str] = []
         with self._lock:
@@ -317,11 +361,46 @@ class ServiceSessionStore:
                 if session.busy or session.status in {Status.EXPIRED, Status.CANCELLED}:
                     continue
                 stale_start = created_start_is_stale(session, moment)
-                if stale_start or (session.expires_at and moment >= session.expires_at):
+                absolute = bool(session.expires_at) and moment >= session.expires_at
+                activity = session.last_activity_mono or session.created_mono
+                idle = (
+                    self.idle_ttl_seconds > 0
+                    and activity > 0
+                    and moment >= activity + self.idle_ttl_seconds
+                )
+                if stale_start or absolute or idle:
                     session.status = Status.EXPIRED
+                    session.browser_released = True
                     session.wipe_secrets()
                     expired.append(session.session_id)
         return expired
+
+    def release_idle_browsers(self, now: float | None = None) -> list[str]:
+        """Free browsers for dead-end sessions that nobody has polled.
+
+        CAPTCHA, login, manual, and account-creation sessions keep their
+        browser until the idle TTL. The session itself stays so status still
+        answers.
+        """
+        moment = monotonic() if now is None else now
+        window = self.dead_end_browser_seconds
+        if window <= 0:
+            return []
+        released: list[str] = []
+        with self._lock:
+            for session in self._sessions.values():
+                if session.busy or session.browser_released:
+                    continue
+                if session.status in {Status.EXPIRED, Status.CANCELLED}:
+                    continue
+                if not _dead_end(session):
+                    continue
+                activity = session.last_activity_mono or session.created_mono
+                if activity <= 0 or moment < activity + window:
+                    continue
+                session.browser_released = True
+                released.append(session.session_id)
+        return released
 
     def start_reaper(self, on_expire: Callable[[str], None], *, interval_seconds: float) -> None:
         """Background sweep. ``on_expire`` closes that session's browser context."""
@@ -331,6 +410,11 @@ class ServiceSessionStore:
         def loop() -> None:
             while not self._stop.wait(interval_seconds):
                 for session_id in self.reap():
+                    try:
+                        on_expire(session_id)
+                    except Exception:
+                        continue
+                for session_id in self.release_idle_browsers():
                     try:
                         on_expire(session_id)
                     except Exception:
@@ -348,6 +432,17 @@ class ServiceSessionStore:
 
 
 CREATED_WITHOUT_START_SECONDS = 120.0
+
+
+def _dead_end(session: ServiceSession) -> bool:
+    """States where nobody is expected to type into the live browser."""
+    status = session.status or ""
+    if status == Status.NO_FORM_FOUND or status.startswith("FAILED") or status in {Status.EXPIRED, "SITE_ERROR"}:
+        return True
+    if session.page_type == "SITE_ERROR":
+        return True
+    messages = session.result.messages if session.result is not None else []
+    return "site_error" in messages
 
 
 def created_start_is_stale(session: ServiceSession, moment: float) -> bool:
