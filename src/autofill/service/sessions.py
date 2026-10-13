@@ -18,6 +18,22 @@ from autofill.models import JobContext
 from autofill.profile import CandidateProfile
 
 
+def _same_confirmed(left: dict, right: dict) -> bool:
+    """True when both records are the same field the engine already filled."""
+    key = str(right.get("fieldKey") or "")
+    if key and key == str(left.get("fieldKey") or ""):
+        return True
+    for name in ("elementId", "automationId"):
+        token = str(right.get(name) or "")
+        if token and token == str(left.get(name) or ""):
+            return True
+    label = str(right.get("label") or "")
+    control = str(right.get("name") or "")
+    if label and label == str(left.get("label") or "") and control and control == str(left.get("name") or ""):
+        return True
+    return False
+
+
 @dataclass
 class ServiceSession:
     """One candidate, one job, one browser run. Secrets live only on this object."""
@@ -88,6 +104,7 @@ class ServiceSession:
     nav_base_entry: int = 0
     nav_base_next: int = 0
     nav_base_pages: int = 0
+    confirmed_values: list[dict] = field(default_factory=list)
     standard_terms_authorized: bool = False
     created_mono: float = 0.0
     auto_consents: list[dict] = field(default_factory=list)
@@ -100,6 +117,30 @@ class ServiceSession:
 
     def __repr__(self) -> str:
         return f"ServiceSession(session_id={self.session_id!r}, status={self.status!r}, mode={self.mode!r})"
+
+    def remember_confirmed_value(self, record: dict) -> None:
+        """Keep a value this engine wrote, so a later resume parse can restore it.
+
+        The value stays in memory. A matching field replaces the previous record
+        when Ashby renders a new node for the same label.
+        """
+        value = str(record.get("value") or "")
+        if not value.strip():
+            return
+        self.remember_secret(value)
+        fresh = {
+            "value": value,
+            "label": str(record.get("label") or ""),
+            "name": str(record.get("name") or ""),
+            "elementId": str(record.get("elementId") or ""),
+            "automationId": str(record.get("automationId") or ""),
+            "fieldKey": str(record.get("fieldKey") or ""),
+            "selector": str(record.get("selector") or ""),
+        }
+        self.confirmed_values = [
+            item for item in self.confirmed_values if not _same_confirmed(item, fresh)
+        ]
+        self.confirmed_values.append(fresh)
 
     def remember_secret(self, value: str) -> None:
         """Register a secret for redaction and for deletion when the session ends."""
@@ -159,6 +200,9 @@ class ServiceSession:
             redaction_filter().discard(value)
         self.held_answers.clear()
         self.held_selectors.clear()
+        for item in self.confirmed_values:
+            redaction_filter().discard(str(item.get("value") or ""))
+        self.confirmed_values.clear()
         self.clear_resume_bytes()
 
 

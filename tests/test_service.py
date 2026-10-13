@@ -649,7 +649,14 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
                 last_navigation={"action": "entry", "result": "advanced"},
             )
 
-        def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "") -> dict:
+        def attach_resume_file(
+            self,
+            session_id: str,
+            name: str,
+            data: bytes,
+            hint: str = "",
+            confirmed=None,
+        ) -> dict:
             return {"verified": True, "reason": "", "siteErrors": [], "restored": 2}
 
         def discard(self, session_id: str) -> None:

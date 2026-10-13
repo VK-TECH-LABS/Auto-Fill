@@ -217,7 +217,7 @@ def fill_resolved_page(
             questions=questions,
         )
         response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
-        _apply(page, requests, response, active, outcome, snapshot.heading)
+        _apply(page, requests, response, active, outcome, snapshot.heading, session_id=session_id)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -240,6 +240,7 @@ def fill_resolved_page(
         )
         return outcome
     finally:
+        outcome.manual_questions = _drop_live_answered(page, outcome.manual_questions)
         ensure_blocker_options(page, outcome.manual_questions)
         if response is not None:
             response.wipe()
@@ -1528,6 +1529,7 @@ def _apply(
     flags: FillFlags,
     outcome: ResolvedPage,
     heading: str,
+    session_id: str = "",
 ) -> None:
     by_intent, unnamed, by_key = _index_answers(response)
     unclassified = _unclassified_count(requests)
@@ -1547,7 +1549,7 @@ def _apply(
         _apply_ask(page, ask, response, flags, outcome, heading, shared)
     if _resume_was_attached(outcome):
         settle_after_resume(page)
-        _refill_cleared_fields(page, ordered, response, flags, outcome, heading, shared)
+        _refill_cleared_fields(page, ordered, response, flags, outcome, heading, shared, session_id=session_id)
         try:
             outcome.snapshot = extract_page(page)
         except Exception:
@@ -1637,7 +1639,7 @@ def _apply_ask(
         _write_text(page, ask.controls[0], text, outcome, key=ask.field_key)
         return
     if ask.field_key not in response.fields and ask.field_key not in response.unresolved:
-        _skip(ask.controls[0], outcome, ask.field_key, "Resolver did not return this key.")
+        _skip(ask.controls[0], outcome, ask.field_key, "Resolver did not return this key.", page=page)
         return
     raw_value = response.fields.get(ask.field_key, "")
     text = "" if raw_value is None else str(raw_value)
@@ -1748,7 +1750,13 @@ _VISIBLE_VALUE_JS = r"""(selector) => {
   }
   const nodes = Array.from(document.querySelectorAll(selector)).filter(shown);
   const el = nodes[0];
-  if (!el || !("value" in el)) return null;
+  if (!el) return null;
+  const type = String(el.getAttribute("type") || "").toLowerCase();
+  if (type === "radio" || type === "checkbox") {
+    const checked = nodes.find((node) => node.checked);
+    return checked ? String(checked.value || "yes") : "";
+  }
+  if (!("value" in el)) return null;
   return String(el.value || "");
 }"""
 
@@ -1823,33 +1831,269 @@ def _restore_value(page, selector: str, value: str) -> bool:
     return type_visible(page, selector, value)
 
 
+_MATCH_VALUE_JS = r"""(hint) => {
+  function norm(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s*✱＊]+$/g, "")
+      .trim();
+  }
+  function shown(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden" || type === "file" || type === "password") return false;
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function labelOf(el) {
+    if (el.id) {
+      const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (lab) return norm(lab.innerText || lab.textContent || "");
+    }
+    const parent = el.closest ? el.closest("label") : null;
+    if (parent) return norm(parent.innerText || parent.textContent || "");
+    return norm(el.getAttribute("aria-label") || "");
+  }
+  function placeholder(text) {
+    const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!folded) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+  }
+  function read(el) {
+    if (!el) return "";
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    const tag = String(el.tagName || "").toLowerCase();
+    if (type === "radio" || type === "checkbox") return el.checked ? String(el.value || "yes") : "";
+    const role = String(el.getAttribute("role") || "").toLowerCase();
+    if (tag === "select") {
+      const option = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+      const label = option ? String(option.text || option.label || "") : "";
+      const value = String(el.value || "");
+      if (!value.trim() || placeholder(label) || placeholder(value)) return "";
+      return value;
+    }
+    if (role === "combobox" || role === "listbox") {
+      const typed = "value" in el ? String(el.value || "") : "";
+      if (typed.trim() && !placeholder(typed)) return typed;
+      const root = (el.closest && el.closest(".select__control")) || el.parentElement;
+      const choice = root
+        ? root.querySelector(".select__single-value, .select__multi-value, [class*='selected-value']")
+        : null;
+      const chosen = choice ? String(choice.textContent || "").replace(/\s+/g, " ").trim() : "";
+      return placeholder(chosen) ? "" : chosen;
+    }
+    if ("value" in el) {
+      const value = String(el.value || "");
+      return placeholder(value) ? "" : value;
+    }
+    return "";
+  }
+  const nodes = Array.from(document.querySelectorAll("input, textarea, select, [role='combobox']")).filter(shown);
+  const id = String(hint.elementId || "");
+  const automation = String(hint.automationId || "");
+  const name = String(hint.name || "");
+  const label = norm(hint.label || "");
+  function group(pred) {
+    return nodes.filter(pred);
+  }
+  function pick(list) {
+    if (!list.length) return null;
+    return list.find((node) => read(node).trim()) || list[0];
+  }
+  let list = [];
+  if (id) list = group((node) => node.id === id);
+  if (!list.length && automation) {
+    list = group((node) => (node.getAttribute("data-automation-id") || "") === automation);
+  }
+  if (!list.length && name) list = group((node) => (node.getAttribute("name") || "") === name);
+  if (!list.length && label) list = group((node) => labelOf(node) === label);
+  const el = pick(list);
+  if (!el) return null;
+  return read(el);
+}"""
+
+_RESTORE_MATCH_JS = r"""(hint) => {
+  function norm(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s*✱＊]+$/g, "")
+      .trim();
+  }
+  function shown(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden" || type === "file" || type === "password" || type === "checkbox" || type === "radio") {
+      return false;
+    }
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function labelOf(el) {
+    if (el.id) {
+      const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+      if (lab) return norm(lab.innerText || lab.textContent || "");
+    }
+    const parent = el.closest ? el.closest("label") : null;
+    if (parent) return norm(parent.innerText || parent.textContent || "");
+    return norm(el.getAttribute("aria-label") || "");
+  }
+  function read(el) {
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "select") return String(el.value || "");
+    return "value" in el ? String(el.value || "") : "";
+  }
+  function write(el, value) {
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "select") {
+      const wanted = String(value || "");
+      for (const option of el.options) {
+        const label = String(option.text || "").replace(/\s+/g, " ").trim();
+        if (option.value !== wanted && label !== wanted) continue;
+        el.value = option.value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
+      return false;
+    }
+    const proto = el instanceof HTMLTextAreaElement
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+  const nodes = Array.from(document.querySelectorAll("input, textarea, select")).filter(shown);
+  const id = String(hint.elementId || "");
+  const automation = String(hint.automationId || "");
+  const name = String(hint.name || "");
+  const label = norm(hint.label || "");
+  let el = null;
+  if (id) el = nodes.find((node) => node.id === id) || null;
+  if (!el && automation) {
+    el = nodes.find((node) => (node.getAttribute("data-automation-id") || "") === automation) || null;
+  }
+  if (!el && name) el = nodes.find((node) => (node.getAttribute("name") || "") === name) || null;
+  if (!el && label) el = nodes.find((node) => labelOf(node) === label) || null;
+  if (!el) return false;
+  if (read(el).trim()) return false;
+  return write(el, String(hint.value || ""));
+}"""
+
+
+def _confirmed_hint(record: dict) -> dict[str, str]:
+    return {
+        "value": str(record.get("value") or ""),
+        "label": str(record.get("label") or ""),
+        "name": str(record.get("name") or ""),
+        "elementId": str(record.get("elementId") or ""),
+        "automationId": str(record.get("automationId") or ""),
+    }
+
+
+def live_field_value(page, control: Control | None = None, **hint) -> str | None:
+    """The visible control's current text, matched by id, name, automation id, or label.
+
+    ``None`` means that control is not on the page. An empty string is a control
+    the parse cleared. A hidden input with the same name is not this value.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    payload = {
+        "elementId": str(hint.get("element_id") or (control.element_id if control is not None else "") or ""),
+        "name": str(hint.get("name") or (control.name if control is not None else "") or ""),
+        "automationId": str(hint.get("automation_id") or (control.automation_id if control is not None else "") or ""),
+        "label": str(hint.get("label") or (control.label if control is not None else "") or ""),
+    }
+    try:
+        found = evaluate(_MATCH_VALUE_JS, payload)
+    except Exception:
+        return None
+    if not isinstance(found, str):
+        return None
+    return found
+
+
+def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
+    """Drop a gap whose visible control already holds a value."""
+    if page is None or getattr(page, "evaluate", None) is None:
+        return questions
+    kept: list[dict] = []
+    for item in questions:
+        if str(item.get("kind") or "") in {"CONSENT", "CONSENT_CHOICE"}:
+            kept.append(item)
+            continue
+        if str(item.get("answerType") or "") not in {"text", "textarea", "number", "date"}:
+            kept.append(item)
+            continue
+        found = live_field_value(
+            page,
+            element_id="",
+            name="",
+            automation_id="",
+            label=str(item.get("text") or ""),
+        )
+        selector = str(item.get("selector") or "")
+        if found is None and selector:
+            current = _visible_value(page, selector)
+            if current and str(current).strip():
+                found = current
+        if found is not None and str(found).strip():
+            continue
+        kept.append(item)
+    return kept
+
+
 def post_upload_refill(
     page,
-    saved: list[tuple[str, str]],
+    confirmed: list[dict] | None = None,
     *,
     session_id: str = "",
     log: bool = True,
 ) -> int:
-    """Settle a resume parse, then write back values it cleared.
+    """Settle a resume parse, then write back values the engine already confirmed.
 
-    A value that is still visible stays, including one a person typed and one
-    the parse replaced. The live required fields are read again after that.
+    The record is the session's fills, not a snapshot taken at upload time. A
+    value that is still visible stays, including one a person typed and one the
+    parse replaced. An empty visible control is filled again, even when Ashby
+    replaced the node.
     """
+    from autofill.fill import confirmed_records, current_session_id
+
     settle_after_resume(page)
+    records = list(confirmed) if confirmed is not None else confirmed_records()
+    evaluate = getattr(page, "evaluate", None)
     restored = 0
-    for selector, value in saved:
-        current = _visible_value(page, selector)
-        if current is None or current.strip():
-            continue
-        if _restore_value(page, selector, value):
-            restored += 1
-    try:
-        fresh = extract_page(page)
-        required_gaps(page, fresh, None)
-    except Exception:
-        pass
+    if evaluate is not None:
+        for record in records:
+            if not isinstance(record, dict) or not str(record.get("value") or "").strip():
+                continue
+            try:
+                wrote = bool(evaluate(_RESTORE_MATCH_JS, _confirmed_hint(record)))
+            except Exception:
+                wrote = False
+            if wrote:
+                restored += 1
     if log:
-        logger.info("session=%s action=post_upload_refill restored=%s", session_id or "-", restored)
+        logger.info(
+            "session=%s action=post_upload_refill restored=%s",
+            session_id or current_session_id() or "-",
+            restored,
+        )
     return restored
 
 
@@ -1861,6 +2105,7 @@ def _refill_cleared_fields(
     outcome: ResolvedPage,
     heading: str,
     shared: tuple,
+    session_id: str = "",
 ) -> None:
     """Write approved values again when a resume parse cleared them.
 
@@ -1889,7 +2134,13 @@ def _refill_cleared_fields(
             _apply_ask(page, ask, response, flags, outcome, heading, refill_shared)
             if _cluster_committed(page, ask.controls):
                 restored += 1
-    logger.info("action=post_upload_refill restored=%s", restored)
+    from autofill.fill import current_session_id
+
+    logger.info(
+        "session=%s action=post_upload_refill restored=%s",
+        session_id or current_session_id() or "-",
+        restored,
+    )
 
 
 _EEO_RE = re.compile(
@@ -2223,7 +2474,7 @@ def _write_control(
     flags: FillFlags,
 ) -> None:
     if not text:
-        _skip(control, outcome, key, "No value for this control.")
+        _skip(control, outcome, key, "No value for this control.", page=page)
         return
     if control.kind == "combobox" and not control.options:
         picked = select_combobox(page, control.selector, text)
@@ -2277,7 +2528,7 @@ def _write_control(
 
 def _write_text(page, control: Control, text: str, outcome: ResolvedPage, *, key: str | None) -> None:
     if not str(text).strip():
-        _skip(control, outcome, key, "Empty value left blank.")
+        _skip(control, outcome, key, "Empty value left blank.", page=page)
         return
     mapped = MappedField(key=key, action="fill", text=str(text), field_class="PROFILE_FIELD", confidence="high")
     outcome.fields.append(apply_mapped(page, control, mapped, overwrite=True))
@@ -2297,7 +2548,21 @@ def _required_question(control: Control) -> bool:
     return True
 
 
-def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str) -> None:
+def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str, page=None) -> None:
+    if page is not None:
+        shown = live_field_value(page, control)
+        if shown is not None and shown.strip():
+            outcome.fields.append(
+                FieldOutcome(
+                    selector=control.selector,
+                    label=control.label,
+                    key=key,
+                    action="skip",
+                    detail="already set",
+                    field_class="PROFILE_FIELD",
+                )
+            )
+            return
     outcome.fields.append(
         FieldOutcome(
             selector=control.selector,
@@ -3109,7 +3374,10 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
         if _has_selected_location(page):
             return _location_pick(page) is not None
         return _typeahead_place_committed(page, control)
-    return control_committed(page, control.selector)
+    if control_committed(page, control.selector):
+        return True
+    shown = live_field_value(page, control)
+    return bool(shown and shown.strip())
 
 
 def _accept_standard_term(page, ask) -> bool:
