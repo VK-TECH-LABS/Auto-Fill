@@ -501,6 +501,19 @@ class _SharedDriver:
                 playwright.stop()
 
 
+def _release_routes(target: Any) -> None:
+    """Drop route handlers and listeners before the page or context is closed."""
+    if target is None:
+        return
+    unroute = getattr(target, "unroute_all", None)
+    if unroute is None:
+        return
+    try:
+        unroute()
+    except Exception:
+        return
+
+
 class _SessionContext:
     """One session's browser context. Only its worker thread touches it."""
 
@@ -561,11 +574,13 @@ class _SessionContext:
         raise StartupError(last)
 
     def close(self) -> None:
-        """Close every page in this context, then the context. The worker's browser stays up."""
+        """Close pages and this context, and drop the references those objects hold."""
         page = self.page
         context = self.context
         self.page = None
         self.context = None
+        self.mark = None
+        self.last_ats = None
         pages: list[Any] = []
         if context is not None:
             try:
@@ -575,11 +590,13 @@ class _SessionContext:
         if page is not None and page not in pages:
             pages.append(page)
         for item in pages:
+            _release_routes(item)
             try:
                 item.close()
             except Exception:
                 continue
         if context is not None:
+            _release_routes(context)
             try:
                 context.close()
             except Exception:
@@ -691,14 +708,22 @@ class _Worker:
         finally:
             self.driver.stop()
 
-    def _close(self, session_id: str) -> None:
+    def _close(self, session_id: str) -> bool:
+        """Close the session. Stop Chromium when this worker has no sessions left."""
         slot = self.sessions.pop(session_id, None)
-        if slot is None:
-            return
+        if slot is not None:
+            try:
+                slot.close()
+            except Exception:
+                pass
+        if self.sessions:
+            return False
         try:
-            slot.close()
+            self.driver.stop()
         except Exception:
-            return
+            self.driver._browser = None
+            self.driver._playwright = None
+        return True
 
     def _recover_driver(self) -> None:
         for session_id in list(self.sessions):
@@ -1296,10 +1321,10 @@ class PlaywrightRunner:
         return worker.submit(read)
 
     def discard(self, session_id: str) -> None:
-        """Close this session's context on every worker that still holds it.
+        """Close this session's page and context, and the browser when it is idle.
 
         A session that never started is not pinned onto a worker just to close
-        nothing. The shared Chromium process stays up.
+        nothing. Chromium stays up while another session on that worker is open.
         """
         workers: list[_Worker] = []
         pinned = self._pinned_worker(session_id)
@@ -1308,19 +1333,25 @@ class PlaywrightRunner:
         for worker in self._workers:
             if worker not in workers and session_id in worker.sessions:
                 workers.append(worker)
+        browser_closed = False
         try:
             for worker in workers:
 
-                def close_one(worker: _Worker = worker) -> None:
-                    worker._close(session_id)
+                def close_one(worker: _Worker = worker) -> bool:
+                    return worker._close(session_id)
 
                 try:
-                    worker.submit(close_one)
+                    browser_closed = bool(worker.submit(close_one)) or browser_closed
                 except Exception:
                     logger.info("session=%s action=discard result=close_failed", session_id)
         finally:
             self._unpin(session_id)
-            logger.info("session=%s action=discard result=closed", session_id)
+            logger.info(
+                "session=%s action=discard result=closed browser=%s rss_bytes=%s",
+                session_id,
+                "closed" if browser_closed else "open",
+                container_memory_bytes(),
+            )
 
     def shutdown(self) -> None:
         """Close every session context, then stop each worker's Playwright driver."""

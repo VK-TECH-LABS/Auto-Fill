@@ -1071,35 +1071,43 @@ def _location_pick(page) -> dict[str, Any] | None:
     return parsed
 
 
+def _place_text_committed(shown: str, city: str, *, require_full: bool) -> bool:
+    """A visible place matches the city. A bare city, or an empty proxy, does not."""
+    folded = normalize(shown)
+    if not folded or folded == normalize(city):
+        return False
+    if require_full and not _full_place(shown):
+        return False
+    return bool(city) and _phrase_in(folded, city)
+
+
 def _location_committed(page, control: Control, city: str) -> bool:
-    """True when a suggestion was recorded, not when the city was only typed.
+    """True when a suggestion was recorded, or the visible control shows the place.
 
     Lever keeps the chosen place in a hidden ``selectedLocation`` input as JSON
-    with an id. The visible box can hold the city, or the hidden input can hold
-    an empty name, while no suggestion has been picked. Ashby shows the chosen
-    place on the combobox itself and closes the list.
+    with an id. That proxy is often empty after the box already shows
+    ``Austin, TX, USA``. A bare typed city is still not a commit. Ashby shows
+    the chosen place on the combobox itself and closes the list.
     """
+    proxy_empty = False
     if _has_selected_location(page):
         pick = _location_pick(page)
-        if pick is None:
-            return False
-        return bool(city) and _phrase_in(normalize(str(pick.get("name") or "")), city)
+        if pick is not None:
+            return bool(city) and _phrase_in(normalize(str(pick.get("name") or "")), city)
+        proxy_empty = True
     if getattr(page, "evaluate", None) is None:
         try:
             typed = str(page.locator(control.selector).input_value() or "")
         except Exception:
             typed = ""
-        folded = normalize(typed)
-        if not folded or folded == normalize(city):
-            return False
-        return _phrase_in(folded, city)
+        return _place_text_committed(typed, city, require_full=proxy_empty)
     if not _settle_rendered_place(page, control):
-        return False
+        shown = live_field_value(page, control) or ""
+        return _place_text_committed(shown, city, require_full=True)
     shown = str(_read_typeahead_state(page, control.selector).get("shown") or "")
-    folded = normalize(shown)
-    if not folded or folded == normalize(city):
-        return False
-    return _phrase_in(folded, city)
+    if not _full_place(shown):
+        shown = live_field_value(page, control) or shown
+    return _place_text_committed(shown, city, require_full=proxy_empty)
 
 
 def _has_selected_location(page) -> bool:
@@ -1995,9 +2003,9 @@ def _visible_value(page, selector: str) -> str | None:
         found = evaluate(_VISIBLE_VALUE_JS, selector)
     except Exception:
         return None
-    if found is None:
+    if not isinstance(found, str):
         return None
-    return str(found)
+    return found
 
 
 def _restore_value(page, selector: str, value: str) -> bool:
@@ -2225,8 +2233,34 @@ def live_field_value(page, control: Control | None = None, **hint) -> str | None
     return found
 
 
+def _visible_control_text(page, control: Control) -> str:
+    """Text on the visible control. A hidden proxy with the same name is ignored."""
+    shown = live_field_value(page, control)
+    if shown and str(shown).strip():
+        return str(shown).strip()
+    current = _visible_value(page, control.selector)
+    if current and str(current).strip():
+        return str(current).strip()
+    return ""
+
+
+def _gap_is_location(item: dict) -> bool:
+    text = str(item.get("text") or "").casefold()
+    key = str(item.get("fieldKey") or "")
+    if key in {"location", "address.city"}:
+        return True
+    if "sponsor" in text or "visa" in text or "relocat" in text:
+        return False
+    return "current location" in text or "working from" in text
+
+
 def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
-    """Drop a gap whose visible control already holds a value."""
+    """Drop a gap whose visible control already holds a value.
+
+    A location box needs the place itself (``Austin, TX, USA``). A bare city
+    stays open. Any other field is answered when its visible control has a
+    value and the hidden proxy is empty.
+    """
     if page is None or getattr(page, "evaluate", None) is None:
         return questions
     kept: list[dict] = []
@@ -2245,13 +2279,18 @@ def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
             label=str(item.get("text") or ""),
         )
         selector = str(item.get("selector") or "")
-        if found is None and selector:
+        if (found is None or not str(found).strip()) and selector:
             current = _visible_value(page, selector)
             if current and str(current).strip():
                 found = current
-        if found is not None and str(found).strip():
+        text = str(found or "").strip()
+        if not text:
+            kept.append(item)
             continue
-        kept.append(item)
+        if _gap_is_location(item) and not _full_place(text):
+            kept.append(item)
+            continue
+        continue
     return kept
 
 
@@ -3764,13 +3803,18 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
         return any(control_committed(page, item.selector) for item in controls)
     control = controls[0]
     if _is_location_typeahead(control):
-        if _has_selected_location(page):
-            return _location_pick(page) is not None
-        return _typeahead_place_committed(page, control)
+        if _has_selected_location(page) and _location_pick(page) is not None:
+            return True
+        if _typeahead_place_committed(page, control):
+            return True
+        state = _read_typeahead_state(page, control.selector)
+        if state.get("expanded"):
+            return False
+        # The hidden selectedLocation proxy is often empty while the box shows the place.
+        return _full_place(_visible_control_text(page, control))
     if control_committed(page, control.selector):
         return True
-    shown = live_field_value(page, control)
-    return bool(shown and shown.strip())
+    return bool(_visible_control_text(page, control))
 
 
 def _accept_standard_term(page, ask) -> bool:

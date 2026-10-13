@@ -275,12 +275,13 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
 
         removed = client.delete(f"/v1/sessions/{session_b}", headers=AUTH)
         assert removed.status_code == 204
-        assert runner._driver._playwright is driver
+        assert runner._driver._playwright is None
         session_c = _create_session(client, fixture_origin, third, "job-c")
         started_c = _start(client, session_c)
         assert started_c["status"] == Status.RESUME_UPLOAD_REQUIRED
         assert started_c["stopped_before_submit"] is True
-        assert runner._driver._playwright is driver
+        assert runner._driver._playwright is not None
+        assert runner._driver._playwright is not driver
         assert _eval(runner, session_c, _FORM_VALUES) == {
             "first": "Drew",
             "email": "drew.example@example.com",
