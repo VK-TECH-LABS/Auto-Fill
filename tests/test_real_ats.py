@@ -2457,6 +2457,54 @@ def test_empty_location_json_does_not_count_and_blocks_ready(browser):
         page.close()
 
 
+def test_visible_place_counts_when_the_hidden_location_proxy_is_empty(browser):
+    """Lever can show Austin, TX, USA while selectedLocation is still empty JSON."""
+    from autofill.extract import extract_page
+    from autofill.follow import follow_answer
+    from autofill.models import Control
+    from autofill.stepfill import _cluster_committed, inspect_required
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1>"
+            "<label for='name'>Full name</label><input id='name' name='name' required value='River Example'>"
+            "<label for='location-input'>Current location</label>"
+            "<input id='location-input' required value='Austin, TX, USA'>"
+            "<input id='selected-location' type='hidden' name='selectedLocation' value='{\"name\":\"\"}'>"
+            "<button type='submit'>Submit application</button>"
+        )
+        gaps, total, done = inspect_required(page, extract_page(page), None)
+        assert total == 2
+        assert done == 2
+        assert gaps == []
+        ready = follow_answer(
+            page,
+            profile=CandidateProfile.from_dict(
+                {"personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+            ),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=None,
+        )
+        assert ready.status == Status.READY_FOR_HUMAN_SUBMIT
+        page.locator("#location-input").fill("Austin")
+        bare, bare_total, bare_done = inspect_required(page, extract_page(page), None)
+        assert bare_total == 2
+        assert bare_done == 1
+        assert any(item.get("text") == "Current location" for item in bare)
+        page.set_content(
+            "<label for='proxy'>Team</label>"
+            "<input id='proxy' type='hidden' name='team' value=''>"
+            "<input id='team' aria-label='Team' value='Platform'>"
+        )
+        hidden = Control(kind="text", label="Team", selector="#proxy", element_id="proxy", name="team")
+        assert _cluster_committed(page, [hidden]) is True
+    finally:
+        page.close()
+
+
 def test_restrictive_covenant_is_not_an_employer_field(browser, resolver):
     server, url = resolver
     server.custom_answers = []  # type: ignore[attr-defined]

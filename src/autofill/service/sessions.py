@@ -209,6 +209,8 @@ class ServiceSession:
         for item in self.confirmed_values:
             redaction_filter().discard(str(item.get("value") or ""))
         self.confirmed_values.clear()
+        self.preview_jpeg = None
+        self.preview_host = ""
         self.clear_resume_bytes()
 
 

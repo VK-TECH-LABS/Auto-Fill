@@ -313,6 +313,47 @@ def test_owner_cap_skips_a_busy_fill_and_can_be_turned_off():
         assert right_held is not None and right_held.status == "CREATED"
 
 
+def test_wipe_drops_the_screenshot_buffer():
+    session = _session()
+    session.preview_jpeg = b"jpeg-bytes"
+    session.preview_host = "jobs.lever.co"
+    session.wipe_secrets()
+    assert session.preview_jpeg is None
+    assert session.preview_host == ""
+
+
+def test_discard_keeps_the_browser_while_another_session_is_open(caplog: pytest.LogCaptureFixture):
+    caplog.set_level(logging.INFO)
+    runner = PlaywrightRunner(enabled=False, workers=1)
+    try:
+        closed = {"browser": False}
+
+        class _Browser:
+            def close(self) -> None:
+                closed["browser"] = True
+
+        class _Playwright:
+            def stop(self) -> None:
+                return None
+
+        runner._workers[0].driver._browser = _Browser()
+        runner._workers[0].driver._playwright = _Playwright()
+        runner._workers[0].sessions["one"] = _SessionContext()
+        runner._workers[0].sessions["two"] = _SessionContext()
+        runner._pins["one"] = 0
+        runner._loads[0] = 2
+        runner.discard("one")
+        assert closed["browser"] is False
+        assert "browser=open" in caplog.text
+        runner._pins["two"] = 0
+        runner._loads[0] = 1
+        runner.discard("two")
+        assert closed["browser"] is True
+        assert "browser=closed" in caplog.text
+    finally:
+        runner.shutdown()
+
+
 def test_blank_owner_does_not_expire_other_sessions():
     store = ServiceSessionStore()
     named = _session("named", "candidate-a")
@@ -332,7 +373,8 @@ def test_blank_owner_does_not_expire_other_sessions():
     assert named.status == "CREATED"
 
 
-def test_discard_closes_pages_and_a_context_whose_pin_was_lost():
+def test_discard_closes_pages_and_a_context_whose_pin_was_lost(caplog: pytest.LogCaptureFixture):
+    caplog.set_level(logging.INFO)
     runner = PlaywrightRunner(enabled=False, workers=2)
     try:
         log: list[str] = []
@@ -352,11 +394,29 @@ def test_discard_closes_pages_and_a_context_whose_pin_was_lost():
         slot = _SessionContext()
         slot.page = page
         slot.context = _Context(page)
+        slot.mark = object()  # type: ignore[assignment]
+        browser_closed = {"browser": False, "playwright": False}
+
+        class _Browser:
+            def close(self) -> None:
+                browser_closed["browser"] = True
+
+        class _Playwright:
+            def stop(self) -> None:
+                browser_closed["playwright"] = True
+
+        runner._workers[1].driver._browser = _Browser()
+        runner._workers[1].driver._playwright = _Playwright()
         runner._workers[1].sessions["sess"] = slot
         runner.discard("sess")
         assert log == ["page", "context"]
+        assert slot.page is None
+        assert slot.context is None
+        assert slot.mark is None
+        assert browser_closed == {"browser": True, "playwright": True}
         assert "sess" not in runner._workers[1].sessions
         assert "sess" not in runner._pins
+        assert "action=discard result=closed browser=closed rss_bytes=" in caplog.text
 
         broken: list[str] = []
 
