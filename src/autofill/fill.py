@@ -153,9 +153,19 @@ def apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool
     return _apply_mapped(page, control, mapped, overwrite=overwrite)
 
 
+def _surface(page, frame_url: str):
+    """The frame that owns the control. A top-level field stays on the page."""
+    from autofill.safeguards import _bound_target
+
+    return _bound_target(page, frame_url or "")
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
+    # A Greenhouse or Lever field can sit in an application iframe. Typing on the
+    # top document misses it, so the name is filled and never recorded.
+    page = _surface(page, getattr(control, "frame_url", "") or "")
     try:
         locator = page.locator(control.selector)
         if mapped.action == "fill":

@@ -1087,7 +1087,10 @@ class PlaywrightRunner:
 
             return int(post_upload_refill(slot.page, records, session_id=session_id))
 
-        return worker.submit(apply)
+        restored = worker.submit(apply)
+        if isinstance(confirmed, list):
+            confirmed[:] = records
+        return restored
 
     def confirm_resume(self, session_id: str) -> dict:
         """Check that the current page shows an accepted resume."""
