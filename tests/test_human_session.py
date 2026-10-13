@@ -336,7 +336,8 @@ def test_crashed_page_is_retryable_and_can_restart(tmp_path):
                 json={"candidateId": "ref-a", "humanResolved": True},
             )
             assert restarted.status_code == 200, restarted.text
-            assert restarted.json()["status"] == Status.READY_FOR_HUMAN_SUBMIT
+            restarted_body = restarted.json()
+            assert restarted_body["status"] == Status.READY_FOR_HUMAN_SUBMIT, restarted_body
             runner._submit(lambda: runner._sessions[session_id].page.close(), session_id)
             closed = client.get(f"/v1/sessions/{session_id}/screenshot", headers=AUTH)
             assert closed.status_code == 410
