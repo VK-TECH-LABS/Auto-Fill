@@ -181,10 +181,6 @@ def fill_resolved_page(
 ) -> ResolvedPage:
     """Inspect this step, ask the resolver only for it, fill, and wipe the values."""
     active = flags or FillFlags()
-    if resume_uploaded:
-        # The upload returned already. Wait until a Greenhouse re-render puts
-        # the fields back before this pass counts or writes them.
-        settle_form(page)
     snapshot = extract_page(page)
     outcome = ResolvedPage(snapshot=snapshot)
     clusters = _clusters(snapshot)
@@ -221,16 +217,7 @@ def fill_resolved_page(
             questions=questions,
         )
         response = _complete_compounds(binding, session_id=session_id, step=step, requests=requests, response=response)
-        _apply(
-            page,
-            requests,
-            response,
-            active,
-            outcome,
-            snapshot.heading,
-            session_id=session_id,
-            preserve_filled=resume_uploaded,
-        )
+        _apply(page, requests, response, active, outcome, snapshot.heading, session_id=session_id)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -527,18 +514,7 @@ def _requested_field_keys(requests: list[_Ask]) -> list[str]:
             keys.append(ask.field_key)
             if ask.field_key == "phone.country":
                 keys.extend(("phone", "address.country"))
-            # A split First/Last form still needs the full name when that is all
-            # the resolver has. The client drops keys that were not requested.
-            if ask.field_key in {"firstName", "lastName"}:
-                keys.append("fullName")
     return _unique(keys)
-
-
-def _surface(page, control: Control):
-    """The frame that owns this control, or the page when it is on top."""
-    from autofill.fill import _surface as surface_for
-
-    return surface_for(page, getattr(control, "frame_url", "") or "")
 
 
 def _compose_location(fields: dict) -> str:
@@ -1152,7 +1128,6 @@ def _remember_location(outcome: ResolvedPage, control: Control, detail: str) -> 
             field_class="PROFILE_FIELD",
         )
     )
-    remember_confirmed(control, detail, field_key="location")
 
 
 def _phone_country_value(fields: dict) -> str:
@@ -1204,7 +1179,6 @@ def _apply_phone_country(page, control: Control, fields: dict, outcome: Resolved
                 field_class="PROFILE_FIELD",
             )
         )
-        remember_confirmed(control, picked.label, field_key="phone.country")
         return
     if option is None:
         _manual(
@@ -1548,46 +1522,6 @@ def _apply_location_query(
     _manual_location(outcome, control, [label for label, _selector in options])
 
 
-def _fill_split_names(response: ResolverResponse) -> None:
-    """Copy a full name into first and last when those boxes were requested without a value.
-
-    Greenhouse asks for firstName and lastName. The resolver often has only
-    fullName, and the client drops a key that was not requested. Splitting
-    here runs before the "key not returned" skip, so both boxes are written
-    and recorded.
-    """
-    full = str(response.fields.get("fullName") or "").strip()
-    if not full:
-        return
-    from autofill.profile import split_name
-
-    first, last = split_name(full)
-    if first and not str(response.fields.get("firstName") or "").strip():
-        response.fields["firstName"] = first
-    if last and not str(response.fields.get("lastName") or "").strip():
-        response.fields["lastName"] = last
-
-
-def _remember_shown(page, control: Control, key: str) -> None:
-    """Record the text already on a control. The value is not logged."""
-    shown = live_field_value(page, control)
-    if shown is None or not str(shown).strip():
-        return
-    remember_confirmed(control, str(shown).strip(), field_key=key or "")
-
-
-def _keep_filled(page, controls: list[Control]) -> bool:
-    """True when a follow-up pass must leave this cluster alone.
-
-    A location box can show a city before the typeahead commit check passes.
-    That visible text is still a filled field and must not be cleared.
-    """
-    if _cluster_committed(page, controls):
-        return True
-    shown = live_field_value(page, controls[0])
-    return bool(shown and str(shown).strip())
-
-
 def _apply(
     page,
     requests: list[_Ask],
@@ -1596,10 +1530,7 @@ def _apply(
     outcome: ResolvedPage,
     heading: str,
     session_id: str = "",
-    *,
-    preserve_filled: bool = False,
 ) -> None:
-    _fill_split_names(response)
     by_intent, unnamed, by_key = _index_answers(response)
     unclassified = _unclassified_count(requests)
     rows = {
@@ -1615,16 +1546,7 @@ def _apply(
     for ask in ordered:
         if not checkpoint():
             break
-        _apply_ask(
-            page,
-            ask,
-            response,
-            flags,
-            outcome,
-            heading,
-            shared,
-            preserve_filled=preserve_filled,
-        )
+        _apply_ask(page, ask, response, flags, outcome, heading, shared)
     if _resume_was_attached(outcome):
         settle_after_resume(page)
         _refill_cleared_fields(page, ordered, response, flags, outcome, heading, shared, session_id=session_id)
@@ -1642,19 +1564,9 @@ def _apply_ask(
     outcome: ResolvedPage,
     heading: str,
     shared: tuple,
-    *,
-    preserve_filled: bool = False,
 ) -> None:
     """Write one ask. ``shared`` carries the step's answer index and repeater cursor."""
     by_intent, unnamed, by_key, unclassified, rows, employment_index = shared
-    if ask.controls:
-        page = _surface(page, ask.controls[0])
-    if preserve_filled and ask.controls and _keep_filled(page, ask.controls):
-        control = ask.controls[0]
-        if control.kind in {"text", "textarea", "combobox", "select"}:
-            key = ask.field_key or (ask.match.intent if ask.match else "") or ""
-            _remember_shown(page, control, key)
-        return
     if any(selector_held(control.selector) for control in ask.controls) and (
         not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
     ):
@@ -1790,89 +1702,6 @@ def settle_after_resume(page, *, timeout_s: float = 3.0) -> None:
         if saw_change and stable >= 2:
             return
         if not saw_change and time.monotonic() >= quiet_after and stable >= 2:
-            return
-
-
-_VISIBLE_FORM_JS = r"""() => {
-  function shown(el) {
-    if (!el || el.nodeType !== 1) return false;
-    const type = String(el.getAttribute("type") || "").toLowerCase();
-    if (type === "hidden" || type === "file" || type === "password") return false;
-    if (el.hidden) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
-    if (parseFloat(style.opacity) === 0) return false;
-    const rect = el.getBoundingClientRect();
-    if (rect.right <= 0) return false;
-    if (rect.width < 2 && rect.height < 2) return false;
-    return true;
-  }
-  const parts = [];
-  let count = 0;
-  for (const el of document.querySelectorAll("input, textarea, select")) {
-    if (!shown(el)) continue;
-    count += 1;
-    const id = el.id || el.getAttribute("name") || el.getAttribute("aria-label") || "";
-    const value = "value" in el ? String(el.value || "") : "";
-    parts.push(id + "=" + value);
-  }
-  return { count: count, signature: parts.join("\n") };
-}"""
-
-
-def _frame_targets(page) -> list:
-    frames = list(getattr(page, "frames", []) or [])
-    return frames or [page]
-
-
-def _form_sample(page) -> tuple[int, str] | None:
-    total = 0
-    parts: list[str] = []
-    saw = False
-    for target in _frame_targets(page):
-        evaluate = getattr(target, "evaluate", None)
-        if evaluate is None:
-            continue
-        try:
-            raw = evaluate(_VISIBLE_FORM_JS)
-        except Exception:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        saw = True
-        total += int(raw.get("count") or 0)
-        parts.append(str(raw.get("signature") or ""))
-    if not saw:
-        return None
-    return total, "\n".join(parts)
-
-
-def settle_form(page, *, timeout_s: float = 12.0) -> None:
-    """Wait until a resume re-render has put the visible fields back.
-
-    The highest visible-field count is the mark. A drop below that mark keeps
-    this waiting until the count returns and holds for about a second. A form
-    that never changes returns in about a second. The budget is a ceiling.
-    """
-    sample = _form_sample(page)
-    if sample is None:
-        return
-    high, previous = sample
-    quiet_since = time.monotonic()
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        _pause(page, 150)
-        sample = _form_sample(page)
-        if sample is None:
-            return
-        count, signature = sample
-        if count != high or signature != previous:
-            if count > high:
-                high = count
-            previous = signature
-            quiet_since = time.monotonic()
-            continue
-        if time.monotonic() - quiet_since >= 1.2:
             return
 
 
@@ -2292,192 +2121,6 @@ def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
     return kept
 
 
-_NAME_HARVEST_JS = r"""() => {
-  function shown(el) {
-    if (!el || el.nodeType !== 1) return false;
-    const type = String(el.getAttribute("type") || "").toLowerCase();
-    if (type === "hidden" || type === "file" || type === "password") return false;
-    if (type && type !== "text" && type !== "search") return false;
-    if (el.hidden) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
-    if (parseFloat(style.opacity) === 0) return false;
-    const rect = el.getBoundingClientRect();
-    if (rect.right <= 0) return false;
-    if (rect.width < 2 && rect.height < 2) return false;
-    return true;
-  }
-  function clean(value) {
-    return String(value || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/[\s*✱＊]+$/g, "")
-      .trim();
-  }
-  function labelOf(el) {
-    const entry = el.closest && el.closest(
-      "[data-field-path], .ashby-application-form-field-entry, .application-question"
-    );
-    if (entry) {
-      const title = entry.querySelector(
-        ".ashby-application-form-question-title, .application-label"
-      );
-      if (title && !title.contains(el)) return clean(title.innerText || title.textContent || "");
-    }
-    if (el.id) {
-      const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
-      if (lab) return clean(lab.innerText || lab.textContent || "");
-    }
-    const parent = el.closest ? el.closest("label") : null;
-    if (parent) return clean(parent.innerText || parent.textContent || "");
-    return clean(el.getAttribute("aria-label") || "");
-  }
-  const exact = {
-    "full name": "fullName",
-    "name": "fullName",
-    "your name": "fullName",
-    "applicant name": "fullName",
-    "legal name": "legalName",
-    "first name": "firstName",
-    "given name": "firstName",
-    "forename": "firstName",
-    "last name": "lastName",
-    "family name": "lastName",
-    "surname": "lastName",
-    "preferred name": "preferredName",
-    "preferred first name": "preferredName",
-    "nickname": "preferredName"
-  };
-  const auto = {
-    "given-name": "firstName",
-    "family-name": "lastName",
-    "name": "fullName",
-    "nickname": "preferredName"
-  };
-  const found = [];
-  for (const el of document.querySelectorAll("input, textarea")) {
-    if (!shown(el)) continue;
-    const value = "value" in el ? String(el.value || "").trim() : "";
-    if (!value) continue;
-    const label = labelOf(el);
-    const folded = label.toLowerCase();
-    if (!folded || folded.indexOf("referr") !== -1 || folded.indexOf("?") !== -1) continue;
-    let key = exact[folded] || "";
-    if (!key) {
-      const tokens = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
-      for (const token of tokens) {
-        if (auto[token]) key = auto[token];
-      }
-    }
-    if (!key) continue;
-    let selector = "";
-    if (el.id) selector = "#" + CSS.escape(el.id);
-    else if (el.getAttribute("name")) {
-      selector = "input[name='" + CSS.escape(el.getAttribute("name")) + "']";
-    }
-    const field = el.closest && el.closest("[data-field-path]");
-    const path = field ? String(field.getAttribute("data-field-path") || "") : "";
-    found.push({
-      value: value,
-      label: label,
-      name: el.getAttribute("name") || "",
-      elementId: el.id || "",
-      automationId: el.getAttribute("data-automation-id") || "",
-      fieldKey: key,
-      fieldPath: path,
-      selector: selector
-    });
-  }
-  return found;
-}"""
-
-
-def _harvest_known(records: list[dict], item: dict) -> bool:
-    key = str(item.get("fieldKey") or "")
-    element = str(item.get("elementId") or "")
-    name = str(item.get("name") or "")
-    label = str(item.get("label") or "")
-    for existing in records:
-        if not isinstance(existing, dict):
-            continue
-        if key and key == str(existing.get("fieldKey") or ""):
-            return True
-        if element and element == str(existing.get("elementId") or ""):
-            return True
-        if name and name == str(existing.get("name") or "") and label and label == str(existing.get("label") or ""):
-            return True
-    return False
-
-
-def _harvest_name_records(page, records: list[dict]) -> None:
-    """Add visible name fields a parser filled and this run never recorded.
-
-    The list grows in place. Values stay out of the logs. A key or id that is
-    already recorded is left as it is.
-    """
-    found: list[dict] = []
-    for target in _frame_targets(page):
-        evaluate = getattr(target, "evaluate", None)
-        if evaluate is None:
-            continue
-        try:
-            raw = evaluate(_NAME_HARVEST_JS) or []
-        except Exception:
-            continue
-        if isinstance(raw, list):
-            found.extend(item for item in raw if isinstance(item, dict))
-    for item in found:
-        value = str(item.get("value") or "").strip()
-        key = str(item.get("fieldKey") or "").strip()
-        if not value or not key or _harvest_known(records, item):
-            continue
-        record = {
-            "value": value,
-            "label": str(item.get("label") or ""),
-            "name": str(item.get("name") or ""),
-            "elementId": str(item.get("elementId") or ""),
-            "automationId": str(item.get("automationId") or ""),
-            "fieldKey": key,
-            "fieldPath": str(item.get("fieldPath") or ""),
-            "selector": str(item.get("selector") or ""),
-        }
-        records.append(record)
-        remember_confirmed(
-            Control(
-                kind="text",
-                selector=record["selector"],
-                label=record["label"],
-                name=record["name"],
-                element_id=record["elementId"],
-                automation_id=record["automationId"],
-                field_path=record["fieldPath"],
-            ),
-            value,
-            field_key=key,
-        )
-
-
-def _restore_one(page, record: dict) -> dict | None:
-    """Match one confirmed value. A miss on the top document tries the frames."""
-    hint = _confirmed_hint(record)
-    missed: dict | None = None
-    for target in _frame_targets(page):
-        evaluate = getattr(target, "evaluate", None)
-        if evaluate is None:
-            continue
-        try:
-            outcome = evaluate(_RESTORE_MATCH_JS, hint)
-        except Exception:
-            continue
-        if not isinstance(outcome, dict):
-            continue
-        result = str(outcome.get("result") or "miss")
-        if result in {"kept", "restored"}:
-            return {"via": str(outcome.get("via") or "none"), "result": result}
-        missed = {"via": str(outcome.get("via") or "none"), "result": "miss"}
-    return missed
-
-
 def post_upload_refill(
     page,
     confirmed: list[dict] | None = None,
@@ -2490,26 +2133,25 @@ def post_upload_refill(
     The record is the session's fills, not a snapshot taken at upload time. A
     value that is still visible stays, including one a person typed and one the
     parse replaced. An empty visible control is filled again, even when Ashby
-    replaced the node. Name boxes the parser filled are added to ``confirmed``
-    when that list was passed in.
+    replaced the node.
     """
     from autofill.fill import confirmed_records, current_session_id
 
-    settle_form(page)
-    if confirmed is not None:
-        records = confirmed
-    else:
-        records = confirmed_records()
-    _harvest_name_records(page, records)
+    settle_after_resume(page)
+    records = list(confirmed) if confirmed is not None else confirmed_records()
     usable = [record for record in records if isinstance(record, dict) and str(record.get("value") or "").strip()]
+    evaluate = getattr(page, "evaluate", None)
     restored = 0
     session = session_id or current_session_id() or "-"
-    if any(getattr(target, "evaluate", None) is not None for target in _frame_targets(page)):
+    if evaluate is not None:
         for record in usable:
             field = str(record.get("fieldKey") or "").strip() or "unkeyed"
             via = "none"
             result = "miss"
-            outcome = _restore_one(page, record)
+            try:
+                outcome = evaluate(_RESTORE_MATCH_JS, _confirmed_hint(record))
+            except Exception:
+                outcome = None
             if isinstance(outcome, dict):
                 via = str(outcome.get("via") or "none")
                 result = str(outcome.get("result") or "miss")
@@ -2791,7 +2433,6 @@ def _apply_question(
                 field_class="APPROVED_QUESTION",
             )
         )
-        remember_confirmed(control, option.label, field_key=match.intent or "")
         return
     if control.kind == "combobox":
         desired = answer.value or (answer.values[0] if answer.values else "")
@@ -2809,7 +2450,6 @@ def _apply_question(
                 field_class="APPROVED_QUESTION",
             )
         )
-        remember_confirmed(control, picked.label, field_key=match.intent or "")
         return
     if control.kind in {"radio", "select"}:
         desired = answer.value or (answer.values[0] if answer.values else "")
@@ -2912,7 +2552,6 @@ def _write_control(
     key: str | None,
     flags: FillFlags,
 ) -> None:
-    page = _surface(page, control)
     if not text:
         _skip(control, outcome, key, "No value for this control.", page=page)
         return
@@ -2991,11 +2630,8 @@ def _required_question(control: Control) -> bool:
 
 def _skip(control: Control, outcome: ResolvedPage, key: str | None, reason: str, page=None) -> None:
     if page is not None:
-        shown = live_field_value(_surface(page, control), control)
+        shown = live_field_value(page, control)
         if shown is not None and shown.strip():
-            # A resume parser, or an earlier write, can fill the name before
-            # this step asks for it. That text is a confirmed fill.
-            remember_confirmed(control, shown.strip(), field_key=key or "")
             outcome.fields.append(
                 FieldOutcome(
                     selector=control.selector,

@@ -81,7 +81,6 @@ from autofill.service.schemas import (
 from autofill.service.sessions import (
     ServiceSession,
     ServiceSessionStore,
-    _same_confirmed,
     created_start_is_stale,
     monotonic,
     new_session_id,
@@ -1028,12 +1027,6 @@ def _follow_verified_resume(
         try:
             if callable(refill):
                 refill(session.session_id, records)
-                for item in records:
-                    if not isinstance(item, dict):
-                        continue
-                    if any(_same_confirmed(existing, item) for existing in session.confirmed_values):
-                        continue
-                    session.remember_confirmed_value(item)
             elif "restored" in report:
                 logger.info(
                     "session=%s action=post_upload_refill records=%s",
