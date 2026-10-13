@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <h1>Application</h1>
+  <label for="name">Full name</label>
+  <input id="name" name="name" autocomplete="name" required>
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="email" required>
+  <label for="phone">Phone</label>
+  <input id="phone" name="phone" type="tel" autocomplete="tel" required>
+  <label for="referral">Referral code</label>
+  <input id="referral" name="referral" value="FRIEND">
+  <label for="resume">Resume</label>
+  <input id="resume" name="resume" type="file">
+  <div id="chip" class="resume-upload-success" hidden>Success!</div>
+  <script>
+    document.getElementById("resume").addEventListener("change", () => {
+      document.getElementById("chip").hidden = false;
+      window.setTimeout(() => {
+        document.getElementById("name").value = "";
+        document.getElementById("phone").value = "";
+        document.getElementById("email").value = "parsed@example.com";
+      }, 200);
+    });
+  </script>
+</body>
+</html>

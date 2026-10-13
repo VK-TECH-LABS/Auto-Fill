@@ -574,7 +574,7 @@ def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False, op
 
 
 _COMMITTED_JS = r"""(selector) => {
-  const el = document.querySelector(selector);
+  function committed(el) {
   if (!el) return false;
   const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
   const tag = String(el.tagName || "");
@@ -647,6 +647,24 @@ _COMMITTED_JS = r"""(selector) => {
   }
   const value = "value" in el ? el.value : el.textContent;
   return String(value || "").trim().length > 0;
+  }
+  function shown(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const type = String(node.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden" || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  const nodes = Array.from(document.querySelectorAll(selector));
+  if (!nodes.length) return false;
+  const visible = nodes.filter(shown);
+  const pool = visible.length ? visible : nodes;
+  for (const node of pool) {
+    if (committed(node)) return true;
+  }
+  return false;
 }"""
 
 

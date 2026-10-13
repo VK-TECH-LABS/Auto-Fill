@@ -42,7 +42,9 @@ from autofill.pagewait import (
     find_entry_control,
     is_login_wall,
     is_review,
+    is_site_error,
     navigation_signature,
+    note_page_type,
     register_pane,
     reset_page_type,
     resettle_account,
@@ -135,6 +137,7 @@ class AutofillOptions:
     resume_site_errors: list[str] = field(default_factory=list)
     on_paint: Any = None
     on_page: Any = None
+    on_navigation: Any = None
     standard_terms_authorized: bool = False
 
 
@@ -168,6 +171,10 @@ class ApplicationResult:
     resume_site_errors: list[str] = field(default_factory=list)
     page_type: str = ""
     auto_consents: list[dict[str, Any]] = field(default_factory=list)
+    entry_clicks: int = 0
+    next_clicks: int = 0
+    pages_advanced: int = 0
+    last_navigation: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -203,6 +210,19 @@ _ACTIVE_OPTIONS: contextvars.ContextVar[AutofillOptions | None] = contextvars.Co
     "autofill_active_options",
     default=None,
 )
+_NAVIGATION: contextvars.ContextVar[dict | None] = contextvars.ContextVar("autofill_navigation", default=None)
+
+
+def _navigation_record() -> dict:
+    record = _NAVIGATION.get()
+    if record is None:
+        record = {"entryClicks": 0, "nextClicks": 0, "pagesAdvanced": 0, "lastNavigation": None}
+        _NAVIGATION.set(record)
+    return record
+
+
+def _reset_navigation() -> None:
+    _NAVIGATION.set({"entryClicks": 0, "nextClicks": 0, "pagesAdvanced": 0, "lastNavigation": None})
 
 
 def _result(session, *, status: str, ats: str | None, login_status: str, **kwargs) -> ApplicationResult:
@@ -241,6 +261,12 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     )
     result.page_type = current_page_type()
     result.auto_consents = consume_auto_consents()
+    nav = _navigation_record()
+    result.entry_clicks = int(nav["entryClicks"])
+    result.next_clicks = int(nav["nextClicks"])
+    result.pages_advanced = int(nav["pagesAdvanced"])
+    last = nav.get("lastNavigation")
+    result.last_navigation = dict(last) if isinstance(last, dict) else None
     total = int(result.progress.get("requiredTotal") or 0)
     done = int(result.progress.get("requiredDone") or 0)
     if status in {
@@ -292,6 +318,17 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ats=ats_name,
             login_status=login_status,
             messages=[challenge_message(snapshot)],
+            **extra,
+        )
+    if is_site_error(snapshot):
+        note_page_type("SITE_ERROR")
+        session.mark(Status.FAILED_RETRYABLE)
+        return snapshot, _result(
+            session,
+            status=Status.FAILED_RETRYABLE,
+            ats=ats_name,
+            login_status=login_status,
+            messages=["site_error"],
             **extra,
         )
     kind = classify_page(snapshot, url=url)
@@ -469,6 +506,7 @@ def autofill_application(
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
     _ACTIVE_OPTIONS.set(opts)
+    _reset_navigation()
     run_started = time.perf_counter()
     inspect_state = {"seen": False}
     store = SessionStore()
@@ -539,6 +577,16 @@ def autofill_application(
             page.goto(application_url)
 
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
+        if is_site_error(snapshot):
+            note_page_type("SITE_ERROR")
+            session.mark(Status.FAILED_RETRYABLE)
+            return _result(
+                session,
+                status=Status.FAILED_RETRYABLE,
+                ats=ats_name,
+                login_status="NOT_REQUIRED",
+                messages=["site_error"],
+            )
         if snapshot.captcha_present:
             session.mark("FAILED")
             return _result(
@@ -790,7 +838,22 @@ def autofill_application(
 
             if resume_blocked and not opts.resume_uploaded:
                 prepared = _attach_prepared(page, opts)
-                if prepared != "attached":
+                if prepared == "attached":
+                    from autofill.stepfill import settle_after_resume
+
+                    settle_after_resume(page)
+                    refilled, snapshot, resume_blocked, refill_manual = fill_one_page(
+                        page,
+                        candidate_profile,
+                        cover_letter_path=opts.cover_letter_path,
+                        cover_letter_text=opts.cover_letter_text,
+                        job=opts.job,
+                        resume_uploaded=opts.resume_uploaded,
+                    )
+                    fields.extend(refilled)
+                    manual.extend(refill_manual)
+                    _note_fill(refilled, opts, run_started, inspect_state)
+                elif prepared != "attached":
                     session.mark("RESUME_UPLOAD_REQUIRED")
                     detected, filled, skipped = _counts(fields)
                     return _result(
@@ -1100,6 +1163,8 @@ def _terminal_status(
             "This page is a job description. Auto-Fill did not find an application form.",
             reason,
         ]
+    if decision == "SITE_ERROR":
+        return Status.FAILED_RETRYABLE, ["site_error"]
     if decision == "CAPTCHA":
         return Status.CAPTCHA_REQUIRED, [challenge_message(snapshot)]
     if decision == "MANUAL":
@@ -1137,6 +1202,29 @@ def _adopt_page(opts: AutofillOptions, new_page):
 def _log_move(session_id: str, action: str, result: str) -> None:
     """``result`` is a token. The label, URL, and candidate values stay out of the log."""
     logger.info("session=%s action=%s result=%s", session_id, action, result)
+    record = _navigation_record()
+    if action == "entry":
+        record["entryClicks"] = int(record["entryClicks"]) + 1
+    elif action == "next":
+        record["nextClicks"] = int(record["nextClicks"]) + 1
+    if result in {"advanced", "new_page"}:
+        record["pagesAdvanced"] = int(record["pagesAdvanced"]) + 1
+    record["lastNavigation"] = {"action": action, "result": result}
+    opts = _ACTIVE_OPTIONS.get()
+    hook = getattr(opts, "on_navigation", None) if opts is not None else None
+    if hook is None:
+        return
+    try:
+        hook(
+            {
+                "entryClicks": int(record["entryClicks"]),
+                "nextClicks": int(record["nextClicks"]),
+                "pagesAdvanced": int(record["pagesAdvanced"]),
+                "lastNavigation": dict(record["lastNavigation"]),
+            }
+        )
+    except Exception:
+        return
 
 
 def _next_button(snapshot, block: tuple | None = None):

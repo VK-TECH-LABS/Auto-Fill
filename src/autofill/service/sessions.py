@@ -81,6 +81,10 @@ class ServiceSession:
     form_seen: bool = False
     pending_resume: bool = False
     page_type: str = ""
+    entry_clicks: int = 0
+    next_clicks: int = 0
+    pages_advanced: int = 0
+    last_navigation: dict | None = None
     standard_terms_authorized: bool = False
     created_mono: float = 0.0
     auto_consents: list[dict] = field(default_factory=list)

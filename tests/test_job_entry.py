@@ -149,7 +149,7 @@ def test_apply_inside_an_iframe_is_clicked(browser):
 def test_multistep_next_save_and_review_stop_before_submit(browser):
     page = browser.new_page()
     try:
-        page.goto((FIXTURES / "multistep_review.html").as_uri())
+        page.goto((FIXTURES / "multistep_pages.html").as_uri())
         result = _run(page, "https://boards.greenhouse.io/example/jobs/1")
         clicked = page.evaluate("() => window.__clicked")
         assert clicked == ["Next", "Save & Continue"]
@@ -169,6 +169,20 @@ def test_stalled_apply_is_clicked_once(browser):
         assert result.status == Status.NAVIGATION_STALLED
         assert result.messages == ["navigation_stalled"]
         assert page.evaluate("() => window.__clicked") == ["Apply"]
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_adp_service_error_is_not_a_login_wall(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "adp_site_error.html").as_uri())
+        result = _run(page, "https://myjobs.adp.com/example/jobs/1")
+        assert result.status == Status.FAILED_RETRYABLE
+        assert result.messages == ["site_error"]
+        assert result.page_type == "SITE_ERROR"
+        assert page.evaluate("() => window.__clicked") == []
         assert result.stopped_before_submit is True
     finally:
         page.close()

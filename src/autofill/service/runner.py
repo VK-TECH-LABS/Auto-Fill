@@ -433,6 +433,7 @@ class FillRequest:
     resume_prepared: bool = False
     on_paint: Any = None
     on_phase: Any = None
+    on_navigation: Any = None
     standard_terms_authorized: bool = False
 
 
@@ -795,6 +796,7 @@ class PlaywrightRunner:
             resume_prepared=request.resume_prepared,
             on_paint=request.on_paint,
             on_page=_bind_page(slot),
+            on_navigation=request.on_navigation,
             standard_terms_authorized=request.standard_terms_authorized,
         )
 
