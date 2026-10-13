@@ -24,12 +24,21 @@ EXTRACT_JS = r"""
   function isHidden(el) {
     const type = (el.getAttribute("type") || "").toLowerCase();
     if (type === "hidden") return true;
+    const file = type === "file";
     for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
       if (node.hidden) return true;
       const style = window.getComputedStyle(node);
       if (style.display === "none" || style.visibility === "hidden") return true;
       if (node.getAttribute("aria-hidden") === "true") return true;
+      // A file input is often transparent on purpose. Other controls at opacity 0
+      // are not fields a person can see.
+      if (!file && parseFloat(style.opacity) === 0) return true;
     }
+    if (file || type === "radio" || type === "checkbox") return false;
+    const rect = el.getBoundingClientRect();
+    // A 1px or off-screen proxy is not the visible control. A file input is excluded above.
+    if (rect.width < 2 && rect.height < 2) return true;
+    if (rect.right <= 0) return true;
     return false;
   }
 
@@ -272,6 +281,11 @@ EXTRACT_JS = r"""
     return dedupeBits(bits);
   }
 
+  function fieldPathOf(el) {
+    const field = el.closest && el.closest("[data-field-path]");
+    return field ? field.getAttribute("data-field-path") || "" : "";
+  }
+
   function selectorFor(el) {
     if (el.id) return "#" + CSS.escape(el.id);
     const name = el.getAttribute("name");
@@ -464,6 +478,7 @@ EXTRACT_JS = r"""
         automationId: el.getAttribute("data-automation-id") || "",
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
         phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
+        fieldPath: fieldPathOf(el),
       });
     }
 
@@ -526,6 +541,7 @@ EXTRACT_JS = r"""
         group: "",
         prompt: "",
         phoneAdjacent: phoneAdjacent(inner || el),
+        fieldPath: fieldPathOf(el),
       });
     }
   });
@@ -1141,6 +1157,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 automation_id=str(raw.get("automationId", "") or ""),
                 max_length=_max_length(raw.get("maxLength")),
                 phone_adjacent=bool(raw.get("phoneAdjacent", False)),
+                field_path=str(raw.get("fieldPath") or ""),
             )
         )
     buttons = [

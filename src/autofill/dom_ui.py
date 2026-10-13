@@ -653,8 +653,10 @@ _COMMITTED_JS = r"""(selector) => {
     const type = String(node.getAttribute("type") || "").toLowerCase();
     if (type === "hidden" || node.hidden) return false;
     const style = window.getComputedStyle(node);
-    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity) === 0) return false;
     const rect = node.getBoundingClientRect();
+    if (rect.right <= 0) return false;
+    if (rect.width < 2 && rect.height < 2) return false;
     return rect.width > 0 || rect.height > 0;
   }
   const nodes = Array.from(document.querySelectorAll(selector));

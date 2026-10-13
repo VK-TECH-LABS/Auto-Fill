@@ -9,6 +9,7 @@ any field is written. Resume file inputs are reported and never selected.
 
 from __future__ import annotations
 
+import threading
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -50,24 +51,29 @@ def _outcome(
     )
 
 
-_CONFIRMED: ContextVar = ContextVar("autofill_confirmed", default=None)
-_CONFIRMED_STORE: ContextVar = ContextVar("autofill_confirmed_store", default=None)
 _SESSION_ID: ContextVar[str] = ContextVar("autofill_session_id", default="")
+# Playwright's sync API switches greenlets around page.evaluate. A ContextVar
+# set on the caller can be invisible after that switch. The worker is one OS
+# thread, and threading.local stays with that thread.
+_BOUND = threading.local()
 
 
-def bind_confirmed(hook, store: list | None = None) -> tuple[Token, Token]:
+def bind_confirmed(hook, store: list | None = None) -> tuple:
     """Remember values this run writes. ``store`` is the session's record."""
-    return _CONFIRMED.set(hook), _CONFIRMED_STORE.set(store)
+    previous = (getattr(_BOUND, "hook", None), getattr(_BOUND, "store", None))
+    _BOUND.hook = hook
+    _BOUND.store = store
+    return previous
 
 
-def reset_confirmed(token: tuple[Token, Token]) -> None:
-    hook_token, store_token = token
-    _CONFIRMED.reset(hook_token)
-    _CONFIRMED_STORE.reset(store_token)
+def reset_confirmed(token: tuple) -> None:
+    hook, store = token
+    _BOUND.hook = hook
+    _BOUND.store = store
 
 
 def confirmed_records() -> list[dict]:
-    store = _CONFIRMED_STORE.get()
+    store = getattr(_BOUND, "store", None)
     if not store:
         return []
     return [dict(item) for item in store if isinstance(item, dict)]
@@ -87,7 +93,7 @@ def current_session_id() -> str:
 
 def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> None:
     """Keep a value the engine wrote and then read back on the control."""
-    hook = _CONFIRMED.get()
+    hook = getattr(_BOUND, "hook", None)
     text = str(value or "")
     if hook is None or not text.strip():
         return
@@ -99,6 +105,7 @@ def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> 
             "elementId": control.element_id or "",
             "automationId": control.automation_id or "",
             "fieldKey": field_key or "",
+            "fieldPath": getattr(control, "field_path", "") or "",
             "selector": control.selector or "",
         }
     )

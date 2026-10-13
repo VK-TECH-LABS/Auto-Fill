@@ -135,12 +135,14 @@ class ServiceSession:
             "elementId": str(record.get("elementId") or ""),
             "automationId": str(record.get("automationId") or ""),
             "fieldKey": str(record.get("fieldKey") or ""),
+            "fieldPath": str(record.get("fieldPath") or ""),
             "selector": str(record.get("selector") or ""),
         }
-        self.confirmed_values = [
-            item for item in self.confirmed_values if not _same_confirmed(item, fresh)
-        ]
-        self.confirmed_values.append(fresh)
+        # Keep this list object. The fill copied it before the first write, and
+        # a later resume upload reads that same list.
+        kept = [item for item in self.confirmed_values if not _same_confirmed(item, fresh)]
+        kept.append(fresh)
+        self.confirmed_values[:] = kept
 
     def remember_secret(self, value: str) -> None:
         """Register a secret for redaction and for deletion when the session ends."""
