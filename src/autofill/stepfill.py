@@ -29,7 +29,7 @@ from autofill.dom_ui import (
     type_visible,
 )
 from autofill.extract import extract_page
-from autofill.fill import apply_mapped, attach_resume
+from autofill.fill import apply_mapped, attach_resume, remember_confirmed
 from autofill.intents import (
     DEMOGRAPHIC_INTENTS,
     UNFILLED_INTENTS,
@@ -1744,12 +1744,14 @@ _VISIBLE_VALUE_JS = r"""(selector) => {
     if (type === "hidden" || type === "file" || type === "password") return false;
     if (el.hidden) return false;
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity) === 0) return false;
     const rect = el.getBoundingClientRect();
+    if (rect.right <= 0) return false;
+    if (rect.width < 2 && rect.height < 2) return false;
     return rect.width > 0 || rect.height > 0;
   }
   const nodes = Array.from(document.querySelectorAll(selector)).filter(shown);
-  const el = nodes[0];
+  const el = nodes.find((node) => "value" in node && String(node.value || "").trim()) || nodes[0];
   if (!el) return null;
   const type = String(el.getAttribute("type") || "").toLowerCase();
   if (type === "radio" || type === "checkbox") {
@@ -1846,11 +1848,20 @@ _MATCH_VALUE_JS = r"""(hint) => {
     if (type === "hidden" || type === "file" || type === "password") return false;
     if (el.hidden) return false;
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity) === 0) return false;
     const rect = el.getBoundingClientRect();
+    if (rect.right <= 0) return false;
+    if (rect.width < 2 && rect.height < 2) return false;
     return rect.width > 0 || rect.height > 0;
   }
   function labelOf(el) {
+    const entry = el.closest && el.closest(
+      "[data-field-path], .ashby-application-form-field-entry, .application-question"
+    );
+    if (entry) {
+      const title = entry.querySelector(".ashby-application-form-question-title, .application-label");
+      if (title && !title.contains(el)) return norm(title.innerText || title.textContent || "");
+    }
     if (el.id) {
       const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
       if (lab) return norm(lab.innerText || lab.textContent || "");
@@ -1898,6 +1909,11 @@ _MATCH_VALUE_JS = r"""(hint) => {
   const automation = String(hint.automationId || "");
   const name = String(hint.name || "");
   const label = norm(hint.label || "");
+  const path = String(hint.fieldPath || "");
+  function fieldPathOf(el) {
+    const field = el.closest && el.closest("[data-field-path]");
+    return field ? String(field.getAttribute("data-field-path") || "") : "";
+  }
   function group(pred) {
     return nodes.filter(pred);
   }
@@ -1907,10 +1923,15 @@ _MATCH_VALUE_JS = r"""(hint) => {
   }
   let list = [];
   if (id) list = group((node) => node.id === id);
+  if (id && list.length && name && !list.some((node) => read(node).trim())) {
+    const named = group((node) => (node.getAttribute("name") || "") === name && node.id !== id);
+    if (named.some((node) => read(node).trim())) list = named;
+  }
   if (!list.length && automation) {
     list = group((node) => (node.getAttribute("data-automation-id") || "") === automation);
   }
   if (!list.length && name) list = group((node) => (node.getAttribute("name") || "") === name);
+  if (!list.length && path) list = group((node) => fieldPathOf(node) === path);
   if (!list.length && label) list = group((node) => labelOf(node) === label);
   const el = pick(list);
   if (!el) return null;
@@ -1934,11 +1955,20 @@ _RESTORE_MATCH_JS = r"""(hint) => {
     }
     if (el.hidden) return false;
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity) === 0) return false;
     const rect = el.getBoundingClientRect();
+    if (rect.right <= 0) return false;
+    if (rect.width < 2 && rect.height < 2) return false;
     return rect.width > 0 || rect.height > 0;
   }
   function labelOf(el) {
+    const entry = el.closest && el.closest(
+      "[data-field-path], .ashby-application-form-field-entry, .application-question"
+    );
+    if (entry) {
+      const title = entry.querySelector(".ashby-application-form-question-title, .application-label");
+      if (title && !title.contains(el)) return norm(title.innerText || title.textContent || "");
+    }
     if (el.id) {
       const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
       if (lab) return norm(lab.innerText || lab.textContent || "");
@@ -1981,16 +2011,45 @@ _RESTORE_MATCH_JS = r"""(hint) => {
   const automation = String(hint.automationId || "");
   const name = String(hint.name || "");
   const label = norm(hint.label || "");
+  const path = String(hint.fieldPath || "");
+  function fieldPathOf(el) {
+    const field = el.closest && el.closest("[data-field-path]");
+    return field ? String(field.getAttribute("data-field-path") || "") : "";
+  }
   let el = null;
-  if (id) el = nodes.find((node) => node.id === id) || null;
+  let via = "none";
+  if (id) {
+    el = nodes.find((node) => node.id === id) || null;
+    if (el) via = "id";
+  }
+  if (el && name && !read(el).trim()) {
+    const named = nodes.find((node) => {
+      return (node.getAttribute("name") || "") === name && node.id !== id && read(node).trim();
+    });
+    if (named) {
+      el = named;
+      via = "name";
+    }
+  }
   if (!el && automation) {
     el = nodes.find((node) => (node.getAttribute("data-automation-id") || "") === automation) || null;
+    if (el) via = "automation";
   }
-  if (!el && name) el = nodes.find((node) => (node.getAttribute("name") || "") === name) || null;
-  if (!el && label) el = nodes.find((node) => labelOf(node) === label) || null;
-  if (!el) return false;
-  if (read(el).trim()) return false;
-  return write(el, String(hint.value || ""));
+  if (!el && name) {
+    el = nodes.find((node) => (node.getAttribute("name") || "") === name) || null;
+    if (el) via = "name";
+  }
+  if (!el && path) {
+    el = nodes.find((node) => fieldPathOf(node) === path) || null;
+    if (el) via = "path";
+  }
+  if (!el && label) {
+    el = nodes.find((node) => labelOf(node) === label) || null;
+    if (el) via = "label";
+  }
+  if (!el) return { via: "none", result: "miss" };
+  if (read(el).trim()) return { via: via, result: "kept" };
+  return { via: via, result: write(el, String(hint.value || "")) ? "restored" : "miss" };
 }"""
 
 
@@ -2001,6 +2060,7 @@ def _confirmed_hint(record: dict) -> dict[str, str]:
         "name": str(record.get("name") or ""),
         "elementId": str(record.get("elementId") or ""),
         "automationId": str(record.get("automationId") or ""),
+        "fieldPath": str(record.get("fieldPath") or ""),
     }
 
 
@@ -2018,6 +2078,9 @@ def live_field_value(page, control: Control | None = None, **hint) -> str | None
         "name": str(hint.get("name") or (control.name if control is not None else "") or ""),
         "automationId": str(hint.get("automation_id") or (control.automation_id if control is not None else "") or ""),
         "label": str(hint.get("label") or (control.label if control is not None else "") or ""),
+        "fieldPath": str(
+            hint.get("field_path") or (getattr(control, "field_path", "") if control is not None else "") or ""
+        ),
     }
     try:
         found = evaluate(_MATCH_VALUE_JS, payload)
@@ -2076,24 +2139,40 @@ def post_upload_refill(
 
     settle_after_resume(page)
     records = list(confirmed) if confirmed is not None else confirmed_records()
+    usable = [record for record in records if isinstance(record, dict) and str(record.get("value") or "").strip()]
     evaluate = getattr(page, "evaluate", None)
     restored = 0
+    session = session_id or current_session_id() or "-"
     if evaluate is not None:
-        for record in records:
-            if not isinstance(record, dict) or not str(record.get("value") or "").strip():
-                continue
+        for record in usable:
+            field = str(record.get("fieldKey") or "").strip() or "unkeyed"
+            via = "none"
+            result = "miss"
             try:
-                wrote = bool(evaluate(_RESTORE_MATCH_JS, _confirmed_hint(record)))
+                outcome = evaluate(_RESTORE_MATCH_JS, _confirmed_hint(record))
             except Exception:
-                wrote = False
-            if wrote:
+                outcome = None
+            if isinstance(outcome, dict):
+                via = str(outcome.get("via") or "none")
+                result = str(outcome.get("result") or "miss")
+                if result not in {"miss", "kept", "restored"}:
+                    result = "miss"
+            elif outcome is True:
+                via = "id"
+                result = "restored"
+            if result == "restored":
                 restored += 1
+            if log:
+                logger.info(
+                    "session=%s action=post_upload_refill_match field=%s via=%s result=%s",
+                    session,
+                    field,
+                    via,
+                    result,
+                )
     if log:
-        logger.info(
-            "session=%s action=post_upload_refill restored=%s",
-            session_id or current_session_id() or "-",
-            restored,
-        )
+        logger.info("session=%s action=post_upload_refill records=%s", session, len(usable))
+        logger.info("session=%s action=post_upload_refill restored=%s", session, restored)
     return restored
 
 
@@ -2491,6 +2570,7 @@ def _write_control(
                 field_class="PROFILE_FIELD",
             )
         )
+        remember_confirmed(control, picked.label, field_key=key or "")
         return
     if control.kind in {"select", "radio", "combobox"}:
         option = match_option_exact(text, control.options)

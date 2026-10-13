@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <h1>Application</h1>
+  <div class="ashby-application-form-field-entry" data-field-path="_systemfield_name">
+    <label class="ashby-application-form-question-title" id="name-title" for="name">Name</label>
+    <input id="name" name="_systemfield_name" autocomplete="name" required>
+  </div>
+  <div class="ashby-application-form-field-entry" data-field-path="_systemfield_email">
+    <label class="ashby-application-form-question-title" for="email">Email</label>
+    <input id="email" name="_systemfield_email" type="email" required>
+  </div>
+  <div class="ashby-application-form-field-entry" data-field-path="_systemfield_phone">
+    <label class="ashby-application-form-question-title" id="phone-title" for="phone">Phone</label>
+    <input id="phone" name="_systemfield_phone" type="tel" required>
+  </div>
+  <label for="referral">Referral code</label>
+  <input id="referral" name="referral" value="FRIEND">
+  <label for="resume">Resume</label>
+  <input id="resume" name="resume" type="file">
+  <div id="chip" class="resume-upload-success" hidden>Success!</div>
+  <script>
+    document.getElementById("resume").addEventListener("change", () => {
+      document.getElementById("chip").hidden = false;
+      window.setTimeout(() => {
+        const name = document.getElementById("name");
+        const nextName = document.createElement("input");
+        nextName.id = "name-live";
+        nextName.name = "field_9f3a";
+        nextName.required = true;
+        nextName.setAttribute("autocomplete", "name");
+        name.replaceWith(nextName);
+
+        const phone = document.getElementById("phone");
+        const nextPhone = document.createElement("input");
+        nextPhone.id = "phone-live";
+        nextPhone.name = "field_phone_new";
+        nextPhone.type = "tel";
+        nextPhone.required = true;
+        phone.replaceWith(nextPhone);
+
+        document.getElementById("email").value = "parsed@example.com";
+      }, 200);
+    });
+  </script>
+</body>
+</html>
