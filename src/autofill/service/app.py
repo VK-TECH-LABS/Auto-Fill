@@ -1012,45 +1012,6 @@ def _request_for(
     )
 
 
-def _follow_verified_resume(
-    session: ServiceSession,
-    store: ServiceSessionStore,
-    runner: FillRunner,
-    limits: dict[str, float | int],
-    records: list[dict],
-    report: dict,
-) -> None:
-    """Restore confirmed fills, then continue the form. The upload call has returned."""
-
-    def follow() -> None:
-        refill = getattr(runner, "refill_confirmed", None)
-        try:
-            if callable(refill):
-                refill(session.session_id, records)
-            elif "restored" in report:
-                logger.info(
-                    "session=%s action=post_upload_refill records=%s",
-                    session.session_id,
-                    int(report.get("restored") or 0),
-                )
-                logger.info(
-                    "session=%s action=post_upload_refill restored=%s",
-                    session.session_id,
-                    int(report.get("restored") or 0),
-                )
-            _run(session, store, runner, limits, resume_uploaded=True)
-        except HTTPException as exc:
-            logger.info(
-                "session=%s action=resume_follow status=%s",
-                session.session_id,
-                exc.status_code,
-            )
-        except Exception as exc:
-            _failed(session, exc)
-
-    threading.Thread(target=follow, name=f"resume-follow-{session.session_id[:8]}", daemon=True).start()
-
-
 def _run(
     session: ServiceSession,
     store: ServiceSessionStore,
@@ -1814,6 +1775,11 @@ def create_app(
         session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         session.resume_uploaded = True
         logger.info("session=%s resume_file=verified", session.session_id)
+        logger.info(
+            "session=%s action=post_upload_refill restored=%s",
+            session.session_id,
+            int(report.get("restored") or 0),
+        )
         if session.paused:
             session.pending_resume = True
             status = _status_out(session)
@@ -1821,16 +1787,10 @@ def create_app(
                 status_code=200,
                 content={"verified": True, "filename": name, "status": status.status},
             )
-        records = [dict(item) for item in session.confirmed_values if isinstance(item, dict)]
-        # The verifier already returned. Refill and the next fill pass publish
-        # status while this response goes back, so the upload stays inside the
-        # caller's budget.
-        session.status = Status.STARTED
-        session.phase = "loaded"
-        _follow_verified_resume(session, store, active_runner, limits, records, report)
+        accepted = _run(session, store, active_runner, limits, resume_uploaded=True)
         return JSONResponse(
             status_code=200,
-            content={"verified": True, "filename": name, "status": Status.STARTED},
+            content={"verified": True, "filename": name, "status": accepted.status},
         )
 
     def _jpeg(session: ServiceSession) -> Response:

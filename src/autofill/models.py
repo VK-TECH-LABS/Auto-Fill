@@ -41,7 +41,6 @@ class Control:
     max_length: int | None = None
     phone_adjacent: bool = False
     frame_url: str = ""
-    field_path: str = ""
 
 
 @dataclass
