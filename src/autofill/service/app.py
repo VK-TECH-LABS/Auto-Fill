@@ -1288,8 +1288,9 @@ def create_app(
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        session.expires_at = monotonic() + session_ttl_seconds
-        session.created_mono = monotonic()
+        opened = monotonic()
+        session.expires_at = opened + session_ttl_seconds
+        session.created_mono = opened
         session.timings["sessionCreatedMs"] = elapsed_ms(started)
         try:
             store.create(session)

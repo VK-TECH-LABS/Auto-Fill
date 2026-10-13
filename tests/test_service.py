@@ -279,7 +279,9 @@ def test_stale_created_session_expires_and_frees_its_slot():
         held = app.state.store.get(session_id)
         assert held is not None
         assert held.status == "CREATED"
-        assert app.state.store.reap(now=held.created_mono + 120) == []
+        moment = held.created_mono + 120
+        still_open = app.state.store.reap(now=moment)
+        assert still_open == [], (held.created_mono, held.expires_at, moment, still_open)
         blocked = client.post("/v1/sessions", headers=AUTH, json=create_body(job_id="job-2"))
         assert blocked.status_code == 429
         expired = app.state.store.reap(now=held.created_mono + 120.01)
