@@ -363,8 +363,56 @@ def _confirm(page, selector: str, filename: str = "") -> dict:
     return {"verified": False, "reason": "not_confirmed", "siteErrors": []}
 
 
-def reattach_verified(page, name: str, mime: str, data: bytes) -> None:
-    """Put the same bytes on an empty resume control. A file already there stays."""
+_ACCEPTED_JS = r"""(filename) => {
+  const wanted = String(filename || "").trim().toLowerCase();
+  if (!wanted) return false;
+  const body = String((document.body && (document.body.innerText || document.body.textContent)) || "").toLowerCase();
+  if (body.indexOf(wanted) === -1) return false;
+  for (const input of document.querySelectorAll("input[type='file']")) {
+    const files = input.files ? Array.from(input.files) : [];
+    if (files.some((file) => String(file.name || "").toLowerCase() === wanted)) return true;
+  }
+  function shown(node) {
+    if (!node || node.nodeType !== 1 || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    return true;
+  }
+  const marks = document.querySelectorAll(
+    "[class*='chip'], [class*='Chip'], [class*='filename'], [class*='file-name'], [class*='file-upload'], " +
+      ".resume-upload-success, [data-automation-id='file-upload-item']"
+  );
+  for (const mark of marks) {
+    if (!shown(mark)) continue;
+    const text = String(mark.innerText || mark.textContent || "").toLowerCase();
+    if (text.indexOf(wanted) !== -1) return true;
+    let host = mark.parentElement;
+    for (let depth = 0; host && depth < 3; depth += 1, host = host.parentElement) {
+      const around = String(host.innerText || host.textContent || "").toLowerCase();
+      if (around.indexOf(wanted) !== -1) return true;
+    }
+  }
+  return false;
+}"""
+
+
+def _filename_accepted(page, filename: str) -> bool:
+    """True when the resume name is already on a chip, even on a replacement input."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not filename:
+        return False
+    try:
+        return bool(evaluate(_ACCEPTED_JS, filename))
+    except Exception:
+        return False
+
+
+def reattach_verified(page, name: str, mime: str, data: bytes, session_id: str = "") -> None:
+    """Put the same bytes on an empty resume control. A file already there stays.
+
+    Greenhouse drops the original file input and leaves the accepted name on a
+    chip beside a new empty input. Uploading again starts a second parse.
+    """
     if not name or not data:
         return
     try:
@@ -374,15 +422,16 @@ def reattach_verified(page, name: str, mime: str, data: bytes) -> None:
     control = resume_control(snapshot)
     if control is None or not control.selector or _has_file(page, control.selector):
         return
-    # Greenhouse replaces the file input with a chip. The bytes are already
-    # accepted, and setting them again starts a second upload.
     once = _confirm_once(page, control.selector, name)
-    if isinstance(once, dict) and str(once.get("state") or "") == "ok":
+    state = str(once.get("state") or "") if isinstance(once, dict) else ""
+    if state == "ok" or _filename_accepted(page, name):
         logger.info("action=resume_reattach result=skipped")
         return
-    from autofill.stepfill import post_upload_refill, snapshot_text_values
+    if state == "error":
+        logger.info("action=resume_reattach result=rejected")
+        return
+    from autofill.stepfill import post_upload_refill
 
-    saved = snapshot_text_values(page)
     try:
         attach_resume_control(
             page,
@@ -391,5 +440,5 @@ def reattach_verified(page, name: str, mime: str, data: bytes) -> None:
         )
     except Exception:
         return
-    post_upload_refill(page, saved)
+    post_upload_refill(page, session_id=session_id)
     logger.info("action=resume_reattach result=uploaded")

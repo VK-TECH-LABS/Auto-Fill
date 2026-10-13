@@ -1006,6 +1006,8 @@ def _request_for(
         on_paint=_paint_frame(session),
         on_phase=_set_phase(session),
         on_navigation=_note_navigation(session),
+        on_confirmed=session.remember_confirmed_value,
+        confirmed_values=session.confirmed_values,
         standard_terms_authorized=session.standard_terms_authorized,
     )
 
@@ -1286,8 +1288,9 @@ def create_app(
                 )
         except ContextError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        session.expires_at = monotonic() + session_ttl_seconds
-        session.created_mono = monotonic()
+        opened = monotonic()
+        session.expires_at = opened + session_ttl_seconds
+        session.created_mono = opened
         session.timings["sessionCreatedMs"] = elapsed_ms(started)
         try:
             store.create(session)
@@ -1744,7 +1747,7 @@ def create_app(
         if attach is None:
             raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
         try:
-            report = attach(session.session_id, name, raw, fieldHint.strip())
+            report = attach(session.session_id, name, raw, fieldHint.strip(), session.confirmed_values)
         except PageUnavailable as exc:
             if exc.status_code == 503:
                 raise HTTPException(

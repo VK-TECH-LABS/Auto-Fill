@@ -434,6 +434,8 @@ class FillRequest:
     on_paint: Any = None
     on_phase: Any = None
     on_navigation: Any = None
+    on_confirmed: Any = None
+    confirmed_values: list | None = None
     standard_terms_authorized: bool = False
 
 
@@ -797,6 +799,8 @@ class PlaywrightRunner:
             on_paint=request.on_paint,
             on_page=_bind_page(slot),
             on_navigation=request.on_navigation,
+            on_confirmed=request.on_confirmed,
+            confirmed_values=request.confirmed_values,
             standard_terms_authorized=request.standard_terms_authorized,
         )
 
@@ -1038,24 +1042,31 @@ class PlaywrightRunner:
 
         return worker.submit(look)
 
-    def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "") -> dict:
+    def attach_resume_file(
+        self,
+        session_id: str,
+        name: str,
+        data: bytes,
+        hint: str = "",
+        confirmed: list | None = None,
+    ) -> dict:
         """Attach resume bytes and require the ATS to accept them."""
         worker = self._pinned_worker(session_id)
         if worker is None:
             return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+        records = [dict(item) for item in confirmed or [] if isinstance(item, dict)]
 
         def apply() -> dict:
             slot = worker.sessions.get(session_id)
             if slot is None or slot.page is None:
                 return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
             from autofill.resume_manual import attach_and_confirm
-            from autofill.stepfill import post_upload_refill, snapshot_text_values
+            from autofill.stepfill import post_upload_refill
 
-            saved = snapshot_text_values(slot.page)
             report = attach_and_confirm(slot.page, name=name, data=data, hint=hint)
             if not report.get("verified"):
                 return report
-            restored = post_upload_refill(slot.page, saved, session_id=session_id, log=False)
+            restored = post_upload_refill(slot.page, records, session_id=session_id, log=False)
             accepted = dict(report)
             accepted["restored"] = restored
             return accepted

@@ -263,6 +263,16 @@ def test_invalid_start_body_marks_the_session_retryable(client: TestClient):
     assert held.result.messages == ["start_failed"]
 
 
+def test_created_start_boundary_ignores_float_noise():
+    from types import SimpleNamespace
+
+    from autofill.service.sessions import created_start_is_stale
+
+    session = SimpleNamespace(status="CREATED", created_mono=405.461677144)
+    assert created_start_is_stale(session, session.created_mono + 120) is False
+    assert created_start_is_stale(session, session.created_mono + 120.01) is True
+
+
 def test_stale_created_session_expires_and_frees_its_slot():
     runner = RecordingRunner()
     app = create_app(
@@ -279,7 +289,9 @@ def test_stale_created_session_expires_and_frees_its_slot():
         held = app.state.store.get(session_id)
         assert held is not None
         assert held.status == "CREATED"
-        assert app.state.store.reap(now=held.created_mono + 120) == []
+        moment = held.created_mono + 120
+        still_open = app.state.store.reap(now=moment)
+        assert still_open == [], (held.created_mono, held.expires_at, moment, still_open)
         blocked = client.post("/v1/sessions", headers=AUTH, json=create_body(job_id="job-2"))
         assert blocked.status_code == 429
         expired = app.state.store.reap(now=held.created_mono + 120.01)
@@ -649,7 +661,14 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
                 last_navigation={"action": "entry", "result": "advanced"},
             )
 
-        def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "") -> dict:
+        def attach_resume_file(
+            self,
+            session_id: str,
+            name: str,
+            data: bytes,
+            hint: str = "",
+            confirmed=None,
+        ) -> dict:
             return {"verified": True, "reason": "", "siteErrors": [], "restored": 2}
 
         def discard(self, session_id: str) -> None:

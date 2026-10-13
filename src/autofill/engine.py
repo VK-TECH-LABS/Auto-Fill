@@ -138,6 +138,8 @@ class AutofillOptions:
     on_paint: Any = None
     on_page: Any = None
     on_navigation: Any = None
+    on_confirmed: Any = None
+    confirmed_values: list | None = None
     standard_terms_authorized: bool = False
 
 
@@ -455,7 +457,13 @@ def _maybe_reattach(page, opts: AutofillOptions) -> None:
         return
     from autofill.resume_manual import reattach_verified
 
-    reattach_verified(page, opts.resume_name, opts.resume_mime, opts.resume_bytes)
+    reattach_verified(
+        page,
+        opts.resume_name,
+        opts.resume_mime,
+        opts.resume_bytes,
+        session_id=opts.session_id,
+    )
 
 
 def _attach_prepared(page, opts: AutofillOptions) -> str:
@@ -469,15 +477,14 @@ def _attach_prepared(page, opts: AutofillOptions) -> str:
     if not opts.resume_bytes or not opts.resume_name:
         return "absent"
     from autofill.resume_manual import attach_and_confirm
-    from autofill.stepfill import post_upload_refill, snapshot_text_values
+    from autofill.stepfill import post_upload_refill
 
-    saved = snapshot_text_values(page)
     report = attach_and_confirm(page, name=opts.resume_name, data=opts.resume_bytes)
     if report.get("verified"):
         opts.resume_uploaded = True
         opts.resume_verified_now = True
         opts.resume_prepared = False
-        post_upload_refill(page, saved, session_id=opts.session_id)
+        post_upload_refill(page, session_id=opts.session_id)
         return "attached"
     opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
     return "failed"
@@ -569,7 +576,13 @@ def autofill_application(
     owns_browser = page is None
     playwright = None
     browser = None
+    from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
+
+    confirmed_token = None
+    session_token = None
     try:
+        confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
+        session_token = bind_session_id(opts.session_id)
         if page is None:
             from playwright.sync_api import sync_playwright
 
@@ -1024,6 +1037,10 @@ def autofill_application(
             timings=_timings(opts),
         )
     finally:
+        if confirmed_token is not None:
+            reset_confirmed(confirmed_token)
+        if session_token is not None:
+            reset_session_id(session_token)
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:

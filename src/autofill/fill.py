@@ -9,6 +9,7 @@ any field is written. Resume file inputs are reported and never selected.
 
 from __future__ import annotations
 
+from contextvars import ContextVar, Token
 from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
@@ -46,6 +47,60 @@ def _outcome(
         action=action or mapped.action,
         detail=detail if detail is not None else mapped.reason,
         field_class=mapped.field_class,
+    )
+
+
+_CONFIRMED: ContextVar = ContextVar("autofill_confirmed", default=None)
+_CONFIRMED_STORE: ContextVar = ContextVar("autofill_confirmed_store", default=None)
+_SESSION_ID: ContextVar[str] = ContextVar("autofill_session_id", default="")
+
+
+def bind_confirmed(hook, store: list | None = None) -> tuple[Token, Token]:
+    """Remember values this run writes. ``store`` is the session's record."""
+    return _CONFIRMED.set(hook), _CONFIRMED_STORE.set(store)
+
+
+def reset_confirmed(token: tuple[Token, Token]) -> None:
+    hook_token, store_token = token
+    _CONFIRMED.reset(hook_token)
+    _CONFIRMED_STORE.reset(store_token)
+
+
+def confirmed_records() -> list[dict]:
+    store = _CONFIRMED_STORE.get()
+    if not store:
+        return []
+    return [dict(item) for item in store if isinstance(item, dict)]
+
+
+def bind_session_id(session_id: str) -> Token:
+    return _SESSION_ID.set(session_id or "")
+
+
+def reset_session_id(token: Token) -> None:
+    _SESSION_ID.reset(token)
+
+
+def current_session_id() -> str:
+    return _SESSION_ID.get() or ""
+
+
+def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> None:
+    """Keep a value the engine wrote and then read back on the control."""
+    hook = _CONFIRMED.get()
+    text = str(value or "")
+    if hook is None or not text.strip():
+        return
+    hook(
+        {
+            "value": text,
+            "label": control.label or "",
+            "name": control.name or "",
+            "elementId": control.element_id or "",
+            "automationId": control.automation_id or "",
+            "fieldKey": field_key or "",
+            "selector": control.selector or "",
+        }
     )
 
 
@@ -106,6 +161,7 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                     detail="Left an existing value in place.",
                 )
             if current.strip() == mapped.text:
+                remember_confirmed(control, current, field_key=mapped.key or "")
                 return _outcome(control, mapped, detail="already set")
             if control.kind in {"text", "textarea", "combobox"}:
                 if not type_visible(page, control.selector, mapped.text):
@@ -115,6 +171,7 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                         locator.fill(mapped.text)
             else:
                 locator.fill(mapped.text)
+            remember_confirmed(control, mapped.text or "", field_key=mapped.key or "")
             return _outcome(control, mapped, detail="filled")
         if mapped.action == "select":
             if control.kind == "radio":
@@ -126,6 +183,7 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 chosen = select_combobox(page, control.selector, mapped.option_label or mapped.text)
                 if chosen is None:
                     return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
+                remember_confirmed(control, chosen.label, field_key=mapped.key or "")
                 return _outcome(control, mapped, detail=chosen.label)
             elif control.kind == "buttons" and mapped.option_selector:
                 from autofill.safeguards import click_choice
@@ -137,6 +195,7 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             else:
                 focus_field(page, control.selector)
                 locator.select_option(label=mapped.option_label)
+            remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
             locator.check()
