@@ -282,6 +282,7 @@ def test_stale_created_session_expires_and_frees_its_slot():
         run_browser=False,
         max_sessions=1,
         reaper_interval_seconds=3600,
+        one_session_per_owner=False,
     )
     with TestClient(app) as client:
         created = client.post("/v1/sessions", headers=AUTH, json=create_body())
@@ -337,7 +338,13 @@ def test_candidate_mismatch_fails_closed(client: TestClient, runner: RecordingRu
     assert status["status"] == "CREATED"
 
 
-def test_sessions_are_isolated(client: TestClient, runner: RecordingRunner):
+def test_sessions_are_isolated(runner: RecordingRunner):
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, one_session_per_owner=False)
+    with TestClient(app) as client:
+        _assert_sessions_are_isolated(client, runner)
+
+
+def _assert_sessions_are_isolated(client: TestClient, runner: RecordingRunner) -> None:
     first = _create(client, job_id="job-1")
     second = _create(client, candidate_id="candidate-a", job_id="job-2", email=EMAIL)
     stored = client.post(
@@ -523,7 +530,7 @@ def test_logs_omit_profile_and_secrets(client: TestClient, caplog: pytest.LogCap
 
 
 def test_session_cap(runner: RecordingRunner):
-    app = create_app(token=TOKEN, runner=runner, max_sessions=1)
+    app = create_app(token=TOKEN, runner=runner, max_sessions=1, one_session_per_owner=False)
     with TestClient(app) as client:
         assert _create(client)["status"] == "CREATED"
         overflow = client.post("/v1/sessions", headers=AUTH, json=create_body(job_id="job-2"))

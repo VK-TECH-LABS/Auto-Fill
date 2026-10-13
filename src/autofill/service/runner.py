@@ -351,6 +351,16 @@ def memory_allows_session() -> bool:
     return False
 
 
+def log_capacity_refusal(sessions: int) -> None:
+    """Record how full the container was when a new browser was refused."""
+    logger.info(
+        "capacity=refused sessions=%s rss_bytes=%s limit_bytes=%s",
+        sessions,
+        container_memory_bytes(),
+        memory_limit_bytes(),
+    )
+
+
 def _block_heavy(page) -> None:
     """Drop video, fonts, and analytics. Documents, scripts, and form calls stay."""
 
@@ -551,12 +561,29 @@ class _SessionContext:
         raise StartupError(last)
 
     def close(self) -> None:
-        """Close this context only. The worker's browser stays up."""
+        """Close every page in this context, then the context. The worker's browser stays up."""
+        page = self.page
         context = self.context
         self.page = None
         self.context = None
+        pages: list[Any] = []
         if context is not None:
-            context.close()
+            try:
+                pages = list(context.pages or [])
+            except Exception:
+                pages = []
+        if page is not None and page not in pages:
+            pages.append(page)
+        for item in pages:
+            try:
+                item.close()
+            except Exception:
+                continue
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                return
 
 
 class _Worker:
@@ -666,8 +693,12 @@ class _Worker:
 
     def _close(self, session_id: str) -> None:
         slot = self.sessions.pop(session_id, None)
-        if slot is not None:
+        if slot is None:
+            return
+        try:
             slot.close()
+        except Exception:
+            return
 
     def _recover_driver(self) -> None:
         for session_id in list(self.sessions):
@@ -852,6 +883,7 @@ class PlaywrightRunner:
                 slot = worker.sessions.get(request.session_id)
                 if slot is None or slot.page is None:
                     if not memory_allows_session():
+                        log_capacity_refusal(len(self._sessions))
                         return self._retryable(request, category="capacity_busy")
                     slot = _SessionContext()
                     try:
@@ -1264,12 +1296,31 @@ class PlaywrightRunner:
         return worker.submit(read)
 
     def discard(self, session_id: str) -> None:
-        """Close this session's context. Other sessions and the browsers stay open."""
-        worker = self._worker_for(session_id)
+        """Close this session's context on every worker that still holds it.
+
+        A session that never started is not pinned onto a worker just to close
+        nothing. The shared Chromium process stays up.
+        """
+        workers: list[_Worker] = []
+        pinned = self._pinned_worker(session_id)
+        if pinned is not None:
+            workers.append(pinned)
+        for worker in self._workers:
+            if worker not in workers and session_id in worker.sessions:
+                workers.append(worker)
         try:
-            worker.submit(lambda: worker._close(session_id))
+            for worker in workers:
+
+                def close_one(worker: _Worker = worker) -> None:
+                    worker._close(session_id)
+
+                try:
+                    worker.submit(close_one)
+                except Exception:
+                    logger.info("session=%s action=discard result=close_failed", session_id)
         finally:
             self._unpin(session_id)
+            logger.info("session=%s action=discard result=closed", session_id)
 
     def shutdown(self) -> None:
         """Close every session context, then stop each worker's Playwright driver."""
