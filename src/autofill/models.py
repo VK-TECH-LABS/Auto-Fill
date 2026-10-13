@@ -40,6 +40,7 @@ class Control:
     automation_id: str = ""
     max_length: int | None = None
     phone_adjacent: bool = False
+    frame_url: str = ""
 
 
 @dataclass
@@ -50,6 +51,14 @@ class ButtonControl:
     selector: str = ""
     control_type: str = ""
     automation_id: str = ""
+    aria_label: str = ""
+    role: str = ""
+    href: str = ""
+    in_header: bool = False
+    in_ad: bool = False
+    in_main: bool = True
+    disabled: bool = False
+    frame_url: str = ""
 
 
 @dataclass
@@ -59,6 +68,14 @@ class LinkControl:
     name: str
     selector: str = ""
     automation_id: str = ""
+    aria_label: str = ""
+    role: str = ""
+    href: str = ""
+    in_header: bool = False
+    in_ad: bool = False
+    in_main: bool = True
+    disabled: bool = False
+    frame_url: str = ""
 
 
 @dataclass

@@ -680,6 +680,16 @@ class _Worker:
         self.driver = _SharedDriver(headless=self.driver._headless, launch_args=self.driver._launch_args)
 
 
+def _bind_page(slot):
+    """Point the session at a tab opened by Apply. Profile data stays on the request."""
+
+    def bind(new_page) -> None:
+        if slot is not None and new_page is not None:
+            slot.page = new_page
+
+    return bind
+
+
 class PlaywrightRunner:
     """Default runner. Manual-ATS and SSO decisions do not launch a browser."""
 
@@ -784,6 +794,7 @@ class PlaywrightRunner:
             resume_bytes=request.resume_bytes,
             resume_prepared=request.resume_prepared,
             on_paint=request.on_paint,
+            on_page=_bind_page(slot),
             standard_terms_authorized=request.standard_terms_authorized,
         )
 

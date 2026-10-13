@@ -15,7 +15,7 @@ from autofill.extract import extract_page
 from autofill.login import _CONFIRM_RE as _VERIFY_RE
 from autofill.login import _LOGIN_RE, _REGISTER_RE
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import classify_control, is_entry_label, semantic_action
+from autofill.safeguards import classify_control, is_entry_control, semantic_action
 
 _WORKDAY_HOST = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
 _DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
@@ -92,20 +92,27 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     if register_pane(snapshot):
         note_page_type("ACCOUNT")
         return "ACCOUNT"
-    if sign_in_pane(snapshot):
-        note_page_type("LOGIN")
-        return "LOGIN"
-    if is_review(snapshot):
-        note_page_type("REVIEW")
-        return "REVIEW"
-    fields = application_controls(snapshot)
+    # A posting with an Apply control is a job page even when the header
+    # offers Sign in. A page that already has application fields stays a form.
     entry = find_entry_control(snapshot)
+    fields = application_controls(snapshot)
     formish = [
         control
         for control in fields
         if control.kind in {"file", "textarea", "select", "radio", "combobox"}
         or control.input_type in {"email", "tel"}
     ]
+    job_text = bool(_JOB_RE.search(text))
+    posting = entry is not None and not fields and not formish
+    if posting and not _password_controls(snapshot) and not snapshot.password_present and job_text:
+        note_page_type("JOB_DESCRIPTION")
+        return "JOB_DESCRIPTION"
+    if sign_in_pane(snapshot):
+        note_page_type("LOGIN")
+        return "LOGIN"
+    if is_review(snapshot):
+        note_page_type("REVIEW")
+        return "REVIEW"
     # A search box is not an application. One real field with no Apply control is.
     if formish or (fields and entry is None):
         note_page_type("APPLICATION_FORM")
@@ -115,7 +122,7 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
         return "APPLY_ENTRY"
     if not fields and any(
         "create account" in button.name.casefold() or "register" in button.name.casefold()
-        for button in snapshot.buttons
+        for button in _content_buttons(snapshot)
     ):
         note_page_type("ACCOUNT")
         return "ACCOUNT"
@@ -228,7 +235,7 @@ def register_pane(snapshot: PageSnapshot) -> bool:
     passwords = _password_controls(snapshot)
     verify = len(passwords) >= 2 or bool(_VERIFY_RE.search(text))
     create = bool(_REGISTER_RE.search(snapshot.heading or "")) or any(
-        _REGISTER_RE.search(button.name) for button in snapshot.buttons
+        _REGISTER_RE.search(button.name) for button in _content_buttons(snapshot)
     )
     if not create and _REGISTER_RE.search(snapshot.page_text or ""):
         create = verify
@@ -243,7 +250,7 @@ def sign_in_pane(snapshot: PageSnapshot) -> bool:
     if find_entry_control(snapshot) is not None or _application_fields(snapshot):
         return False
     passwords = _password_controls(snapshot)
-    login_button = any(_LOGIN_RE.search(button.name) for button in snapshot.buttons)
+    login_button = any(_LOGIN_RE.search(button.name) for button in _content_buttons(snapshot))
     login_heading = bool(_LOGIN_RE.search(snapshot.heading or ""))
     if passwords or snapshot.password_present:
         return bool(login_button or login_heading or _account_chrome(snapshot))
@@ -356,31 +363,26 @@ def _entry_name(name: str) -> str:
     return " ".join(name.split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
 
 
-def _known_entry(name: str, selector: str, control_type: str = "") -> bool:
+def _known_entry(control) -> bool:
     """An employer entry control. Submit application is never one.
 
     A bare ``Apply`` whose type is submit stays on the final-submit path.
     Greenhouse ``#apply_button``, a Lever apply posting button, and the
-    labeled entry phrases are entry controls.
+    labeled entry phrases are entry controls. Header and ad controls are not.
     """
-    label = _entry_name(name)
-    if re.search(r"\b(submit|send(\s+my)?\s+application)\b", label):
-        return False
-    selector_text = (selector or "").casefold()
-    if selector_text in {"#apply_button"} or selector_text.endswith("#apply_button"):
-        return True
-    if "postings-btn" in selector_text and "apply" in label:
-        return True
-    # A bare Apply whose type is submit stays on the final-submit path.
-    if (control_type or "").casefold() == "submit" and label == "apply":
-        return False
-    if is_entry_label(name):
-        return True
-    if label.startswith("apply for this job") or label.startswith("apply now"):
-        return True
-    if label.startswith("i'm interested") or label.startswith("im interested"):
-        return True
-    return False
+    return is_entry_control(
+        getattr(control, "name", "") or "",
+        selector=getattr(control, "selector", "") or "",
+        control_type=getattr(control, "control_type", "") or "",
+        aria_label=getattr(control, "aria_label", "") or "",
+        automation_id=getattr(control, "automation_id", "") or "",
+        href=getattr(control, "href", "") or "",
+        role=getattr(control, "role", "") or "",
+        disabled=bool(getattr(control, "disabled", False)),
+        in_header=bool(getattr(control, "in_header", False)),
+        in_ad=bool(getattr(control, "in_ad", False)),
+        in_main=bool(getattr(control, "in_main", True)),
+    )
 
 
 def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
@@ -392,11 +394,25 @@ def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
         return None
     candidates: list[ButtonControl] = []
     for button in snapshot.buttons:
-        if _known_entry(button.name, button.selector, button.control_type):
+        if _known_entry(button):
             candidates.append(button)
     for link in snapshot.links:
-        if link.selector and _known_entry(link.name, link.selector):
-            candidates.append(ButtonControl(name=link.name, selector=link.selector))
+        if link.selector and _known_entry(link):
+            candidates.append(
+                ButtonControl(
+                    name=link.name,
+                    selector=link.selector,
+                    automation_id=link.automation_id,
+                    aria_label=link.aria_label,
+                    role=link.role or "link",
+                    href=link.href,
+                    in_header=link.in_header,
+                    in_ad=link.in_ad,
+                    in_main=link.in_main,
+                    disabled=link.disabled,
+                    frame_url=link.frame_url,
+                )
+            )
     manual = [button for button in candidates if _entry_name(button.name) == "apply manually"]
     if manual:
         return manual[0]
@@ -417,8 +433,13 @@ def _host(page) -> str:
     return (urlparse(str(getattr(page, "url", "") or "")).hostname or "").lower()
 
 
+def _content_buttons(snapshot: PageSnapshot) -> list[ButtonControl]:
+    """Buttons in the page body. Header and ad chrome are not the form."""
+    return [button for button in snapshot.buttons if not button.in_header and not button.in_ad]
+
+
 def _account_chrome(snapshot: PageSnapshot) -> bool:
-    names = " ".join(button.name.casefold() for button in snapshot.buttons)
+    names = " ".join(button.name.casefold() for button in _content_buttons(snapshot))
     names = f"{names} {(snapshot.heading or '').casefold()}"
     return "sign in" in names or "log in" in names or "create account" in names
 
@@ -520,13 +541,80 @@ def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
 
 
 def is_login_wall(snapshot: PageSnapshot) -> bool:
-    """Sign-in or create-account choices with no form and no entry button."""
+    """Sign-in or create-account choices with no form and no entry button.
+
+    A header Sign in, Log in, or Create account link is site chrome. It does
+    not make a job description a login wall.
+    """
     if snapshot.captcha_present or visible_fields(snapshot) or is_review(snapshot):
         return False
     if choose_entry(snapshot) is not None:
         return False
-    for button in snapshot.buttons:
+    for button in _content_buttons(snapshot):
         name = button.name.casefold()
         if "sign in" in name or "log in" in name or "create account" in name:
             return True
     return False
+
+
+_VALIDATION_ERROR = (
+    "required field",
+    "this field is required",
+    "is required",
+    "invalid",
+    "select an option",
+    "please select",
+    "enter a valid",
+    "select one",
+    "valid date",
+)
+
+
+def validation_message(snapshot: PageSnapshot) -> str:
+    """The first visible validation alert, or an empty string.
+
+    Job text that mentions a requirement is not an alert. The returned text
+    is the alert itself, capped so a page dump cannot land in the log.
+    """
+    for alert in snapshot.alerts:
+        text = " ".join(str(alert).split())
+        folded = text.casefold()
+        if text and any(phrase in folded for phrase in _VALIDATION_ERROR):
+            return text[:300]
+    return ""
+
+
+def navigation_signature(page, snapshot: PageSnapshot) -> tuple:
+    """URL route, visible fields, and heading. Used to see whether a click moved."""
+    url = ""
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        url = ""
+    parsed = urlparse(url)
+    route = (parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+    fields = tuple(
+        (control.selector, getattr(control, "frame_url", "") or "")
+        for control in snapshot.controls
+        if not control.hidden
+    )
+    heading = " ".join((snapshot.heading or "").split()).casefold()
+    return (route, fields, heading)
+
+
+def navigation_changed(before: tuple, page, snapshot: PageSnapshot) -> bool:
+    """True when the route, the form, or the step heading changed."""
+    return navigation_signature(page, snapshot) != before
+
+
+def wait_for_navigation(page, before: tuple, *, timeout_s: float = 1.5):
+    """Poll until the page moves or the budget ends. Returns ``(advanced, snapshot)``."""
+    deadline = time.monotonic() + timeout_s
+    snapshot = None
+    while True:
+        snapshot = extract_page(page)
+        if navigation_changed(before, page, snapshot):
+            return True, snapshot
+        if time.monotonic() >= deadline:
+            return False, snapshot
+        _pause(page, 150)

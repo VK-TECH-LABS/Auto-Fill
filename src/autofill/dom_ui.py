@@ -423,6 +423,7 @@ def workflow_percent(status: str, page_type: str, required_total: int, required_
         "CANCELLED",
         "EXPIRED",
         "CREATED",
+        "NAVIGATION_STALLED",
     }:
         return 0
     if required_total <= 0:

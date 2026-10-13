@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -893,7 +894,14 @@ def _start(client: TestClient, resolver_origin: str, url: str) -> dict:
     session_id = created.json()["sessionId"]
     started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
     assert started.status_code == 200, started.text
-    return started.json()
+    body = started.json()
+    deadline = time.monotonic() + 40
+    while body.get("status") == Status.STARTED and time.monotonic() < deadline:
+        time.sleep(0.05)
+        polled = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert polled.status_code == 200, polled.text
+        body = polled.json()
+    return body
 
 
 def _credentials(client: TestClient, session_id: str, *, mode: str, password: str):

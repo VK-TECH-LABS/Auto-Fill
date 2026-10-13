@@ -42,12 +42,15 @@ from autofill.pagewait import (
     find_entry_control,
     is_login_wall,
     is_review,
+    navigation_signature,
     register_pane,
     reset_page_type,
     resettle_account,
     sign_in_pane,
     terminal_kind,
+    validation_message,
     visible_fields,
+    wait_for_navigation,
     wait_for_render,
 )
 from autofill.profile import CandidateProfile
@@ -97,6 +100,7 @@ class Status:
     NO_FORM_FOUND = "NO_FORM_FOUND"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
+    NAVIGATION_STALLED = "NAVIGATION_STALLED"
 
 
 @dataclass
@@ -130,6 +134,7 @@ class AutofillOptions:
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
     on_paint: Any = None
+    on_page: Any = None
     standard_terms_authorized: bool = False
 
 
@@ -248,6 +253,7 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         Status.RESUME_UPLOAD_REQUIRED,
         Status.NO_FORM_FOUND,
         Status.READY_FOR_HUMAN_SUBMIT,
+        Status.NAVIGATION_STALLED,
     }:
         result.progress["percent"] = workflow_percent(status, result.page_type, total, done)
     if status == Status.NO_FORM_FOUND and total <= 0 and result.page_type not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
@@ -542,7 +548,17 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=[challenge_message(snapshot)],
             )
-        snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        try:
+            page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        except NavigationStalled:
+            session.mark(Status.NAVIGATION_STALLED)
+            return _result(
+                session,
+                status=Status.NAVIGATION_STALLED,
+                ats=ats_name,
+                login_status="NOT_REQUIRED",
+                messages=["navigation_stalled"],
+            )
         snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name)
         if stopped is not None:
             return stopped
@@ -630,6 +646,7 @@ def autofill_application(
         submit_controls: list[str] = []
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
+        nav_block: tuple | None = None
         for index in range(opts.max_pages):
             _maybe_reattach(page, opts)
             snapshot = _timed_extract(page, opts, run_started, inspect_state)
@@ -648,7 +665,23 @@ def autofill_application(
                     messages=[challenge_message(snapshot)],
                     submit_controls=submit_controls,
                 )
-            snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+            try:
+                page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+            except NavigationStalled:
+                detected, filled, skipped = _counts(fields)
+                session.mark(Status.NAVIGATION_STALLED)
+                return _result(
+                    session,
+                    status=Status.NAVIGATION_STALLED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=["navigation_stalled"],
+                    submit_controls=submit_controls,
+                )
             if snapshot.captcha_present:
                 session.mark("FAILED")
                 detected, filled, skipped = _counts(fields)
@@ -790,19 +823,62 @@ def autofill_application(
                     submit_controls=submit_controls,
                 )
 
-            nxt = next(
-                (
-                    button
-                    for button in snapshot.buttons
-                    if not is_add_row(button.name)
-                    and field_class_for_button(button.name, control_type=button.control_type) == "NAVIGATION_CONTROL"
-                ),
-                None,
-            )
+            alert = validation_message(snapshot)
+            if alert:
+                session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                detected, filled, skipped = _counts(fields)
+                return _result(
+                    session,
+                    status=Status.MANUAL_ANSWER_REQUIRED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=[alert],
+                    submit_controls=submit_controls,
+                )
+            current_sig = navigation_signature(page, snapshot)
+            if nav_block is not None and nav_block[2] != current_sig:
+                nav_block = None
+            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
             if nxt is None:
                 break
             session.mark("NEXT_PAGE")
-            activate(page, nxt.selector, nxt.name, control_type=nxt.control_type)
+            try:
+                page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except NavigationStalled:
+                detected, filled, skipped = _counts(fields)
+                session.mark(Status.NAVIGATION_STALLED)
+                return _result(
+                    session,
+                    status=Status.NAVIGATION_STALLED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=["navigation_stalled"],
+                    submit_controls=submit_controls,
+                )
+            if validation_message(snapshot):
+                session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                detected, filled, skipped = _counts(fields)
+                return _result(
+                    session,
+                    status=Status.MANUAL_ANSWER_REQUIRED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=[validation_message(snapshot)],
+                    submit_controls=submit_controls,
+                )
+            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
 
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
@@ -900,9 +976,6 @@ _RESOLVER_STATUS = {
     "invalid": Status.FAILED_FINAL,
         "too_large": Status.FAILED_RETRYABLE,
 }
-
-_VALIDATION = ("invalid phone", "valid date", "select one", "required")
-
 
 def is_ats_timeout(exc: BaseException) -> bool:
     """True for a navigation or page timeout. The category is ``ats_timeout``."""
@@ -1040,29 +1113,140 @@ def _terminal_status(
     return Status.FILLED, ["Filled what it could. A person clicks Submit or Apply."]
 
 
+class NavigationStalled(Exception):
+    """A click did not change the page. The same control is not clicked again."""
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+        super().__init__(action)
+
+
+def _adopt_page(opts: AutofillOptions, new_page):
+    """Keep screenshot, interact, and status on a tab the entry click opened."""
+    if new_page is None:
+        return None
+    hook = getattr(opts, "on_page", None)
+    if hook is not None:
+        try:
+            hook(new_page)
+        except Exception:
+            pass
+    return new_page
+
+
+def _log_move(session_id: str, action: str, result: str) -> None:
+    """``result`` is a token. The label, URL, and candidate values stay out of the log."""
+    logger.info("session=%s action=%s result=%s", session_id, action, result)
+
+
+def _next_button(snapshot, block: tuple | None = None):
+    """The forward control on this step. Submit, Send, and Complete stay unclicked.
+
+    ``block`` is ``(selector, name, signature)`` for a click that already moved
+    the page. The same control is not pressed again while that page is showing.
+    """
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if is_add_row(button.name):
+            continue
+        if not is_forward_navigation(button.name, control_type=button.control_type):
+            continue
+        if field_class_for_button(button.name, control_type=button.control_type) != "NAVIGATION_CONTROL":
+            continue
+        if block is not None and block[:2] == (button.selector, button.name):
+            continue
+        return button
+    return None
+
+
+def _confirm_move(page, before, opts: AutofillOptions, started: float, state: dict):
+    """Return the snapshot when the click moved the page. Otherwise raise."""
+    try:
+        advanced, snapshot = wait_for_navigation(page, before)
+    except Exception as exc:
+        if is_browser_crash(exc) or is_ats_timeout(exc):
+            raise
+        return False, None
+    if not advanced or snapshot is None:
+        return False, snapshot
+    fresh = _timed_extract(page, opts, started, state)
+    return True, fresh
+
+
 def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float, state: dict):
-    """Click at most two entry controls while the page is still a posting."""
+    """Click at most two entry controls while the page is still a posting.
+
+    A click that does not open a form, change the route, or open a tab is not
+    repeated. The caller stops with ``NAVIGATION_STALLED``.
+    """
     for _ in range(2):
         if snapshot.captcha_present:
-            return snapshot
+            return page, snapshot
         kind = _observe_page(page, snapshot)
         if kind not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
-            return snapshot
+            return page, snapshot
         button = find_entry_control(snapshot)
         if button is None:
-            return snapshot
-        logger.info("session=%s action=entry", session.session_id)
+            return page, snapshot
+        before = navigation_signature(page, snapshot)
         try:
-            activate_entry(page, button.selector, button.name, control_type=button.control_type)
+            new_page = activate_entry(
+                page,
+                button.selector,
+                button.name,
+                control_type=button.control_type,
+                aria_label=button.aria_label,
+                automation_id=button.automation_id,
+                href=button.href,
+                role=button.role,
+                frame_url=button.frame_url,
+            )
         except HumanSubmissionRequired:
             raise
         except Exception as exc:
             if is_browser_crash(exc) or is_ats_timeout(exc):
                 raise
-            return snapshot
-        snapshot = _timed_extract(page, opts, started, state)
+            _log_move(session.session_id, "entry", "stalled")
+            raise NavigationStalled("entry") from exc
+        opened = _adopt_page(opts, new_page)
+        if opened is not None:
+            page = opened
+            _log_move(session.session_id, "entry", "new_page")
+            snapshot = _timed_extract(page, opts, started, state)
+            continue
+        try:
+            advanced, snapshot = _confirm_move(page, before, opts, started, state)
+        except Exception:
+            raise
+        if not advanced:
+            _log_move(session.session_id, "entry", "stalled")
+            raise NavigationStalled("entry")
+        _log_move(session.session_id, "entry", "advanced")
     _observe_page(page, snapshot)
-    return snapshot
+    return page, snapshot
+
+
+def _activate_forward(page, button, session, opts: AutofillOptions, started: float, state: dict, snapshot):
+    """Click Next and require the page to move. A dead click is not repeated.
+
+    A validation alert or a challenge that appears on the same route is
+    returned so the caller can correct it or stop. It is not a second click.
+    """
+    before = navigation_signature(page, snapshot)
+    activate(page, button.selector, button.name, control_type=button.control_type, frame_url=button.frame_url)
+    advanced, fresh = _confirm_move(page, before, opts, started, state)
+    if fresh is None:
+        _log_move(session.session_id, "next", "stalled")
+        raise NavigationStalled("next")
+    if advanced or fresh.captcha_present:
+        _log_move(session.session_id, "next", "advanced")
+        return page, fresh
+    if validation_message(fresh):
+        _log_move(session.session_id, "next", "invalid")
+        return page, fresh
+    _log_move(session.session_id, "next", "stalled")
+    raise NavigationStalled("next")
 
 
 def _manual_for_gaps(
@@ -1101,11 +1285,6 @@ def _public_questions(items: list[dict]) -> list[dict]:
         if entry not in published:
             published.append(entry)
     return published
-
-
-def _validation_hit(snapshot) -> bool:
-    blob = validation_blob(snapshot)
-    return any(phrase in blob for phrase in _VALIDATION)
 
 
 def _remember_submit(snapshot, submit_controls: list[str]) -> None:
@@ -1168,6 +1347,7 @@ def _run_resolver_pages(
             questions=gaps,
         )
 
+    nav_block: tuple | None = None
     for index in range(opts.max_pages):
         _maybe_reattach(page, opts)
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
@@ -1177,7 +1357,11 @@ def _run_resolver_pages(
                 Status.CAPTCHA_REQUIRED,
                 [challenge_message(snapshot)],
             )
-        snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        try:
+            page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
+        except NavigationStalled:
+            session.mark(Status.NAVIGATION_STALLED)
+            return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
         snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name, login_status=login_status)
         if stopped is not None:
             return stopped
@@ -1190,6 +1374,7 @@ def _run_resolver_pages(
         session.mark("FILL_PAGE" if index == 0 else "FILL_NEXT_PAGE")
         on_review = step_name == "review" or "review" in snapshot.heading.casefold()
         flags = FillFlags()
+        recheck = False
         for attempt in range(3):
             outcome = fill_resolved_page(
                 page,
@@ -1265,34 +1450,41 @@ def _run_resolver_pages(
             held = stop_required(snapshot, outcome.manual_questions)
             if held is not None:
                 return held
-            nxt = next(
-                (
-                    button
-                    for button in snapshot.buttons
-                    if is_forward_navigation(button.name, control_type=button.control_type)
-                ),
-                None,
-            )
+            alert = validation_message(snapshot)
+            if alert and not recheck:
+                updated = flags_for_alerts(validation_blob(snapshot), flags)
+                if updated != flags and attempt < 2:
+                    flags = updated
+                    recheck = True
+                    continue
+                session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                return finish(Status.MANUAL_ANSWER_REQUIRED, [alert])
+            recheck = False
+            current_sig = navigation_signature(page, snapshot)
+            if nav_block is not None and nav_block[2] != current_sig:
+                nav_block = None
+            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
             if nxt is None:
                 break
             session.mark("NEXT_PAGE")
-            activate(page, nxt.selector, nxt.name, control_type=nxt.control_type)
-            snapshot = _timed_extract(page, opts, run_started, inspect_state)
+            try:
+                page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except NavigationStalled:
+                session.mark(Status.NAVIGATION_STALLED)
+                return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
             if snapshot.captcha_present:
                 session.mark("FAILED")
                 return finish(
                     Status.CAPTCHA_REQUIRED,
                     [challenge_message(snapshot)],
                 )
-            if not _validation_hit(snapshot):
-                break
-            flags = flags_for_alerts(validation_blob(snapshot), flags)
-            if attempt == 2:
-                session.mark(Status.FAILED_RETRYABLE)
-                return finish(
-                    Status.FAILED_RETRYABLE,
-                    ["Validation could not be corrected within the attempt limit."],
-                )
+            if validation_message(snapshot):
+                if attempt == 2:
+                    session.mark(Status.MANUAL_ANSWER_REQUIRED)
+                    return finish(Status.MANUAL_ANSWER_REQUIRED, [validation_message(snapshot)])
+                continue
+            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
+            break
 
     snapshot = _timed_extract(page, opts, run_started, inspect_state)
     _remember_submit(snapshot, submit_controls)
