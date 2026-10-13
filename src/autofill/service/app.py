@@ -590,10 +590,11 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         session.page_type = result.page_type
     if result.auto_consents:
         session.auto_consents = list(result.auto_consents)
-    session.entry_clicks = int(result.entry_clicks)
-    session.next_clicks = int(result.next_clicks)
-    session.pages_advanced = int(result.pages_advanced)
-    session.last_navigation = dict(result.last_navigation) if result.last_navigation else None
+    session.entry_clicks = session.nav_base_entry + int(result.entry_clicks)
+    session.next_clicks = session.nav_base_next + int(result.next_clicks)
+    session.pages_advanced = session.nav_base_pages + int(result.pages_advanced)
+    if result.last_navigation:
+        session.last_navigation = dict(result.last_navigation)
     startup = {"navigation_timeout", "browser_crashed", "blocked", "capacity", "capacity_busy"}
     if not (result.status == Status.FAILED_RETRYABLE and startup.intersection(result.messages)):
         session.phase = "loaded"
@@ -940,14 +941,15 @@ def _set_phase(session: ServiceSession):
 
 
 def _note_navigation(session: ServiceSession):
-    """Copy click counters onto the session. The payload has no labels or values."""
+    """Add this run's clicks to the session total. The payload has no labels or values."""
 
     def note(record: dict) -> None:
-        session.entry_clicks = int(record.get("entryClicks") or 0)
-        session.next_clicks = int(record.get("nextClicks") or 0)
-        session.pages_advanced = int(record.get("pagesAdvanced") or 0)
+        session.entry_clicks = session.nav_base_entry + int(record.get("entryClicks") or 0)
+        session.next_clicks = session.nav_base_next + int(record.get("nextClicks") or 0)
+        session.pages_advanced = session.nav_base_pages + int(record.get("pagesAdvanced") or 0)
         last = record.get("lastNavigation")
-        session.last_navigation = dict(last) if isinstance(last, dict) else None
+        if isinstance(last, dict):
+            session.last_navigation = dict(last)
 
     return note
 
@@ -1029,10 +1031,11 @@ def _run(
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
     session.human_resolved = session.human_resolved or human_resolved
     previous = session.status
-    session.entry_clicks = 0
-    session.next_clicks = 0
-    session.pages_advanced = 0
-    session.last_navigation = None
+    # Later runs add to these totals. A resume upload must not zero the clicks
+    # from the run that opened the form.
+    session.nav_base_entry = session.entry_clicks
+    session.nav_base_next = session.next_clicks
+    session.nav_base_pages = session.pages_advanced
     session.status = Status.STARTED
     session.phase = "launching"
     session.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1769,6 +1772,11 @@ def create_app(
         session.resume_verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         session.resume_uploaded = True
         logger.info("session=%s resume_file=verified", session.session_id)
+        logger.info(
+            "session=%s action=post_upload_refill restored=%s",
+            session.session_id,
+            int(report.get("restored") or 0),
+        )
         if session.paused:
             session.pending_resume = True
             status = _status_out(session)

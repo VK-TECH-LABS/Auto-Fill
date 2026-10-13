@@ -7,6 +7,7 @@ is bounded. An invisible reCAPTCHA or hCaptcha widget is not a wall.
 from __future__ import annotations
 
 import contextvars
+import logging
 import re
 import time
 from urllib.parse import urlparse
@@ -16,6 +17,8 @@ from autofill.login import _CONFIRM_RE as _VERIFY_RE
 from autofill.login import _LOGIN_RE, _REGISTER_RE
 from autofill.models import ButtonControl, Control, PageSnapshot
 from autofill.safeguards import classify_control, is_entry_control, semantic_action
+
+logger = logging.getLogger("autofill.pagewait")
 
 _WORKDAY_HOST = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
 _DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
@@ -356,13 +359,32 @@ def _closed(exc: BaseException) -> bool:
     return "has been closed" in text or "browser closed" in text or "target closed" in text
 
 
+def _document_complete(page) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate("() => document.readyState") == "complete"
+    except Exception as exc:
+        if _closed(exc) or _timeout(exc):
+            raise
+        return False
+
+
+def _note_render_wait(started: float) -> None:
+    elapsed = int((time.perf_counter() - started) * 1000)
+    if elapsed >= 200:
+        logger.info("action=render_wait elapsed_ms=%s", elapsed)
+
+
 def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
-    """Network idle, then poll until a form or a known marker appears.
+    """Poll until a form or a known marker appears.
 
     ``timeout_s`` caps the poll. A page that already has controls returns
-    on the first look, without waiting out network idle. Timeouts from the
-    idle wait are ignored. A dead browser or a timeout while reading the
-    page is raised.
+    on the first look. A document that has already finished loading does not
+    wait out network idle: an open Greenhouse page keeps connections up, so
+    that wait always burns its budget. Timeouts from a first-load idle wait
+    are ignored. A dead browser or a timeout while reading the page is raised.
     """
     try:
         if render_ready(extract_page(page)):
@@ -370,24 +392,29 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     except Exception as exc:
         if _closed(exc) or _timeout(exc):
             raise
-    load = getattr(page, "wait_for_load_state", None)
-    if load is not None:
-        for state, budget in (("domcontentloaded", 2000), ("networkidle", 1500)):
-            try:
-                load(state, timeout=budget)
-            except Exception as exc:
-                if _closed(exc):
-                    raise
-                continue
+    started = time.perf_counter()
+    # Network idle is only useful before the first document finishes.
+    if not _document_complete(page):
+        load = getattr(page, "wait_for_load_state", None)
+        if load is not None:
+            for state, budget in (("domcontentloaded", 2000), ("networkidle", 1500)):
+                try:
+                    load(state, timeout=budget)
+                except Exception as exc:
+                    if _closed(exc):
+                        raise
+                    continue
     deadline = time.monotonic() + timeout_s
     while True:
         snapshot = extract_page(page)
         if render_ready(snapshot):
             _settle_account_pane(page, snapshot)
+            _note_render_wait(started)
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _settle_account_pane(page, snapshot)
+            _note_render_wait(started)
             return
         pause = getattr(page, "wait_for_timeout", None)
         try:
@@ -398,6 +425,7 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
         except Exception as exc:
             if _closed(exc) or _timeout(exc):
                 raise
+            _note_render_wait(started)
             return
 
 

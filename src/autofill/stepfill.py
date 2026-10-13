@@ -177,6 +177,7 @@ def fill_resolved_page(
     step: str,
     flags: FillFlags | None = None,
     hook=None,
+    resume_uploaded: bool = False,
 ) -> ResolvedPage:
     """Inspect this step, ask the resolver only for it, fill, and wipe the values."""
     active = flags or FillFlags()
@@ -187,6 +188,10 @@ def fill_resolved_page(
     for kind, controls in clusters:
         ask = _describe(kind, controls, snapshot.heading, hook)
         if ask is None:
+            continue
+        if ask.field_key == "resume.file" and resume_uploaded:
+            # The resume-file endpoint already attached this file. Uploading
+            # it again restarts the ATS parse and the confirmation wait.
             continue
         if ask.resume:
             outcome.resume_blocked = True
@@ -1698,6 +1703,156 @@ def settle_after_resume(page, *, timeout_s: float = 3.0) -> None:
             return
 
 
+_SNAPSHOT_VALUES_JS = r"""() => {
+  function shown(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden" || type === "file" || type === "password" || type === "checkbox" || type === "radio") {
+      return false;
+    }
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  const saved = [];
+  for (const el of document.querySelectorAll("input, textarea, select")) {
+    if (!shown(el) || !("value" in el)) continue;
+    const value = String(el.value || "");
+    if (!value.trim()) continue;
+    let selector = "";
+    if (el.id) {
+      selector = "#" + CSS.escape(el.id);
+    } else {
+      if (!el.getAttribute("data-autofill-restore")) {
+        el.setAttribute("data-autofill-restore", Math.random().toString(36).slice(2));
+      }
+      selector = "[data-autofill-restore='" + el.getAttribute("data-autofill-restore") + "']";
+    }
+    saved.push([selector, value]);
+  }
+  return saved;
+}"""
+
+_VISIBLE_VALUE_JS = r"""(selector) => {
+  function shown(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const type = String(el.getAttribute("type") || "").toLowerCase();
+    if (type === "hidden" || type === "file" || type === "password") return false;
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  const nodes = Array.from(document.querySelectorAll(selector)).filter(shown);
+  const el = nodes[0];
+  if (!el || !("value" in el)) return null;
+  return String(el.value || "");
+}"""
+
+_SET_SELECT_JS = r"""({ selector, value }) => {
+  const el = document.querySelector(selector);
+  if (!el || String(el.tagName || "").toLowerCase() !== "select") return false;
+  const wanted = String(value || "");
+  for (const option of el.options) {
+    const label = String(option.text || "").replace(/\s+/g, " ").trim();
+    if (option.value !== wanted && label !== wanted) continue;
+    el.value = option.value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+  return false;
+}"""
+
+_TAG_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  return el ? String(el.tagName || "").toLowerCase() : "";
+}"""
+
+
+def snapshot_text_values(page) -> list[tuple[str, str]]:
+    """Visible text, select, and textarea values currently on the page."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return []
+    try:
+        raw = evaluate(_SNAPSHOT_VALUES_JS) or []
+    except Exception:
+        return []
+    saved: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        selector = str(item[0] or "")
+        value = str(item[1] or "")
+        if selector and value.strip():
+            saved.append((selector, value))
+    return saved
+
+
+def _visible_value(page, selector: str) -> str | None:
+    """The visible control's value. ``None`` when that control is not on the page."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return None
+    try:
+        found = evaluate(_VISIBLE_VALUE_JS, selector)
+    except Exception:
+        return None
+    if found is None:
+        return None
+    return str(found)
+
+
+def _restore_value(page, selector: str, value: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        kind = str(evaluate(_TAG_JS, selector) or "")
+    except Exception:
+        return False
+    if kind == "select":
+        try:
+            return bool(evaluate(_SET_SELECT_JS, {"selector": selector, "value": value}))
+        except Exception:
+            return False
+    return type_visible(page, selector, value)
+
+
+def post_upload_refill(
+    page,
+    saved: list[tuple[str, str]],
+    *,
+    session_id: str = "",
+    log: bool = True,
+) -> int:
+    """Settle a resume parse, then write back values it cleared.
+
+    A value that is still visible stays, including one a person typed and one
+    the parse replaced. The live required fields are read again after that.
+    """
+    settle_after_resume(page)
+    restored = 0
+    for selector, value in saved:
+        current = _visible_value(page, selector)
+        if current is None or current.strip():
+            continue
+        if _restore_value(page, selector, value):
+            restored += 1
+    try:
+        fresh = extract_page(page)
+        required_gaps(page, fresh, None)
+    except Exception:
+        pass
+    if log:
+        logger.info("session=%s action=post_upload_refill restored=%s", session_id or "-", restored)
+    return restored
+
+
 def _refill_cleared_fields(
     page,
     requests: list[_Ask],
@@ -1717,21 +1872,24 @@ def _refill_cleared_fields(
         for item in outcome.fields
         if item.selector and item.action in _FILLED_ACTIONS and item.key != "resume.file"
     }
-    if not written:
-        return
-    by_intent, unnamed, by_key, unclassified, rows, _index = shared
-    refill_shared = (by_intent, unnamed, by_key, unclassified, rows, [-1])
-    for ask in requests:
-        if ask.field_key == "resume.file" or not ask.controls:
-            continue
-        selector = ask.controls[0].selector
-        if not selector or selector not in written:
-            continue
-        if any(selector_held(control.selector) for control in ask.controls):
-            continue
-        if _cluster_committed(page, ask.controls):
-            continue
-        _apply_ask(page, ask, response, flags, outcome, heading, refill_shared)
+    restored = 0
+    if written:
+        by_intent, unnamed, by_key, unclassified, rows, _index = shared
+        refill_shared = (by_intent, unnamed, by_key, unclassified, rows, [-1])
+        for ask in requests:
+            if ask.field_key == "resume.file" or not ask.controls:
+                continue
+            selector = ask.controls[0].selector
+            if not selector or selector not in written:
+                continue
+            if any(selector_held(control.selector) for control in ask.controls):
+                continue
+            if _cluster_committed(page, ask.controls):
+                continue
+            _apply_ask(page, ask, response, flags, outcome, heading, refill_shared)
+            if _cluster_committed(page, ask.controls):
+                restored += 1
+    logger.info("action=post_upload_refill restored=%s", restored)
 
 
 _EEO_RE = re.compile(

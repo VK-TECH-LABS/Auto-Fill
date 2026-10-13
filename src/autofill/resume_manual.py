@@ -7,6 +7,7 @@ enough.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
@@ -14,6 +15,8 @@ from autofill.extract import extract_page
 from autofill.models import Control, PageSnapshot
 from autofill.resume_fetch import sanitized_resume_name
 from autofill.safeguards import attach_resume_control
+
+logger = logging.getLogger("autofill.resume_manual")
 
 _OLE = b"\xd0\xcf\x11\xe0"
 _ZIP = b"PK\x03\x04"
@@ -300,9 +303,11 @@ def _resume_selector(page, hint: str) -> str:
 
 def attach_and_confirm(page, *, name: str, data: bytes, hint: str = "") -> dict:
     """Attach bytes, then require an attached indicator and no upload error."""
+    started = time.perf_counter()
     selector = _resume_selector(page, hint)
     if not selector:
         return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
+    attach_started = time.perf_counter()
     try:
         attach_resume_control(
             page,
@@ -311,7 +316,17 @@ def attach_and_confirm(page, *, name: str, data: bytes, hint: str = "") -> dict:
         )
     except Exception:
         return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
-    return _confirm(page, selector, name)
+    attach_ms = int((time.perf_counter() - attach_started) * 1000)
+    report = _confirm(page, selector, name)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    state = "ok" if report.get("verified") else str(report.get("reason") or "wait")
+    logger.info(
+        "action=resume_confirm elapsed_ms=%s attach_ms=%s state=%s",
+        elapsed_ms,
+        attach_ms,
+        state,
+    )
+    return report
 
 
 def confirm_current(page, hint: str = "", filename: str = "") -> dict:
@@ -344,7 +359,7 @@ def _confirm(page, selector: str, filename: str = "") -> dict:
             return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
         if time.monotonic() >= deadline:
             break
-        time.sleep(0.25)
+        time.sleep(0.1)
     return {"verified": False, "reason": "not_confirmed", "siteErrors": []}
 
 
@@ -359,6 +374,15 @@ def reattach_verified(page, name: str, mime: str, data: bytes) -> None:
     control = resume_control(snapshot)
     if control is None or not control.selector or _has_file(page, control.selector):
         return
+    # Greenhouse replaces the file input with a chip. The bytes are already
+    # accepted, and setting them again starts a second upload.
+    once = _confirm_once(page, control.selector, name)
+    if isinstance(once, dict) and str(once.get("state") or "") == "ok":
+        logger.info("action=resume_reattach result=skipped")
+        return
+    from autofill.stepfill import post_upload_refill, snapshot_text_values
+
+    saved = snapshot_text_values(page)
     try:
         attach_resume_control(
             page,
@@ -367,3 +391,5 @@ def reattach_verified(page, name: str, mime: str, data: bytes) -> None:
         )
     except Exception:
         return
+    post_upload_refill(page, saved)
+    logger.info("action=resume_reattach result=uploaded")

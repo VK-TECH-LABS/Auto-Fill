@@ -85,6 +85,9 @@ class ServiceSession:
     next_clicks: int = 0
     pages_advanced: int = 0
     last_navigation: dict | None = None
+    nav_base_entry: int = 0
+    nav_base_next: int = 0
+    nav_base_pages: int = 0
     standard_terms_authorized: bool = False
     created_mono: float = 0.0
     auto_consents: list[dict] = field(default_factory=list)
