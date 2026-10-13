@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -646,6 +647,8 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
                     candidate_id=request.candidate_id,
                     job_id=request.job_id,
                     messages=["synthetic run"],
+                    fields_detected=4,
+                    fields_filled=0,
                 )
             return ApplicationResult(
                 status=Status.RESUME_UPLOAD_REQUIRED,
@@ -659,6 +662,8 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
                 entry_clicks=1,
                 pages_advanced=1,
                 last_navigation={"action": "entry", "result": "advanced"},
+                fields_detected=19,
+                fields_filled=14,
             )
 
         def attach_resume_file(
@@ -694,10 +699,19 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
         )
         assert uploaded.status_code == 200, uploaded.text
         assert uploaded.json()["verified"] is True
+        assert uploaded.json()["status"] == Status.STARTED
+        deadline = time.monotonic() + 2
+        body: dict = {}
+        while time.monotonic() < deadline:
+            status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+            body = status.json()
+            if body["status"] == Status.READY_FOR_HUMAN_SUBMIT and "restored=2" in caplog.text:
+                break
+            time.sleep(0.02)
         assert "action=post_upload_refill restored=2" in caplog.text
-        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
-        body = status.json()
         assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
+        assert body["fieldsDetected"] == 19
+        assert body["fieldsFilled"] == 14
         assert body["entryClicks"] == 1
         assert body["pagesAdvanced"] == 1
         assert body["lastNavigation"] == {"action": "entry", "result": "advanced"}

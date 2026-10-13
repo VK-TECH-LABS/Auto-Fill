@@ -1054,24 +1054,44 @@ class PlaywrightRunner:
         worker = self._pinned_worker(session_id)
         if worker is None:
             return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
-        records = [dict(item) for item in confirmed or [] if isinstance(item, dict)]
 
         def apply() -> dict:
             slot = worker.sessions.get(session_id)
             if slot is None or slot.page is None:
                 return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
             from autofill.resume_manual import attach_and_confirm
-            from autofill.stepfill import post_upload_refill
 
             report = attach_and_confirm(slot.page, name=name, data=data, hint=hint)
             if not report.get("verified"):
                 return report
-            restored = post_upload_refill(slot.page, records, session_id=session_id, log=False)
-            accepted = dict(report)
-            accepted["restored"] = restored
-            return accepted
+            return dict(report)
 
         return worker.submit(apply)
+
+    def refill_confirmed(self, session_id: str, confirmed: list | None = None) -> int:
+        """Write confirmed fills back onto the page after a resume parse.
+
+        Runs on the worker that owns the page. The upload request returns
+        before this, so the follow-up fill can keep going in the background.
+        """
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return 0
+        records = [dict(item) for item in confirmed or [] if isinstance(item, dict)]
+
+        def apply() -> int:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return 0
+            from autofill.stepfill import post_upload_refill
+
+            restored = int(post_upload_refill(slot.page, records, session_id=session_id))
+            return restored
+
+        restored = worker.submit(apply)
+        if isinstance(confirmed, list):
+            confirmed[:] = records
+        return restored
 
     def confirm_resume(self, session_id: str) -> dict:
         """Check that the current page shows an accepted resume."""

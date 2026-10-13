@@ -10,7 +10,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from autofill.extract import extract_page
-from autofill.fill import bind_session_id, reset_session_id
+from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
 from autofill.resolver import ResolverBinding, ResolverResponse
 from autofill.resume_fetch import ResumePayload
 from autofill.resume_manual import reattach_verified
@@ -238,6 +238,178 @@ def test_reattach_skips_when_the_accepted_chip_is_outside_the_new_input(browser)
         page.goto((FIXTURES / "greenhouse_chip_outside.html").as_uri())
         reattach_verified(page, "notes.pdf", "application/pdf", PDF, session_id="sess-greenhouse")
         assert page.locator("#resume-next").evaluate("el => el.files.length") == 0
+    finally:
+        page.close()
+
+
+def test_single_name_box_is_filled_and_recorded_from_first_and_last(browser, monkeypatch):
+    """Ashby and Lever ask for fullName. The live resolver returns the parts."""
+
+    def fake_resolve(*_args, **kwargs):
+        assert "fullName" in kwargs["fields"]
+        assert "firstName" in kwargs["fields"]
+        assert "lastName" in kwargs["fields"]
+        return ResolverResponse(
+            fields={
+                "firstName": "River",
+                "lastName": "Example",
+                "email": "river.example@example.com",
+            }
+        )
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    sink: list[dict] = []
+    token = bind_confirmed(sink.append, sink)
+    try:
+        page.goto((FIXTURES / "lever_apply_live.html").as_uri())
+        outcome = fill_resolved_page(
+            page,
+            _binding(),
+            session_id="sess-lever-name",
+            ats_name="lever",
+            step="application",
+        )
+        assert page.locator("input[name=name]").input_value() == "River Example"
+        assert any(item.get("fieldKey") == "fullName" for item in sink)
+        texts = " ".join(str(item.get("text") or "") for item in outcome.manual_questions).casefold()
+        assert "full name" not in texts
+        gaps = required_gaps(page, outcome.snapshot or extract_page(page), None)
+        gap_text = " ".join(str(item.get("text") or "") for item in gaps).casefold()
+        assert "full name" not in gap_text
+    finally:
+        reset_confirmed(token)
+        page.close()
+
+
+def test_legal_name_box_is_filled_from_first_and_last(browser, monkeypatch):
+    """Ashby labels the single name box Legal Name and asks for legalName."""
+
+    def fake_resolve(*_args, **kwargs):
+        assert "legalName" in kwargs["fields"]
+        assert "firstName" in kwargs["fields"]
+        assert "lastName" in kwargs["fields"]
+        return ResolverResponse(fields={"firstName": "River", "lastName": "Example"})
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    sink: list[dict] = []
+    token = bind_confirmed(sink.append, sink)
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='legal'>Legal Name</label><input id='legal' name='name' required>"
+            "</form>"
+        )
+        outcome = fill_resolved_page(
+            page,
+            _binding(),
+            session_id="sess-ashby-legal",
+            ats_name="ashby",
+            step="application",
+        )
+        assert page.locator("#legal").input_value() == "River Example"
+        assert any(item.get("fieldKey") == "legalName" for item in sink)
+        texts = " ".join(str(item.get("text") or "") for item in outcome.manual_questions).casefold()
+        assert "legal name" not in texts
+    finally:
+        reset_confirmed(token)
+        page.close()
+
+
+def test_split_name_boxes_are_filled_from_a_full_name(browser, monkeypatch):
+    monkeypatch.setattr(
+        "autofill.stepfill.resolve_step",
+        lambda *_args, **_kwargs: ResolverResponse(fields={"fullName": "River Example"}),
+    )
+    page = browser.new_page()
+    sink: list[dict] = []
+    token = bind_confirmed(sink.append, sink)
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='first'>First Name</label><input id='first' autocomplete='given-name'>"
+            "<label for='last'>Last Name</label><input id='last' autocomplete='family-name'>"
+            "</form>"
+        )
+        fill_resolved_page(
+            page,
+            _binding(),
+            session_id="sess-gh-name",
+            ats_name="greenhouse",
+            step="application",
+        )
+        assert page.locator("#first").input_value() == "River"
+        assert page.locator("#last").input_value() == "Example"
+        keys = {item.get("fieldKey") for item in sink}
+        assert "firstName" in keys
+        assert "lastName" in keys
+    finally:
+        reset_confirmed(token)
+        page.close()
+
+
+def test_follow_up_keeps_a_filled_name(browser, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_resolve(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ResolverResponse(fields={"firstName": "River", "lastName": "Example"})
+        return ResolverResponse(fields={"fullName": "Other Person"})
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><form>"
+            "<label for='name'>Name</label><input id='name' name='name' autocomplete='name' required>"
+            "</form>"
+        )
+        fill_resolved_page(
+            page,
+            _binding(),
+            session_id="sess-keep",
+            ats_name="ashby",
+            step="application",
+        )
+        assert page.locator("#name").input_value() == "River Example"
+        fill_resolved_page(
+            page,
+            _binding(),
+            session_id="sess-keep",
+            ats_name="ashby",
+            step="application",
+            resume_uploaded=True,
+        )
+        assert page.locator("#name").input_value() == "River Example"
+    finally:
+        page.close()
+
+
+def test_refill_waits_until_dropped_fields_return(browser, caplog):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<h1>Application</h1><div id='slot'>"
+            "<label for='name'>Full name</label><input id='name' name='name'>"
+            "<label for='phone'>Phone</label><input id='phone' name='phone'>"
+            "</div><script>"
+            "const html = document.getElementById('slot').innerHTML;"
+            "setTimeout(() => { document.getElementById('slot').innerHTML = ''; }, 40);"
+            "setTimeout(() => { document.getElementById('slot').innerHTML = html; }, 700);"
+            "</script>"
+        )
+        caplog.set_level(logging.INFO, logger="autofill.stepfill")
+        started = time.monotonic()
+        restored = post_upload_refill(page, _confirmed(), session_id="sess-settle")
+        elapsed = time.monotonic() - started
+        assert elapsed < 6
+        assert restored == 2
+        assert page.locator("#name").input_value() == "River Example"
+        assert page.locator("#phone").input_value() == "5550100199"
+        assert "field=fullName" in caplog.text
+        assert "result=restored" in caplog.text
     finally:
         page.close()
 
