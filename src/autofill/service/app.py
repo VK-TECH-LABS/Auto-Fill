@@ -1826,7 +1826,14 @@ def create_app(
         if attach is None:
             raise HTTPException(status_code=409, detail={"reason": "resume_not_required"})
         try:
-            report = attach(session.session_id, name, raw, fieldHint.strip(), session.confirmed_values)
+            report = attach(
+                session.session_id,
+                name,
+                raw,
+                fieldHint.strip(),
+                session.confirmed_values,
+                timings=session.timings,
+            )
         except PageUnavailable as exc:
             if exc.status_code == 503:
                 raise HTTPException(
