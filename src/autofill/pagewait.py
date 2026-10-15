@@ -12,6 +12,7 @@ import re
 import time
 from urllib.parse import urlparse
 
+from autofill.ats import WORKDAY_HOST_RE
 from autofill.extract import extract_page
 from autofill.login import _CONFIRM_RE as _VERIFY_RE
 from autofill.login import _LOGIN_RE, _REGISTER_RE
@@ -20,7 +21,7 @@ from autofill.safeguards import classify_control, is_entry_control, semantic_act
 
 logger = logging.getLogger("autofill.pagewait")
 
-_WORKDAY_HOST = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
+_WORKDAY_HOST = WORKDAY_HOST_RE
 _DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
 
 
@@ -265,18 +266,28 @@ def register_pane(snapshot: PageSnapshot) -> bool:
     """Email / password / verify password / Create Account, including page text.
 
     Scored before a zero-field or ``NO_FORM`` decision. A job posting that
-    merely mentions an account is not this pane.
+    merely mentions an account is not this pane. Two visible password fields
+    are Create Account unless the page is only a Sign In form.
     """
     if snapshot.captcha_present:
         return False
     text = _pane_text(snapshot)
     passwords = _password_controls(snapshot)
+    ids = {item for item in snapshot.automation_ids if item}
+    if {"createAccountSubmitButton", "verifyPassword"} & ids and (passwords or snapshot.password_present):
+        return True
     verify = len(passwords) >= 2 or bool(_VERIFY_RE.search(text))
     create = bool(_REGISTER_RE.search(snapshot.heading or "")) or any(
         _REGISTER_RE.search(button.name) for button in _content_buttons(snapshot)
     )
     if not create and _REGISTER_RE.search(snapshot.page_text or ""):
         create = verify
+    if len(passwords) >= 2 and not create:
+        heading = snapshot.heading or ""
+        loginish = bool(_LOGIN_RE.search(heading)) or any(
+            _LOGIN_RE.search(button.name) for button in _content_buttons(snapshot)
+        )
+        create = bool(_REGISTER_RE.search(text)) or not loginish
     passwordish = bool(passwords) or snapshot.password_present or bool(re.search(r"\bpassword\b", text, re.IGNORECASE))
     return bool(verify and create and passwordish)
 
@@ -342,7 +353,10 @@ def render_ready(snapshot: PageSnapshot) -> bool:
         return True
     if register_pane(snapshot) or sign_in_pane(snapshot):
         return True
-    names = " ".join(button.name.casefold() for button in snapshot.buttons)
+    # Header Sign In is site chrome. It must not end the wait before the form paints.
+    names = " ".join(
+        button.name.casefold() for button in snapshot.buttons if not button.in_header and not button.in_ad
+    )
     markers = ("apply", "sign in", "log in", "create account")
     return any(marker in names for marker in markers)
 
@@ -360,15 +374,30 @@ def _closed(exc: BaseException) -> bool:
 
 
 def _document_complete(page) -> bool:
+    return _ready_state(page) == "complete"
+
+
+def _document_settled(page) -> bool:
+    """True once the document can be inspected. Network idle is not required."""
+    state = _ready_state(page)
+    if state is None:
+        return True
+    return state in {"interactive", "complete"}
+
+
+def _ready_state(page) -> str | None:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
-        return False
+        return None
     try:
-        return evaluate("() => document.readyState") == "complete"
+        state = evaluate("() => document.readyState")
     except Exception as exc:
         if _closed(exc) or _timeout(exc):
             raise
-        return False
+        return None
+    if not isinstance(state, str):
+        return None
+    return state
 
 
 def _note_render_wait(started: float) -> None:
@@ -377,14 +406,59 @@ def _note_render_wait(started: float) -> None:
         logger.info("action=render_wait elapsed_ms=%s", elapsed)
 
 
+_PROBE_JS = r"""() => {
+  function count(node) {
+    if (!node || !node.querySelectorAll) return 0;
+    const found = node.querySelectorAll("input, textarea, select, button, [role='button'], iframe").length;
+    if (found) return found;
+    for (const el of node.querySelectorAll("*")) {
+      if (el.shadowRoot) {
+        const nested = count(el.shadowRoot);
+        if (nested) return nested;
+      }
+    }
+    return 0;
+  }
+  if (count(document) > 0) return true;
+  const text = ((document.body && document.body.innerText) || "").slice(0, 1500).toLowerCase();
+  return text.indexOf("create account") !== -1 || text.indexOf("sign in") !== -1 || text.indexOf("apply") !== -1;
+}"""
+
+
+def _probe_controls(page) -> bool | None:
+    """True when a cheap look sees controls. ``None`` when the page cannot say."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        found = evaluate(_PROBE_JS)
+    except Exception as exc:
+        if _closed(exc) or _timeout(exc):
+            raise
+        return None
+    if isinstance(found, bool):
+        return found
+    return None
+
+
+def _pump_between_waits() -> None:
+    try:
+        from autofill.dom_ui import _pump_queue
+
+        _pump_queue()
+    except Exception:
+        return
+
+
 def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     """Poll until a form or a known marker appears.
 
     ``timeout_s`` caps the poll. A page that already has controls returns
-    on the first look. A document that has already finished loading does not
-    wait out network idle: an open Greenhouse page keeps connections up, so
-    that wait always burns its budget. Timeouts from a first-load idle wait
-    are ignored. A dead browser or a timeout while reading the page is raised.
+    on the first look. A document that has reached ``interactive`` does not
+    wait for network idle: an open Greenhouse page keeps connections up.
+    The loop uses a small probe and runs the full DOM scan only when that
+    probe sees controls, or once at the deadline. A dead browser or a
+    timeout while reading the page is raised.
     """
     try:
         if render_ready(extract_page(page)):
@@ -393,35 +467,50 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
         if _closed(exc) or _timeout(exc):
             raise
     started = time.perf_counter()
-    # Network idle is only useful before the first document finishes.
-    if not _document_complete(page):
+    if not _document_settled(page):
         load = getattr(page, "wait_for_load_state", None)
         if load is not None:
-            for state, budget in (("domcontentloaded", 2000), ("networkidle", 1500)):
-                try:
-                    load(state, timeout=budget)
-                except Exception as exc:
-                    if _closed(exc):
-                        raise
-                    continue
+            try:
+                load("domcontentloaded", timeout=2000)
+            except Exception as exc:
+                if _closed(exc):
+                    raise
     deadline = time.monotonic() + timeout_s
+    snapshot = None
     while True:
-        snapshot = extract_page(page)
-        if render_ready(snapshot):
-            _settle_account_pane(page, snapshot)
-            _note_render_wait(started)
-            return
+        probed = _probe_controls(page)
+        if probed is not False:
+            try:
+                snapshot = extract_page(page)
+            except Exception as exc:
+                if _closed(exc) or _timeout(exc):
+                    raise
+                _note_render_wait(started)
+                return
+            if render_ready(snapshot):
+                _settle_account_pane(page, snapshot)
+                _note_render_wait(started)
+                return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if snapshot is None:
+                try:
+                    snapshot = extract_page(page)
+                except Exception as exc:
+                    if _closed(exc) or _timeout(exc):
+                        raise
+                    _note_render_wait(started)
+                    return
             _settle_account_pane(page, snapshot)
             _note_render_wait(started)
             return
+        _pump_between_waits()
         pause = getattr(page, "wait_for_timeout", None)
         try:
             if pause is None:
-                time.sleep(min(0.2, remaining))
+                time.sleep(min(0.1, remaining))
             else:
-                pause(int(min(200, remaining * 1000)))
+                pause(int(min(100, remaining * 1000)))
         except Exception as exc:
             if _closed(exc) or _timeout(exc):
                 raise
@@ -557,7 +646,7 @@ def _should_settle(page, snapshot: PageSnapshot) -> bool:
         return False
     if _application_fields(snapshot) and not snapshot.password_present:
         return False
-    workday = bool(_WORKDAY_HOST.match(_host(page)))
+    workday = bool(_WORKDAY_HOST.search(_host(page)))
     return bool(snapshot.password_present or workday or _account_chrome(snapshot))
 
 
@@ -589,13 +678,17 @@ def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
     """
     if not _should_settle(page, snapshot):
         return
-    workday = bool(_WORKDAY_HOST.match(_host(page)))
-    budget = 3.5 if workday and not _account_decisive(snapshot) else 0.6
+    if _account_decisive(snapshot) and (register_pane(snapshot) or sign_in_pane(snapshot)):
+        return
+    workday = bool(_WORKDAY_HOST.search(_host(page)))
+    budget = 2.0 if workday and not _account_decisive(snapshot) else 0.4
     deadline = time.monotonic() + budget
     previous = _account_signature(snapshot)
     seen_decisive = _account_decisive(snapshot)
     while time.monotonic() < deadline:
-        _pause(page, 200)
+        _pause(page, 100)
+        if _probe_controls(page) is False:
+            continue
         try:
             current = extract_page(page)
         except Exception as exc:
@@ -604,8 +697,9 @@ def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
             return
         signature = _account_signature(current)
         decisive = _account_decisive(current)
-        if decisive and seen_decisive and signature == previous:
-            return
+        if decisive and (register_pane(current) or sign_in_pane(current) or seen_decisive):
+            if signature == previous or register_pane(current):
+                return
         previous = signature
         seen_decisive = decisive
 

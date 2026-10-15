@@ -1,6 +1,6 @@
 """ATS host detection from ApplyPilot's form notes and sites.yaml lists."""
 
-from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
+from autofill.ats import WORKDAY_HOST_RE, detect_ats, is_blocked_sso, is_manual_ats
 
 
 def test_known_application_hosts():
@@ -38,3 +38,10 @@ def test_manual_ats_and_sso_are_refused():
     assert is_blocked_sso("https://acme.okta.com/login/login.htm")
     assert is_blocked_sso("https://acme.auth0.com/authorize")
     assert not is_blocked_sso("https://example.com/okta-mentioned-in-the-path")
+
+
+def test_workday_careers_hosts_include_site_and_tenant_domains():
+    assert WORKDAY_HOST_RE.search("cbm.wd1.myworkdaysite.com")
+    assert WORKDAY_HOST_RE.search("nidec.wd5.myworkdayjobs.com")
+    assert WORKDAY_HOST_RE.search("impl.workday.com")
+    assert not WORKDAY_HOST_RE.search("boards.greenhouse.io")

@@ -1920,6 +1920,25 @@ def test_workday_password_requirements_list_is_the_policy(browser):
         page.close()
 
 
+def test_workday_create_account_is_its_own_state(browser):
+    page = browser.new_page()
+    try:
+        page.goto((FIXTURES / "workday_password.html").as_uri())
+        result, timings = _run(page, "https://nidec.wd5.myworkdayjobs.com/en-US/Nidec/job/Controls-Engineer")
+        assert result.status == Status.ACCOUNT_CREATION_REQUIRED, result.messages
+        assert result.page_type == "ACCOUNT"
+        assert result.account["mode"] == "register"
+        assert result.fields_filled == 0
+        assert result.fields_detected >= 2
+        assert result.progress["requiredDone"] == 0
+        assert page.locator("#email").input_value() == ""
+        assert page.locator("#password").input_value() == ""
+        assert page.locator("#verify").input_value() == ""
+        assert timings["detectMs"] >= 0
+    finally:
+        page.close()
+
+
 def test_phone_country_menu_is_not_an_address_blocker(browser, resolver):
     server, url = resolver
     server.custom_answers = []  # type: ignore[attr-defined]

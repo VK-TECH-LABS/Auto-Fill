@@ -300,6 +300,22 @@ def _protocol_070(opts: AutofillOptions) -> bool:
     return protocol_at_least(opts.protocol_version)
 
 
+def _this_page_counts(extra: dict, snapshot) -> None:
+    """Field totals for the page in front of us. Earlier pages are not included."""
+    from autofill.pagewait import visible_fields
+
+    extra["fields_detected"] = len(visible_fields(snapshot))
+    extra["fields_filled"] = 0
+    extra["fields_skipped"] = 0
+    state = current_run()
+    if state is None:
+        return
+    state.seen.clear()
+    state.done.clear()
+    state.progress["requiredTotal"] = 0
+    state.progress["requiredDone"] = 0
+
+
 def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
     """Score account, sign-in, job, and empty pages before a zero-field NO_FORM.
 
@@ -335,6 +351,7 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
         )
     kind = classify_page(snapshot, url=url)
     if not opts.human_resolved and (register_pane(snapshot) or kind == "ACCOUNT"):
+        _this_page_counts(extra, snapshot)
         decision = account_decision(snapshot, url, ats_name)
         if decision is not None and decision.status == Status.ACCOUNT_CREATION_REQUIRED:
             message = decision.message
@@ -364,10 +381,12 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     password_fields = any(control.kind == "password" and not control.hidden for control in snapshot.controls)
-    # A password form stays on the credential path. Text-only and empty sign-in panes stop here.
+    # A Sign In password form stays on the credential path so stored credentials can be used.
+    # Create Account is handled above. Text-only and empty sign-in panes stop here.
     if not opts.human_resolved and (sign_in_pane(snapshot) or kind == "LOGIN" or is_login_wall(snapshot)) and not (
         snapshot.password_present or password_fields
     ):
+        _this_page_counts(extra, snapshot)
         session.mark("LOGIN_FAILED")
         return snapshot, _attach_login_account(
             _result(
@@ -384,6 +403,7 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             opts,
         )
     if not opts.human_resolved and kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
+        _this_page_counts(extra, snapshot)
         session.mark(Status.JOB_DESCRIPTION)
         return snapshot, _result(
             session,
@@ -396,12 +416,43 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ],
             **extra,
         )
+    if register_pane(snapshot) and not opts.human_resolved:
+        _this_page_counts(extra, snapshot)
+        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+        scored = score_account(snapshot, url)
+        return snapshot, _result(
+            session,
+            status=Status.ACCOUNT_CREATION_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=["Create an employer account. Nothing was typed."],
+            account=account_view(snapshot, url, ats_name, mode="register", alternate=scored.alternate),
+            **extra,
+        )
     if kind == "CONFIRMATION" or (
         not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot) and kind not in {
             "APPLICATION_FORM",
             "REVIEW",
         }
     ):
+        if not opts.human_resolved and (sign_in_pane(snapshot) or is_login_wall(snapshot)):
+            _this_page_counts(extra, snapshot)
+            session.mark("LOGIN_FAILED")
+            return snapshot, _attach_login_account(
+                _result(
+                    session,
+                    status=Status.LOGIN_REQUIRED,
+                    ats=ats_name,
+                    login_status="LOGIN_REQUIRED",
+                    messages=["Sign-in is required before the application form. Nothing was typed."],
+                    **extra,
+                ),
+                snapshot,
+                url,
+                ats_name,
+                opts,
+            )
+        _this_page_counts(extra, snapshot)
         session.mark(Status.NO_FORM_FOUND)
         return snapshot, _result(
             session,
@@ -479,7 +530,9 @@ def _attach_prepared(page, opts: AutofillOptions) -> str:
     from autofill.resume_manual import attach_and_confirm
     from autofill.stepfill import post_upload_refill
 
+    upload_started = time.perf_counter()
     report = attach_and_confirm(page, name=opts.resume_name, data=opts.resume_bytes)
+    _add_ms(opts, "uploadMs", upload_started)
     if report.get("verified"):
         opts.resume_uploaded = True
         opts.resume_verified_now = True
@@ -631,7 +684,27 @@ def autofill_application(
         detector = LoginDetector()
         mode = detector.mode(snapshot, application_url)
         login_status = "NOT_REQUIRED"
-        if mode == "account_creation":
+        if mode == "account_creation" or register_pane(snapshot):
+            if register_pane(snapshot):
+                session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+                scored = score_account(snapshot, getattr(page, "url", "") or application_url)
+                return _result(
+                    session,
+                    status=Status.ACCOUNT_CREATION_REQUIRED,
+                    ats=ats_name,
+                    login_status="NOT_REQUIRED",
+                    messages=["Create an employer account. Nothing was typed."],
+                    account=account_view(
+                        snapshot,
+                        getattr(page, "url", "") or application_url,
+                        ats_name,
+                        mode="register",
+                        alternate=scored.alternate,
+                    ),
+                    fields_detected=len(visible_fields(snapshot)),
+                    fields_filled=0,
+                    fields_skipped=0,
+                )
             session.mark("FAILED")
             return _result(
                 session,
@@ -789,6 +862,7 @@ def autofill_application(
             step_name = page_step(ats_name, snapshot.heading, application_url)
             session.mark("FILL_PAGE" if index == 0 else "FILL_NEXT_PAGE")
             if step_name == "review" or "review" in snapshot.heading.casefold():
+                fill_started = time.perf_counter()
                 page_fields, snapshot, _, page_manual = fill_one_page(
                     page,
                     candidate_profile,
@@ -799,6 +873,7 @@ def autofill_application(
                 )
                 fields.extend(page_fields)
                 manual.extend(page_manual)
+                _add_ms(opts, "fillMs", fill_started)
                 _note_fill(page_fields, opts, run_started, inspect_state)
                 fresh = extract_page(page)
                 gaps, total, _done = inspect_required(page, fresh, candidate_profile)
@@ -836,6 +911,7 @@ def autofill_application(
                     submit_controls=submit_controls,
                 )
 
+            fill_started = time.perf_counter()
             page_fields, snapshot, resume_blocked, page_manual = fill_one_page(
                 page,
                 candidate_profile,
@@ -846,6 +922,7 @@ def autofill_application(
             )
             fields.extend(page_fields)
             manual.extend(page_manual)
+            _add_ms(opts, "fillMs", fill_started)
             _note_fill(page_fields, opts, run_started, inspect_state)
             for button in snapshot.buttons:
                 if field_class_for_button(button.name, control_type=button.control_type) == "FINAL_SUBMIT":
@@ -1096,6 +1173,15 @@ def _mark_ms(opts: AutofillOptions, key: str, started: float) -> None:
     opts.timings[key] = 0 if elapsed <= 0 else max(1, int(elapsed))
 
 
+def _add_ms(opts: AutofillOptions, key: str, started: float) -> None:
+    """Add a stage duration. Repeated stages, such as Next, accumulate."""
+    if opts.timings is None:
+        return
+    elapsed = (time.perf_counter() - started) * 1000
+    extra = 0 if elapsed <= 0 else max(1, int(elapsed))
+    opts.timings[key] = int(opts.timings.get(key) or 0) + extra
+
+
 def _note_fill(fields, opts: AutofillOptions, started: float, state: dict) -> None:
     note_filled(fields)
     if state.get("filled"):
@@ -1118,6 +1204,7 @@ def _paint(page, opts: AutofillOptions) -> None:
 
 
 def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> Any:
+    detect_started = time.perf_counter()
     wait_for_render(page)
     snapshot = extract_page(page)
     note_snapshot(snapshot)
@@ -1125,6 +1212,7 @@ def _timed_extract(page, opts: AutofillOptions, started: float, state: dict) -> 
     if not state.get("seen"):
         state["seen"] = True
         _mark_ms(opts, "firstFormInspectedMs", started)
+        _mark_ms(opts, "detectMs", detect_started)
     return snapshot
 
 
@@ -1339,8 +1427,10 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     returned so the caller can correct it or stop. It is not a second click.
     """
     before = navigation_signature(page, snapshot)
+    next_started = time.perf_counter()
     activate(page, button.selector, button.name, control_type=button.control_type, frame_url=button.frame_url)
     advanced, fresh = _confirm_move(page, before, opts, started, state)
+    _add_ms(opts, "nextMs", next_started)
     if fresh is None:
         _log_move(session.session_id, "next", "stalled")
         raise NavigationStalled("next")

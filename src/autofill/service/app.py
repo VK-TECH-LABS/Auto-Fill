@@ -145,8 +145,13 @@ def _public_status(session: ServiceSession) -> str:
     return status
 
 
-def _limit_interact(session) -> None:
-    """30 human actions per minute before 0.7.0, and 60 after."""
+def _limit_interact(session, action: str = "click") -> None:
+    """30 human actions per minute before 0.7.0, and 60 after.
+
+    Wheel and scroll do not count. Clicks, typing, and keys do.
+    """
+    if action == "scroll":
+        return
     cap = 60 if _is_070(session) else 30
     now = time.monotonic()
     session.interact_marks = [mark for mark in session.interact_marks if now - mark < 60]
@@ -500,6 +505,11 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
         contextReadyMs=int(raw.get("contextReadyMs", 0)),
         browserPrewarmMs=int(raw.get("browserPrewarmMs", 0)),
         firstFillMs=int(raw.get("firstFillMs", 0)),
+        pageLoadMs=int(raw.get("pageLoadMs", 0)),
+        detectMs=int(raw.get("detectMs", 0)),
+        fillMs=int(raw.get("fillMs", 0)),
+        nextMs=int(raw.get("nextMs", 0)),
+        uploadMs=int(raw.get("uploadMs", 0)),
     )
 
 
@@ -966,7 +976,15 @@ def _paint_frame(session: ServiceSession):
     """Store a JPEG as soon as the page can be captured. A crash propagates."""
 
     def paint(page) -> None:
-        image = page.screenshot(type="jpeg", quality=60)
+        from autofill.engine import is_browser_crash
+        from autofill.service.runner import capture_jpeg
+
+        try:
+            image = capture_jpeg(page)
+        except Exception as exc:
+            if is_browser_crash(exc):
+                raise
+            return
         host = ""
         try:
             host = urlparse(str(getattr(page, "url", "") or "")).hostname or ""
@@ -1871,6 +1889,12 @@ def create_app(
         _reject_expired(session)
         if session.busy and session.preview_jpeg:
             return _jpeg(session)
+        if session.busy:
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            )
         shot = getattr(active_runner, "screenshot", None)
         try:
             image = shot(session_id) if shot is not None else None
@@ -1968,7 +1992,7 @@ def create_app(
         _check_candidate(session, body.candidate_id.strip(), body.candidate_ref.strip(), machine=True)
         if session.status not in _HUMAN_STOP:
             raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
-        _limit_interact(session)
+        _limit_interact(session, body.action)
         action = {
             "action": body.action,
             "x": body.x,

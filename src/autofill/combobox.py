@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from autofill.dom_ui import focus_field
+from autofill.dom_ui import focus_field, type_char_delay
 from autofill.intents import match_option_exact
 from autofill.models import Option
 from autofill.safeguards import click_choice, dismiss_combobox, open_combobox
@@ -278,10 +278,10 @@ def _type_filter(page, selector: str, text: str) -> None:
         if inner.count():
             target = inner.first
         target.fill("")
-        target.press_sequentially(text, delay=20)
+        target.press_sequentially(text, delay=type_char_delay())
     except Exception:
         return
-    _pause(page, 80)
+    _pause(page, 40)
 
 
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
@@ -319,7 +319,7 @@ def _keyboard_commit(page, selector: str, desired: str) -> None:
         if inner.count():
             target = inner.first
         target.fill("")
-        target.press_sequentially(desired, delay=30)
+        target.press_sequentially(desired, delay=type_char_delay())
         target.press("Enter")
     except Exception:
         return

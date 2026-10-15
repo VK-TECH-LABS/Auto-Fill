@@ -1080,7 +1080,13 @@ EXTRACT_JS = r"""
   }
   const alerts = [];
   eachRoot(document, (root) => {
-    for (const node of root.querySelectorAll("[role='alert'], .field-error")) {
+    const alertSelector = [
+      "[role='alert']",
+      ".field-error",
+      "[data-automation-id='errorMessage']",
+      "[data-automation-id='validationError']",
+    ].join(", ");
+    for (const node of root.querySelectorAll(alertSelector)) {
       if (!isHidden(node)) {
         const text = textOf(node);
         if (text) alerts.push(text.slice(0, 300));
@@ -1270,16 +1276,71 @@ def _merge_snapshot(base: PageSnapshot, extra: PageSnapshot) -> None:
         base.password_hint = extra.password_hint
 
 
+_FINGERPRINT_JS = r"""() => {
+  const bits = [location.href, document.readyState];
+  function walk(node) {
+    if (!node || !node.querySelectorAll) return;
+    const nodes = node.querySelectorAll("input, textarea, select, button, [role='alert']");
+    bits.push(String(nodes.length));
+    for (const el of nodes) {
+      const type = (el.getAttribute("type") || "").toLowerCase();
+      const value = "value" in el ? String(el.value || "").length : String((el.textContent || "").length);
+      bits.push([el.id || "", el.getAttribute("data-automation-id") || "", type, value].join(":"));
+    }
+    for (const el of node.querySelectorAll("*")) {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  }
+  walk(document);
+  const body = document.body;
+  bits.push(String(body ? (body.innerText || "").length : 0));
+  return bits.join("|");
+}"""
+
+
+def _fingerprint(page) -> str | None:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        token = evaluate(_FINGERPRINT_JS)
+    except Exception:
+        return None
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
+def _remember_scan(page, token: str, snapshot: PageSnapshot) -> None:
+    try:
+        page._af_extract = (token, snapshot)
+    except Exception:
+        return
+
+
 def extract_page(page) -> PageSnapshot:
-    """Evaluate the extractor in ``page`` and in same-origin or ATS iframes."""
+    """Evaluate the extractor in ``page`` and in same-origin or ATS iframes.
+
+    A second call on an unchanged main document reuses the previous snapshot.
+    Pages with extra frames are scanned again, because the form may live there.
+    """
+    frames = getattr(page, "frames", None)
+    frame_list = list(frames) if frames else []
+    cached = getattr(page, "_af_extract", None)
+    if cached and len(frame_list) <= 1:
+        token = _fingerprint(page)
+        if token and token == cached[0]:
+            return cached[1]
     # Call the arrow function as an expression. Playwright also accepts a bare
     # function string, but invoking it keeps the contract obvious.
     data = page.evaluate("(" + EXTRACT_JS + ")()")
     snapshot = parse_snapshot(data)
-    frames = getattr(page, "frames", None)
-    if not frames:
+    if not frame_list:
+        token = _fingerprint(page)
+        if token:
+            _remember_scan(page, token, snapshot)
         return snapshot
-    for frame in list(frames):
+    for frame in frame_list:
         if not _usable_frame(page, frame):
             continue
         try:
@@ -1289,4 +1350,8 @@ def extract_page(page) -> PageSnapshot:
         extra = parse_snapshot(extra_data)
         _tag_frame(extra, _frame_url(frame))
         _merge_snapshot(snapshot, extra)
+    if len(frame_list) <= 1:
+        token = _fingerprint(page)
+        if token:
+            _remember_scan(page, token, snapshot)
     return snapshot

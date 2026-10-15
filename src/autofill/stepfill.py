@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -26,6 +25,7 @@ from autofill.dom_ui import (
     refill_cleared,
     selector_held,
     sync_required_progress,
+    type_char_delay,
     type_visible,
 )
 from autofill.extract import extract_page
@@ -1429,13 +1429,7 @@ def _apply_location(
         _manual_location(outcome, control)
         return
     field = page.locator(control.selector)
-    delay = 20
-    raw_delay = os.environ.get("AUTOFILL_TYPE_DELAY")
-    if raw_delay is not None:
-        try:
-            delay = max(0, int(raw_delay))
-        except ValueError:
-            delay = 20
+    delay = type_char_delay()
     if trace is None:
         trace = {}
     listener = _watch_location_search(page, trace)

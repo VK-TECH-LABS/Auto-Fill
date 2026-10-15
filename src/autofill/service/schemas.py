@@ -390,6 +390,11 @@ class TimingsOut(BaseModel):
     context_ready_ms: int = Field(default=0, alias="contextReadyMs")
     browser_prewarm_ms: int = Field(default=0, alias="browserPrewarmMs")
     first_fill_ms: int = Field(default=0, alias="firstFillMs")
+    page_load_ms: int = Field(default=0, alias="pageLoadMs")
+    detect_ms: int = Field(default=0, alias="detectMs")
+    fill_ms: int = Field(default=0, alias="fillMs")
+    next_ms: int = Field(default=0, alias="nextMs")
+    upload_ms: int = Field(default=0, alias="uploadMs")
 
 
 class RunStatusOut(BaseModel):
