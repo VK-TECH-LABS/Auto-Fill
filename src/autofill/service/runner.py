@@ -26,6 +26,7 @@ from autofill.engine import (
     ApplicationResult,
     AutofillOptions,
     Status,
+    _add_ms,
     autofill_application,
     is_ats_timeout,
     is_browser_crash,
@@ -1138,6 +1139,7 @@ class PlaywrightRunner:
         data: bytes,
         hint: str = "",
         confirmed: list | None = None,
+        timings: dict[str, int] | None = None,
     ) -> dict:
         """Attach resume bytes and require the ATS to accept them."""
         worker = self._pinned_worker(session_id)
@@ -1150,7 +1152,13 @@ class PlaywrightRunner:
                 return {"verified": False, "reason": "no_upload_control", "siteErrors": []}
             from autofill.resume_manual import attach_and_confirm
 
-            report = attach_and_confirm(slot.page, name=name, data=data, hint=hint)
+            upload_started = time.perf_counter()
+            try:
+                report = attach_and_confirm(slot.page, name=name, data=data, hint=hint)
+            finally:
+                if timings is not None:
+                    opts = AutofillOptions(timings=timings)
+                    _add_ms(opts, "uploadMs", upload_started)
             if not report.get("verified"):
                 return report
             return dict(report)

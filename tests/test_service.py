@@ -680,6 +680,7 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
             data: bytes,
             hint: str = "",
             confirmed=None,
+            timings=None,
         ) -> dict:
             return {"verified": True, "reason": "", "siteErrors": [], "restored": 2}
 
@@ -722,6 +723,55 @@ def test_resume_file_then_status_keeps_clicks_and_logs_the_refill(caplog):
         assert body["entryClicks"] == 1
         assert body["pagesAdvanced"] == 1
         assert body["lastNavigation"] == {"action": "entry", "result": "advanced"}
+
+
+def test_resume_file_attach_records_upload_time(monkeypatch):
+    """The resume-file attach is the upload stage. Its time lands on status."""
+    from autofill.service.runner import _SessionContext
+
+    def fake_attach(page, *, name, data, hint=""):
+        time.sleep(0.02)
+        return {"verified": True, "reason": "", "siteErrors": []}
+
+    monkeypatch.setattr("autofill.resume_manual.attach_and_confirm", fake_attach)
+    runner = PlaywrightRunner(enabled=False, headless=True, workers=1)
+
+    def run(request: FillRequest) -> ApplicationResult:
+        worker = runner._workers[0]
+        if request.session_id not in worker.sessions:
+            slot = _SessionContext()
+            slot.page = object()
+            worker.sessions[request.session_id] = slot
+            runner._pins[request.session_id] = 0
+            runner._loads[0] = 1
+        return ApplicationResult(
+            status=Status.RESUME_UPLOAD_REQUIRED,
+            ats="ashby",
+            current_step=Status.RESUME_UPLOAD_REQUIRED,
+            login_status="NOT_REQUIRED",
+            session_id=request.session_id,
+            candidate_id=request.candidate_id,
+            job_id=request.job_id,
+            messages=["Upload the resume."],
+        )
+
+    monkeypatch.setattr(runner, "run", run)
+    app = create_app(token=TOKEN, runner=runner, run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = _create(client)
+        session_id = created["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        uploaded = client.post(
+            f"/v1/sessions/{session_id}/resume-file",
+            headers=AUTH,
+            data={"candidateId": "candidate-a"},
+            files={"file": ("notes.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.status_code == 200, status.text
+        assert status.json()["timings"]["uploadMs"] >= 1
 
 
 def test_service_source_has_no_host_application():

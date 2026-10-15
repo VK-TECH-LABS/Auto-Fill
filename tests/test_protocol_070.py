@@ -161,7 +161,15 @@ class _Runner:
     def probe_challenge(self, session_id: str) -> str:
         return self.challenge
 
-    def attach_resume_file(self, session_id: str, name: str, data: bytes, hint: str = "", confirmed=None) -> dict:
+    def attach_resume_file(
+        self,
+        session_id: str,
+        name: str,
+        data: bytes,
+        hint: str = "",
+        confirmed=None,
+        timings=None,
+    ) -> dict:
         if not self.resume_ok:
             return {"verified": False, "reason": "ats_rejected", "siteErrors": ["failed to upload"]}
         return {"verified": True, "reason": "", "siteErrors": []}
