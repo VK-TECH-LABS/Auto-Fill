@@ -2547,3 +2547,53 @@ def test_restrictive_covenant_is_not_an_employer_field(browser, resolver):
         assert "employment[]" not in requested
     finally:
         page.close()
+
+
+def test_resolver_path_records_fill_next_and_upload_time(browser, resolver):
+    """The resolver loop times each fill, Next, and a prepared resume attach."""
+    server, url = resolver
+    server.custom_fields = {"email": EMAIL}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<section id='one'>"
+            "<h1>Application</h1>"
+            "<label for='email'>Email</label>"
+            "<input id='email' name='email' type='email' required>"
+            "<label for='resume'>Resume</label>"
+            "<input id='resume' name='resume' type='file'>"
+            "<div id='chip' role='status' hidden>Uploaded</div>"
+            "<button type='button' id='next'>Next</button>"
+            "</section>"
+            "<section id='two' hidden><h1>Review</h1></section>"
+            "<script>"
+            "document.getElementById('resume').addEventListener('change', function () {"
+            "  if (this.files && this.files.length) document.getElementById('chip').hidden = false;"
+            "});"
+            "document.getElementById('next').addEventListener('click', () => {"
+            "  document.getElementById('one').hidden = true;"
+            "  document.getElementById('two').hidden = false;"
+            "});"
+            "</script>"
+        )
+        result, timings = _run(
+            page,
+            "https://boards.greenhouse.io/example/jobs/1",
+            resolver=_binding(url),
+            resume_name="notes.pdf",
+            resume_mime="application/pdf",
+            resume_bytes=PDF,
+            resume_prepared=True,
+        )
+        assert result.status == Status.FILLED, result.messages
+        assert page.locator("#email").input_value() == EMAIL
+        assert page.locator("#resume").evaluate("el => el.files.length") == 1
+        assert timings["fillMs"] >= 1
+        assert timings["firstFillMs"] >= 1
+        assert timings["nextMs"] >= 1
+        assert timings["uploadMs"] >= 1
+        assert result.timings["fillMs"] == timings["fillMs"]
+        assert result.next_clicks >= 1
+    finally:
+        page.close()

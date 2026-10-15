@@ -1571,6 +1571,7 @@ def _run_resolver_pages(
         flags = FillFlags()
         recheck = False
         for attempt in range(3):
+            fill_started = time.perf_counter()
             outcome = fill_resolved_page(
                 page,
                 binding,
@@ -1581,6 +1582,7 @@ def _run_resolver_pages(
                 hook=opts.intent_hook,
                 resume_uploaded=opts.resume_uploaded,
             )
+            _add_ms(opts, "fillMs", fill_started)
             fields.extend(outcome.fields)
             manual.extend(outcome.manual_actions)
             _note_fill(outcome.fields, opts, run_started, inspect_state)
