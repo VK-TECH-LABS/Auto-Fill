@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from autofill.ats import WORKDAY_HOST_RE
 from autofill.credentials import Credentials
 from autofill.extract import extract_page
 from autofill.models import Control, PageSnapshot
@@ -213,7 +214,7 @@ _OTP_LABEL_RE = re.compile(r"\b(verification code|passcode|otp|code)\b", re.IGNO
 _EXISTS_RE = re.compile(r"already exists|account exists|already registered|email is taken", re.IGNORECASE)
 _EMAIL_REDACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _DIGIT_RUN_RE = re.compile(r"\d{3,}")
-_WORKDAY_HOST_RE = re.compile(r"^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$", re.IGNORECASE)
+_WORKDAY_HOST_RE = WORKDAY_HOST_RE
 _LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
 _POLICY_MIN_RE = re.compile(r"(?:at least|minimum(?: of)?|min(?:imum)? of)\s+(\d+)\s+character", re.IGNORECASE)
 _POLICY_DIGIT_RE = re.compile(
@@ -367,7 +368,7 @@ def tenant_identity(url: str, ats: str | None) -> dict:
     origin = f"{parsed.scheme}://{host}" if parsed.scheme and host else ""
     parts = [part for part in (parsed.path or "").split("/") if part]
     key = host
-    if _WORKDAY_HOST_RE.match(host):
+    if _WORKDAY_HOST_RE.search(host):
         site = next((part for part in parts if not _LOCALE_SEGMENT_RE.match(part)), "")
         key = f"{host}/{site}" if site else host
     elif parts and (

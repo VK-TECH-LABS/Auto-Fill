@@ -755,3 +755,66 @@ def test_compound_privacy_and_job_alerts_stay_consent():
         assert _accept_standard_term(Page(), _Ask(controls=[control], consent=True)) is False
     assert checked == []
     assert consume_auto_consents() == []
+
+
+def test_header_sign_in_does_not_make_an_empty_page_ready():
+    from autofill.pagewait import render_ready
+
+    chrome = PageSnapshot(
+        controls=[],
+        heading="",
+        buttons=[ButtonControl(name="Sign In", selector="#signin", in_header=True)],
+    )
+    assert render_ready(chrome) is False
+    posting = PageSnapshot(
+        controls=[],
+        heading="Example Role",
+        buttons=[
+            ButtonControl(name="Sign In", selector="#signin", in_header=True),
+            ButtonControl(name="Apply", selector="#apply"),
+        ],
+    )
+    assert render_ready(posting) is True
+
+
+def test_two_password_fields_are_account_creation_on_the_current_page():
+    """Create Account is not a sign-in wall, and earlier field totals are not reused."""
+    payload = {
+        "controls": [
+            {"kind": "text", "label": "Email Address", "selector": "#email", "inputType": "email"},
+            {"kind": "password", "label": "Password", "selector": "#password", "inputType": "password"},
+            {"kind": "password", "label": "Verify New Password", "selector": "#verify", "inputType": "password"},
+        ],
+        "buttons": [{"name": "Create Account", "selector": "#create", "controlType": "button"}],
+        "captcha": False,
+        "password": True,
+        "heading": "Controls Engineer",
+        "pageText": "Email Address Password Verify New Password",
+        "links": [],
+        "automationIds": ["verifyPassword"],
+    }
+
+    class Page:
+        url = "https://cbm.wd1.myworkdaysite.com/en-US/CBM/login"
+
+        def wait_for_timeout(self, millis):
+            return None
+
+        def evaluate(self, script, arg=None):
+            return payload
+
+    result = autofill_application(
+        Page.url,
+        CandidateProfile.from_dict(
+            {"candidateId": "ref-a", "personal": {"full_name": "River Example", "email": "river.example@example.com"}}
+        ),
+        options=AutofillOptions(page=Page(), protocol_version="0.7.0", session_id="sess-cbm", candidate_id="ref-a"),
+    )
+    assert result.status == Status.ACCOUNT_CREATION_REQUIRED
+    assert result.page_type == "ACCOUNT"
+    assert result.account["mode"] == "register"
+    assert result.fields_detected == 3
+    assert result.fields_filled == 0
+    assert result.progress["requiredDone"] == 0
+    assert result.progress["requiredTotal"] == 0
+    assert result.status != Status.LOGIN_REQUIRED

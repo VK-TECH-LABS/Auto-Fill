@@ -281,19 +281,24 @@ def test_blocking_picks_status_then_the_first_human_item():
     }
 
 
-def test_typing_delays_stay_in_range():
+def test_typing_delays_stay_in_range(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("AUTOFILL_TYPE_DELAY", raising=False)
     seen: list[int] = []
 
     def randint(low: int, high: int) -> int:
-        assert (low, high) == (30, 70)
+        assert (low, high) == (0, 5)
         seen.append(len(seen))
-        return 30 if len(seen) % 2 else 70
+        return 0 if len(seen) % 2 else 5
 
     short = typing_delays("abcd", randint)
-    assert short == [30, 70, 30, 70]
-    assert all(30 <= delay <= 70 for delay in short)
+    assert short == [0, 5, 0, 5]
+    assert all(0 <= delay <= 5 for delay in short)
     assert len(typing_delays("x" * 200, randint)) == 200
     assert len(typing_delays("x" * 201, randint)) == 40
+    monkeypatch.setenv("AUTOFILL_TYPE_DELAY", "12")
+    assert typing_delays("ab", randint) == [12, 12]
+    monkeypatch.setenv("AUTOFILL_TYPE_DELAY", "0")
+    assert typing_delays("ab", randint) == [0, 0]
 
 
 def test_checkpoint_pauses_between_fields():
@@ -336,6 +341,39 @@ def test_focus_waits_before_typing(monkeypatch: pytest.MonkeyPatch):
 
     assert focus_field(Page(), "#name") is True
     assert waits == [300]
+
+
+def test_scroll_does_not_consume_the_interact_cap():
+    from types import SimpleNamespace
+
+    from autofill.service.app import _limit_interact
+
+    session = SimpleNamespace(protocol_version="0.7.0", interact_marks=[])
+    for _ in range(80):
+        _limit_interact(session, "scroll")
+    assert session.interact_marks == []
+    _limit_interact(session, "click")
+    _limit_interact(session, "key")
+    _limit_interact(session, "type")
+    assert len(session.interact_marks) == 3
+
+
+def test_focus_skips_the_scroll_wait_when_the_field_is_already_visible(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("AUTOFILL_TYPE_DELAY", "1")
+    waits: list[int] = []
+
+    class Page:
+        def evaluate(self, script, arg=None):
+            return False
+
+        def add_init_script(self, script):
+            return None
+
+        def wait_for_timeout(self, millis: int) -> None:
+            waits.append(millis)
+
+    assert focus_field(Page(), "#name") is False
+    assert waits == []
 
 
 def test_protocol_060_status_keeps_050_fields(answer_app):
@@ -533,7 +571,7 @@ def _spy(page) -> None:
 def test_text_fill_scrolls_smoothly_before_typing_and_skips_highlight(browser):
     page = browser.new_page()
     try:
-        page.set_content("<label for='name'>Full name</label><input id='name'>")
+        page.set_content("<div style='height:2400px'></div><label for='name'>Full name</label><input id='name'>")
         _spy(page)
         outcome = apply_mapped(
             page,
@@ -1071,7 +1109,7 @@ def test_blocking_question_is_centered_and_known_fields_stay_plain(browser):
     page = browser.new_page()
     try:
         page.set_content(
-            "<h1>Employment History</h1><form>"
+            "<div style='height:2400px'></div><h1>Employment History</h1><form>"
             "<label for='phone'>Phone</label><input id='phone' name='phone' required>"
             "<label for='years'>How many years of experience do you have?</label>"
             "<input id='years' name='years' required>"

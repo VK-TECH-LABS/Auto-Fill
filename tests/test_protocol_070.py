@@ -627,10 +627,16 @@ def test_interact_allows_the_new_statuses_and_a_higher_rate(api):
             ).status_code
             == 200
         )
-    limited = client.post(
+    scrolled = client.post(
         f"/v1/sessions/{session_id}/interact",
         headers=AUTH,
         json={"action": "scroll", "dy": 10, "dx": 4, "candidateRef": "ref-a"},
+    )
+    assert scrolled.status_code == 200, scrolled.text
+    limited = client.post(
+        f"/v1/sessions/{session_id}/interact",
+        headers=AUTH,
+        json={"action": "key", "key": "End", "candidateRef": "ref-a"},
     )
     assert limited.status_code == 429
 

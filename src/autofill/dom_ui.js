@@ -18,7 +18,26 @@
     if (window.__afClock && typeof window.__afClock.nextDelay === "function") {
       return window.__afClock.nextDelay();
     }
-    return 30 + Math.floor(Math.random() * 41);
+    if (window.__afFast) {
+      return 0;
+    }
+    if (typeof window.__afTypeDelay === "number") {
+      return window.__afTypeDelay;
+    }
+    return Math.floor(Math.random() * 6);
+  }
+
+  function inView(el) {
+    if (!el || typeof el.getBoundingClientRect !== "function") {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    const height = window.innerHeight || document.documentElement.clientHeight || 0;
+    const width = window.innerWidth || document.documentElement.clientWidth || 0;
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    return rect.bottom > 0 && rect.right > 0 && rect.top < height && rect.left < width;
   }
 
   function setNative(el, value) {
@@ -40,10 +59,13 @@
   }
 
   function focusField(el) {
-    if (!el || typeof el.scrollIntoView !== "function") {
-      return;
+    if (!el) {
+      return false;
     }
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    const visible = inView(el);
+    if (!visible && typeof el.scrollIntoView === "function") {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     try {
       el.focus({ preventScroll: true });
     } catch (error) {
@@ -53,6 +75,7 @@
         /* The scroll already happened. */
       }
     }
+    return !visible;
   }
 
   function typingTarget(el) {

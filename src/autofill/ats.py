@@ -14,8 +14,15 @@ SSO hosts listed in that same file are refused rather than logged into.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+# Any Workday careers host, not only ``tenant.wdN.myworkdayjobs.com``.
+WORKDAY_HOST_RE = re.compile(
+    r"(^|\.)(myworkdayjobs\.com|myworkdaysite\.com|myworkday\.com|workday\.com)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)

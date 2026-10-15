@@ -67,8 +67,7 @@ STAGE_TITLES = {
 _FOCUS_JS = """(selector) => {
   const el = document.querySelector(selector);
   if (!el || !window.__afUI) return false;
-  window.__afUI.focusField(el);
-  return true;
+  return !!window.__afUI.focusField(el);
 }"""
 
 _TYPE_JS = """async ({ selector, text, append }) => {
@@ -286,14 +285,36 @@ def load_script() -> str:
     return _JS_PATH.read_text(encoding="utf-8")
 
 
+def configured_type_delay() -> int | None:
+    """``AUTOFILL_TYPE_DELAY`` when it is set. ``None`` means the 0–5 ms default."""
+    raw = os.environ.get("AUTOFILL_TYPE_DELAY")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        return None
+
+
 def fast_pace() -> bool:
-    return os.environ.get("AUTOFILL_TYPE_DELAY") == "0"
+    return configured_type_delay() == 0
+
+
+def type_char_delay() -> int:
+    """Per-character delay for a combobox. The default sits inside 0–5 ms."""
+    delay = configured_type_delay()
+    if delay is None:
+        return 3
+    return delay
 
 
 def install_source() -> str:
     script = load_script()
-    if fast_pace():
+    delay = configured_type_delay()
+    if delay == 0:
         return script + "\nwindow.__afFast = true;\n"
+    if delay is not None:
+        return script + f"\nwindow.__afTypeDelay = {delay};\n"
     return script
 
 
@@ -384,9 +405,15 @@ def attach_page(page: Any) -> None:
 
 
 def typing_delays(text: str, randint) -> list[int]:
-    """Per-character delays in the closed range 30..70. Long text types 40 of them."""
+    """Per-character delays. The default is 0..5. ``AUTOFILL_TYPE_DELAY`` overrides it.
+
+    Long text types 40 of them. ``0`` is the fast path and does not call ``randint``.
+    """
     count = 40 if len(text) > 200 else len(text)
-    return [int(randint(30, 70)) for _ in range(count)]
+    delay = configured_type_delay()
+    if delay is not None:
+        return [delay for _ in range(count)]
+    return [int(randint(0, 5)) for _ in range(count)]
 
 
 def workflow_percent(status: str, page_type: str, required_total: int, required_done: int) -> int:

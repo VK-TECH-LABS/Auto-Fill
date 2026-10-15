@@ -361,13 +361,31 @@ def log_capacity_refusal(sessions: int) -> None:
     )
 
 
+def capture_jpeg(page) -> bytes:
+    """Viewport JPEG. Fonts are not loaded, so the capture must not wait on them."""
+    try:
+        return page.screenshot(type="jpeg", quality=60, animations="disabled", caret="hide", timeout=1200)
+    except TypeError:
+        return page.screenshot(type="jpeg", quality=60)
+
+
 def _block_heavy(page) -> None:
-    """Drop video, fonts, and analytics. Documents, scripts, and form calls stay."""
+    """Drop video and analytics. Fonts are answered empty so a screenshot can finish.
+
+    Documents, scripts, and form calls stay. An aborted font leaves
+    ``document.fonts.ready`` pending, and a screenshot waits on that.
+    """
 
     def handle(route) -> None:
         request = route.request
         url = request.url.casefold()
-        if request.resource_type in {"media", "font"} or any(host in url for host in _BLOCKED_HOSTS):
+        if request.resource_type == "font":
+            try:
+                route.fulfill(status=200, content_type="font/woff2", body=b"")
+            except Exception:
+                route.abort()
+            return
+        if request.resource_type == "media" or any(host in url for host in _BLOCKED_HOSTS):
             route.abort()
             return
         route.continue_()
@@ -521,6 +539,7 @@ class _SessionContext:
         self.context: Any = None
         self.page: Any = None
         self.context_ready_ms = 0
+        self.page_load_ms = 0
         self.mark: PageMark | None = None
         self.last_ats: str | None = None
 
@@ -551,7 +570,9 @@ class _SessionContext:
                 self.context_ready_ms = elapsed_ms(started)
                 page = context.new_page()
                 _block_heavy(page)
+                navigation_started = time.perf_counter()
                 page.goto(url, wait_until="domcontentloaded", timeout=max(1, int(remaining * 1000)))
+                self.page_load_ms = elapsed_ms(navigation_started)
                 self.context = context
                 self.page = page
                 if on_phase is not None:
@@ -809,6 +830,15 @@ class PlaywrightRunner:
             self.browser_ready_ms = 0
             self.browser_prewarm_ms = 0
             return 0
+        if not memory_allows_session():
+            logger.info(
+                "prewarm=skipped reason=memory rss_bytes=%s limit_bytes=%s",
+                container_memory_bytes(),
+                memory_limit_bytes(),
+            )
+            self.browser_ready_ms = 0
+            self.browser_prewarm_ms = 0
+            return 0
         started = time.perf_counter()
         threads = [
             threading.Thread(target=worker.prewarm, name=f"autofill-prewarm-{worker.index}")
@@ -867,6 +897,8 @@ class PlaywrightRunner:
         if slot is not None and slot.context_ready_ms:
             timings["contextReadyMs"] = slot.context_ready_ms
             timings.setdefault("browserReadyMs", slot.context_ready_ms)
+            if slot.page_load_ms:
+                timings["pageLoadMs"] = slot.page_load_ms
         return timings
 
     def _run_engine(
@@ -975,7 +1007,7 @@ class PlaywrightRunner:
 
             try:
                 host = urlparse(slot.page.url).hostname or ""
-                image = slot.page.screenshot(type="jpeg", quality=60)
+                image = capture_jpeg(slot.page)
             except Exception as exc:
                 if _page_navigating(exc):
                     raise PageUnavailable(503) from None
