@@ -750,6 +750,113 @@ def test_lever_location_portal_uses_keyboard_when_the_click_does_not_commit(brow
         page.close()
 
 
+def _suggestion_page(places: list[str], *, commit_click: bool) -> str:
+    click = (
+        "item.addEventListener('click', () => {"
+        "input.value = item.textContent;"
+        "hidden.value = JSON.stringify({name: item.textContent, id: item.id});"
+        "});"
+        if commit_click
+        else "item.addEventListener('mousedown', (event) => event.preventDefault());"
+    )
+    return (
+        "<h1>Application</h1><form>"
+        "<label for='location-input'>Current location</label>"
+        "<input id='location-input' name='location' type='text' autocomplete='off'>"
+        "<input id='selected-location' type='hidden' name='selectedLocation'>"
+        "</form><script>"
+        "const input = document.getElementById('location-input');"
+        "const hidden = document.getElementById('selected-location');"
+        f"const places = {json.dumps(places)};"
+        "input.addEventListener('input', () => {"
+        "document.querySelectorAll('.dropdown-location').forEach((node) => node.remove());"
+        "hidden.value = '';"
+        "places.forEach((place, index) => {"
+        "const item = document.createElement('div');"
+        "item.className = 'dropdown-location';"
+        "item.id = 'location-' + index;"
+        "item.textContent = place;"
+        f"{click}"
+        "document.body.appendChild(item);"
+        "});"
+        "});"
+        "input.addEventListener('keydown', (event) => {"
+        "if (event.key !== 'Enter') return;"
+        "window.__entered = (window.__entered || 0) + 1;"
+        "event.preventDefault();"
+        "const first = document.querySelector('.dropdown-location');"
+        "if (!first) return;"
+        "input.value = first.textContent;"
+        "hidden.value = JSON.stringify({name: first.textContent, id: first.id || 'picked'});"
+        "});"
+        "</script>"
+    )
+
+
+def _nyc_profile() -> CandidateProfile:
+    return CandidateProfile.from_dict(
+        {
+            "candidateId": "ref-a",
+            "personal": {
+                "full_name": "River Example",
+                "email": EMAIL,
+                "city": "Boston",
+                "province_state": "NY",
+                "country": "United States",
+            },
+        }
+    )
+
+
+def test_nyc_location_uses_profile_state_and_skips_stockholm(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {"address.city": "NYC"}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(
+            _suggestion_page(
+                ["Stockholm, Sweden", "New York, NY, USA"],
+                commit_click=True,
+            )
+        )
+        result, _timings = _run(
+            page,
+            "https://jobs.lever.co/example/role",
+            profile=_nyc_profile(),
+            resolver=_binding(url),
+        )
+        assert page.locator("#location-input").input_value() == "New York, NY, USA"
+        stored = json.loads(page.locator("#selected-location").input_value())
+        assert stored["name"] == "New York, NY, USA"
+        assert "Stockholm" not in page.locator("#location-input").input_value()
+        assert [item.get("text") for item in result.manual_questions] == []
+    finally:
+        page.close()
+
+
+def test_unmatched_location_suggestion_stays_a_human_question(browser, resolver):
+    server, url = resolver
+    server.custom_fields = {"address.city": "NYC"}  # type: ignore[attr-defined]
+    server.custom_answers = []  # type: ignore[attr-defined]
+    page = browser.new_page()
+    try:
+        page.set_content(_suggestion_page(["Stockholm, Sweden", "New York, NY, USA"], commit_click=False))
+        result, _timings = _run(
+            page,
+            "https://jobs.lever.co/example/role",
+            profile=_nyc_profile(),
+            resolver=_binding(url),
+        )
+        assert page.evaluate("() => window.__entered || 0") == 0
+        assert page.locator("#location-input").input_value() == ""
+        assert "Stockholm" not in page.locator("#selected-location").input_value()
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert "Current location" in [item.get("text") for item in result.manual_questions]
+    finally:
+        page.close()
+
+
 def test_lever_location_free_text_when_no_suggestions_appear(browser, resolver, caplog):
     server, url = resolver
     caplog.set_level("INFO")

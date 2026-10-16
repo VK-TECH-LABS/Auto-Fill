@@ -22,6 +22,7 @@ from autofill.credentials import CredentialProvider, SiteContext
 from autofill.dom_ui import (
     attach_page,
     begin_run,
+    bind_preview,
     current_run,
     empty_progress,
     end_run,
@@ -69,10 +70,12 @@ from autofill.safeguards import (
 from autofill.session import SessionStore
 from autofill.stepfill import (
     FillFlags,
+    bind_location_profile,
     fill_resolved_page,
     flags_for_alerts,
     inspect_required,
     required_gaps,
+    reset_location_profile,
     validation_blob,
 )
 
@@ -597,6 +600,8 @@ def autofill_application(
         ats=ats_name,
         refill_cleared=_protocol_070(opts),
     )
+    bind_preview(lambda current: _paint(current, opts))
+    _profile_token = bind_location_profile(candidate_profile)
     session.mark("DETECT_ATS")
     logger.info(
         "session=%s domain=%s ats=%s step=%s",
@@ -608,6 +613,7 @@ def autofill_application(
 
     if is_manual_ats(application_url):
         session.mark("FAILED")
+        reset_location_profile(_profile_token)
         return _result(
             session,
             status=Status.MANUAL_REVIEW_REQUIRED,
@@ -617,6 +623,7 @@ def autofill_application(
         )
     if is_blocked_sso(application_url):
         session.mark("FAILED")
+        reset_location_profile(_profile_token)
         return _result(
             session,
             status=Status.UNSUPPORTED,
@@ -1114,6 +1121,7 @@ def autofill_application(
             timings=_timings(opts),
         )
     finally:
+        reset_location_profile(_profile_token)
         if confirmed_token is not None:
             reset_confirmed(confirmed_token)
         if session_token is not None:

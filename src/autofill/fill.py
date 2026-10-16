@@ -13,13 +13,21 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
-from autofill.dom_ui import checkpoint, control_committed, focus_field, refill_cleared, selector_held, type_visible
+from autofill.dom_ui import (
+    checkpoint,
+    control_committed,
+    focus_field,
+    refill_cleared,
+    refresh_preview,
+    selector_held,
+    type_visible,
+)
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
 from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
-from autofill.safeguards import activate, classify_control, is_add_row
+from autofill.safeguards import _bound_target, activate, classify_control, is_add_row
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -146,62 +154,126 @@ def apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool
     return _apply_mapped(page, control, mapped, overwrite=overwrite)
 
 
+def _value_matches(current: str, expected: str) -> bool:
+    """The page already shows this exact text. A reformatted phone is not exact."""
+    got = current.strip()
+    want = expected.strip()
+    return bool(got) and bool(want) and (got == want or got.casefold() == want.casefold())
+
+
+def _value_verified(current: str, expected: str) -> bool:
+    """True when the page shows the value that was written.
+
+    A site may regroup a phone number. That still counts after the write.
+    It does not count as the value we were about to type.
+    """
+    if _value_matches(current, expected):
+        return True
+    got = current.strip()
+    want = expected.strip()
+    if not got or not want:
+        return False
+    want_digits = "".join(character for character in want if character.isdigit())
+    got_digits = "".join(character for character in got if character.isdigit())
+    return len(want_digits) >= 7 and want_digits == got_digits
+
+
+def _shown_value(locator) -> str:
+    try:
+        return str(locator.input_value() or "")
+    except Exception:
+        return ""
+
+
+def _verified_or_blank(control: Control, mapped: MappedField, locator, expected: str) -> FieldOutcome:
+    shown = _shown_value(locator)
+    if not _value_verified(shown, expected):
+        return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+    remember_confirmed(control, shown.strip(), field_key=mapped.key or "")
+    refresh_preview(getattr(locator, "page", None))
+    return _outcome(control, mapped, detail="filled")
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
     try:
-        locator = page.locator(control.selector)
+        target = _bound_target(page, getattr(control, "frame_url", "") or "")
+        locator = target.locator(control.selector)
         if mapped.action == "fill":
-            current = locator.input_value()
-            if not overwrite and current.strip() and current.strip() != mapped.text:
+            current = _shown_value(locator)
+            if not overwrite and current.strip() and not _value_matches(current, mapped.text or ""):
                 return _outcome(
                     control,
                     mapped,
                     action="skip",
                     detail="Left an existing value in place.",
                 )
-            if current.strip() == mapped.text:
-                remember_confirmed(control, current, field_key=mapped.key or "")
+            if _value_matches(current, mapped.text or ""):
+                remember_confirmed(control, current.strip(), field_key=mapped.key or "")
                 return _outcome(control, mapped, detail="already set")
             if control.kind in {"text", "textarea", "combobox"}:
-                if not type_visible(page, control.selector, mapped.text):
+                if not type_visible(target, control.selector, mapped.text):
                     if hasattr(locator, "evaluate"):
                         locator.evaluate(_SET_NATIVE, mapped.text)
-                    else:
+                    elif hasattr(locator, "fill"):
                         locator.fill(mapped.text)
-            else:
+            elif hasattr(locator, "fill"):
                 locator.fill(mapped.text)
-            remember_confirmed(control, mapped.text or "", field_key=mapped.key or "")
-            return _outcome(control, mapped, detail="filled")
+            return _verified_or_blank(control, mapped, locator, mapped.text or "")
         if mapped.action == "select":
             if control.kind == "radio":
-                focus_field(page, mapped.option_selector or control.selector)
-                page.locator(mapped.option_selector).check()
-            elif control.kind == "combobox":
+                option = target.locator(mapped.option_selector or control.selector)
+                focus_field(target, mapped.option_selector or control.selector)
+                option.check()
+                if not option.is_checked():
+                    return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+                remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
+                refresh_preview(page)
+                return _outcome(control, mapped, detail=mapped.option_label or "selected")
+            if control.kind == "combobox":
                 from autofill.combobox import select_combobox
 
-                chosen = select_combobox(page, control.selector, mapped.option_label or mapped.text)
+                chosen = select_combobox(target, control.selector, mapped.option_label or mapped.text)
                 if chosen is None:
                     return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
                 remember_confirmed(control, chosen.label, field_key=mapped.key or "")
+                refresh_preview(page)
                 return _outcome(control, mapped, detail=chosen.label)
-            elif control.kind == "buttons" and mapped.option_selector:
+            if control.kind == "buttons" and mapped.option_selector:
                 from autofill.safeguards import click_choice
 
-                click_choice(page, mapped.option_selector, mapped.option_label)
-            elif mapped.option_value:
-                focus_field(page, control.selector)
+                click_choice(target, mapped.option_selector, mapped.option_label)
+                remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
+                refresh_preview(page)
+                return _outcome(control, mapped, detail=mapped.option_label or "selected")
+            expected = mapped.option_label or mapped.option_value or mapped.text or ""
+            focus_field(target, control.selector)
+            if mapped.option_value:
                 locator.select_option(value=mapped.option_value)
             else:
-                focus_field(page, control.selector)
                 locator.select_option(label=mapped.option_label)
-            remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
+            shown = _shown_value(locator)
+            if not (
+                _value_verified(shown, expected)
+                or _value_verified(shown, mapped.option_value or "")
+                or _value_verified(shown, mapped.option_label or "")
+            ):
+                return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            remember_confirmed(control, shown.strip(), field_key=mapped.key or "")
+            refresh_preview(page)
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
             locator.check()
+            if hasattr(locator, "is_checked") and not locator.is_checked():
+                return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            refresh_preview(page)
             return _outcome(control, mapped, detail="checked")
         if mapped.action == "uncheck":
             locator.uncheck()
+            if hasattr(locator, "is_checked") and locator.is_checked():
+                return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            refresh_preview(page)
             return _outcome(control, mapped, detail="unchecked")
         if mapped.action == "upload":
             locator.set_input_files(mapped.text)

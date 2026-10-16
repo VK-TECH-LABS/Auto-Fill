@@ -191,6 +191,18 @@ def test_location_state_alias_picks_austin_tx():
     assert choose_location_label(labels, city="Austin", region="", country="US") is None
     assert choose_location_label(labels, city="austin", region="tx", country="us") == "Austin, TX, USA"
     assert choose_location_label(["AUSTIN, TX, USA"], city="Austin", region="TX", country="US") == "AUSTIN, TX, USA"
+    nyc = ["Stockholm, Sweden", "New York, NY, USA"]
+    assert choose_location_label(nyc, city="NYC", region="NY", country="US") == "New York, NY, USA"
+    assert choose_location_label(["Stockholm, Sweden"], city="NYC", region="NY", country="US") is None
+    assert choose_location_label(nyc, city="NYC", region="", country="") == "New York, NY, USA"
+    same_place = [
+        "New York, MO, USA",
+        "NYC, NY, USA",
+        "New York, USA",
+        "New York, NY, USA",
+        "Stockholm, Sweden",
+    ]
+    assert choose_location_label(same_place, city="NYC", region="NY", country="US") == "New York, NY, USA"
     sponsor = Control(
         kind="combobox",
         label="Will you now or in the future require sponsorship for a visa to remain in your current location?",

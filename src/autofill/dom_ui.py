@@ -10,6 +10,7 @@ import contextvars
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,8 @@ class RunState:
         self.selector_to_key: dict[str, str] = {}
         self.halted = ""
         self.token: contextvars.Token | None = None
+        self.preview: Callable[[Any], None] | None = None
+        self.preview_at = 0.0
 
 
 _RUN: contextvars.ContextVar[RunState | None] = contextvars.ContextVar("af_run", default=None)
@@ -920,21 +923,66 @@ def finalize_run(status: str) -> tuple[dict[str, Any], dict[str, Any] | None, li
     _refresh(state)
     item = choose_blocking(status, state.open_items)
     present_blocking(state.page, item)
+    if status in _FRESH_FRAME and state.page is not None:
+        refresh_preview(state.page, force=True)
     return dict(state.progress), public_blocking(item), [dict(entry) for entry in state.open_items]
 
 
+_FRESH_FRAME = frozenset(
+    {
+        "MANUAL_ANSWER_REQUIRED",
+        "RESUME_UPLOAD_REQUIRED",
+        "LOGIN_REQUIRED",
+        "CAPTCHA_REQUIRED",
+        "ACCOUNT_CREATION_REQUIRED",
+        "EMAIL_VERIFICATION_REQUIRED",
+        "MANUAL_REVIEW_REQUIRED",
+        "READY_FOR_HUMAN_SUBMIT",
+    }
+)
+
+
+def bind_preview(paint: Callable[[Any], None] | None) -> None:
+    """Remember the callback that stores a preview frame for this run."""
+    state = current_run()
+    if state is None:
+        return
+    state.preview = paint
+    state.preview_at = 0.0
+
+
+def refresh_preview(page: Any, *, force: bool = False) -> None:
+    """Store one preview frame. A fill updates it at most once every 500 ms.
+
+    ``force`` is the human stop. It scrolls first, then captures even when a
+    frame was stored a moment ago. The capture runs on the fill thread so a
+    screenshot request can keep serving the cache.
+    """
+    state = current_run()
+    if state is None or page is None or state.preview is None:
+        return
+    now = time.monotonic()
+    if not force and now - state.preview_at < 0.5:
+        return
+    state.preview_at = now
+    host = getattr(page, "page", None)
+    if host is None:
+        host = page
+    state.preview(host)
+
+
 def present_blocking(page: Any, item: dict[str, Any] | None) -> None:
-    """Center and outline a human-action field. Other kinds stay unmarked."""
+    """Center the current question. The outline stays on a human-action field."""
     if page is None:
         return
+    selector = str((item or {}).get("selector") or "")
+    if selector:
+        focus_field(page, selector)
     if item is None or str(item.get("kind") or "") not in HIGHLIGHT_KINDS:
         clear_highlight(page, None)
         return
-    selector = str(item.get("selector") or "")
-    if not selector:
-        return
-    focus_field(page, selector)
-    highlight(page, selector)
+    if selector:
+        highlight(page, selector)
 
 
 def _wait_for_scroll(page: Any) -> None:
@@ -986,6 +1034,8 @@ def type_visible(page: Any, selector: str, text: str) -> bool:
         install(page)
         typed = _type_once(page, selector, text)
     _pump_queue()
+    if typed:
+        refresh_preview(page)
     return typed
 
 

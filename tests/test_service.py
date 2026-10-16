@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -772,6 +773,85 @@ def test_resume_file_attach_records_upload_time(monkeypatch):
         status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
         assert status.status_code == 200, status.text
         assert status.json()["timings"]["uploadMs"] >= 1
+
+
+def test_resume_follow_answers_status_while_the_fill_is_busy():
+    """A verified resume continues on its own. Status stays 200 while that fill holds the lock."""
+    inside = threading.Event()
+    release = threading.Event()
+
+    class Runner:
+        def run(self, request: FillRequest) -> ApplicationResult:
+            if request.resume_uploaded:
+                inside.set()
+                assert release.wait(3)
+                return ApplicationResult(
+                    status=Status.MANUAL_ANSWER_REQUIRED,
+                    ats="greenhouse",
+                    current_step=Status.MANUAL_ANSWER_REQUIRED,
+                    login_status="NOT_REQUIRED",
+                    session_id=request.session_id,
+                    candidate_id=request.candidate_id,
+                    job_id=request.job_id,
+                    messages=["A required field is still empty."],
+                )
+            return ApplicationResult(
+                status=Status.RESUME_UPLOAD_REQUIRED,
+                ats="greenhouse",
+                current_step=Status.RESUME_UPLOAD_REQUIRED,
+                login_status="NOT_REQUIRED",
+                session_id=request.session_id,
+                candidate_id=request.candidate_id,
+                job_id=request.job_id,
+                messages=["Upload the resume."],
+            )
+
+        def attach_resume_file(
+            self,
+            session_id: str,
+            name: str,
+            data: bytes,
+            hint: str = "",
+            confirmed=None,
+            timings=None,
+        ) -> dict:
+            return {"verified": True, "reason": "", "siteErrors": []}
+
+        def discard(self, session_id: str) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    app = create_app(token=TOKEN, runner=Runner(), run_browser=False, reaper_interval_seconds=60)
+    with TestClient(app) as client:
+        created = _create(client)
+        session_id = created["sessionId"]
+        started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+        assert started.status_code == 200, started.text
+        uploaded = client.post(
+            f"/v1/sessions/{session_id}/resume-file",
+            headers=AUTH,
+            data={"candidateId": "candidate-a"},
+            files={"file": ("notes.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        assert uploaded.json()["status"] == Status.STARTED
+        assert inside.wait(3)
+        status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+        assert status.status_code == 200, status.text
+        assert status.json()["status"] == Status.STARTED
+        release.set()
+        deadline = time.monotonic() + 3
+        body: dict = {}
+        while time.monotonic() < deadline:
+            status = client.get(f"/v1/sessions/{session_id}/status", headers=AUTH)
+            assert status.status_code == 200, status.text
+            body = status.json()
+            if body["status"] == Status.MANUAL_ANSWER_REQUIRED:
+                break
+            time.sleep(0.02)
+        assert body["status"] == Status.MANUAL_ANSWER_REQUIRED
 
 
 def test_service_source_has_no_host_application():

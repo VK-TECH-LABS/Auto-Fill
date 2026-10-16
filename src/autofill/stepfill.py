@@ -1,7 +1,8 @@
 """Fill one application step from resolver values, then drop those values.
 
-Profile records are not consulted while writing. The only values written are
-the ones the resolver returned for the keys and intents on this step.
+The city typed into a location box is the resolver's city. A profile state or
+country is used only to choose among suggestions when the resolver omitted
+them. Other profile records are not written.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import json
 import logging
 import re
 import time
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,6 +68,17 @@ from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice, dismiss_combobox
 
 logger = logging.getLogger("autofill.stepfill")
+
+_LOCATION_PROFILE: ContextVar[CandidateProfile | None] = ContextVar("autofill_location_profile", default=None)
+
+
+def bind_location_profile(profile: CandidateProfile | None) -> Token:
+    """Remember a profile for location matching. The city still comes from the resolver."""
+    return _LOCATION_PROFILE.set(profile)
+
+
+def reset_location_profile(token: Token) -> None:
+    _LOCATION_PROFILE.reset(token)
 
 _LEGAL_RE = re.compile(
     r"\b(i agree|i certify|i acknowledge|terms of (service|use)|privacy policy|attest|e-?sign|legal attestation)\b"
@@ -603,6 +616,12 @@ _COUNTRIES = {
     "gb": "united kingdom",
     "great britain": "united kingdom",
 }
+# City nicknames only. A bare "ny" is the state, not New York City.
+_CITY_ALIASES = {
+    "nyc": ("new york", "new york city"),
+    "new york": ("nyc", "new york city"),
+    "new york city": ("nyc", "new york"),
+}
 _LOCATION_OPTIONS_JS = r"""
 (selector) => {
   const el = document.querySelector(selector);
@@ -714,6 +733,35 @@ def _location_parts(fields: dict) -> tuple[str, str, str]:
     return city, region, country
 
 
+def _with_profile_place(region: str, country: str) -> tuple[str, str]:
+    """Fill a missing state or country from the profile. Never replace one the resolver sent."""
+    profile = _LOCATION_PROFILE.get()
+    personal = getattr(profile, "personal", None)
+    if personal is None:
+        return region, country
+    if not region:
+        region = str(getattr(personal, "province_state", "") or "").strip()
+    if not country:
+        country = str(getattr(personal, "country", "") or "").strip()
+    return region, country
+
+
+def _city_names(city: str) -> list[str]:
+    token = normalize(city)
+    if not token:
+        return []
+    names = [token]
+    for alias in _CITY_ALIASES.get(token, ()):
+        if alias not in names:
+            names.append(alias)
+    return names
+
+
+def _city_in_text(text: str, city: str) -> bool:
+    folded = normalize(text)
+    return any(_phrase_in(folded, name) for name in _city_names(city))
+
+
 def _phrase_in(folded: str, phrase: str) -> bool:
     token = normalize(phrase)
     if not token:
@@ -756,39 +804,84 @@ def _alias_in(folded: str, value: str, table: dict[str, str]) -> bool:
 
 def _same_city(label: str, city: str) -> bool:
     """True when the suggestion's city equals ``city``, ignoring case."""
-    wanted = normalize(city)
-    if not wanted:
+    names = _city_names(city)
+    if not names:
         return False
     head = normalize(label.split(",")[0])
-    if head == wanted:
+    if head in names:
         return True
-    return _phrase_in(normalize(label), city)
+    return _city_in_text(label, city)
+
+
+def _label_tail(label: str) -> str:
+    """The place after the city. The state name must be here, not inside the city."""
+    pieces = [part.strip() for part in label.split(",") if part.strip()]
+    if len(pieces) < 2:
+        return ""
+    return normalize(", ".join(pieces[1:]))
+
+
+def _place_agrees(label: str, city: str, region: str, country: str) -> bool:
+    """The shown place is the city, and the state and country when those are known."""
+    if not _same_city(label, city):
+        return False
+    scope = _label_tail(label) or normalize(label)
+    if region and not _alias_in(scope, region, _STATES):
+        return False
+    if country and not _alias_in(scope, country, _COUNTRIES):
+        return False
+    return True
+
+
+def _prefer_same_place(labels: list[str], city: str) -> str | None:
+    """One label when every hit is the same city with the same state and country.
+
+    ``NYC, NY, USA`` and ``New York, NY, USA`` are that place. Two identical
+    labels, or two different states, are not.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        key = normalize(label)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(label)
+    # Two copies of one label are not a choice. Different wording of one place is.
+    if len(unique) == 1:
+        return None
+    labels = unique
+
+    def rank(label: str) -> int:
+        head = normalize(label.split(",")[0])
+        if head not in _city_names(city):
+            return 0
+        return len(head)
+
+    best = max(rank(label) for label in labels)
+    if best <= 0:
+        return None
+    top = [label for label in labels if rank(label) == best]
+    if len(top) == 1:
+        return top[0]
+    return None
 
 
 def choose_location_label(labels: list[str], *, city: str, region: str, country: str) -> str | None:
     """One suggestion that matches the city and, when present, the region and country."""
     winners: list[tuple[int, str]] = []
     for label in labels:
-        folded = normalize(label)
-        if not _same_city(label, city):
+        if not _place_agrees(label, city, region, country):
             continue
-        score = 4
-        if region:
-            if not _alias_in(folded, region, _STATES):
-                continue
-            score += 2
-        if country:
-            if not _alias_in(folded, country, _COUNTRIES):
-                continue
-            score += 1
+        score = 4 + (2 if region else 0) + (1 if country else 0)
         winners.append((score, label))
     if not winners:
         return None
     best = max(score for score, _label in winners)
     chosen = [label for score, label in winners if score == best]
-    if len(chosen) != 1:
-        return None
-    return chosen[0]
+    if len(chosen) == 1:
+        return chosen[0]
+    return _prefer_same_place(chosen, city)
 
 
 def _location_options(page, selector: str) -> list[tuple[str, str]]:
@@ -1074,11 +1167,12 @@ def _location_pick(page) -> dict[str, Any] | None:
 def _place_text_committed(shown: str, city: str, *, require_full: bool) -> bool:
     """A visible place matches the city. A bare city, or an empty proxy, does not."""
     folded = normalize(shown)
-    if not folded or folded == normalize(city):
+    names = _city_names(city)
+    if not folded or not names or folded in names:
         return False
     if require_full and not _full_place(shown):
         return False
-    return bool(city) and _phrase_in(folded, city)
+    return _city_in_text(shown, city)
 
 
 def _location_committed(page, control: Control, city: str) -> bool:
@@ -1093,7 +1187,7 @@ def _location_committed(page, control: Control, city: str) -> bool:
     if _has_selected_location(page):
         pick = _location_pick(page)
         if pick is not None:
-            return bool(city) and _phrase_in(normalize(str(pick.get("name") or "")), city)
+            return _city_in_text(str(pick.get("name") or ""), city)
         proxy_empty = True
     if getattr(page, "evaluate", None) is None:
         try:
@@ -1349,6 +1443,8 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     # The caller named a city. When several places share it, keep the first
     # suggestion the geocoder ranked. A profile fill with no region still asks.
     trace["exact"] = value if location_shape(value) == "place" else ""
+    # Several places can share a city. The first geocoder row is kept only when
+    # no state or country is known. A known place never takes an unmatched row.
     _apply_location(page, control, fields, outcome, ranked=True, trace=trace)
     city, _region, _country = _location_parts(fields)
     labels = pickable_location_labels(
@@ -1417,6 +1513,7 @@ def _apply_location(
 ) -> None:
     """Type the city and keep a suggestion. A typed value that the list does not commit stays manual."""
     city, region, country = _location_parts(fields)
+    region, country = _with_profile_place(region, country)
     if not city:
         # The resolver sent no city and no location string. Say so: this is a
         # profile gap, not a picker failure, and it was silent before.
@@ -1501,14 +1598,16 @@ def _apply_location_query(
     trace["count"] = len(options)
     trace["labels"] = [label for label, _selector in options]
     logger.info("location suggestions status=%s count=%s", status if status is not None else "none", len(options))
-    if match is None and ranked and not region:
+    if match is None and ranked and not region and not country:
         hits = [item for item in options if _same_city(item[0], city)]
         if hits:
             match = hits[0]
             logger.info("location answer ranked=first count=%s", len(hits))
     if match is not None:
         click_choice(page, match[1], match[0])
-        if not _location_committed(page, control, city):
+        if not _location_committed(page, control, city) and _keyboard_may_commit(
+            options, match, city, region, country
+        ):
             try:
                 _keep_enter_from_submitting(page)
                 field.press("ArrowDown")
@@ -1519,10 +1618,9 @@ def _apply_location_query(
                 if _location_committed(page, control, city):
                     break
                 _pause(page, 50)
-        if _location_committed(page, control, city):
-            picked = _location_pick(page) or {}
-            detail = str(picked.get("name") or match[0])
-            _remember_location(outcome, control, detail)
+        shown = _agreed_place(page, control, field, city, region, country)
+        if shown:
+            _remember_location(outcome, control, shown)
             return
     if not options:
         reason = "no_suggestions"
@@ -1535,11 +1633,65 @@ def _apply_location_query(
         reason,
         _location_suggestion_log([item[0] for item in options]),
     )
+    _clear_location_entry(page, field)
+    _manual_location(outcome, control, [label for label, _selector in options])
+
+
+def _keyboard_may_commit(
+    options: list[tuple[str, str]],
+    match: tuple[str, str],
+    city: str,
+    region: str,
+    country: str,
+) -> bool:
+    """Enter confirms the highlighted row, which is the first suggestion.
+
+    That row is safe only when it is the matched place. Otherwise Enter would
+    keep a different city, such as Stockholm for NYC.
+    """
+    if not options:
+        return False
+    first = options[0][0]
+    if normalize(first) != normalize(match[0]):
+        return False
+    return _place_agrees(first, city, region, country)
+
+
+def _agreed_place(page, control: Control, field, city: str, region: str, country: str) -> str:
+    """The place now on the page, when it matches. The intended label is not a fallback."""
+    if not _location_committed(page, control, city):
+        return ""
+    pick = _location_pick(page) or {}
+    shown = str(pick.get("name") or "").strip()
+    if not shown:
+        try:
+            shown = str(field.input_value() or "").strip()
+        except Exception:
+            shown = ""
+    if shown and _place_agrees(shown, city, region, country):
+        return shown
+    return ""
+
+
+def _clear_location_entry(page, field) -> None:
     try:
         field.fill("")
     except Exception:
         pass
-    _manual_location(outcome, control, [label for label, _selector in options])
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(
+            """() => {
+              const hidden = document.querySelector(
+                "input[name='selectedLocation'], input[name='selected_location']"
+              );
+              if (hidden) hidden.value = "";
+            }"""
+        )
+    except Exception:
+        return
 
 
 def _fill_name_parts(response: ResolverResponse) -> None:
