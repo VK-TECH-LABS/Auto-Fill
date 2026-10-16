@@ -259,3 +259,22 @@ def test_validation_redraw_is_not_an_advance_but_a_new_step_is():
     assert navigation_changed(before, page, _snap(["#a", "#b", "#x"])) is True
     assert navigation_changed(before, page, _snap(["#y"])) is True
     assert navigation_changed(before, page, _snap(["#a", "#b", "#c"], heading="Review")) is True
+
+
+def test_work_status_is_not_a_disability_question_and_base_salary_is_salary():
+    from autofill.intents import classify_question
+
+    assert classify_question("Work Status").intent != "DISABILITY_STATUS"
+    assert classify_question("Disability Status").intent == "DISABILITY_STATUS"
+    assert classify_question("Veteran Status").intent == "VETERAN_STATUS"
+    salary = classify_question("Minimum Desired Base Salary")
+    assert (salary.intent, salary.confidence) == ("SALARY_EXPECTATION", "HIGH")
+
+
+def test_a_saved_whole_number_matches_its_formatted_option_only():
+    from autofill.intents import options_equivalent
+
+    assert options_equivalent("100000", "100,000")
+    assert options_equivalent("$100,000", "100000")
+    assert not options_equivalent("100000", "100,000 - 120,000")
+    assert not options_equivalent("10000", "100,000")

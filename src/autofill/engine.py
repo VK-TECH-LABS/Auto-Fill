@@ -10,6 +10,7 @@ The final Submit control is never clicked. CAPTCHA widgets stop the run.
 
 from __future__ import annotations
 
+import re
 import contextvars
 import logging
 import time
@@ -1429,6 +1430,9 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
     return page, snapshot
 
 
+_RESUME_NAMED = re.compile(r"\b(resume|résumé|cv|curriculum vitae)\b", re.IGNORECASE)
+
+
 def _same_route(page, before: tuple) -> bool:
     """True when the URL route is the one recorded before the click."""
     from urllib.parse import urlparse
@@ -1455,8 +1459,15 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     if fresh is None:
         _log_move(session.session_id, "next", "stalled")
         raise NavigationStalled("next")
-    if advanced and not fresh.captcha_present and validation_message(fresh) and _same_route(page, before):
-        # The employer redrew this step with an error. That is not a new page.
+    if (
+        advanced
+        and not fresh.captcha_present
+        and validation_message(fresh)
+        and _same_route(page, before)
+        and invalid_field_messages(page)
+    ):
+        # The employer redrew this step and flagged a field. That is not a new page.
+        # A stale banner with no flagged field does not hold back a real advance.
         _log_move(session.session_id, "next", "invalid")
         return page, fresh
     if advanced or fresh.captcha_present:
@@ -1730,6 +1741,17 @@ def _run_resolver_pages(
                     [challenge_message(snapshot)],
                 )
             if validation_message(snapshot):
+                named = invalid_field_messages(page)
+                if not opts.resume_uploaded and any(_RESUME_NAMED.search(item) for item in named):
+                    # The employer flagged the resume, which this step hid behind
+                    # its own picker. Attach the prepared file and try the step again.
+                    if _attach_prepared(page, opts) == "attached":
+                        continue
+                    session.mark(Status.RESUME_UPLOAD_REQUIRED)
+                    return finish(
+                        Status.RESUME_UPLOAD_REQUIRED,
+                        ["Upload the resume that was already downloaded, then continue with resumeUploaded.", *named],
+                    )
                 if attempt == 2:
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)
                     return finish(

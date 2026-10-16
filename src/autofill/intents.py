@@ -136,6 +136,8 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("SALARY_EXPECTATION", "compensation expectation"),
     ("SALARY_EXPECTATION", "pay expectation"),
     ("SALARY_EXPECTATION", "expected salary"),
+    ("SALARY_EXPECTATION", "base salary"),
+    ("SALARY_EXPECTATION", "minimum salary"),
     ("EMPLOYMENT_TYPE", "employment type"),
     ("EMPLOYMENT_TYPE", "type of employment"),
     ("EMPLOYMENT_TYPE", "full time or part time"),
@@ -440,6 +442,10 @@ def _planned(match: IntentMatch) -> IntentMatch:
     return IntentMatch(match.intent, match.confidence, match.source, match.text, fallback, combine)
 
 
+# Words that say nothing about the topic on their own.
+_GENERIC_TOKENS = frozenset({"status", "demographic", "type", "time", "date"})
+
+
 def _level2(text: str) -> IntentMatch | None:
     asked = _tokens(text)
     if len(asked) < 2:
@@ -450,7 +456,11 @@ def _level2(text: str) -> IntentMatch | None:
         known = _tokens(prototype)
         if not known:
             continue
-        score = len(asked & known) / len(asked | known)
+        shared = asked & known
+        if not shared - _GENERIC_TOKENS:
+            # "Work Status" shares only "status" with the disability prototype.
+            continue
+        score = len(shared) / len(asked | known)
         if score > best_score:
             best_score = score
             best_intent = intent
@@ -574,6 +584,15 @@ def percent_bucket(value: str) -> str | None:
     return _BUCKETS.get(_compact(value))
 
 
+_NUMBER_RE = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.0+)?$")
+
+
+def _plain_number(value: str) -> str | None:
+    """'100,000', '$100000' and '100000.00' are the same whole number. Ranges are not."""
+    found = _NUMBER_RE.match(str(value or "").strip())
+    return found.group(1).replace(",", "") if found else None
+
+
 def options_equivalent(desired: str, option: str) -> bool:
     """True only for an exact label or a listed equivalent. No approximation."""
     left = normalize_question(desired)
@@ -585,6 +604,9 @@ def options_equivalent(desired: str, option: str) -> bool:
     left_bucket = percent_bucket(desired)
     right_bucket = percent_bucket(option)
     if left_bucket is not None and left_bucket == right_bucket:
+        return True
+    left_number = _plain_number(desired)
+    if left_number is not None and left_number == _plain_number(option):
         return True
     if left in _NO or right in _NO:
         return left in _NO and right in _NO
