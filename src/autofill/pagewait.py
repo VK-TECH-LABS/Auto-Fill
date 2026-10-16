@@ -767,8 +767,84 @@ def navigation_signature(page, snapshot: PageSnapshot) -> tuple:
 
 
 def navigation_changed(before: tuple, page, snapshot: PageSnapshot) -> bool:
-    """True when the route, the form, or the step heading changed."""
-    return navigation_signature(page, snapshot) != before
+    """True when the route, the step heading, or most of the form changed.
+
+    A validation redraw keeps the same fields on screen and is not an advance.
+    A new step adds fields, most of the old ones leave, or the step had no fields.
+    """
+    after = navigation_signature(page, snapshot)
+    if after == before:
+        return False
+    if len(before) < 3 or len(after) < 3:
+        return True
+    if after[0] != before[0] or after[2] != before[2]:
+        return True
+    old_fields = set(before[1])
+    if not old_fields:
+        return bool(after[1])
+    new_fields = set(after[1])
+    if new_fields - old_fields and not validation_message(snapshot):
+        # New fields with no employer error: the click opened the next section.
+        # The same fields plus an error is a validation redraw, not an advance.
+        return True
+    kept = old_fields & new_fields
+    return len(kept) * 2 < len(old_fields)
+
+
+_INVALID_FIELDS_JS = r"""() => {
+  const vis = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const out = [];
+  const nodes = document.querySelectorAll(
+    "[aria-invalid=true], input.ng-invalid, select.ng-invalid, textarea.ng-invalid"
+  );
+  for (const el of nodes) {
+    if (!vis(el) || out.length >= 5) continue;
+    const label = (el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute("aria-label") || "";
+    const box = el.closest(".jv-form-field, .field, .form-group, [data-automation-id]") || el.parentElement;
+    let error = "";
+    const described = el.getAttribute("aria-describedby");
+    if (described) {
+      const node = document.getElementById(described.split(/\s+/)[0]);
+      if (node) error = node.innerText || "";
+    }
+    if (!error && box) {
+      const hint = box.querySelector("[role=alert], .error, [class*=error]");
+      if (hint) error = hint.innerText || "";
+    }
+    const name = String(label || "").replace(/\s+/g, " ").replace(/\*/g, "").trim().slice(0, 80);
+    const text = String(error || "").replace(/\s+/g, " ").trim().slice(0, 160);
+    if (name || text) out.push(text ? name + ": " + text : name);
+  }
+  const notes = document.querySelectorAll(
+    "[role=alert], .jv-form-field-error, .field-error, .error-message, [class*=error-message], .error"
+  );
+  for (const note of notes) {
+    if (!vis(note) || out.length >= 5) continue;
+    const text = String(note.innerText || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 120) continue;
+    let name = "";
+    let node = note.parentElement;
+    for (let depth = 0; node && depth < 4 && !name; depth += 1, node = node.parentElement) {
+      const title = node.querySelector("label, legend, h2, h3, h4");
+      if (title && !title.contains(note)) name = title.innerText || "";
+    }
+    name = String(name || "").replace(/\s+/g, " ").replace(/\*/g, "").trim().slice(0, 80);
+    if (!out.some((item) => item.indexOf(text) !== -1)) out.push(name ? name + ": " + text : text);
+  }
+  return out;
+}"""
+
+
+def invalid_field_messages(page) -> list[str]:
+    """Name each field the employer marked invalid, with its error text. Values are not read."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return []
+    try:
+        found = evaluate(_INVALID_FIELDS_JS)
+    except Exception:
+        return []
+    return [str(item) for item in found or [] if str(item).strip()]
 
 
 def wait_for_navigation(page, before: tuple, *, timeout_s: float = 1.5):

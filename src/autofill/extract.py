@@ -602,7 +602,20 @@ EXTRACT_JS = r"""
     if (!el) return false;
     if (el.required || el.getAttribute("aria-required") === "true") return true;
     const label = requirementLabel(el);
+    // A control whose own label says "(optional)" is not required, even when a
+    // nearby label carries an asterisk.
+    if (labelSaysOptional(el, label)) return false;
     return !!(label && hasRequirementMark(label));
+  }
+
+  function labelSaysOptional(el, label) {
+    const own = el.closest ? el.closest("label") : null;
+    const texts = [
+      own ? own.textContent : "",
+      label ? label.textContent : "",
+      el.parentElement ? el.parentElement.textContent : "",
+    ];
+    return texts.some((text) => /\(\s*optional\s*\)/i.test(String(text || "").slice(0, 400)));
   }
 
   function classMarksRequired(node) {
