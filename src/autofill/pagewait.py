@@ -773,7 +773,7 @@ def icims_login_gate(snapshot: PageSnapshot, url: str) -> bool:
         return False
     if snapshot.captcha_present and not snapshot.controls:
         return False
-    framed = [c for c in snapshot.controls if not c.hidden and getattr(c, "frame_url", "")]
+    framed = [c for c in snapshot.controls if not c.hidden and c.frame_url]
     if not framed:
         return False
     return all(c.kind == "email" or "email" in (c.label or "").casefold() for c in framed)
