@@ -42,6 +42,7 @@ from autofill.pagewait import (
     classify_page,
     current_page_type,
     find_entry_control,
+    icims_login_gate,
     invalid_field_messages,
     is_login_wall,
     is_review,
@@ -388,7 +389,9 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
     password_fields = any(control.kind == "password" and not control.hidden for control in snapshot.controls)
     # A Sign In password form stays on the credential path so stored credentials can be used.
     # Create Account is handled above. Text-only and empty sign-in panes stop here.
-    if not opts.human_resolved and (sign_in_pane(snapshot) or kind == "LOGIN" or is_login_wall(snapshot)) and not (
+    if not opts.human_resolved and (
+        sign_in_pane(snapshot) or kind == "LOGIN" or is_login_wall(snapshot) or icims_login_gate(snapshot, url)
+    ) and not (
         snapshot.password_present or password_fields
     ):
         _this_page_counts(extra, snapshot)
