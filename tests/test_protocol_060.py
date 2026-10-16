@@ -21,14 +21,19 @@ from autofill.dom_ui import (
     PauseGate,
     _committed,
     begin_run,
+    bind_preview,
     checkpoint,
     choose_blocking,
     commit_visible,
+    current_run,
     end_run,
+    finalize_run,
     focus_field,
+    note_filled,
     present_blocking,
     progress_percent,
     public_blocking,
+    refresh_preview,
     safe_label,
     stage_for,
     type_visible,
@@ -585,6 +590,70 @@ def test_text_fill_scrolls_smoothly_before_typing_and_skips_highlight(browser):
         assert events[0] == {"type": "scroll", "behavior": "smooth", "block": "center", "id": "name"}
         assert any(item["type"] == "input" for item in events)
         assert events.index(next(item for item in events if item["type"] == "input")) > 0
+    finally:
+        page.close()
+
+
+def test_preview_refreshes_after_a_write_and_forces_a_frame_at_a_stop():
+    paints: list[object] = []
+    host = object()
+
+    class Frame:
+        page = host
+
+    token = begin_run(page=host)
+    try:
+        bind_preview(lambda current: paints.append(current))
+        refresh_preview(host)
+        refresh_preview(host)
+        assert paints == [host]
+        refresh_preview(Frame(), force=True)
+        assert paints == [host, host]
+        finalize_run("MANUAL_ANSWER_REQUIRED")
+        assert len(paints) == 3
+    finally:
+        end_run(token)
+
+
+def test_iframe_fill_is_reread_before_it_counts(browser, monkeypatch):
+    page = browser.new_page()
+    try:
+        page.set_content("<iframe id='box' srcdoc=\"<label for='email'>Email</label><input id='email'>\"></iframe>")
+        inner = next(frame for frame in page.frames if frame != page.main_frame)
+        outcome = apply_mapped(
+            page,
+            Control(kind="text", selector="#email", label="Email", frame_url=inner.url),
+            MappedField(key="email", action="fill", text="river.example@example.com"),
+        )
+        assert outcome.action == "fill"
+        assert outcome.detail == "filled"
+        assert inner.locator("#email").input_value() == "river.example@example.com"
+    finally:
+        page.close()
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            "<label for='email'>Email</label><input id='email'>"
+            "<script>document.getElementById('email').addEventListener('input', (event) => {"
+            "event.target.value = '';"
+            "});</script>"
+        )
+        monkeypatch.setattr("autofill.fill.type_visible", lambda *_args, **_kwargs: False)
+        outcome = apply_mapped(
+            page,
+            Control(kind="text", selector="#email", label="Email"),
+            MappedField(key="email", action="fill", text="river.example@example.com"),
+        )
+        assert outcome.action == "unanswered"
+        assert outcome.detail == "Value did not stay on the page."
+        assert page.locator("#email").input_value() == ""
+        token = begin_run()
+        try:
+            note_filled([outcome])
+            assert current_run().filled_keys == []
+        finally:
+            end_run(token)
     finally:
         page.close()
 

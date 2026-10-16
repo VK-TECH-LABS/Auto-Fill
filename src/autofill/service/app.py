@@ -1065,15 +1065,31 @@ def _follow_verified_resume(
                     session.session_id,
                     int(report.get("restored") or 0),
                 )
-            _run(session, store, runner, limits, resume_uploaded=True)
-        except HTTPException as exc:
-            logger.info(
-                "session=%s action=resume_follow status=%s",
-                session.session_id,
-                exc.status_code,
-            )
         except Exception as exc:
             _failed(session, exc)
+            return
+        # The upload returns before this thread takes the run lock. A start that
+        # is still finishing answers 409 for a moment. Retry that conflict, then
+        # continue. Status stays readable the whole time.
+        for attempt in range(8):
+            try:
+                _run(session, store, runner, limits, resume_uploaded=True)
+                return
+            except HTTPException as exc:
+                detail = exc.detail
+                busy = exc.status_code == 409 and isinstance(detail, dict) and detail.get("reason") == "busy"
+                if busy and attempt < 7:
+                    time.sleep(0.25)
+                    continue
+                logger.info(
+                    "session=%s action=resume_follow status=%s",
+                    session.session_id,
+                    exc.status_code,
+                )
+                return
+            except Exception as exc:
+                _failed(session, exc)
+                return
 
     threading.Thread(target=follow, name=f"resume-follow-{session.session_id[:8]}", daemon=True).start()
 
