@@ -2400,6 +2400,22 @@ def _gap_is_location(item: dict) -> bool:
     return "current location" in text or "working from" in text
 
 
+_NATIVE_CHOICE_JS = """(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const tag = el.tagName.toLowerCase();
+  return tag === "select" || el.type === "radio" || el.type === "checkbox";
+}"""
+
+
+def _native_choice(page, selector: str) -> bool:
+    """A native select, radio, or checkbox. Custom comboboxes keep their own commit check."""
+    try:
+        return bool(page.evaluate(_NATIVE_CHOICE_JS, selector))
+    except Exception:
+        return False
+
+
 def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
     """Drop a gap whose visible control already holds a value.
 
@@ -2415,6 +2431,11 @@ def _drop_live_answered(page, questions: list[dict]) -> list[dict]:
             kept.append(item)
             continue
         if str(item.get("answerType") or "") not in {"text", "textarea", "number", "date"}:
+            # A select, radio, checkbox, or combobox the person already set in
+            # the preview is answered on the page. It does not block Next.
+            selector = str(item.get("selector") or "")
+            if selector and _native_choice(page, selector) and control_committed(page, selector):
+                continue
             kept.append(item)
             continue
         found = live_field_value(
@@ -2876,7 +2897,7 @@ def _apply_question(
         _manual(
             outcome,
             match,
-            blocking=any(item.required for item in ask.controls) or match.intent == "REFERRAL",
+            blocking=any(item.required for item in ask.controls),
             controls=ask.controls,
         )
         return

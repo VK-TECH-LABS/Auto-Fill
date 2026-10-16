@@ -41,6 +41,7 @@ from autofill.pagewait import (
     classify_page,
     current_page_type,
     find_entry_control,
+    invalid_field_messages,
     is_login_wall,
     is_review,
     is_site_error,
@@ -1428,6 +1429,18 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
     return page, snapshot
 
 
+def _same_route(page, before: tuple) -> bool:
+    """True when the URL route is the one recorded before the click."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(str(getattr(page, "url", "") or ""))
+    except Exception:
+        return False
+    route = (parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+    return bool(before) and before[0] == route
+
+
 def _activate_forward(page, button, session, opts: AutofillOptions, started: float, state: dict, snapshot):
     """Click Next and require the page to move. A dead click is not repeated.
 
@@ -1442,6 +1455,10 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     if fresh is None:
         _log_move(session.session_id, "next", "stalled")
         raise NavigationStalled("next")
+    if advanced and not fresh.captcha_present and validation_message(fresh) and _same_route(page, before):
+        # The employer redrew this step with an error. That is not a new page.
+        _log_move(session.session_id, "next", "invalid")
+        return page, fresh
     if advanced or fresh.captcha_present:
         _log_move(session.session_id, "next", "advanced")
         return page, fresh
@@ -1495,6 +1512,30 @@ def _remember_submit(snapshot, submit_controls: list[str]) -> None:
         if field_class_for_button(button.name, control_type=button.control_type) == "FINAL_SUBMIT":
             if button.name not in submit_controls:
                 submit_controls.append(button.name)
+
+
+def _blocks(item: dict) -> bool:
+    """A manual item stops Next only when it is blocking and the page requires it.
+
+    A saved answer that did not fit the options still stops, so the person sees it.
+    """
+    if not item.get("blocking", True):
+        return False
+    return bool(item.get("required", True)) or item.get("kind") == "OPTION_MISMATCH"
+
+
+def _revealed_fields(page, snapshot, settle_ms: int = 600) -> bool:
+    """True when visible fields appeared on the same step after the last write."""
+    if page is None or snapshot is None or getattr(page, "wait_for_timeout", None) is None:
+        return False
+    before = {control.selector for control in snapshot.controls if not control.hidden}
+    try:
+        page.wait_for_timeout(settle_ms)
+        fresh = extract_page(page)
+    except Exception:
+        return False
+    after = {control.selector for control in fresh.controls if not control.hidden}
+    return bool(after - before)
 
 
 def _run_resolver_pages(
@@ -1597,8 +1638,12 @@ def _run_resolver_pages(
             if outcome.snapshot is not None:
                 snapshot = outcome.snapshot
                 _remember_submit(snapshot, submit_controls)
-            blocking = [item for item in outcome.manual_questions if item.get("blocking", True)]
-            optional = [item for item in outcome.manual_questions if not item.get("blocking", True)]
+            blocking = [item for item in outcome.manual_questions if _blocks(item)]
+            optional = [item for item in outcome.manual_questions if not _blocks(item)]
+            if attempt < 2 and _revealed_fields(page, outcome.snapshot or snapshot):
+                # The write opened more of this step (a consent gate or a
+                # conditional section). Fill what appeared before deciding.
+                continue
             if outcome.resume_blocked and not opts.resume_uploaded:
                 prepared = _attach_prepared(page, opts)
                 if prepared != "attached":
@@ -1664,7 +1709,7 @@ def _run_resolver_pages(
                     recheck = True
                     continue
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
-                return finish(Status.MANUAL_ANSWER_REQUIRED, [alert])
+                return finish(Status.MANUAL_ANSWER_REQUIRED, [alert, *invalid_field_messages(page)])
             recheck = False
             current_sig = navigation_signature(page, snapshot)
             if nav_block is not None and nav_block[2] != current_sig:
@@ -1687,7 +1732,10 @@ def _run_resolver_pages(
             if validation_message(snapshot):
                 if attempt == 2:
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)
-                    return finish(Status.MANUAL_ANSWER_REQUIRED, [validation_message(snapshot)])
+                    return finish(
+                        Status.MANUAL_ANSWER_REQUIRED,
+                        [validation_message(snapshot), *invalid_field_messages(page)],
+                    )
                 continue
             nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
             break

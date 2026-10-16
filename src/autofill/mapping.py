@@ -504,10 +504,18 @@ def acknowledgement_kind(control: Control) -> str:
 
 
 def mark_required_acknowledgements(controls: list[Control]) -> None:
-    """A consent statement is required until a person confirms it."""
+    """A consent statement is required until a person confirms it.
+
+    A statement the employer labels "(optional)" stays optional.
+    """
     for control in controls:
         if control.kind == "checkbox" and acknowledgement_kind(control) == "consent":
+            if _OPTIONAL_LABEL_RE.search(control.label or ""):
+                continue
             control.required = True
+
+
+_OPTIONAL_LABEL_RE = re.compile(r"\(\s*optional\s*\)", re.IGNORECASE)
 
 
 def is_honeypot(control: Control) -> bool:
