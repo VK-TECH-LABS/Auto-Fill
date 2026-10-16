@@ -770,7 +770,7 @@ def navigation_changed(before: tuple, page, snapshot: PageSnapshot) -> bool:
     """True when the route, the step heading, or most of the form changed.
 
     A validation redraw keeps the same fields on screen and is not an advance.
-    A new step replaces some of them, most of them leave, or the step had no fields.
+    A new step adds fields, most of the old ones leave, or the step had no fields.
     """
     after = navigation_signature(page, snapshot)
     if after == before:
@@ -783,9 +783,12 @@ def navigation_changed(before: tuple, page, snapshot: PageSnapshot) -> bool:
     if not old_fields:
         return bool(after[1])
     new_fields = set(after[1])
+    if new_fields - old_fields and not validation_message(snapshot):
+        # New fields with no employer error: the click opened the next section.
+        # The same fields plus an error is a validation redraw, not an advance.
+        return True
     kept = old_fields & new_fields
-    replaced = bool(old_fields - new_fields) and bool(new_fields - old_fields)
-    return replaced or len(kept) * 2 < len(old_fields)
+    return len(kept) * 2 < len(old_fields)
 
 
 _INVALID_FIELDS_JS = r"""() => {

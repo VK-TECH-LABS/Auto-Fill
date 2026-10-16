@@ -235,11 +235,11 @@ def test_jobvite_flow_reveal_then_next_twice_stops_before_submit(browser, resolv
         page.close()
 
 
-def _snap(selectors: list[str], heading: str = "Example"):
+def _snap(selectors: list[str], heading: str = "Example", alerts: tuple = ()):
     from types import SimpleNamespace
 
     controls = [SimpleNamespace(selector=item, hidden=False, frame_url="") for item in selectors]
-    return SimpleNamespace(controls=controls, heading=heading)
+    return SimpleNamespace(controls=controls, heading=heading, alerts=list(alerts))
 
 
 def test_validation_redraw_is_not_an_advance_but_a_new_step_is():
@@ -250,8 +250,11 @@ def test_validation_redraw_is_not_an_advance_but_a_new_step_is():
     page = SimpleNamespace(url=URL)
     before = navigation_signature(page, _snap(["#a", "#b", "#c"]))
     assert navigation_changed(before, page, _snap(["#a", "#b", "#c"])) is False
-    # The employer re-renders the same step with one extra error-only control.
-    assert navigation_changed(before, page, _snap(["#a", "#b", "#c", "#d"])) is False
+    # The employer re-renders the same step with an error and one extra control.
+    redraw = _snap(["#a", "#b", "#c", "#d"], alerts=("This field is required",))
+    assert navigation_changed(before, page, redraw) is False
+    # The click opened the next section below the first one, with no error.
+    assert navigation_changed(before, page, _snap(["#a", "#b", "#c", "#d"])) is True
     # A persistent gate stays and the step's own field is replaced.
     assert navigation_changed(before, page, _snap(["#a", "#b", "#x"])) is True
     assert navigation_changed(before, page, _snap(["#y"])) is True
