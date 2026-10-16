@@ -450,6 +450,45 @@ def _pump_between_waits() -> None:
         return
 
 
+# ATS shells that paint the posting and the Apply entry inside a content iframe
+# after DOMContentLoaded (iCIMS ``icims_content_iframe``). The outer page has
+# site chrome with a search box, which must not end the render wait early.
+_CONTENT_FRAME_JS = r"""() => {
+  const frames = document.querySelectorAll("iframe#icims_content_iframe, iframe[name='icims_content_iframe']");
+  const icims = /(^|\.)icims\.com$/i.test(location.hostname) && !/[?&]in_iframe=1/.test(location.search);
+  // The shell script inserts the iframe late. Wait a bounded time for it.
+  if (icims && !frames.length && !document.querySelector("form input:not([type=hidden]):not([name=q])")) {
+    if (document.readyState !== "complete" || performance.now() < 8000) return true;
+  }
+  for (const f of frames) {
+    let doc = null;
+    try { doc = f.contentDocument; } catch (e) { return false; }
+    if (!doc || !doc.body) return true;
+    const href = String((doc.location && doc.location.href) || "");
+    if (!href || href === "about:blank") return true;
+    if (doc.readyState === "loading") return true;
+    if (!doc.querySelector("a, button, input, select, textarea")) return true;
+  }
+  return false;
+}"""
+
+
+def content_frame_pending(page) -> bool:
+    """True while a known ATS content iframe exists but has not painted yet."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate(_CONTENT_FRAME_JS) is True
+    except Exception as exc:
+        if _closed(exc):
+            raise
+        # iCIMS reloads the shell with ?mobile=false&needsRedirect=false. A read
+        # during that redirect is not a settled page.
+        text = str(exc).casefold()
+        return "context was destroyed" in text or "navigat" in text
+
+
 def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     """Poll until a form or a known marker appears.
 
@@ -461,7 +500,7 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     timeout while reading the page is raised.
     """
     try:
-        if render_ready(extract_page(page)):
+        if not content_frame_pending(page) and render_ready(extract_page(page)):
             return
     except Exception as exc:
         if _closed(exc) or _timeout(exc):
@@ -487,7 +526,7 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
                     raise
                 _note_render_wait(started)
                 return
-            if render_ready(snapshot):
+            if render_ready(snapshot) and not content_frame_pending(page):
                 _settle_account_pane(page, snapshot)
                 _note_render_wait(started)
                 return
@@ -719,6 +758,25 @@ def is_login_wall(snapshot: PageSnapshot) -> bool:
         if "sign in" in name or "log in" in name or "create account" in name:
             return True
     return False
+
+
+def icims_login_gate(snapshot: PageSnapshot, url: str) -> bool:
+    """iCIMS email-first sign-in: ``/login`` with a lone Email box and Next.
+
+    Apply on an iCIMS posting opens this gate inside ``icims_content_iframe``.
+    Typing the email starts an account sign-in or registration, so it is a
+    login wall, not an application form.
+    """
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").casefold()
+    if "icims.com" not in host or not re.search(r"/login(?:$|[/?#])", parsed.path + "/"):
+        return False
+    if snapshot.captcha_present and not snapshot.controls:
+        return False
+    framed = [c for c in snapshot.controls if not c.hidden and getattr(c, "frame_url", "")]
+    if not framed:
+        return False
+    return all(c.kind == "email" or "email" in (c.label or "").casefold() for c in framed)
 
 
 _VALIDATION_ERROR = (
