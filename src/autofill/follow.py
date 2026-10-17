@@ -27,7 +27,7 @@ from autofill.extract import extract_page
 from autofill.fill import apply_mapped
 from autofill.mapping import MapCursor, is_honeypot, map_field
 from autofill.models import Control, JobContext, PageSnapshot
-from autofill.pagewait import classify_page, current_page_type, terminal_kind
+from autofill.pagewait import classify_page, current_page_type, site_error_messages, terminal_kind
 from autofill.profile import CandidateProfile
 from autofill.stepfill import inspect_required
 
@@ -156,7 +156,7 @@ def follow_answer(
         elif decision == "SITE_ERROR":
             status = Status.FAILED_RETRYABLE
             present_blocking(page, None)
-            messages = ["site_error"]
+            messages = site_error_messages(snapshot)
         elif decision == "CAPTCHA":
             status = Status.CAPTCHA_REQUIRED
             present_blocking(page, None)

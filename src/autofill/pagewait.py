@@ -47,6 +47,7 @@ _JOB_RE = re.compile(
     re.IGNORECASE,
 )
 _SEARCH_RE = re.compile(r"\b(search|query|filter jobs|keyword)\b", re.IGNORECASE)
+_CHAT_RE = re.compile(r"\b(chat ?bot|chat window|chat message|ask (a|me) question|type your message)\b", re.IGNORECASE)
 _SITE_ERROR_STRONG = re.compile(
     r"\b("
     r"problem with the service"
@@ -58,10 +59,37 @@ _SITE_ERROR_STRONG = re.compile(
     r"|gateway time-?out"
     r"|(?:error|http)\s*5\d\d"
     r"|5\d\d\s+error"
+    r"|service interruption"
+    r"|(?:down|offline) for (?:scheduled )?maintenance"
+    r"|(?:site|website|system|portal) is (?:currently )?undergoing (?:scheduled )?maintenance"
+    r"|(?:workday|site|website|service|system|application|portal) is "
+    r"(?:currently |temporarily )?(?:unavailable|down|offline)"
     r")\b",
     re.IGNORECASE,
 )
 _SITE_ERROR_SOFT = re.compile(r"\bplease try again\b", re.IGNORECASE)
+
+
+_OUTAGE_RE = re.compile(
+    r"\b("
+    r"service interruption"
+    r"|(?:down|offline) for (?:scheduled )?maintenance"
+    r"|(?:site|website|system|portal) is (?:currently )?undergoing (?:scheduled )?maintenance"
+    r"|(?:workday|site|website|service|system|application|portal) is "
+    r"(?:currently |temporarily )?(?:unavailable|down|offline)"
+    r"|temporarily unavailable"
+    r"|service unavailable"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def site_error_messages(snapshot: PageSnapshot) -> list[str]:
+    """``site_error``, plus ``employer_site_unavailable`` for a maintenance or outage page."""
+    text = f"{snapshot.heading} {snapshot.page_text}"
+    if _OUTAGE_RE.search(text):
+        return ["site_error", "employer_site_unavailable"]
+    return ["site_error"]
 
 
 def note_page_type(kind: str) -> None:
@@ -89,7 +117,7 @@ def application_controls(snapshot: PageSnapshot) -> list[Control]:
             for part in (control.label, control.name, control.placeholder, control.aria_label, control.input_type)
             if part
         )
-        if control.input_type == "search" or _SEARCH_RE.search(blob):
+        if control.input_type == "search" or _SEARCH_RE.search(blob) or _CHAT_RE.search(blob):
             continue
         if control.kind in {"file", "textarea", "select", "radio", "checkbox", "combobox", "buttons"}:
             found.append(control)

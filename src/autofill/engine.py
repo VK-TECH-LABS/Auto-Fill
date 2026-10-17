@@ -53,6 +53,7 @@ from autofill.pagewait import (
     reset_page_type,
     resettle_account,
     sign_in_pane,
+    site_error_messages,
     terminal_kind,
     validation_message,
     visible_fields,
@@ -352,7 +353,7 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             status=Status.FAILED_RETRYABLE,
             ats=ats_name,
             login_status=login_status,
-            messages=["site_error"],
+            messages=site_error_messages(snapshot),
             **extra,
         )
     kind = classify_page(snapshot, url=url)
@@ -666,7 +667,7 @@ def autofill_application(
                 status=Status.FAILED_RETRYABLE,
                 ats=ats_name,
                 login_status="NOT_REQUIRED",
-                messages=["site_error"],
+                messages=site_error_messages(snapshot),
             )
         if snapshot.captcha_present:
             session.mark("FAILED")
@@ -1282,7 +1283,7 @@ def _terminal_status(
             reason,
         ]
     if decision == "SITE_ERROR":
-        return Status.FAILED_RETRYABLE, ["site_error"]
+        return Status.FAILED_RETRYABLE, site_error_messages(snapshot)
     if decision == "CAPTCHA":
         return Status.CAPTCHA_REQUIRED, [challenge_message(snapshot)]
     if decision == "MANUAL":
