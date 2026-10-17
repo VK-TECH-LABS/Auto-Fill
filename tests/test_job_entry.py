@@ -180,7 +180,7 @@ def test_adp_service_error_is_not_a_login_wall(browser):
         page.goto((FIXTURES / "adp_site_error.html").as_uri())
         result = _run(page, "https://myjobs.adp.com/example/jobs/1")
         assert result.status == Status.FAILED_RETRYABLE
-        assert result.messages == ["site_error"]
+        assert result.messages == ["site_error", "employer_site_unavailable"]
         assert result.page_type == "SITE_ERROR"
         assert page.evaluate("() => window.__clicked") == []
         assert result.stopped_before_submit is True
