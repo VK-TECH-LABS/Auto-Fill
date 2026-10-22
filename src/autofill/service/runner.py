@@ -1231,6 +1231,7 @@ class PlaywrightRunner:
             blocking=dict(follow.blocking) if follow.blocking else None,
             open_items=list(follow.open_items),
             manual_questions=list(follow.manual_questions),
+            account=dict(follow.account) if follow.account else None,
         )
         result.page_type = current_page_type()
         return result

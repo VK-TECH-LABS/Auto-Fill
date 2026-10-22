@@ -1473,6 +1473,10 @@ def create_app(
             }
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
+                # The person may have created the account in the live view. The run
+                # checks the page again and stops on the Create Account form if it is
+                # still there. Continue never types an account or skips that check.
+                allowed.add(Status.ACCOUNT_CREATION_REQUIRED)
             if session.status not in allowed:
                 raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
             return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)

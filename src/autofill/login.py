@@ -278,6 +278,66 @@ def _control_blob(control: Control) -> str:
     )
 
 
+_CONFIRM_ID_RE = re.compile(r"verify|confirm|retype|re-?enter|repeat", re.IGNORECASE)
+_SIGNIN_ALTERNATE_IDS = frozenset({"signInLink", "signInButton"})
+
+
+def _create_account_ids(ids: set[str]) -> set[str]:
+    """Workday Create Account automation ids. ``createAccountLink`` sits on the Sign In pane."""
+    return {item for item in ids if item.startswith("createAccount") and item != "createAccountLink"} | (
+        {"verifyPassword"} & ids
+    )
+
+
+def confirm_password_control(snapshot: PageSnapshot) -> Control | None:
+    """A visible Verify / Confirm password box next to another password box. Sign In never has one."""
+    passwords = _passwords(snapshot)
+    if len(passwords) < 2:
+        return None
+    for control in passwords:
+        blob = " ".join(part for part in (_control_blob(control), control.automation_id, control.element_id) if part)
+        if _CONFIRM_RE.search(blob) or (
+            control.automation_id and _CONFIRM_ID_RE.search(control.automation_id)
+        ):
+            return control
+    return None
+
+
+def create_account_form(snapshot: PageSnapshot) -> bool:
+    """A Create Account form, scored before any Sign In rule.
+
+    Either a password box confirmed by a Verify / Confirm password box, or a
+    Workday Create Account id (``createAccountSubmitButton``,
+    ``createAccountCheckbox``, ``verifyPassword``) with a visible password box.
+    A Sign In link, tab, or header button on the same page does not change this.
+    An application form that mixes in a password is not an account page.
+    """
+    if snapshot.captcha_present:
+        return False
+    if LoginDetector()._looks_like_application(snapshot) and snapshot.password_present:
+        return False
+    if confirm_password_control(snapshot) is not None:
+        return True
+    ids = _automation_ids(snapshot)
+    if not (_passwords(snapshot) or snapshot.password_present):
+        return False
+    if "signInSubmitButton" in ids and not ({"createAccountSubmitButton", "verifyPassword"} & ids):
+        return False
+    return bool(_create_account_ids(ids))
+
+
+def _sign_in_alternate(snapshot: PageSnapshot) -> bool:
+    """A Sign In link, tab, or button the person can use instead of Create Account."""
+    if any(_LOGIN_RE.search(link.name) for link in snapshot.links):
+        return True
+    for button in snapshot.buttons:
+        if button.automation_id in _SIGNIN_ALTERNATE_IDS:
+            return True
+        if not button.in_header and not button.in_ad and _LOGIN_RE.search(button.name):
+            return True
+    return False
+
+
 def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     """Highest score wins. A tie is Sign In. A real application form is not an account page."""
     del url
@@ -307,7 +367,10 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     if _FORGOT_RE.search(link_names) or _FORGOT_RE.search(page_text):
         login += 2
     ids = _automation_ids(snapshot)
-    register_pane = "createAccountSubmitButton" in ids or "verifyPassword" in ids
+    create_form = create_account_form(snapshot)
+    register_pane = create_form or "createAccountSubmitButton" in ids or "verifyPassword" in ids
+    if create_form:
+        register += 4
     if "createAccountSubmitButton" in ids:
         register += 3
     if "verifyPassword" in ids:
@@ -332,8 +395,13 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
             register_score=register,
             login_score=login,
         )
-    if register > login and register > 0:
-        return AccountScore(mode="register", alternate=signin_link, register_score=register, login_score=login)
+    if create_form or (register > login and register > 0):
+        return AccountScore(
+            mode="register",
+            alternate=signin_link or _sign_in_alternate(snapshot),
+            register_score=register,
+            login_score=login,
+        )
     if login > 0 and login >= register:
         return AccountScore(
             mode="login",
@@ -444,6 +512,7 @@ def account_view(
     """Public account description. It never includes a password or email value."""
     email = _email_control(snapshot)
     chosen = mode if mode in {"register", "login"} else "login"
+    fields = account_fields(snapshot)
     return {
         "mode": chosen,
         "alternateModeAvailable": bool(alternate),
@@ -451,7 +520,47 @@ def account_view(
         "passwordPolicy": password_policy(snapshot) if snapshot.password_present or chosen == "register" else None,
         "emailPrefillAllowed": not bool(email is not None and email.read_only),
         "siteErrors": [redact_site_error(item) for item in (site_errors or [])[:5]],
+        "fields": fields,
+        "requiredFields": [item["role"] for item in fields if item["required"]],
     }
+
+
+_FIELD_LABEL_MAX = 80
+
+
+def _field_label(control: Control) -> str:
+    """The page's own label for an account box. It is site text, never a value."""
+    text = " ".join((control.label or control.aria_label or control.placeholder or "").split())
+    return redact_site_error(text)[:_FIELD_LABEL_MAX]
+
+
+def account_fields(snapshot: PageSnapshot) -> list[dict]:
+    """Account boxes on this pane: email, password, confirmPassword, terms. No values.
+
+    Workday marks every Create Account box required. Other sites use
+    ``required`` / ``aria-required``. The account boxes themselves are always
+    needed, so email and passwords count as required.
+    """
+    out: list[dict] = []
+    email = _email_control(snapshot)
+    if email is not None:
+        out.append({"role": "email", "label": _field_label(email), "required": True})
+    confirm = confirm_password_control(snapshot)
+    for control in _passwords(snapshot):
+        role = "confirmPassword" if confirm is not None and control.selector == confirm.selector else "password"
+        if role == "password" and any(item["role"] == "password" for item in out):
+            role = "confirmPassword"
+        out.append({"role": role, "label": _field_label(control), "required": True})
+    for control in snapshot.controls:
+        if control.hidden or control.kind != "checkbox":
+            continue
+        blob = " ".join(part for part in (_control_blob(control), control.prompt, control.group) if part)
+        account_box = control.automation_id.startswith("createAccount") if control.automation_id else False
+        if account_box or _TERMS_RE.search(blob) or re.search(r"\bconsent\b", blob, re.IGNORECASE):
+            required = bool(control.required) or account_box
+            out.append({"role": "terms", "label": _field_label(control), "required": required})
+            break
+    return out[:6]
 
 
 def account_decision(snapshot: PageSnapshot, url: str, ats: str | None) -> AccountStop | None:
@@ -478,6 +587,28 @@ def login_account_view(snapshot: PageSnapshot, url: str, ats: str | None) -> dic
     if scored.application or scored.mode != "login":
         return None
     return account_view(snapshot, url, ats, mode="login", alternate=scored.alternate)
+
+
+def stop_account(snapshot: PageSnapshot, url: str, ats: str | None, status: str) -> tuple[str, dict | None]:
+    """Status and account description for an account stop.
+
+    A page that scores as Create Account is never reported as Sign In: a
+    ``LOGIN_REQUIRED`` stop on such a page becomes ``ACCOUNT_CREATION_REQUIRED``
+    with ``mode=register``. A genuine Sign In page keeps ``LOGIN_REQUIRED`` and
+    its sign-in description. An application form gets no account.
+    """
+    scored = score_account(snapshot, url)
+    if scored.application:
+        return status, None
+    if status == "LOGIN_REQUIRED" and scored.mode == "register":
+        return "ACCOUNT_CREATION_REQUIRED", account_view(
+            snapshot, url, ats, mode="register", alternate=scored.alternate
+        )
+    if status == "ACCOUNT_CREATION_REQUIRED":
+        return status, account_view(snapshot, url, ats, mode="register", alternate=scored.alternate)
+    if status == "LOGIN_REQUIRED" and scored.mode == "login":
+        return status, account_view(snapshot, url, ats, mode="login", alternate=scored.alternate)
+    return status, None
 
 
 def account_exists_text(snapshot: PageSnapshot) -> bool:
