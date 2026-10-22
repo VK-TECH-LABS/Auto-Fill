@@ -15,14 +15,17 @@ from urllib.parse import urlparse
 from autofill.ats import WORKDAY_HOST_RE
 from autofill.extract import extract_page
 from autofill.login import _CONFIRM_RE as _VERIFY_RE
-from autofill.login import _LOGIN_RE, _REGISTER_RE
+from autofill.login import _LOGIN_RE, _REGISTER_RE, create_account_form
 from autofill.models import ButtonControl, Control, PageSnapshot
 from autofill.safeguards import classify_control, is_entry_control, semantic_action
 
 logger = logging.getLogger("autofill.pagewait")
 
 _WORKDAY_HOST = WORKDAY_HOST_RE
-_DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
+_DECISIVE_IDS = frozenset(
+    {"createAccountSubmitButton", "createAccountCheckbox", "signInSubmitButton", "verifyPassword"}
+)
+_WORKDAY_SHELL_BUDGET = 4.0
 
 
 def visible_fields(snapshot: PageSnapshot) -> list:
@@ -299,6 +302,10 @@ def register_pane(snapshot: PageSnapshot) -> bool:
     """
     if snapshot.captcha_present:
         return False
+    # Verify / Confirm password, or a Workday Create Account id, decides it before
+    # any Sign In rule. A Sign In link or header button does not make it a login.
+    if create_account_form(snapshot):
+        return True
     text = _pane_text(snapshot)
     passwords = _password_controls(snapshot)
     ids = {item for item in snapshot.automation_ids if item}
@@ -748,7 +755,8 @@ def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
     if _account_decisive(snapshot) and (register_pane(snapshot) or sign_in_pane(snapshot)):
         return
     workday = bool(_WORKDAY_HOST.search(_host(page)))
-    budget = 2.0 if workday and not _account_decisive(snapshot) else 0.4
+    # A Workday Create Account step can paint its Sign In chrome seconds before the form.
+    budget = _WORKDAY_SHELL_BUDGET if workday and not _account_decisive(snapshot) else 0.4
     deadline = time.monotonic() + budget
     previous = _account_signature(snapshot)
     seen_decisive = _account_decisive(snapshot)

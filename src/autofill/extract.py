@@ -986,9 +986,21 @@ EXTRACT_JS = r"""
     }
   });
   const automationIds = [];
+  // Workday draws Create Account / Sign In as an aria-hidden button under a
+  // click_filter overlay. That button is still on screen and names the pane.
+  const paneIds = new Set(["createAccountSubmitButton", "signInSubmitButton"]);
+  function renderedButAriaHidden(el) {
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden) return false;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    }
+    return true;
+  }
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll("[data-automation-id]")) {
-      if (isHidden(el)) continue;
+      const paneId = paneIds.has(el.getAttribute("data-automation-id") || "");
+      if (isHidden(el) && !(paneId && renderedButAriaHidden(el))) continue;
       const id = el.getAttribute("data-automation-id");
       if (id && automationIds.indexOf(id) === -1) automationIds.push(id);
     }
@@ -1049,7 +1061,8 @@ EXTRACT_JS = r"""
         for (const child of Array.from(wrap.children || [])) {
           if (child.contains && child.contains(el)) continue;
           const tag = child.tagName ? child.tagName.toLowerCase() : "";
-          if (tag === "ul" || tag === "ol") push(child);
+          // A progress bar or nav list beside the form is not a password rule.
+          if ((tag === "ul" || tag === "ol") && looksLikeRules(child)) push(child);
           else if (policyId(child) && !pushLists(child)) push(child);
         }
         let sib = wrap.nextElementSibling;

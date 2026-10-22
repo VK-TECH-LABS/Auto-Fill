@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Analyst | Example Workday Careers</title></head>
+<body>
+<!-- Synthetic Workday-style Create Account step (modelled on a real tenant's DOM shape). No real data. -->
+<header data-automation-id="header">
+  <a href="#home" data-automation-id="logoLink">Example Careers</a>
+  <button type="button" data-automation-id="utilityButtonSignIn">Sign In</button>
+  <button type="button" data-automation-id="searchForJobsButton">Search for Jobs</button>
+</header>
+<main>
+  <h2 data-automation-id="jobPostingHeader">Example Analyst</h2>
+  <ol data-automation-id="progressBar">
+    <li data-automation-id="progressBarActiveStep">Create Account/Sign In</li>
+    <li>My Information</li>
+    <li>My Experience</li>
+    <li>Application Questions</li>
+    <li>Voluntary Disclosures</li>
+    <li>Review</li>
+  </ol>
+  <div data-automation-id="createAccountPage">
+    <h2 data-automation-id="headingText">Create Account</h2>
+    <form onsubmit="return false" novalidate>
+      <div data-automation-id="formField-email">
+        <label for="input-4">Email Address<abbr title="required">*</abbr></label>
+        <input id="input-4" type="text" data-automation-id="email" aria-required="true" autocomplete="email">
+      </div>
+      <div data-automation-id="formField-password">
+        <label for="input-5">Password<abbr title="required">*</abbr></label>
+        <input id="input-5" type="password" data-automation-id="password" aria-required="true" aria-describedby="pw-rules">
+      </div>
+      <div id="pw-rules" data-automation-id="passwordRequirements">
+        <p>Password Requirements:</p>
+        <ul>
+          <li>A lowercase character</li>
+          <li>An uppercase character</li>
+          <li>A numeric character</li>
+          <li>A special character</li>
+          <li>A minimum of 8 characters</li>
+        </ul>
+      </div>
+      <div data-automation-id="formField-verifyPassword">
+        <label for="input-6">Verify New Password<abbr title="required">*</abbr></label>
+        <input id="input-6" type="password" data-automation-id="verifyPassword" aria-required="true">
+      </div>
+      <div data-automation-id="formField-createAccountCheckbox">
+        <input id="input-7" type="checkbox" data-automation-id="createAccountCheckbox" aria-required="true">
+        <label for="input-7">Yes, I have read and consent to the terms and conditions</label>
+      </div>
+      <div style="position: relative">
+        <div role="button" tabindex="0" aria-label="Create Account" data-automation-id="click_filter"
+             style="position:absolute;inset:0;cursor:pointer"></div>
+        <button type="submit" tabindex="-1" aria-hidden="true" data-automation-id="createAccountSubmitButton">Create Account</button>
+      </div>
+    </form>
+    <p>Already have an account? <button type="button" data-automation-id="signInLink">Sign In</button></p>
+  </div>
+</main>
+<div id="done" hidden></div>
+<script>
+window.__created = 0;
+document.querySelector("[data-automation-id='click_filter']").addEventListener("click", function () {
+  window.__created += 1;
+  document.querySelector("[data-automation-id='createAccountPage']").remove();
+  var done = document.getElementById("done");
+  done.hidden = false;
+  done.textContent = "Check your inbox to verify your email.";
+});
+document.querySelector("[data-automation-id='signInLink']").addEventListener("click", function () {
+  window.location.hash = "signin";
+});
+</script>
+</body>
+</html>
