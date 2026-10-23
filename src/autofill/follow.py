@@ -56,6 +56,7 @@ class FollowUp:
     messages: list[str] = field(default_factory=list)
     mark: PageMark | None = None
     typed: list[str] = field(default_factory=list)
+    account: dict | None = None
 
 
 def read_page_mark(page) -> tuple[PageMark, PageSnapshot]:
@@ -122,6 +123,7 @@ def follow_answer(
         from autofill.extract import extract_page
 
         gaps, total, done = inspect_required(page, extract_page(page), profile, prior)
+    account: dict | None = None
     if gaps:
         status = Status.MANUAL_ANSWER_REQUIRED
         present_blocking(page, gaps[0])
@@ -137,14 +139,18 @@ def follow_answer(
             status = Status.READY_FOR_HUMAN_SUBMIT
             present_blocking(page, None)
             messages = ["Every required field on this page is filled. A person clicks Submit."]
-        elif decision == "ACCOUNT":
-            status = Status.ACCOUNT_CREATION_REQUIRED
+        elif decision in {"ACCOUNT", "LOGIN"}:
+            from autofill.login import stop_account
+
+            info = detect_ats(_page_url(page))
+            wanted = Status.ACCOUNT_CREATION_REQUIRED if decision == "ACCOUNT" else Status.LOGIN_REQUIRED
+            # A Create Account form is never a Sign In stop, even with a Sign In link beside it.
+            status, account = stop_account(snapshot, _page_url(page), info.name if info else None, wanted)
             present_blocking(page, None)
-            messages = ["Create an employer account. Nothing was typed."]
-        elif decision == "LOGIN":
-            status = Status.LOGIN_REQUIRED
-            present_blocking(page, None)
-            messages = ["Sign-in is required before the application form. Nothing was typed."]
+            if status == Status.ACCOUNT_CREATION_REQUIRED:
+                messages = ["Create an employer account. Nothing was typed."]
+            else:
+                messages = ["Sign-in is required before the application form. Nothing was typed."]
         elif decision == "JOB":
             status = Status.JOB_DESCRIPTION
             present_blocking(page, None)
@@ -193,6 +199,7 @@ def follow_answer(
         blocking=public_blocking(gaps[0]) if gaps else None,
         manual_questions=_public_questions(gaps),
         messages=messages,
+        account=account,
         mark=mark,
         typed=typed,
     )

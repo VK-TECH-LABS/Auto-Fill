@@ -177,6 +177,9 @@ def test_auth_rejects_missing_and_wrong_tokens(client: TestClient):
         "features": ["standardTerms"],
     }
     assert health.json() == expected_health
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json() == expected_health
     versioned = client.get("/v1/health")
     assert versioned.status_code == 200
     assert versioned.json() == expected_health

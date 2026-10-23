@@ -35,7 +35,15 @@ from autofill.dom_ui import (
 )
 from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
-from autofill.login import LoginDetector, account_decision, account_view, run_login, score_account, verification_present
+from autofill.login import (
+    LoginDetector,
+    account_decision,
+    account_view,
+    run_login,
+    score_account,
+    stop_account,
+    verification_present,
+)
 from autofill.mapping import bind_standard_terms, consume_auto_consents
 from autofill.models import FillResult, JobContext
 from autofill.pagewait import (
@@ -250,6 +258,14 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     if active is not None:
         kwargs.setdefault("resume_verified_now", active.resume_verified_now)
         kwargs.setdefault("resume_site_errors", list(active.resume_site_errors))
+    pending = _PENDING_ACCOUNT.get()
+    if pending is not None:
+        _PENDING_ACCOUNT.set(None)
+        if pending[0] == status and pending[1] is not None and kwargs.get("account") is None:
+            if status == Status.ACCOUNT_CREATION_REQUIRED or (
+                active is not None and _protocol_070(active)
+            ):
+                kwargs["account"] = pending[1]
     progress, blocking, open_items = finalize_run(status)
     state = current_run()
     if "completed_keys" not in kwargs and state is not None:
@@ -357,7 +373,10 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     kind = classify_page(snapshot, url=url)
-    if not opts.human_resolved and (register_pane(snapshot) or kind == "ACCOUNT"):
+    # A Create Account form is checked before any Sign In rule, and Continue
+    # (``human_resolved``) does not skip it: the form is still in front of us.
+    # Only the weaker text-only ACCOUNT page type is left to the person.
+    if register_pane(snapshot) or (not opts.human_resolved and kind == "ACCOUNT"):
         _this_page_counts(extra, snapshot)
         decision = account_decision(snapshot, url, ats_name)
         if decision is not None and decision.status == Status.ACCOUNT_CREATION_REQUIRED:
@@ -396,20 +415,15 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
         snapshot.password_present or password_fields
     ):
         _this_page_counts(extra, snapshot)
-        session.mark("LOGIN_FAILED")
-        return snapshot, _attach_login_account(
-            _result(
-                session,
-                status=Status.LOGIN_REQUIRED,
-                ats=ats_name,
-                login_status="LOGIN_REQUIRED",
-                messages=["Sign-in is required before the application form. Nothing was typed."],
-                **extra,
-            ),
+        return snapshot, _login_stop(
+            session,
             snapshot,
             url,
             ats_name,
             opts,
+            messages=["Sign-in is required before the application form. Nothing was typed."],
+            login_status=login_status,
+            **extra,
         )
     if not opts.human_resolved and kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
         _this_page_counts(extra, snapshot)
@@ -425,19 +439,6 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ],
             **extra,
         )
-    if register_pane(snapshot) and not opts.human_resolved:
-        _this_page_counts(extra, snapshot)
-        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
-        scored = score_account(snapshot, url)
-        return snapshot, _result(
-            session,
-            status=Status.ACCOUNT_CREATION_REQUIRED,
-            ats=ats_name,
-            login_status=login_status,
-            messages=["Create an employer account. Nothing was typed."],
-            account=account_view(snapshot, url, ats_name, mode="register", alternate=scored.alternate),
-            **extra,
-        )
     if kind == "CONFIRMATION" or (
         not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot) and kind not in {
             "APPLICATION_FORM",
@@ -446,20 +447,15 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
     ):
         if not opts.human_resolved and (sign_in_pane(snapshot) or is_login_wall(snapshot)):
             _this_page_counts(extra, snapshot)
-            session.mark("LOGIN_FAILED")
-            return snapshot, _attach_login_account(
-                _result(
-                    session,
-                    status=Status.LOGIN_REQUIRED,
-                    ats=ats_name,
-                    login_status="LOGIN_REQUIRED",
-                    messages=["Sign-in is required before the application form. Nothing was typed."],
-                    **extra,
-                ),
+            return snapshot, _login_stop(
+                session,
                 snapshot,
                 url,
                 ats_name,
                 opts,
+                messages=["Sign-in is required before the application form. Nothing was typed."],
+                login_status=login_status,
+                **extra,
             )
         _this_page_counts(extra, snapshot)
         session.mark(Status.NO_FORM_FOUND)
@@ -492,6 +488,57 @@ def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str 
         messages=[decision.message],
         account=decision.account,
         **extra,
+    )
+
+
+_CREATE_ACCOUNT_MESSAGE = "Create an employer account. Nothing was typed."
+
+
+def _login_stop(
+    session,
+    snapshot,
+    url: str,
+    ats_name: str | None,
+    opts: AutofillOptions,
+    *,
+    messages: list[str],
+    login_status: str = "NOT_REQUIRED",
+    **extra,
+) -> ApplicationResult:
+    """A Sign In stop, unless the page is really a Create Account form.
+
+    A page that scores as Create Account (Verify / Confirm password, Workday
+    ``createAccount*`` ids) is reported as ``ACCOUNT_CREATION_REQUIRED`` with a
+    ``mode=register`` account, even when a Sign In link or tab is visible.
+    """
+    status, account = stop_account(snapshot, url, ats_name, Status.LOGIN_REQUIRED)
+    if status == Status.ACCOUNT_CREATION_REQUIRED:
+        logger.info("session=%s account_stop=register source=sign_in_check", session.session_id)
+        note_page_type("ACCOUNT")
+        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+        return _result(
+            session,
+            status=Status.ACCOUNT_CREATION_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=[_CREATE_ACCOUNT_MESSAGE],
+            account=account,
+            **extra,
+        )
+    session.mark("LOGIN_FAILED")
+    return _attach_login_account(
+        _result(
+            session,
+            status=Status.LOGIN_REQUIRED,
+            ats=ats_name,
+            login_status="LOGIN_REQUIRED",
+            messages=messages,
+            **extra,
+        ),
+        snapshot,
+        url,
+        ats_name,
+        opts,
     )
 
 
@@ -736,19 +783,14 @@ def autofill_application(
             )
             creds = credential_provider.get_credentials(context, session.candidate_id) if credential_provider else None
             if creds is None or not creds.password or not (creds.email or creds.username):
-                session.mark("LOGIN_FAILED")
-                return _attach_login_account(
-                    _result(
-                        session,
-                        status=Status.LOGIN_REQUIRED,
-                        ats=ats_name,
-                        login_status="LOGIN_REQUIRED",
-                        messages=["No credentials for this candidate and site. Nothing was typed."],
-                    ),
+                return _login_stop(
+                    session,
                     snapshot,
                     getattr(page, "url", "") or application_url,
                     ats_name,
                     opts,
+                    messages=["No credentials for this candidate and site. Nothing was typed."],
+                    login_status="NOT_REQUIRED",
                 )
             outcome, login_steps = run_login(page, creds)
             session.steps.extend(login_steps)
@@ -1254,6 +1296,16 @@ def _no_form_messages() -> list[str]:
     ]
 
 
+_PENDING_ACCOUNT: contextvars.ContextVar[tuple[str, dict | None] | None] = contextvars.ContextVar(
+    "autofill_pending_account", default=None
+)
+
+
+def _ats_for(page) -> str | None:
+    info = detect_ats(_page_url(page))
+    return info.name if info else None
+
+
 def _terminal_status(
     page,
     snapshot,
@@ -1272,9 +1324,15 @@ def _terminal_status(
         required_total=required_total,
         submit_names=submit_names,
     )
-    if decision == "ACCOUNT":
-        return Status.ACCOUNT_CREATION_REQUIRED, ["Create an employer account. Nothing was typed."]
-    if decision == "LOGIN":
+    _PENDING_ACCOUNT.set(None)
+    if decision in {"ACCOUNT", "LOGIN"}:
+        wanted = Status.ACCOUNT_CREATION_REQUIRED if decision == "ACCOUNT" else Status.LOGIN_REQUIRED
+        status, account = stop_account(snapshot, _page_url(page), _ats_for(page), wanted)
+        _PENDING_ACCOUNT.set((status, account))
+        if status == Status.ACCOUNT_CREATION_REQUIRED:
+            if decision == "LOGIN":
+                note_page_type("ACCOUNT")
+            return Status.ACCOUNT_CREATION_REQUIRED, [_CREATE_ACCOUNT_MESSAGE]
         return Status.LOGIN_REQUIRED, ["Sign-in is required before the application form. Nothing was typed."]
     if decision == "JOB":
         reason = "job_description" if current_page_type() == "JOB_DESCRIPTION" else "apply_entry"
