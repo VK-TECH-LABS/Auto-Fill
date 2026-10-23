@@ -36,7 +36,7 @@ from autofill.redact import install_redaction, redaction_filter
 from autofill.resolver import ResolverBinding
 from autofill.resume_manual import ResumeRejected, max_resume_bytes, mime_for, validate_resume
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
-from autofill.service.auth import require_configured_token, tokens_match
+from autofill.service.auth import accepted_tokens, tokens_match_any
 from autofill.service.context import (
     ContextError,
     build_binding,
@@ -1207,6 +1207,7 @@ def _start_in_background(session, store, runner, limits) -> RunStatusOut:
 def create_app(
     *,
     token: str,
+    previous_token: str | None = None,
     runner: FillRunner | None = None,
     run_browser: bool = True,
     max_sessions: int = 32,
@@ -1221,8 +1222,11 @@ def create_app(
     dead_end_browser_seconds: float = 120,
     one_session_per_owner: bool = True,
 ) -> FastAPI:
-    """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
-    expected = require_configured_token(token)
+    """Build the service. ``token`` is the bearer secret and is not stored in the schema.
+
+    ``previous_token`` (optional) is also accepted during a token rotation.
+    """
+    expected = accepted_tokens(token, previous_token)
     install_redaction()
     store = ServiceSessionStore(max_sessions=max_sessions)
     store.idle_ttl_seconds = idle_ttl_seconds
@@ -1274,7 +1278,7 @@ def create_app(
         presented = ""
         if credentials is not None and credentials.scheme.lower() == "bearer":
             presented = credentials.credentials
-        if not tokens_match(presented, expected):
+        if not tokens_match_any(presented, expected):
             raise HTTPException(
                 status_code=401,
                 detail="Unauthorized",
