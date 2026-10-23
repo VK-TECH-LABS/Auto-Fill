@@ -1319,6 +1319,7 @@ def create_app(
         return JSONResponse(status_code=422, content={"detail": detail})
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
+    @app.get("/health/ready", response_model=HealthOut, tags=["health"])
     @app.get("/v1/health", response_model=HealthOut, tags=["health"])
     def health() -> HealthOut:
         return HealthOut()
