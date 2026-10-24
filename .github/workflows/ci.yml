@@ -1,8 +1,17 @@
-name: Tests
+# Pull requests into staging (integration) and main (production), plus pushes to staging.
+# workflow_dispatch re-runs CI on a developer branch after the handoff bot commit.
+# A push made with GITHUB_TOKEN does not start workflows by itself.
+name: CI
 
 on:
-  push:
   pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -17,8 +26,12 @@ jobs:
       - name: Install Chromium for Playwright
         run: python -m playwright install --with-deps chromium
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests scripts
       - name: Typecheck
         run: mypy
       - name: Run tests
         run: pytest
+      - name: Build
+        run: |
+          pip install build
+          python -m build
