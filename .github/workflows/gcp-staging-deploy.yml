@@ -1,10 +1,7 @@
+# paused: Railway is active host, Oct 2026
 name: Auto-Fill Engine Staging CI/CD (GCP Cloud Run)
 
 on:
-  pull_request:
-    branches: [staging, main]
-  push:
-    branches: [staging]
   workflow_dispatch:
 
 concurrency:
