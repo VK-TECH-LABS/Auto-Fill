@@ -497,9 +497,10 @@ _COOKIE_DISMISS_JS = r"""() => {
     }
   }
   function isCookieBox(node) {
-    const id = ((node.id || "") + " " + String(node.className || "")).toLowerCase();
+    const id = ((node.id || "") + " " + String(node.className || "") + " "
+      + (node.getAttribute("data-automation-id") || "")).toLowerCase();
     const blob = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 180).toLowerCase();
-    const marked = /cookie|onetrust|cookiebot|trustarc|consent-banner|privacy-banner/.test(id);
+    const marked = /cookie|onetrust|cookiebot|trustarc|consent-banner|privacy-banner|legalnotice/.test(id);
     const titled = /\b(cookie|cookies|privacy preference|we value your privacy)\b/.test(blob);
     if (!marked && !titled) return false;
     if (/\b(submit application|create account|send application)\b/.test(blob)) return false;
@@ -526,7 +527,9 @@ _COOKIE_DISMISS_JS = r"""() => {
     const selector = [
       "[role='dialog']", "[role='alertdialog']", "[aria-modal='true']",
       "[id*='cookie' i]", "[class*='cookie' i]", "[id*='onetrust' i]", "[class*='onetrust' i]",
-      "[id*='consent' i]", "[class*='consent' i]"
+      "[id*='consent' i]", "[class*='consent' i]",
+      // Workday marks its banner with data-automation-id; its classes are hashed.
+      "[data-automation-id*='cookie' i]", "[data-automation-id*='legalNotice' i]"
     ].join(", ");
     for (const node of root.querySelectorAll(selector)) {
       if (isCookieBox(node)) boxes.push(node);

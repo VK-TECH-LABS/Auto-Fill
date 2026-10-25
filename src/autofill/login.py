@@ -19,7 +19,13 @@ from autofill.ats import WORKDAY_HOST_RE
 from autofill.credentials import Credentials
 from autofill.extract import extract_page
 from autofill.models import Control, PageSnapshot
-from autofill.safeguards import activate, activate_account_switch, activate_login, activate_login_at_point
+from autofill.safeguards import (
+    activate,
+    activate_account_switch,
+    activate_login,
+    activate_login_at_point,
+    dismiss_cookie_banner,
+)
 
 logger = logging.getLogger("autofill.login")
 
@@ -138,6 +144,7 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
     """
     steps: list[str] = []
     detector = LoginDetector()
+    clear_cookie_banner(page)
     snapshot = extract_page(page)
     if snapshot.captcha_present:
         return "CAPTCHA_REQUIRED", steps
@@ -305,7 +312,10 @@ _CONTACT_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTACT_REACH_RE = re.compile(r"\b(?:e-?mail|phone|mobile|telephone)\b", re.IGNORECASE)
-_EXISTS_RE = re.compile(r"already exists|account exists|already registered|email is taken", re.IGNORECASE)
+_EXISTS_RE = re.compile(
+    r"already exists|account exists|already registered|email is taken|already in use|already been used",
+    re.IGNORECASE,
+)
 _EMAIL_REDACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _DIGIT_RUN_RE = re.compile(r"\d{3,}")
 _WORKDAY_HOST_RE = WORKDAY_HOST_RE
@@ -840,3 +850,79 @@ def open_email_sign_in(page, snapshot: PageSnapshot) -> PageSnapshot | None:
         if time.monotonic() >= deadline:
             return fresh
         _pause(page, 150)
+
+
+def clear_cookie_banner(page) -> bool:
+    """Close a cookie banner before typing into an account form. At most two tries."""
+    closed = False
+    for _ in range(2):
+        try:
+            if not dismiss_cookie_banner(page):
+                break
+        except Exception:
+            break
+        closed = True
+        _pause(page, 200)
+    return closed
+
+
+# Workday: "You may have entered the wrong email address or password or your
+# account might be locked." A new Workday account that is not verified yet gets
+# the same banner, and Workday locks an account after repeated tries.
+_WRONG_OR_LOCKED_RE = re.compile(
+    r"wrong (?:e-?mail|password|user)|incorrect (?:e-?mail|password|user)|invalid (?:e-?mail|password|user|credentials)"
+    r"|might be locked|(?:account|user) (?:is |has been |was )?locked"
+    r"|too many (?:failed )?(?:sign-?in |login )?attempts",
+    re.IGNORECASE,
+)
+_UNVERIFIED_RE = re.compile(
+    r"not (?:been |yet )?verified|verify your (?:e-?mail|account)|unverified|activate your account",
+    re.IGNORECASE,
+)
+
+LOGIN_FAILED_MESSAGES = {
+    "wrong_or_locked": (
+        "The employer site says the email or password is wrong or the account is locked. "
+        "Auto-Fill will not try again. If the account was just created, open the employer's verification "
+        "email first. Then sign in in the live preview, or use Forgot password, and press Continue."
+    ),
+    "unverified": (
+        "The employer account is not verified yet. Open the employer's verification email, "
+        "then press Continue."
+    ),
+    "rejected": (
+        "The employer site did not accept the sign-in. Auto-Fill will not try again. "
+        "Sign in in the live preview, then press Continue."
+    ),
+}
+
+
+def login_failure_reason(snapshot: PageSnapshot) -> str:
+    """``wrong_or_locked``, ``unverified``, or ``rejected`` from the site's own banner."""
+    text = " ".join(part for part in (snapshot.banner, *snapshot.alerts, snapshot.page_text) if part)
+    if _UNVERIFIED_RE.search(text):
+        return "unverified"
+    if _WRONG_OR_LOCKED_RE.search(text):
+        return "wrong_or_locked"
+    return "rejected"
+
+
+def sign_in_switch_target(snapshot: PageSnapshot):
+    """The "Sign In" link on a Create Account pane (Workday ``signInLink``), or None.
+
+    A header Sign In button is skipped: it opens the same dialog on some tenants
+    and leaves the Create Account form in place on others.
+    """
+    for item in [*snapshot.links, *snapshot.buttons]:
+        if getattr(item, "in_header", False) or getattr(item, "in_ad", False) or getattr(item, "disabled", False):
+            continue
+        selector = str(getattr(item, "selector", "") or "")
+        name = str(getattr(item, "name", "") or "")
+        if not selector or not name:
+            continue
+        automation_id = getattr(item, "automation_id", "")
+        if automation_id == "signInLink" or re.fullmatch(r"\s*(?:sign\s*in|log\s*in)\s*", name, re.IGNORECASE):
+            if automation_id in {"signInSubmitButton", "utilityButtonSignIn"}:
+                continue
+            return item
+    return None

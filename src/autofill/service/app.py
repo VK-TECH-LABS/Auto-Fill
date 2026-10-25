@@ -441,6 +441,20 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
     outcome = str(report.get("outcome") or "pending")
     if report.get("status"):
         session.status = str(report["status"])
+    if report.get("verifyBeforeSignIn") and _is_070(session):
+        # The site created the account and went back to Sign In. Do not sign in
+        # with the new password before the verification email: Workday answers
+        # "wrong email or password or your account might be locked" and may lock
+        # it. Continue (humanResolved) signs in once after the person verifies.
+        session.status = Status.EMAIL_VERIFICATION_REQUIRED
+        session.pending_resume = False
+        _sync_checkpoint(session)
+        return CredentialsOut(
+            sessionId=session.session_id,
+            outcome="registered",
+            status=_public_status(session),
+            **proof,
+        )
     if session.paused:
         session.pending_resume = outcome in {"signed_in", "registered", "verification_required"}
         _sync_checkpoint(session)
@@ -640,6 +654,10 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         session.phase = "loaded"
     if result.account is not None:
         session.account = result.account
+    if result.status == Status.LOGIN_FAILED:
+        # The site refused these credentials. Never type them again on their
+        # own; a new /credentials call or the person in the live view decides.
+        session.credentials.clear()
     for key in result.completed_keys:
         if key and key not in session.completed_keys:
             session.completed_keys.append(key)
@@ -1500,6 +1518,11 @@ def create_app(
             }
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
+                # After a refused sign-in the person signs in in the live view
+                # (or verifies the account) and presses Continue, as the
+                # Companion copy says. The refused password was dropped, so the
+                # run only checks the page; it never retypes it.
+                allowed.add(Status.LOGIN_FAILED)
                 # The person may have created the account in the live view. The run
                 # checks the page again and stops on the Create Account form if it is
                 # still there. Continue never types an account or skips that check.

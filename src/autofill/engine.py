@@ -592,6 +592,40 @@ def _login_stop(
     )
 
 
+def _login_failed(session, page, url: str, ats_name: str | None, secrets: list[str]) -> ApplicationResult:
+    """LOGIN_FAILED with the site's own banner and a plain reason. Nothing is retried."""
+    from autofill.login import LOGIN_FAILED_MESSAGES, login_failure_reason, redact_site_error
+
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        snapshot = None
+    reason = "rejected"
+    errors: list[str] = []
+    account = None
+    if snapshot is not None:
+        reason = login_failure_reason(snapshot)
+        for raw in [snapshot.banner, *snapshot.alerts]:
+            cleaned = redact_site_error(raw, secrets)
+            if cleaned and cleaned not in errors:
+                errors.append(cleaned)
+        try:
+            account = account_view(snapshot, url, ats_name, mode="login", alternate=False, site_errors=errors[:5])
+        except Exception:
+            account = None
+    if account is not None:
+        account["loginFailure"] = reason
+    logger.info("session=%s login_failed reason=%s site_errors=%d", session.session_id, reason, len(errors))
+    return _result(
+        session,
+        status=Status.LOGIN_FAILED,
+        ats=ats_name,
+        login_status="LOGIN_FAILED",
+        messages=[LOGIN_FAILED_MESSAGES[reason]],
+        account=account,
+    )
+
+
 def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_name: str | None, opts: AutofillOptions):
     if not _protocol_070(opts) or result.status != Status.LOGIN_REQUIRED:
         return result
@@ -859,12 +893,12 @@ def autofill_application(
                 )
             if outcome != "AUTHENTICATED":
                 session.mark("LOGIN_FAILED")
-                return _result(
+                return _login_failed(
                     session,
-                    status=Status.LOGIN_FAILED,
-                    ats=ats_name,
-                    login_status="LOGIN_FAILED",
-                    messages=["Login failed. The application was not filled."],
+                    page,
+                    getattr(page, "url", "") or application_url,
+                    ats_name,
+                    [value for value in (creds.email, creds.username, creds.password) if value],
                 )
             login_status = "AUTHENTICATED"
         else:
