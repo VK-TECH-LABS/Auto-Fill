@@ -1518,15 +1518,33 @@ def create_app(
 
     @router.post("/sessions/{session_id}/resume", response_model=RunStatusOut, tags=["sessions"])
     def resume_session(session_id: str) -> RunStatusOut:
-        """Release a paused fill. This does not start a run that has already stopped."""
+        """Release a paused fill. A cleared captcha or verification stop fills again.
+
+        A challenge that is still on the page is left stopped. This does not
+        submit the application and does not solve the challenge.
+        """
         session = _session_or_404(session_id)
         _reject_expired(session)
         session.pause_gate.resume()
         session.paused = False
         logger.info("session=%s action=resume", session.session_id)
-        if _is_070(session) and session.pending_resume and not session.busy:
+        if session.busy:
+            return _status_out(session)
+        if _is_070(session) and session.pending_resume:
             session.pending_resume = False
             return _run(session, store, active_runner, limits, resume_uploaded=session.resume_uploaded)
+        if session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
+            found = _probe_challenge(session, active_runner)
+            if found != "clear":
+                return _status_out(session)
+            return _run(
+                session,
+                store,
+                active_runner,
+                limits,
+                resume_uploaded=session.resume_uploaded,
+                human_resolved=True,
+            )
         return _status_out(session)
 
     @router.post(

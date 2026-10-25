@@ -1122,7 +1122,7 @@ class PlaywrightRunner:
                 if is_browser_crash(exc):
                     raise PageUnavailable(410) from None
                 if _page_navigating(exc):
-                    return "captcha"
+                    raise PageUnavailable(503) from None
                 raise
             if snapshot.captcha_present:
                 return "captcha"
