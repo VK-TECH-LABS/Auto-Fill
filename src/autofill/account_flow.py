@@ -18,8 +18,11 @@ from autofill.login import (
     SecretInputError,
     account_exists_text,
     account_view,
+    application_form_visible,
+    clear_cookie_banner,
     redact_site_error,
     score_account,
+    sign_in_switch_target,
     verification_present,
 )
 from autofill.mapping import (
@@ -37,6 +40,13 @@ _logger = logging.getLogger("autofill.account")
 _EEO_RE = re.compile(r"\b(eeo|equal employment|self-identif|voluntary|work authorization)\b", re.IGNORECASE)
 _TERMS_RE = re.compile(r"\b(terms|privacy)\b", re.IGNORECASE)
 _WAIT_SECONDS = 15.0
+# After Create Account the form disappears while the site works. A page without
+# a password box must stay that way this long before it counts as registered.
+_SETTLE_SECONDS = 1.5
+_VERIFY_FIRST_MESSAGE = (
+    "The employer created the account and returned to Sign In. Workday sends a verification "
+    "email first; signing in before it is opened can lock the account. Open that email, then press Continue."
+)
 
 
 def run_account_action(
@@ -80,6 +90,7 @@ def _perform_account_action(
     standard_terms: bool = False,
 ) -> dict:
     secrets = [value for value in (email, username, password, confirm) if value]
+    clear_cookie_banner(page)
     snapshot = extract_page(page)
     if snapshot.captcha_present:
         return _challenge(snapshot, page.url or "", ats)
@@ -102,7 +113,19 @@ def _perform_account_action(
         if scored.mode != "register":
             return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "login"}
     if mode == "login" and scored.mode == "register":
-        return {"ok": False, "reason": "mode_mismatch", "detected": "register"}
+        # A saved login on a Create Account pane: open the pane's Sign In link
+        # instead of refusing, so an existing account is not created twice.
+        target = sign_in_switch_target(snapshot)
+        if target is None:
+            return {"ok": False, "reason": "mode_mismatch", "detected": "register"}
+        try:
+            activate_account_switch(page, target.selector, target.name)
+        except SubmitBlockedError:
+            return {"ok": False, "reason": "mode_mismatch", "detected": "register"}
+        snapshot = _settled_mode(page, "login")
+        scored = score_account(snapshot, page.url or "")
+        if scored.mode != "login":
+            return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "register"}
     if scored.mode != mode:
         return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "login"}
     terms = None
@@ -475,9 +498,28 @@ def _challenge(snapshot: PageSnapshot, url: str, ats: str | None) -> dict:
     }
 
 
+def _settled_mode(page, wanted: str, timeout_s: float = 4.0) -> PageSnapshot:
+    """Poll until the account pane shows ``wanted`` mode, or the timeout passes."""
+    deadline = time.monotonic() + timeout_s
+    snapshot = extract_page(page)
+    while score_account(snapshot, page.url or "").mode != wanted and time.monotonic() < deadline:
+        time.sleep(0.15)
+        snapshot = extract_page(page)
+    return snapshot
+
+
+def _returned_to_sign_in(snapshot: PageSnapshot, url: str) -> bool:
+    """After Create Account the site shows its Sign In pane with no error."""
+    if not snapshot.password_present:
+        return False
+    scored = score_account(snapshot, url)
+    return not scored.application and scored.mode == "login"
+
+
 def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secrets: list[str]) -> dict:
     deadline = time.monotonic() + _WAIT_SECONDS
     last = extract_page(page)
+    clear_since: float | None = None
     while True:
         last = extract_page(page)
         if last.captcha_present:
@@ -497,9 +539,30 @@ def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secr
         errors = _errors(last, secrets)
         if errors and last.password_present:
             return _rejected(last, page.url or "", ats, mode, alternate, errors, secrets)
+        if mode == "register" and _returned_to_sign_in(last, page.url or ""):
+            # Workday accepted the form and went back to Sign In. Signing in
+            # now, before the verification email, fails with "wrong email or
+            # password or your account might be locked" and can lock it.
+            _logger.info("account_outcome=registered next=verify_before_sign_in")
+            return {
+                "ok": True,
+                "outcome": "registered",
+                "status": "EMAIL_VERIFICATION_REQUIRED",
+                "verifyBeforeSignIn": True,
+                "message": _VERIFY_FIRST_MESSAGE,
+                "siteErrors": [],
+                "account": _view(last, page.url or "", ats, "login", False, []),
+            }
         if not last.password_present:
-            outcome = "registered" if mode == "register" else "signed_in"
-            return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
+            if mode != "register" or application_form_visible(last):
+                outcome = "registered" if mode == "register" else "signed_in"
+                return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
+            now = time.monotonic()
+            clear_since = clear_since if clear_since is not None else now
+            if now - clear_since >= _SETTLE_SECONDS:
+                return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
+        else:
+            clear_since = None
         if time.monotonic() >= deadline:
             break
         time.sleep(0.25)
