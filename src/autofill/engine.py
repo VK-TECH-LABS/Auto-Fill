@@ -52,6 +52,7 @@ from autofill.pagewait import (
     find_entry_control,
     icims_login_gate,
     invalid_field_messages,
+    is_job_closed,
     is_login_wall,
     is_review,
     is_site_error,
@@ -75,6 +76,7 @@ from autofill.safeguards import (
     HumanSubmissionRequired,
     activate,
     activate_entry,
+    dismiss_cookie_banner,
     field_class_for_button,
     is_add_row,
     is_forward_navigation,
@@ -285,6 +287,10 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         **kwargs,
     )
     result.page_type = current_page_type()
+    if result.page_type == "JOB_CLOSED":
+        result.progress["stage"] = "CLOSED"
+        result.progress["currentLabel"] = "Job closed"
+        result.progress["percent"] = 0
     result.auto_consents = consume_auto_consents()
     nav = _navigation_record()
     result.entry_clicks = int(nav["entryClicks"])
@@ -359,6 +365,17 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ats=ats_name,
             login_status=login_status,
             messages=[challenge_message(snapshot)],
+            **extra,
+        )
+    if is_job_closed(snapshot):
+        note_page_type("JOB_CLOSED")
+        session.mark(Status.FAILED_FINAL)
+        return snapshot, _result(
+            session,
+            status=Status.FAILED_FINAL,
+            ats=ats_name,
+            login_status=login_status,
+            messages=["job_expired"],
             **extra,
         )
     if is_site_error(snapshot):
@@ -1340,6 +1357,8 @@ def _terminal_status(
             "This page is a job description. Auto-Fill did not find an application form.",
             reason,
         ]
+    if decision == "JOB_CLOSED":
+        return Status.FAILED_FINAL, ["job_expired"]
     if decision == "SITE_ERROR":
         return Status.FAILED_RETRYABLE, site_error_messages(snapshot)
     if decision == "CAPTCHA":
@@ -1448,13 +1467,21 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
     for _ in range(2):
         if snapshot.captcha_present:
             return page, snapshot
+        if is_job_closed(snapshot):
+            note_page_type("JOB_CLOSED")
+            return page, snapshot
         kind = _observe_page(page, snapshot)
         if kind not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
             return page, snapshot
-        button = find_entry_control(snapshot)
+        button = find_entry_control(snapshot, on_posting=True)
         if button is None:
             return page, snapshot
         before = navigation_signature(page, snapshot)
+        try:
+            dismiss_cookie_banner(page)
+        except Exception as exc:
+            if is_browser_crash(exc) or is_ats_timeout(exc):
+                raise
         try:
             new_page = activate_entry(
                 page,
@@ -1466,6 +1493,10 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
                 href=button.href,
                 role=button.role,
                 frame_url=button.frame_url,
+                in_header=button.in_header,
+                in_ad=button.in_ad,
+                in_main=button.in_main,
+                on_posting=True,
             )
         except HumanSubmissionRequired:
             raise

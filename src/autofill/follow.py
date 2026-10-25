@@ -159,6 +159,10 @@ def follow_answer(
                 "This page is a job description. Auto-Fill did not find an application form.",
                 reason,
             ]
+        elif decision == "JOB_CLOSED":
+            status = Status.FAILED_FINAL
+            present_blocking(page, None)
+            messages = ["job_expired"]
         elif decision == "SITE_ERROR":
             status = Status.FAILED_RETRYABLE
             present_blocking(page, None)
@@ -246,6 +250,14 @@ def _progress(
     if not label or stage != heading_stage:
         label = STAGE_TITLES.get(stage, STAGE_TITLES["QUESTIONS"])
     percent = progress_percent(stage, total, done)
+    if current_page_type() == "JOB_CLOSED":
+        return {
+            "stage": "CLOSED",
+            "requiredTotal": total,
+            "requiredDone": done,
+            "percent": 0,
+            "currentLabel": "Job closed",
+        }
     if status in {
         "JOB_DESCRIPTION",
         "ACCOUNT_CREATION_REQUIRED",

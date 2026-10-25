@@ -48,6 +48,7 @@ STAGE_PERCENT = {
     "RESUME": 85,
     "REVIEW": 95,
     "READY": 100,
+    "CLOSED": 0,
 }
 STAGE_TITLES = {
     "OPENING": "Opening",
@@ -63,6 +64,7 @@ STAGE_TITLES = {
     "RESUME": "Resume",
     "REVIEW": "Review",
     "READY": "Ready",
+    "CLOSED": "Job closed",
 }
 
 _FOCUS_JS = """(selector) => {

@@ -12,7 +12,10 @@ continue, Proceed, Review, Add another) go through :func:`activate`.
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger("autofill.safeguards")
 
 # Permanent. Read by tests so a future "just this once" flag fails CI.
 HUMAN_SUBMIT_ONLY = True
@@ -199,6 +202,13 @@ def is_entry_label(name: str) -> bool:
     return any(label.startswith(prefix) for prefix in _ENTRY_PREFIXES)
 
 
+def _posting_entry_name(name: str, aria_label: str, automation_id: str) -> bool:
+    """An Apply label on a job posting. Href-only matches are not enough in the header."""
+    return bool(
+        is_entry_label(name) or is_entry_label(aria_label) or is_entry_label(_fold_token(automation_id))
+    )
+
+
 def is_entry_control(
     name: str,
     *,
@@ -212,14 +222,19 @@ def is_entry_control(
     in_header: bool = False,
     in_ad: bool = False,
     in_main: bool = True,
+    on_posting: bool = False,
 ) -> bool:
     """A visible, enabled Apply control in the main content.
 
     Header sign-in, ads, and unrelated links are not entries. A bare ``Apply``
     whose type is submit stays on the final-submit path unless the selector is
-    the known Greenhouse or Lever entry control.
+    the known Greenhouse or Lever entry control, or the caller is still on the
+    job posting. ``on_posting`` also accepts that Apply in the posting header.
     """
-    if disabled or in_header or in_ad or not in_main:
+    if disabled or in_ad:
+        return False
+    posting_named = bool(on_posting and _posting_entry_name(name, aria_label, automation_id))
+    if (in_header or not in_main) and not posting_named:
         return False
     role_text = (role or "").casefold()
     if role_text and role_text not in {"button", "link"}:
@@ -232,7 +247,7 @@ def is_entry_control(
         return True
     if "postings-btn" in selector_text and "apply" in label:
         return True
-    if (control_type or "").casefold() == "submit" and label == "apply":
+    if (control_type or "").casefold() == "submit" and label == "apply" and not posting_named:
         return False
     token = _fold_token(automation_id)
     if is_entry_label(name) or is_entry_label(aria_label) or is_entry_label(token):
@@ -418,12 +433,18 @@ def activate_entry(
     href: str = "",
     role: str = "",
     frame_url: str = "",
+    in_header: bool = False,
+    in_ad: bool = False,
+    in_main: bool = True,
+    on_posting: bool = False,
 ):
     """Open a job description into the application. Submit on a form stays forbidden.
 
     The caller must already know the page has no application form. This does
     not classify ``Apply`` as safe navigation for later pages. A new tab or
     popup opened by the click is returned so the same session can follow it.
+    ``on_posting`` is only for that job-description Apply, including one in the
+    posting header or with type submit.
     """
     if not HUMAN_SUBMIT_ONLY:
         raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
@@ -435,12 +456,124 @@ def activate_entry(
         automation_id=automation_id,
         href=href,
         role=role,
+        in_header=in_header,
+        in_ad=in_ad,
+        in_main=in_main,
+        on_posting=on_posting,
     ):
         raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
         )
     # Lever renders two Apply links with the same class. The first is the posting entry.
     return _click_for_popup(page, selector, frame_url)
+
+
+_COOKIE_DISMISS_JS = r"""() => {
+  function textOf(el) {
+    return (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+  }
+  function hidden(el) {
+    if (!el || el.nodeType !== 1) return true;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return true;
+    const box = el.getBoundingClientRect();
+    return box.width < 2 || box.height < 2;
+  }
+  function eachRoot(root, visit) {
+    visit(root);
+    if (!root.querySelectorAll) return;
+    for (const el of root.querySelectorAll("*")) {
+      if (el.shadowRoot) eachRoot(el.shadowRoot, visit);
+    }
+  }
+  function isCookieBox(node) {
+    const id = ((node.id || "") + " " + String(node.className || "")).toLowerCase();
+    const blob = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 180).toLowerCase();
+    const marked = /cookie|onetrust|cookiebot|trustarc|consent-banner|privacy-banner/.test(id);
+    const titled = /\b(cookie|cookies|privacy preference|we value your privacy)\b/.test(blob);
+    if (!marked && !titled) return false;
+    if (/\b(submit application|create account|send application)\b/.test(blob)) return false;
+    return true;
+  }
+  function score(name) {
+    const n = name.toLowerCase();
+    if (/\b(submit|application|account|sign[\s-]?in|log[\s-]?in|register|apply)\b/.test(n)) return 100;
+    if (n.length > 48) return 100;
+    const order = [
+      "reject all", "decline all", "deny all", "reject", "decline", "deny",
+      "only necessary", "necessary only", "essential only", "use necessary",
+      "accept all", "allow all", "accept", "allow", "i agree", "agree",
+      "got it", "okay", "ok", "save preferences", "confirm my choices", "close"
+    ];
+    for (let i = 0; i < order.length; i += 1) {
+      if (n === order[i] || n.indexOf(order[i] + " ") === 0) return i;
+    }
+    return 100;
+  }
+  const boxes = [];
+  eachRoot(document, (root) => {
+    if (!root.querySelectorAll) return;
+    const selector = [
+      "[role='dialog']", "[role='alertdialog']", "[aria-modal='true']",
+      "[id*='cookie' i]", "[class*='cookie' i]", "[id*='onetrust' i]", "[class*='onetrust' i]",
+      "[id*='consent' i]", "[class*='consent' i]"
+    ].join(", ");
+    for (const node of root.querySelectorAll(selector)) {
+      if (isCookieBox(node)) boxes.push(node);
+    }
+  });
+  let best = null;
+  let bestScore = 100;
+  for (const box of boxes) {
+    const controls = box.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit'], a");
+    for (const el of controls) {
+      if (hidden(el) || el.getAttribute("data-af-cookie-tried") === "1") continue;
+      const name = textOf(el);
+      const rank = score(name);
+      if (rank < bestScore) {
+        best = el;
+        bestScore = rank;
+      }
+    }
+  }
+  if (!best) return "";
+  const name = textOf(best);
+  best.setAttribute("data-af-cookie-tried", "1");
+  if ((best.getAttribute("type") || "").toLowerCase() === "submit") best.setAttribute("type", "button");
+  best.click();
+  return name;
+}"""
+
+
+def dismiss_cookie_banner(page) -> bool:
+    """Dismiss a cookie or consent dialog. This is not an application submit.
+
+    Reject or decline is preferred. Accept is used when that is the only
+    control that closes the dialog. Application Submit is never chosen.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        return False
+    targets = []
+    main = getattr(page, "main_frame", None)
+    if main is not None:
+        targets.append(main)
+    else:
+        targets.append(page)
+    for frame in list(getattr(page, "frames", []) or []):
+        if frame not in targets:
+            targets.append(frame)
+    for target in targets:
+        evaluate = getattr(target, "evaluate", None)
+        if evaluate is None:
+            continue
+        try:
+            name = evaluate(_COOKIE_DISMISS_JS)
+        except Exception:
+            continue
+        if isinstance(name, str) and name.strip():
+            logger.info("action=cookie_dismiss result=clicked")
+            return True
+    return False
 
 
 def open_combobox(page, selector: str) -> None:
