@@ -354,6 +354,9 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
     if resettle_account(page, snapshot):
         snapshot = extract_page(page)
         note_snapshot(snapshot)
+    opened = _open_email_sign_in_once(page, snapshot, session)
+    if opened is not None:
+        return _pane_stop(page, opened, session, opts, ats_name, **extra)
     url = _page_url(page)
     extra.setdefault("fields_detected", len(visible_fields(snapshot)))
     login_status = str(extra.pop("login_status", "NOT_REQUIRED"))
@@ -485,6 +488,36 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     return snapshot, None
+
+
+def _open_email_sign_in_once(page, snapshot, session):
+    """On a Google / Apple / LinkedIn chooser, open the email sign-in form once.
+
+    Workday tenants such as KLA show only identity-provider buttons and a
+    "Sign in with email" button until that button is clicked. Without the click
+    the run stopped on "Sign in inside the preview" even with saved credentials.
+    Identity-provider buttons are never clicked here.
+    """
+    from autofill.login import email_sign_in_button, open_email_sign_in
+
+    if "OPEN_EMAIL_SIGN_IN" in session.steps or snapshot.captcha_present:
+        return None
+    if email_sign_in_button(snapshot) is None:
+        return None
+    on_sign_in = (
+        sign_in_pane(snapshot)
+        or is_login_wall(snapshot)
+        or classify_page(snapshot, url=_page_url(page)) == "LOGIN"
+    )
+    if not on_sign_in:
+        return None
+    session.steps.append("OPEN_EMAIL_SIGN_IN")
+    fresh = open_email_sign_in(page, snapshot)
+    if fresh is None:
+        return None
+    note_snapshot(fresh)
+    logger.info("session=%s email_sign_in=opened", session.session_id)
+    return fresh
 
 
 def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):

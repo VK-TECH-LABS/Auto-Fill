@@ -30,8 +30,8 @@ from autofill.mapping import (
     standard_terms_enabled,
     terms_category,
 )
-from autofill.models import Control, PageSnapshot
-from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch
+from autofill.models import ButtonControl, Control, PageSnapshot
+from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch, press_choice_label
 
 _logger = logging.getLogger("autofill.account")
 _EEO_RE = re.compile(r"\b(eeo|equal employment|self-identif|voluntary|work authorization)\b", re.IGNORECASE)
@@ -129,12 +129,27 @@ def _perform_account_action(
     if standard_terms:
         rows = _accept_account_terms(page, snapshot)
     elif terms is not None:
-        page.locator(terms.selector).check()
+        if not check_registered(page, terms.selector):
+            return _rejected(
+                snapshot,
+                page.url or "",
+                ats,
+                mode,
+                scored.alternate,
+                ["The terms checkbox did not stay checked on the employer page."],
+                secrets,
+            )
     button = _primary_button(snapshot, mode)
     if button is None:
         return {"ok": False, "reason": "not_at_account_step"}
     try:
-        activate_account(page, button.selector, button.name, control_type=button.control_type)
+        activate_account(
+            page,
+            button.selector,
+            button.name,
+            control_type=button.control_type,
+            at_point=_covered_pane_button(snapshot, button),
+        )
     except SubmitBlockedError:
         rejected = _rejected(
             snapshot,
@@ -201,19 +216,87 @@ def _accept_account_terms(page, snapshot: PageSnapshot) -> list[dict]:
             continue
         category = terms_category(control)
         checked = False
-        if category in AUTO_CONSENT_CATEGORIES and control.required:
-            try:
-                page.locator(control.selector).check()
-            except Exception:
-                _logger.info("auto_consent category=%s result=failed", category)
-                category = "CONSENT"
-            else:
+        # Workday validates its Create Account box in script, so the input may not
+        # carry ``required``; its automation id says the site needs it.
+        required = control.required or control.automation_id == "createAccountCheckbox"
+        if category in AUTO_CONSENT_CATEGORIES and required:
+            if check_registered(page, control.selector):
                 record_auto_consent(control, category)
                 checked = True
+            else:
+                _logger.info("auto_consent category=%s result=failed", category)
+                category = "CONSENT"
         else:
             category = "CONSENT"
         rows.append({"textExcerpt": _statement(control), "category": category, "checked": checked})
     return rows
+
+
+_CHECKED_JS = """(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return null;
+  if (el.type === "checkbox" || el.type === "radio") return !!el.checked;
+  const state = el.getAttribute("aria-checked");
+  return state === null ? null : state === "true";
+}"""
+
+
+def _is_checked(page, selector: str) -> bool | None:
+    """The page's own checked state, or None when it cannot be read."""
+    locator = page.locator(selector)
+    reader = getattr(locator, "is_checked", None)
+    if reader is not None:
+        try:
+            return bool(reader())
+        except Exception:
+            pass
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        state = evaluate(_CHECKED_JS, selector)
+    except Exception:
+        return None
+    return state if isinstance(state, bool) else None
+
+
+def check_registered(page, selector: str) -> bool:
+    """Check one box with a real pointer click and confirm the page kept it.
+
+    A script that sets ``input.checked`` paints the box but a React form such as
+    Workday never sees it, and the site still says "Please check the box to
+    continue". Playwright's ``check()`` clicks like a person. A box covered by a
+    styled wrapper falls back to its label. At most three attempts, each verified.
+    """
+    attempts = (
+        lambda: page.locator(selector).check(timeout=3000),
+        lambda: page.locator(selector).check(force=True, timeout=3000),
+        lambda: press_choice_label(page, selector),
+    )
+    for attempt in attempts:
+        if _is_checked(page, selector) is True:
+            return True
+        try:
+            attempt()
+        except TypeError:
+            # Test doubles accept ``check()`` without keyword arguments.
+            try:
+                page.locator(selector).check()
+            except Exception:
+                continue
+        except Exception:
+            continue
+        state = _is_checked(page, selector)
+        if state is None or state:
+            return True
+    return _is_checked(page, selector) is True
+
+
+def _covered_pane_button(snapshot: PageSnapshot, button: ButtonControl) -> bool:
+    """True for the Workday submit button kept aria-hidden under its overlay."""
+    if button.automation_id not in _PANE_SUBMIT_IDS:
+        return False
+    return not any(item.selector == button.selector for item in snapshot.buttons)
 
 
 def _attach_proof(result: dict, proof: dict, rows: list[dict], *, standard_terms: bool) -> dict:
@@ -263,11 +346,15 @@ def _password_targets(snapshot: PageSnapshot, mode: str) -> tuple[Control | None
     return primary, confirm_box
 
 
+_PANE_SUBMIT_IDS = {"createAccountSubmitButton": "Create Account", "signInSubmitButton": "Sign In"}
+
+
 def _primary_button(snapshot: PageSnapshot, mode: str):
     wanted = "createAccountSubmitButton" if mode == "register" else "signInSubmitButton"
     for button in snapshot.buttons:
         if button.automation_id == wanted:
             return button
+    covered = _covered_pane_target(snapshot, wanted)
     prefer = _REGISTER_RE if mode == "register" else _LOGIN_RE
     for button in snapshot.buttons:
         if prefer.search(button.name):
@@ -278,7 +365,25 @@ def _primary_button(snapshot: PageSnapshot, mode: str):
             continue
         if re.search(r"\b(continue|next)\b", button.name, re.IGNORECASE):
             return button
-    return None
+    return covered
+
+
+def _covered_pane_target(snapshot: PageSnapshot, wanted: str) -> ButtonControl | None:
+    """The aria-hidden Workday submit under a nameless ``click_filter``.
+
+    Extraction skips both: the button is aria-hidden and the overlay has no name.
+    The pane id is still recorded, so the button is clicked at its centre, where
+    the overlay takes the pointer like a person's click.
+    """
+    if wanted not in set(snapshot.automation_ids or []):
+        return None
+    return ButtonControl(
+        name=_PANE_SUBMIT_IDS[wanted],
+        selector=f"[data-automation-id='{wanted}']",
+        control_type="button",
+        automation_id=wanted,
+        role="button",
+    )
 
 
 def _switch_target(snapshot: PageSnapshot) -> tuple[str, str] | None:

@@ -19,7 +19,7 @@ from autofill.ats import WORKDAY_HOST_RE
 from autofill.credentials import Credentials
 from autofill.extract import extract_page
 from autofill.models import Control, PageSnapshot
-from autofill.safeguards import activate, activate_login
+from autofill.safeguards import activate, activate_account_switch, activate_login, activate_login_at_point
 
 logger = logging.getLogger("autofill.login")
 
@@ -89,6 +89,12 @@ def _login_button(snapshot: PageSnapshot):
     for button in snapshot.buttons:
         name = button.name.casefold()
         if "sign up" in name or "register" in name or "create account" in name:
+            continue
+        # A header Sign In reopens the dialog, and "Sign in with Google" hands
+        # the candidate to an identity provider. Neither submits this form.
+        if getattr(button, "in_header", False) or getattr(button, "in_ad", False):
+            continue
+        if getattr(button, "disabled", False) or "sign in with" in name or "continue with" in name:
             continue
         if "sign in" in name or "log in" in name or name == "login":
             return button
@@ -176,10 +182,22 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
     _type_secret(page, identity.selector, _identity(creds, identity))
     _type_secret(page, password.selector, creds.password)
     button = _login_button(snapshot)
+    covered = False
+    if button is None and "signInSubmitButton" in set(snapshot.automation_ids or []):
+        # Workday keeps the real Sign In button aria-hidden under a nameless overlay.
+        from autofill.models import ButtonControl
+
+        button = ButtonControl(
+            name="Sign In", selector="[data-automation-id='signInSubmitButton']", automation_id="signInSubmitButton"
+        )
+        covered = True
     if button is None:
         return "LOGIN_FAILED", steps
     steps.append("LOGIN_SUBMIT")
-    activate_login(page, button.selector, button.name, control_type=button.control_type)
+    if covered:
+        activate_login_at_point(page, button.selector, button.name)
+    else:
+        activate_login(page, button.selector, button.name, control_type=button.control_type)
     steps.append("WAIT_FOR_LOGIN")
     outcome = _await_signed_in(page)
     if outcome == "CAPTCHA_REQUIRED":
@@ -762,3 +780,63 @@ def stop_account(snapshot: PageSnapshot, url: str, ats: str | None, status: str)
 def account_exists_text(snapshot: PageSnapshot) -> bool:
     blob = " ".join(part for part in [snapshot.banner, snapshot.heading, snapshot.page_text, *snapshot.alerts] if part)
     return bool(_EXISTS_RE.search(blob))
+
+
+# "Sign in with email" beside Google / Apple / LinkedIn buttons. Workday tenants
+# hide the email and password boxes behind it. Identity-provider buttons are not
+# matched: Auto-Fill has no Google, Apple, or LinkedIn password for the candidate.
+_EMAIL_PATH_RE = re.compile(
+    r"^\s*(?:(?:sign\s*in|log\s*in|continue|sign\s*up|create account)\s+(?:with|using|via)\s+"
+    r"(?:your\s+|my\s+)?(?:e-?mail(?:\s+address)?|password)"
+    r"|use\s+(?:my\s+|your\s+)?e-?mail(?:\s+address)?(?:\s+instead)?)\s*$",
+    re.IGNORECASE,
+)
+_EMAIL_PATH_IDS = frozenset({"SignInWithEmailButton", "signInWithEmailButton", "signInWithEmail"})
+_EMAIL_PATH_WAIT_SECONDS = 4.0
+
+
+def email_sign_in_button(snapshot: PageSnapshot):
+    """The "Sign in with email" control on an SSO chooser, or None."""
+    if snapshot.password_present or _passwords(snapshot):
+        return None
+    for item in [*snapshot.buttons, *snapshot.links]:
+        if getattr(item, "in_header", False) or getattr(item, "in_ad", False) or getattr(item, "disabled", False):
+            continue
+        selector = str(getattr(item, "selector", "") or "")
+        if not selector:
+            continue
+        automation_id = getattr(item, "automation_id", "")
+        if automation_id in _EMAIL_PATH_IDS or _EMAIL_PATH_RE.search(str(getattr(item, "name", "") or "")):
+            return item
+    return None
+
+
+def open_email_sign_in(page, snapshot: PageSnapshot) -> PageSnapshot | None:
+    """Click "Sign in with email" and wait for the email or password box.
+
+    Returns the new snapshot, or None when there was nothing to click or the
+    form did not appear. One click; no identity-provider button is touched.
+    """
+    target = email_sign_in_button(snapshot)
+    if target is None:
+        return None
+    name = target.name or "Sign in with email"
+    if not _EMAIL_PATH_RE.search(name):
+        name = "Sign in with email"
+    try:
+        activate_account_switch(page, target.selector, name, control_type=getattr(target, "control_type", ""))
+    except Exception:
+        logger.info("email sign-in: click failed")
+        return None
+    deadline = time.monotonic() + _EMAIL_PATH_WAIT_SECONDS
+    while True:
+        try:
+            fresh = extract_page(page)
+        except Exception:
+            fresh = None
+        if fresh is not None and (fresh.password_present or _passwords(fresh) or fresh.captcha_present):
+            logger.info("email sign-in: form opened")
+            return fresh
+        if time.monotonic() >= deadline:
+            return fresh
+        _pause(page, 150)
