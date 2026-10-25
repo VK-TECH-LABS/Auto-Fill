@@ -383,10 +383,27 @@ STANDARD_TERMS_DENY: tuple[str, ...] = (
 # (I agree to|I accept|I have read and agree to) the
 # (Terms of Service|Terms and Conditions|Terms of Use|Privacy Policy|Privacy Notice)
 # (and [the] <same document>)*
-_TERMS_DOCUMENT = r"(?:terms of service|terms and conditions|terms of use|privacy policy|privacy notice)"
+_TERMS_DOCUMENT = (
+    r"(?:terms of service|terms and conditions|terms conditions|terms of use"
+    r"|(?:(?:candidate|applicant) )?privacy (?:policy|notice|statement))"
+)
+# Workday tenants word the Create Account box as, for example,
+# "Yes, I have read and consent to the terms and conditions" or
+# "I understand and acknowledge the terms of use for Example Company (EC)".
+# The optional tail names whose document it is, in at most eight plain words,
+# and never carries another verb or a second promise (checked in code).
+_TERMS_VERB = (
+    r"(?:i have read and (?:agree to|accept|consent to|acknowledge|understand)"
+    r"|i have read and understood|i understand and (?:agree to|accept|acknowledge)"
+    r"|i agree to|i accept|i consent to|i acknowledge)"
+)
 _STANDARD_TERMS_SENTENCE = re.compile(
-    rf"(?:i have read and agree to|i agree to|i accept) the {_TERMS_DOCUMENT}"
+    rf"(?:yes )?{_TERMS_VERB} (?:the )?{_TERMS_DOCUMENT}"
     rf"(?: and (?:the )?{_TERMS_DOCUMENT})*"
+    r"(?P<tail> (?:for|of|at) (?:[a-z0-9]+ ){0,7}[a-z0-9]+)?"
+)
+_TERMS_TAIL_STOP = frozenset(
+    {"and", "or", "to", "i", "me", "my", "that", "agree", "accept", "consent", "receive", "share", "allow", "use"}
 )
 # The whole statement, with no free-word gap:
 # I (consent|agree) to (submit|the submission of|the processing of)
@@ -430,7 +447,13 @@ def consume_auto_consents() -> list[dict]:
 def _is_standard_terms(statement: str) -> bool:
     """True only when the whole statement is a fixed terms or privacy sentence."""
     text = normalize(statement)
-    return bool(text) and _STANDARD_TERMS_SENTENCE.fullmatch(text) is not None
+    if not text:
+        return False
+    match = _STANDARD_TERMS_SENTENCE.fullmatch(text)
+    if match is None:
+        return False
+    tail = match.group("tail") or ""
+    return not (set(tail.split()[1:]) & _TERMS_TAIL_STOP)
 
 
 def _is_submission_consent(statement: str) -> bool:

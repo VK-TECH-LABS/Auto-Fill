@@ -334,9 +334,19 @@ def activate_login(page, selector: str, name: str, *, control_type: str = "") ->
     perform_click(page, selector, name, control_type=control_type, purpose="login")
 
 
-def activate_account(page, selector: str, name: str, *, control_type: str = "") -> None:
-    """Click the account form's primary button. Submit Application stays forbidden."""
-    perform_click(page, selector, name, control_type=control_type, purpose="account")
+def activate_account(page, selector: str, name: str, *, control_type: str = "", at_point: bool = False) -> None:
+    """Click the account form's primary button. Submit Application stays forbidden.
+
+    ``at_point`` clicks the centre of the control with the mouse. Workday draws
+    Create Account / Sign In as an aria-hidden button under a ``click_filter``
+    overlay that may have no name; the overlay only reacts to a real pointer click.
+    """
+    perform_click(page, selector, name, control_type=control_type, purpose="account", at_point=at_point)
+
+
+def activate_login_at_point(page, selector: str, name: str, *, control_type: str = "") -> None:
+    """Sign In through a covered Workday submit button. Same guard as ``activate_login``."""
+    perform_click(page, selector, name, control_type=control_type, purpose="login", at_point=True)
 
 
 def activate_account_switch(page, selector: str, name: str, *, control_type: str = "") -> None:
@@ -616,7 +626,8 @@ def choose_option(page, opener_selector: str, option_selector: str, option_name:
 
 
 _ACCOUNT_NAME_RE = re.compile(
-    r"\b(create account|register|sign\s*up|join|sign\s*in|log\s*in|login)\b",
+    r"\b(create account|register|sign\s*up|join|sign\s*in|log\s*in|login"
+    r"|continue with e-?mail|use (?:my |your )?e-?mail)\b",
     re.IGNORECASE,
 )
 
@@ -639,6 +650,39 @@ def _account_button_allowed(name: str, *, control_type: str = "") -> bool:
     return False
 
 
+_POINT_HIT_JS = """([x, y, selector]) => {
+  const target = document.querySelector(selector);
+  const hit = document.elementFromPoint(x, y);
+  if (!target || !hit) return false;
+  if (hit === target || target.contains(hit) || hit.contains(target)) return true;
+  // The Workday overlay is a sibling of the covered button inside one wrapper.
+  const filter = hit.closest("[data-automation-id='click_filter']");
+  return !!(filter && filter.parentElement && filter.parentElement.contains(target));
+}"""
+
+
+def _click(page, selector: str, frame_url: str, at_point: bool) -> None:
+    locator = _bound_target(page, frame_url).locator(selector)
+    if not at_point:
+        locator.click()
+        return
+    target = locator.first
+    try:
+        target.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    box = target.bounding_box()
+    if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+        raise SubmitBlockedError("The account button is not on screen.")
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    # Only click when the pointer lands on this button or its own overlay, never a
+    # different control drawn on top of it.
+    if not page.evaluate(_POINT_HIT_JS, [x, y, selector]):
+        raise SubmitBlockedError("Another element covers the account button.")
+    page.mouse.click(x, y)
+
+
 def perform_click(
     page,
     selector: str,
@@ -647,6 +691,7 @@ def perform_click(
     control_type: str = "",
     purpose: str,
     frame_url: str = "",
+    at_point: bool = False,
 ) -> None:
     """Central click guard.
 
@@ -666,7 +711,7 @@ def perform_click(
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only an existing-account Log in or Sign in is allowed."
             )
-        _bound_target(page, frame_url).locator(selector).click()
+        _click(page, selector, frame_url, at_point)
         return
     if purpose == "navigation":
         if klass != ActionClass.NAVIGATION:
@@ -680,7 +725,7 @@ def perform_click(
             raise SubmitBlockedError(
                 f"Refusing to activate {name!r}. Only the account form's primary button is allowed."
             )
-        _bound_target(page, frame_url).locator(selector).click()
+        _click(page, selector, frame_url, at_point)
         return
     if purpose == "account_switch":
         if not _ACCOUNT_NAME_RE.search(name):
@@ -690,3 +735,34 @@ def perform_click(
         _bound_target(page, frame_url).locator(selector).click()
         return
     raise SubmitBlockedError(f"Unknown click purpose {purpose!r}.")
+
+
+# A checkbox or radio is toggled with a native click. Setting ``.checked`` from
+# script paints the box, but React (Workday, Greenhouse, Ashby) keeps its own
+# state and the site still reports the box as unchecked. This press refuses any
+# node that is not a checkbox or radio input, so it cannot reach a button.
+PRESS_CHOICE_JS = """(node, on) => {
+  if (!node || node.tagName !== "INPUT" || (node.type !== "checkbox" && node.type !== "radio")) return false;
+  if (node.disabled) return false;
+  if (node.checked === on) return true;
+  node.click();
+  return node.checked === on;
+}"""
+
+
+def press_choice_label(page, selector: str) -> None:
+    """Click the ``<label for=id>`` of one checkbox or radio input.
+
+    Used when a styled wrapper covers the box itself. Refuses a selector that is
+    not a plain ``#id`` and a label that sits inside a button or link.
+    """
+    if not re.fullmatch(r"#[A-Za-z][\w:.-]*", selector or ""):
+        raise SubmitBlockedError("label press needs an #id selector")
+    label = page.locator(f"label[for='{selector[1:]}']").first
+    inside_action = label.evaluate(
+        "(el) => !!el.closest('button, a[href], [role=button], [role=link]')"
+    )
+    kind = page.locator(selector).first.evaluate("(el) => el.tagName === 'INPUT' ? el.type : ''")
+    if inside_action or kind not in {"checkbox", "radio"}:
+        raise SubmitBlockedError("label press refused")
+    label.click(timeout=3000)

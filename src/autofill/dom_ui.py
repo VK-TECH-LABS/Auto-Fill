@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from autofill.adapters import page_step
+from autofill.safeguards import PRESS_CHOICE_JS
 
 _JS_PATH = Path(__file__).with_name("dom_ui.js")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -106,7 +107,7 @@ _COMBOBOX_JS = r"""(selector) => {
   return !!(el.closest && el.closest("[class*='select__control']"));
 }"""
 
-_CHOOSE_JS = """({ selector, expected, multi }) => {
+_CHOOSE_JS = ("""({ selector, expected, multi }) => {
   const root = document.querySelector(selector);
   if (!root) return false;
   const wanted = multi && Array.isArray(expected) ? expected : [expected];
@@ -134,23 +135,21 @@ _CHOOSE_JS = """({ selector, expected, multi }) => {
   const group = name
     ? Array.from(document.querySelectorAll("input")).filter((node) => node.type === kind && node.name === name)
     : [root];
+  const press = __PRESS__;
   if (root.type === "checkbox" && !multi) {
     const word = String(wanted[0] || "").trim();
     const on = word === "Yes" || word === "True" || word === "true";
-    root.checked = on;
-    paint(root);
-    return true;
+    return press(root, on);
   }
   let hits = 0;
   for (const word of wanted) {
     const match = group.find((node) => String(node.value || "").trim() === word || labelOf(node) === word);
     if (!match) return false;
-    match.checked = true;
-    paint(match);
+    if (!press(match, true)) return false;
     hits += 1;
   }
   return hits === wanted.length && hits > 0;
-}"""
+}""").replace("__PRESS__", PRESS_CHOICE_JS)
 
 _VERIFY_JS = """({ selector, expected, multi, fieldKey }) => {
   const root = document.querySelector(selector);
