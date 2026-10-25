@@ -35,3 +35,51 @@ jobs:
         run: |
           pip install build
           python -m build
+
+  # Runs only after CI passed on a push to staging (i.e. a merged PR).
+  # Deploys this exact commit to Railway tile-arc/staging with a staging-only
+  # project token. No developer Railway account or approval is involved.
+  deploy-staging:
+    name: Deploy staging (Railway)
+    needs: test
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/staging' &&
+      github.repository == 'VK-TECH-LABS/Auto-Fill'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: railway-staging-deploy-auto-fill
+      cancel-in-progress: false
+    environment:
+      name: staging
+      url: https://auto-fill-staging-staging-a6c4.up.railway.app
+    steps:
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Deploy to Railway staging
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+          DEPLOY_SHA: ${{ github.sha }}
+          RAILWAY_PROJECT_ID: bd7d499c-9beb-4776-9a9c-7e25aab79b56
+          RAILWAY_ENVIRONMENT_ID: 46db411b-faef-41cb-9ae2-3fb57533f27a
+          DEPLOY_STAGES: 77ca63c0-1334-43e5-8a28-41414e426903  # auto-fill-staging
+          HEALTH_CHECKS: >-
+            https://auto-fill-staging-staging-a6c4.up.railway.app/health
+            https://auto-fill-staging-staging-a6c4.up.railway.app/health/ready
+            https://vinayaka-app-staging-staging.up.railway.app/api/health
+          LOG_DIR: railway-deploy-logs
+        run: python3 scripts/deploy/railway-staging-deploy.py
+
+      - name: Keep Railway logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: railway-staging-deploy-logs-${{ github.sha }}
+          path: railway-deploy-logs/
+          if-no-files-found: ignore
+          retention-days: 30
