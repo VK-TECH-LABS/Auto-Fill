@@ -1,0 +1,37 @@
+{
+  "record_type": "deploy-flow",
+  "status": "live",
+  "repository": "VK-TECH-LABS/Auto-Fill",
+  "files_touched": [],
+  "flow": [
+    "branch tharun/<task> or saiteja/<task> from staging",
+    "pull request into staging",
+    "CI (ruff, mypy, pytest, build) + Handoff ownership check",
+    "merge in GitHub (no direct push, no force-push)",
+    "CI on the merge commit, then job 'Deploy staging (Railway)' deploys that exact commit"
+  ],
+  "developers": {
+    "tharun": {"github": "tarunb1724", "branch_prefix": "tharun/"},
+    "saiteja": {"github": "Gollapally123", "branch_prefix": "saiteja/"}
+  },
+  "railway": {
+    "project": "tile-arc",
+    "environment": "staging",
+    "services": ["auto-fill-staging"],
+    "deployed_by": "GitHub Actions (.github/workflows/ci.yml job deploy-staging, secret RAILWAY_STAGING_TOKEN)",
+    "native_railway_github_trigger": "removed for staging on 2026-10-25",
+    "developer_railway_account_needed": false,
+    "production_touched": false
+  },
+  "health": [
+    "https://auto-fill-staging-staging-a6c4.up.railway.app/health",
+    "https://auto-fill-staging-staging-a6c4.up.railway.app/health/ready"
+  ],
+  "verified": {
+    "e2e_merge_commit": "1863b80661d7ea71d039a7881a6049615698c4ee",
+    "e2e_run": "https://github.com/VK-TECH-LABS/Auto-Fill/actions/runs/40229448000"
+  },
+  "docs": "docs/DEPLOY.md",
+  "next_action": "Resume normal work: claim a task with .handoff/<developer>--<task>.json on your branch (see AGENTS.md), open a PR into staging, merge when green; staging deploys automatically.",
+  "updated_at": "2026-10-25T20:25:00Z"
+}

@@ -42,9 +42,10 @@ two merges never deploy at the same time or out of order.
 
 ## Not used for staging
 
-- Railway's own GitHub auto-deploy trigger for `auto-fill-staging` is turned off
-  for the staging environment once this job is verified. It needed the pushing
-  GitHub account to be linked to a Railway project member.
+- Railway's own GitHub auto-deploy trigger for `auto-fill-staging` was removed
+  for the staging environment on 2026-10-25, after this job was verified. It
+  needed the pushing GitHub account to be linked to a Railway project member.
+  Every staging deploy now comes from the `Deploy staging (Railway)` job.
 - `main` never deploys staging. Developer branches never deploy anywhere.
 - `.github/workflows/gcp-staging-deploy.yml` stays manual-only.
 - Production is not touched by this job; the token cannot reach it.
