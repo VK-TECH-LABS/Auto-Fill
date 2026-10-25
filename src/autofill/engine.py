@@ -790,7 +790,10 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=["Password field is mixed with the application. Auto-Fill will not create an account."],
             )
-        if mode in {"password", "email_first"} and not opts.human_resolved:
+        # Continue on a sign-in form that is still showing uses saved credentials,
+        # then fills the application. It never creates an account. A Create Account
+        # pane already returned above.
+        if mode in {"password", "email_first"} and (not opts.human_resolved or sign_in_pane(snapshot)):
             context = SiteContext(
                 url=application_url,
                 domain=domain,

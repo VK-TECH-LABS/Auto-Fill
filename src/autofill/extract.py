@@ -994,9 +994,6 @@ EXTRACT_JS = r"""
       const inputType = String(control.inputType || "").toLowerCase();
       if (
         kind === "password" ||
-        kind === "file" ||
-        kind === "checkbox" ||
-        kind === "radio" ||
         inputType === "password" ||
         inputType === "hidden" ||
         inputType === "search"
@@ -1017,6 +1014,9 @@ EXTRACT_JS = r"""
         kind === "textarea" ||
         kind === "select" ||
         kind === "combobox" ||
+        kind === "file" ||
+        kind === "radio" ||
+        kind === "checkbox" ||
         inputType === "email" ||
         inputType === "tel" ||
         inputType === "number"
