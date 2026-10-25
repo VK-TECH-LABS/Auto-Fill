@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -154,9 +155,16 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
             return "LOGIN_FAILED", steps
         steps.append("LOGIN_CONTINUE")
         activate(page, button.selector, button.name, control_type=button.control_type)
-        snapshot = extract_page(page)
-        if snapshot.captcha_present:
+        revealed = _await_password_step(page)
+        if revealed == "CAPTCHA_REQUIRED":
             return "CAPTCHA_REQUIRED", steps
+        snapshot = revealed if isinstance(revealed, PageSnapshot) else extract_page(page)
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED", steps
+        if application_form_visible(snapshot) or verification_present(snapshot):
+            steps.append("AUTHENTICATED")
+            logger.info("login finished: authenticated")
+            return "AUTHENTICATED", steps
 
     password = _password_control(snapshot)
     identity = _email_control(snapshot)
@@ -173,15 +181,68 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
     steps.append("LOGIN_SUBMIT")
     activate_login(page, button.selector, button.name, control_type=button.control_type)
     steps.append("WAIT_FOR_LOGIN")
-    snapshot = extract_page(page)
-    if snapshot.captcha_present:
+    outcome = _await_signed_in(page)
+    if outcome == "CAPTCHA_REQUIRED":
         return "CAPTCHA_REQUIRED", steps
-    if snapshot.password_present or _ERROR_RE.search(snapshot.banner or ""):
+    if outcome != "AUTHENTICATED":
         logger.info("login failed: form still asking for credentials")
         return "LOGIN_FAILED", steps
     steps.append("AUTHENTICATED")
     logger.info("login finished: authenticated")
     return "AUTHENTICATED", steps
+
+
+def _pause(page, millis: int) -> None:
+    pause = getattr(page, "wait_for_timeout", None)
+    try:
+        if pause is None:
+            time.sleep(millis / 1000)
+        else:
+            pause(millis)
+    except Exception:
+        return
+
+
+def _login_rejected(snapshot: PageSnapshot) -> bool:
+    """The password form is still up and the site showed a rejection."""
+    text = " ".join(part for part in (snapshot.banner, *snapshot.alerts) if part)
+    if _ERROR_RE.search(text):
+        return True
+    return bool(snapshot.password_present and (snapshot.banner or snapshot.alerts))
+
+
+def _await_signed_in(page) -> str:
+    """Wait for the application after Sign In. A rejection fails immediately.
+
+    A slow employer keeps the password box for a moment after a good password.
+    That wait is not a failed login, and it does not create an account.
+    """
+    deadline = time.monotonic() + _LOGIN_WAIT_SECONDS
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return "LOGIN_FAILED"
+    while True:
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED"
+        if application_form_visible(snapshot) or verification_present(snapshot):
+            return "AUTHENTICATED"
+        if _login_rejected(snapshot):
+            return "LOGIN_FAILED"
+        heading = (snapshot.heading or "").casefold()
+        still_login = snapshot.password_present or "sign in" in heading or "log in" in heading
+        if not still_login and (snapshot.controls or snapshot.buttons):
+            return "AUTHENTICATED"
+        if time.monotonic() >= deadline:
+            break
+        _pause(page, 150)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return "LOGIN_FAILED"
+    if snapshot.password_present or _login_rejected(snapshot):
+        return "LOGIN_FAILED"
+    return "AUTHENTICATED"
 
 
 def protocol_at_least(version: str, target: str = "0.7.0") -> bool:
@@ -216,6 +277,11 @@ _DIAL_OR_POSTAL_RE = re.compile(
     r"\b(?:country|area|postal|zip|dial|calling)\s*codes?\b",
     re.IGNORECASE,
 )
+_NOT_OTP_CODE_RE = re.compile(
+    r"\b(?:referral|promo(?:tional)?|coupon|discount|employee|vendor|access|gift)\b",
+    re.IGNORECASE,
+)
+_LOGIN_WAIT_SECONDS = 3.0
 _CONTACT_NAME_RE = re.compile(
     r"\b(?:first name|last name|full name|given name|family name|surname)\b",
     re.IGNORECASE,
@@ -423,15 +489,15 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
 
 
 def _otp_control(control: Control) -> bool:
-    """A real one-time-code box. A dial code or postal code is not one."""
+    """A real one-time-code box. A dial code, postal code, or referral code is not one."""
     if control.hidden:
         return False
     if (control.autocomplete or "").casefold() == "one-time-code":
         return True
-    if control.max_length is None or not 4 <= control.max_length <= 8:
-        return False
     blob = _control_blob(control)
-    if _DIAL_OR_POSTAL_RE.search(blob):
+    if _DIAL_OR_POSTAL_RE.search(blob) or _NOT_OTP_CODE_RE.search(blob):
+        return False
+    if control.max_length is None or not 4 <= control.max_length <= 8:
         return False
     return bool(_OTP_LABEL_RE.search(blob) or _OTP_PIN_RE.search(blob))
 
@@ -443,21 +509,72 @@ def _contact_application(snapshot: PageSnapshot) -> bool:
     return bool(_CONTACT_NAME_RE.search(blob) and _CONTACT_REACH_RE.search(blob))
 
 
+def _job_application(snapshot: PageSnapshot) -> bool:
+    """Questions or contact fields. A lone email or password box is not one."""
+    if _contact_application(snapshot):
+        return True
+    for control in snapshot.controls:
+        if control.hidden or control.disabled:
+            continue
+        if control.kind == "password" or (control.input_type or "").casefold() == "password":
+            continue
+        if _otp_control(control):
+            continue
+        if control.kind in {"file", "textarea", "select", "radio", "combobox", "checkbox"}:
+            return True
+        if control.kind == "text" or (control.input_type or "").casefold() in {"tel", "number", "url"}:
+            blob = _control_blob(control)
+            if (control.input_type or "").casefold() == "email" or re.search(
+                r"\b(?:e-?mail|username|user name)\b", blob, re.IGNORECASE
+            ):
+                continue
+            return True
+    return False
+
+
 def verification_present(snapshot: PageSnapshot) -> bool:
     """OTP or an email-verification notice. A password form is not this page.
 
-    A country, area, postal, zip, or dial code is not an OTP. A contact form
-    that mentions a code in page text is not one either, unless a real
-    one-time-code control is on the page.
+    A country, area, postal, zip, or dial code is not an OTP. A referral,
+    promo, or access code is not one either. A contact form or question page
+    that mentions a code in page text is not one, unless a real one-time-code
+    control is on the page.
     """
     if snapshot.password_present:
         return False
     if any(_otp_control(control) for control in snapshot.controls):
         return True
-    if _contact_application(snapshot):
+    if _job_application(snapshot):
         return False
     text = " ".join(part for part in (snapshot.page_text, snapshot.heading, snapshot.banner) if part)
     return bool(_OTP_TEXT_RE.search(text))
+
+
+def application_form_visible(snapshot: PageSnapshot) -> bool:
+    """A job form is on screen. Create Account, a real OTP, and a real captcha are not."""
+    if snapshot.captcha_present or snapshot.password_present:
+        return False
+    if verification_present(snapshot):
+        return False
+    return _job_application(snapshot)
+
+
+def _await_password_step(page) -> PageSnapshot | str:
+    """After email-first Continue, wait for the password box or the application."""
+    deadline = time.monotonic() + _LOGIN_WAIT_SECONDS
+    snapshot = extract_page(page)
+    while True:
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED"
+        if _password_control(snapshot) is not None or application_form_visible(snapshot):
+            return snapshot
+        if time.monotonic() >= deadline:
+            return snapshot
+        _pause(page, 150)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return snapshot
 
 
 def tenant_identity(url: str, ats: str | None) -> dict:

@@ -289,6 +289,28 @@ def _shot_headers(session: ServiceSession, *, host: str = "", retry: bool = Fals
     return headers
 
 
+def _application_visible(session: ServiceSession, runner: FillRunner) -> bool:
+    """True when the live page shows a job form and not a real challenge."""
+    probe = getattr(runner, "application_visible", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe(session.session_id))
+    except PageUnavailable as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            ) from None
+        _mark_browser_crash(session)
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail="The page crashed.",
+            headers=_shot_headers(session),
+        ) from None
+
+
 def _probe_challenge(session: ServiceSession, runner: FillRunner) -> str:
     probe = getattr(runner, "probe_challenge", None)
     if probe is None:
@@ -1518,10 +1540,11 @@ def create_app(
 
     @router.post("/sessions/{session_id}/resume", response_model=RunStatusOut, tags=["sessions"])
     def resume_session(session_id: str) -> RunStatusOut:
-        """Release a paused fill. A cleared captcha or verification stop fills again.
+        """Release a paused fill. A visible application form is filled again.
 
-        A challenge that is still on the page is left stopped. This does not
-        submit the application and does not solve the challenge.
+        A challenge that is still on the page is left stopped. A Create Account
+        form that is still showing is left stopped. This does not submit the
+        application, solve a challenge, or create an account.
         """
         session = _session_or_404(session_id)
         _reject_expired(session)
@@ -1537,6 +1560,23 @@ def create_app(
             found = _probe_challenge(session, active_runner)
             if found != "clear":
                 return _status_out(session)
+            return _run(
+                session,
+                store,
+                active_runner,
+                limits,
+                resume_uploaded=session.resume_uploaded,
+                human_resolved=True,
+            )
+        # The person signed in or opened the form in the live view. Fill it.
+        # A Create Account form that is still showing is not an application, so
+        # resume does not register an account.
+        if session.status in {
+            Status.LOGIN_REQUIRED,
+            Status.NO_FORM_FOUND,
+            Status.JOB_DESCRIPTION,
+            Status.ACCOUNT_CREATION_REQUIRED,
+        } and _application_visible(session, active_runner):
             return _run(
                 session,
                 store,

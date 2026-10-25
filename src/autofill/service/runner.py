@@ -1132,6 +1132,31 @@ class PlaywrightRunner:
 
         return worker.submit(look)
 
+    def application_visible(self, session_id: str) -> bool:
+        """True when a job form is on screen. A password pane or real challenge is not."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return False
+
+        def look() -> bool:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return False
+            from autofill.extract import extract_page
+            from autofill.login import application_form_visible
+
+            try:
+                snapshot = extract_page(slot.page)
+            except Exception as exc:
+                if is_browser_crash(exc):
+                    raise PageUnavailable(410) from None
+                if _page_navigating(exc):
+                    raise PageUnavailable(503) from None
+                raise
+            return application_form_visible(snapshot)
+
+        return bool(worker.submit(look))
+
     def attach_resume_file(
         self,
         session_id: str,
