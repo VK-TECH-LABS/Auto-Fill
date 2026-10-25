@@ -1628,6 +1628,21 @@ def _blocks(item: dict) -> bool:
     return bool(item.get("required", True)) or item.get("kind") == "OPTION_MISMATCH"
 
 
+_STRUCTURE_ACTIONS = frozenset({"select", "check", "uncheck"})
+
+
+def _reveal_settle_ms(fields: list) -> int:
+    """A choice can reveal the next controls after a short timer. Text does not.
+
+    Jobvite reveals the rest of the step 300 ms after the country select, so a
+    select, check, or uncheck still waits. A text-only step does not.
+    """
+    for item in fields:
+        if getattr(item, "action", "") in _STRUCTURE_ACTIONS:
+            return 600
+    return 40
+
+
 def _revealed_fields(page, snapshot, settle_ms: int = 600) -> bool:
     """True when visible fields appeared on the same step after the last write."""
     if page is None or snapshot is None or getattr(page, "wait_for_timeout", None) is None:
@@ -1744,7 +1759,11 @@ def _run_resolver_pages(
                 _remember_submit(snapshot, submit_controls)
             blocking = [item for item in outcome.manual_questions if _blocks(item)]
             optional = [item for item in outcome.manual_questions if not _blocks(item)]
-            if attempt < 2 and _revealed_fields(page, outcome.snapshot or snapshot):
+            if attempt < 2 and _revealed_fields(
+                page,
+                outcome.snapshot or snapshot,
+                settle_ms=_reveal_settle_ms(outcome.fields),
+            ):
                 # The write opened more of this step (a consent gate or a
                 # conditional section). Fill what appeared before deciding.
                 continue

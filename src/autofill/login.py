@@ -211,6 +211,16 @@ _OTP_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _OTP_LABEL_RE = re.compile(r"\b(verification code|passcode|otp|code)\b", re.IGNORECASE)
+_OTP_PIN_RE = re.compile(r"\bpin\b", re.IGNORECASE)
+_DIAL_OR_POSTAL_RE = re.compile(
+    r"\b(?:country|area|postal|zip|dial|calling)\s*codes?\b",
+    re.IGNORECASE,
+)
+_CONTACT_NAME_RE = re.compile(
+    r"\b(?:first name|last name|full name|given name|family name|surname)\b",
+    re.IGNORECASE,
+)
+_CONTACT_REACH_RE = re.compile(r"\b(?:e-?mail|phone|mobile|telephone)\b", re.IGNORECASE)
 _EXISTS_RE = re.compile(r"already exists|account exists|already registered|email is taken", re.IGNORECASE)
 _EMAIL_REDACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _DIGIT_RUN_RE = re.compile(r"\d{3,}")
@@ -412,19 +422,40 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     return AccountScore(mode="none", alternate=False, register_score=register, login_score=login)
 
 
+def _otp_control(control: Control) -> bool:
+    """A real one-time-code box. A dial code or postal code is not one."""
+    if control.hidden:
+        return False
+    if (control.autocomplete or "").casefold() == "one-time-code":
+        return True
+    if control.max_length is None or not 4 <= control.max_length <= 8:
+        return False
+    blob = _control_blob(control)
+    if _DIAL_OR_POSTAL_RE.search(blob):
+        return False
+    return bool(_OTP_LABEL_RE.search(blob) or _OTP_PIN_RE.search(blob))
+
+
+def _contact_application(snapshot: PageSnapshot) -> bool:
+    """Name plus email or phone. That page is an application, not an inbox check."""
+    blobs = [_control_blob(control) for control in snapshot.controls if not control.hidden]
+    blob = " ".join(blobs)
+    return bool(_CONTACT_NAME_RE.search(blob) and _CONTACT_REACH_RE.search(blob))
+
+
 def verification_present(snapshot: PageSnapshot) -> bool:
-    """OTP or an email-verification notice. A password form is not this page."""
+    """OTP or an email-verification notice. A password form is not this page.
+
+    A country, area, postal, zip, or dial code is not an OTP. A contact form
+    that mentions a code in page text is not one either, unless a real
+    one-time-code control is on the page.
+    """
     if snapshot.password_present:
         return False
-    for control in snapshot.controls:
-        if control.hidden:
-            continue
-        if (control.autocomplete or "").casefold() == "one-time-code":
-            return True
-        if control.max_length is not None and 4 <= control.max_length <= 8 and _OTP_LABEL_RE.search(
-            _control_blob(control)
-        ):
-            return True
+    if any(_otp_control(control) for control in snapshot.controls):
+        return True
+    if _contact_application(snapshot):
+        return False
     text = " ".join(part for part in (snapshot.page_text, snapshot.heading, snapshot.banner) if part)
     return bool(_OTP_TEXT_RE.search(text))
 

@@ -616,10 +616,14 @@ _COMMITTED_JS = r"""(selector) => {
     if (!folded) return true;
     return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
   }
+  function rootOf(node) {
+    const root = node && typeof node.getRootNode === "function" ? node.getRootNode() : document;
+    return root && typeof root.querySelectorAll === "function" ? root : document;
+  }
   if (type === "radio") {
     const name = el.getAttribute("name") || "";
     if (!name) return !!el.checked;
-    const nodes = document.querySelectorAll("input[type='radio']");
+    const nodes = rootOf(el).querySelectorAll("input[type='radio']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
     }
@@ -629,7 +633,7 @@ _COMMITTED_JS = r"""(selector) => {
     if (el.checked) return true;
     const name = el.getAttribute("name") || "";
     if (!name) return false;
-    const nodes = document.querySelectorAll("input[type='checkbox']");
+    const nodes = rootOf(el).querySelectorAll("input[type='checkbox']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
     }
@@ -689,7 +693,25 @@ _COMMITTED_JS = r"""(selector) => {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 || rect.height > 0;
   }
-  const nodes = Array.from(document.querySelectorAll(selector));
+  function collect(selector) {
+    const found = [];
+    function walk(node) {
+      if (!node || typeof node.querySelectorAll !== "function") return;
+      let matches;
+      try {
+        matches = node.querySelectorAll(selector);
+      } catch (error) {
+        return;
+      }
+      for (const match of matches) found.push(match);
+      for (const child of node.querySelectorAll("*")) {
+        if (child.shadowRoot) walk(child.shadowRoot);
+      }
+    }
+    walk(document);
+    return found;
+  }
+  const nodes = collect(selector);
   if (!nodes.length) return false;
   const visible = nodes.filter(shown);
   const pool = visible.length ? visible : nodes;

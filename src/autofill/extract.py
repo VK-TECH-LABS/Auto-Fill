@@ -941,13 +941,7 @@ EXTRACT_JS = r"""
   for (const phrase of wallPhrases) {
     if (wallText.indexOf(phrase) !== -1) botWall = true;
   }
-  if (botWall) captcha = true;
-  const challengeSelector = [
-    ".h-captcha",
-    ".g-recaptcha",
-    ".cf-turnstile",
-    "#px-captcha",
-    ".px-captcha",
+  const frameSelector = [
     "iframe[src*='hcaptcha.com']",
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='arkoselabs']",
@@ -955,11 +949,87 @@ EXTRACT_JS = r"""
     "iframe[src*='captcha-delivery']",
     "iframe[src*='recaptcha']",
   ].join(", ");
+  const challengeSelector = [
+    ".h-captcha",
+    ".g-recaptcha",
+    ".cf-turnstile",
+    "#px-captcha",
+    ".px-captcha",
+    frameSelector,
+  ].join(", ");
+  function challengeCopy(el) {
+    const text = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    return (
+      text.indexOf("i'm not a robot") !== -1 ||
+      text.indexOf("i’m not a robot") !== -1 ||
+      text.indexOf("i am not a robot") !== -1 ||
+      text.indexOf("verify you are human") !== -1 ||
+      text.indexOf("verify you are a human") !== -1 ||
+      text.indexOf("press and hold") !== -1 ||
+      text.indexOf("press & hold") !== -1
+    );
+  }
+  function interactiveChallenge(el) {
+    // An empty sized holder is not a widget. A shown iframe or checkbox copy is.
+    if (!challengeShown(el)) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+    if (tag === "iframe") return true;
+    if (el.querySelectorAll) {
+      for (const frame of el.querySelectorAll(frameSelector)) {
+        if (challengeShown(frame)) return true;
+      }
+    }
+    return challengeCopy(el);
+  }
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll(challengeSelector)) {
-      if (challengeShown(el)) captcha = true;
+      if (interactiveChallenge(el)) captcha = true;
     }
   });
+  function applicationFieldsVisible() {
+    for (const control of controls) {
+      if (control.hidden || control.disabled) continue;
+      const kind = String(control.kind || "");
+      const inputType = String(control.inputType || "").toLowerCase();
+      if (
+        kind === "password" ||
+        kind === "file" ||
+        kind === "checkbox" ||
+        kind === "radio" ||
+        inputType === "password" ||
+        inputType === "hidden" ||
+        inputType === "search"
+      ) {
+        continue;
+      }
+      const blob = [
+        control.label,
+        control.ariaLabel,
+        control.placeholder,
+        control.name,
+        control.nearby,
+        control.prompt,
+      ].join(" ").toLowerCase();
+      if (/\b(language|locale)\b/.test(blob) && !/\b(e-?mail|phone|mobile|name)\b/.test(blob)) continue;
+      if (
+        kind === "text" ||
+        kind === "textarea" ||
+        kind === "select" ||
+        kind === "combobox" ||
+        inputType === "email" ||
+        inputType === "tel" ||
+        inputType === "number"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // A wall phrase beside a real application form is not a challenge. A
+  // full-page wall with no fillable fields still is.
+  if (applicationFieldsVisible()) botWall = false;
+  else if (botWall) captcha = true;
   const links = [];
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll("a[href], [role='link']")) {

@@ -868,6 +868,9 @@ def _match_rule(control: Control) -> str | None:
                 return "phone"
             return mapped
     if "country code" in blob or "dial code" in blob or "calling code" in blob:
+        # A text dial-code box is not an address. Leave a prefilled +1 alone.
+        if control.kind not in {"select", "combobox"}:
+            return None
         return "country"
     label = normalize(control.label or control.aria_label or control.placeholder)
     if label in {"current location", "location", "your location"} and "relocat" not in label:
