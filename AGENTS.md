@@ -31,3 +31,7 @@ Do not enable real account creation or final job submission in tests or in produ
 ## Checks
 
 Pull requests to `staging` and `main`, and pushes to `staging`, run lint, typecheck, tests, and a package build (`.github/workflows/ci.yml`). `.github/workflows/gcp-staging-deploy.yml` is manual-only while Railway is the host.
+
+## Staging deploys
+
+A merge into `staging` deploys that commit to Railway `auto-fill-staging` after CI passes on the merge commit. GitHub Actions runs the deploy with a staging-only project token, so no developer needs a Railway account or approval. See `docs/DEPLOY.md`.
