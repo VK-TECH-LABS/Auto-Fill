@@ -504,7 +504,12 @@ def _open_email_sign_in_once(page, snapshot, session):
         return None
     if email_sign_in_button(snapshot) is None:
         return None
-    if not (sign_in_pane(snapshot) or is_login_wall(snapshot) or classify_page(snapshot, url=_page_url(page)) == "LOGIN"):
+    on_sign_in = (
+        sign_in_pane(snapshot)
+        or is_login_wall(snapshot)
+        or classify_page(snapshot, url=_page_url(page)) == "LOGIN"
+    )
+    if not on_sign_in:
         return None
     session.steps.append("OPEN_EMAIL_SIGN_IN")
     fresh = open_email_sign_in(page, snapshot)

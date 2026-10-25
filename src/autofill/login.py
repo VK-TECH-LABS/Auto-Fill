@@ -802,9 +802,11 @@ def email_sign_in_button(snapshot: PageSnapshot):
     for item in [*snapshot.buttons, *snapshot.links]:
         if getattr(item, "in_header", False) or getattr(item, "in_ad", False) or getattr(item, "disabled", False):
             continue
-        if not item.selector:
+        selector = str(getattr(item, "selector", "") or "")
+        if not selector:
             continue
-        if item.automation_id in _EMAIL_PATH_IDS or _EMAIL_PATH_RE.search(item.name or ""):
+        automation_id = getattr(item, "automation_id", "")
+        if automation_id in _EMAIL_PATH_IDS or _EMAIL_PATH_RE.search(str(getattr(item, "name", "") or "")):
             return item
     return None
 
