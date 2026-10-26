@@ -17,6 +17,9 @@
     "stale" puts alert text on the Create Account pane before the press;
     "flash" shows alert text for "holdMs" after the press while the form is still
     mounted, then the spinner runs; "reject" shows a lasting error and creates nothing.
+  * BW Better World 2026-10-27 (verify before sign in): "blankMs" leaves an empty pane
+    (no form, no spinner) for that long after the spinner before Sign In opens;
+    "unverified" = "1" makes Sign In answer "Verify your account before you sign in".
 -->
 <div data-automation-id="legalNoticeBanner" class="css-7q1x9z"
      style="position:fixed;top:0;left:0;right:0;height:140px;z-index:50;background:#fff;border-bottom:1px solid #999">
@@ -69,7 +72,12 @@ function createPane() {
     function spin() {
       pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
       var spinnerMs = parseInt(localStorage.getItem("spinnerMs") || "500", 10);
-      setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : signInPane, spinnerMs);
+      var blankMs = parseInt(localStorage.getItem("blankMs") || "0", 10);
+      function blankThenSignIn() {
+        pane.innerHTML = '<div data-automation-id="createAccountSuccess"></div>';
+        setTimeout(signInPane, blankMs);
+      }
+      setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : (blankMs > 0 ? blankThenSignIn : signInPane), spinnerMs);
     }
     var holdMs = parseInt(localStorage.getItem("holdMs") || "0", 10);
     if (localStorage.getItem("flash")) { cerr.textContent = localStorage.getItem("flash"); }
@@ -98,6 +106,11 @@ function signInPane() {
     + '</div>';
   pane.querySelector("[data-automation-id='signInSubmitButton']").addEventListener("click", function () {
     window.__signedIn += 1;
+    if (localStorage.getItem("unverified") === "1") {
+      document.getElementById("err").textContent =
+        "Verify your account before you sign in or request a verification email.";
+      return;
+    }
     if (localStorage.getItem("locked") === "1") {
       document.getElementById("err").textContent =
         "Error: You may have entered the wrong email address or password or your account might be locked.";
