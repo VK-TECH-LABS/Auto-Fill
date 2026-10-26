@@ -10,6 +10,9 @@
     sends a verification email first).
   * localStorage "start" = "signin" opens on Sign In; "locked" = "1" makes Sign In
     answer with Workday's wrong-email-or-locked banner.
+  * "spinnerMs" sets how long the Create Account spinner lasts (default 500; live
+    Workday tenants such as Ameren take 2-3 s). "after" = "app" makes Create Account
+    land on My Information instead of Sign In (tenants that sign in automatically).
 -->
 <div data-automation-id="legalNoticeBanner" class="css-7q1x9z"
      style="position:fixed;top:0;left:0;right:0;height:140px;z-index:50;background:#fff;border-bottom:1px solid #999">
@@ -54,9 +57,16 @@ function createPane() {
   pane.querySelector("[data-automation-id='createAccountSubmitButton']").addEventListener("click", function () {
     window.__created += 1;
     pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
-    setTimeout(signInPane, 500);
+    var spinnerMs = parseInt(localStorage.getItem("spinnerMs") || "500", 10);
+    setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : signInPane, spinnerMs);
   });
   pane.querySelector("[data-automation-id='signInLink']").addEventListener("click", signInPane);
+}
+function myInfoPane() {
+  pane.innerHTML = '<div data-automation-id="applyFlowMyInfoPage"><h2>My Information</h2>'
+    + '<label for="first">First Name</label><input id="first" type="text" data-automation-id="legalNameSection_firstName">'
+    + '<label for="last">Last Name</label><input id="last" type="text" data-automation-id="legalNameSection_lastName">'
+    + '<button type="button" data-automation-id="bottom-navigation-next-button">Save and Continue</button></div>';
 }
 function signInPane() {
   pane.innerHTML = '<div data-automation-id="signInPage">'
@@ -78,10 +88,7 @@ function signInPane() {
         "Error: You may have entered the wrong email address or password or your account might be locked.";
       return;
     }
-    pane.innerHTML = '<div data-automation-id="applyFlowMyInfoPage"><h2>My Information</h2>'
-      + '<label for="first">First Name</label><input id="first" type="text" data-automation-id="legalNameSection_firstName">'
-      + '<label for="last">Last Name</label><input id="last" type="text" data-automation-id="legalNameSection_lastName">'
-      + '<button type="button" data-automation-id="bottom-navigation-next-button">Save and Continue</button></div>';
+    myInfoPane();
   });
   pane.querySelector("[data-automation-id='createAccountLink']").addEventListener("click", createPane);
 }
