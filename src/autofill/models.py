@@ -109,6 +109,8 @@ class MappedField:
     reason: str = ""
     field_class: str = ""
     confidence: str = "high"
+    related_fields: tuple[str, ...] = ()
+    challenge: str = ""
 
 
 @dataclass
