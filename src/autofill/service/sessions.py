@@ -106,6 +106,8 @@ class ServiceSession:
     nav_base_pages: int = 0
     confirmed_values: list[dict] = field(default_factory=list)
     standard_terms_authorized: bool = False
+    # Workday account registered here; no Continue since. See engine._verify_first.
+    verify_pending: bool = False
     created_mono: float = 0.0
     last_activity_mono: float = 0.0
     browser_released: bool = False

@@ -392,6 +392,9 @@ def _account_proof(report: dict) -> dict[str, Any]:
 
 
 _ACCOUNT_STEP_STATUSES = frozenset({Status.ACCOUNT_CREATION_REQUIRED, Status.LOGIN_REQUIRED, Status.LOGIN_FAILED})
+# A just-registered account stays "verify first" while the run is still on an
+# account step. Any other status (application form, review, failure) clears it.
+_VERIFY_PENDING_STATUSES = _ACCOUNT_STEP_STATUSES | {Status.EMAIL_VERIFICATION_REQUIRED}
 
 
 def _finish_account_action(session: ServiceSession, report: dict, resume_run) -> CredentialsOut:
@@ -478,6 +481,11 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             status=_public_status(session),
             **proof,
         )
+    if outcome == "registered" and recovered is None and _is_070(session):
+        # RC-V1: the site took Create Account but no form or Sign In showed yet.
+        # The resume run must not type this new password into a Sign In pane
+        # before the verification email is opened (engine._verify_first).
+        session.verify_pending = True
     if session.paused:
         session.pending_resume = outcome in {"signed_in", "registered", "verification_required"}
         _sync_checkpoint(session)
@@ -490,7 +498,9 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
         )
     if outcome in {"signed_in", "registered", "verification_required"}:
         accepted = resume_run()
-        if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED:
+        if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED and outcome != "registered":
+            # A registered account that stops on the verify card is still "registered":
+            # the caller keeps (saves) its password, and the status says verify first.
             outcome = "verification_required"
         return CredentialsOut(
             sessionId=session.session_id, outcome=outcome, status=accepted.status, recovered=recovered, **proof
@@ -1101,6 +1111,7 @@ def _request_for(
         on_confirmed=session.remember_confirmed_value,
         confirmed_values=session.confirmed_values,
         standard_terms_authorized=session.standard_terms_authorized,
+        verify_pending=session.verify_pending,
     )
 
 
@@ -1180,6 +1191,10 @@ def _run(
     # calls keep that confirmation instead of asking again.
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
     session.human_resolved = session.human_resolved or human_resolved
+    if human_resolved:
+        # A person pressed Continue after registering (e.g. after opening the
+        # verification email). Sign In may now use the saved login once.
+        session.verify_pending = False
     previous = session.status
     # Later runs add to these totals. A resume upload must not zero the clicks
     # from the run that opened the form.
@@ -1201,6 +1216,8 @@ def _run(
                 )
             )
             accepted = _accept_result(session, result)
+            if session.status not in _VERIFY_PENDING_STATUSES:
+                session.verify_pending = False
         except HTTPException:
             session.status = previous
             raise

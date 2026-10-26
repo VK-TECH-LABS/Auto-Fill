@@ -158,6 +158,9 @@ class AutofillOptions:
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
+    # The service registered a Workday account in this session and no person has
+    # pressed Continue since. A Sign In pane now means "verify the email first".
+    verify_pending: bool = False
 
 
 @dataclass
@@ -592,8 +595,66 @@ def _login_stop(
     )
 
 
-def _login_failed(session, page, url: str, ats_name: str | None, secrets: list[str]) -> ApplicationResult:
-    """LOGIN_FAILED with the site's own banner and a plain reason. Nothing is retried."""
+def _account_sign_in_pane(snapshot, url: str) -> bool:
+    """A Sign In pane by the account scorer (Workday's email box is type=text).
+
+    ``sign_in_pane`` treats any plain text input as an application field, so after
+    Continue (``human_resolved``) a Workday Sign In pane was filled as if it were the
+    application (status FILLED, nobody signed in). Continue after the verify card
+    must sign in once instead.
+    """
+    from autofill.account_flow import _returned_to_sign_in
+
+    try:
+        return _returned_to_sign_in(snapshot, url)
+    except Exception:
+        return False
+
+
+def _verify_first(opts: AutofillOptions, ats_name: str | None, url: str) -> bool:
+    """A Workday account registered in this session is still waiting for its verification email."""
+    from autofill.account_flow import _is_workday
+
+    return bool(opts.verify_pending) and _protocol_070(opts) and _is_workday(ats_name, url)
+
+
+def _verify_before_sign_in(session, snapshot, url: str, ats_name: str | None) -> ApplicationResult:
+    """Park on the existing verify card. Nothing is typed into Sign In."""
+    from autofill.account_flow import _VERIFY_FIRST_MESSAGE
+
+    try:
+        account = account_view(snapshot, url, ats_name, mode="login", alternate=False)
+    except Exception:
+        account = None
+    if account is not None:
+        account["verifyBeforeSignIn"] = True
+    logger.info("session=%s verify_before_sign_in=true reason=registered_unverified", session.session_id)
+    session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+    return _result(
+        session,
+        status=Status.EMAIL_VERIFICATION_REQUIRED,
+        ats=ats_name,
+        login_status="LOGIN_REQUIRED",
+        messages=[_VERIFY_FIRST_MESSAGE],
+        account=account,
+    )
+
+
+def _login_failed(
+    session,
+    page,
+    url: str,
+    ats_name: str | None,
+    secrets: list[str],
+    *,
+    verify_card: bool = False,
+) -> ApplicationResult:
+    """LOGIN_FAILED with the site's own banner and a plain reason. Nothing is retried.
+
+    With ``verify_card`` (protocol 0.7.0) an "account not verified" banner stops on
+    EMAIL_VERIFICATION_REQUIRED instead: Companion shows the verify card, refuses
+    saved-login typing there, and Continue signs in once after the person verifies.
+    """
     from autofill.login import LOGIN_FAILED_MESSAGES, login_failure_reason, redact_site_error
 
     try:
@@ -616,6 +677,19 @@ def _login_failed(session, page, url: str, ats_name: str | None, secrets: list[s
     if account is not None:
         account["loginFailure"] = reason
     logger.info("session=%s login_failed reason=%s site_errors=%d", session.session_id, reason, len(errors))
+    if verify_card and reason == "unverified":
+        if account is not None:
+            account["verifyBeforeSignIn"] = True
+        logger.info("session=%s verify_before_sign_in=true reason=login_unverified", session.session_id)
+        session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+        return _result(
+            session,
+            status=Status.EMAIL_VERIFICATION_REQUIRED,
+            ats=ats_name,
+            login_status="LOGIN_FAILED",
+            messages=[LOGIN_FAILED_MESSAGES[reason]],
+            account=account,
+        )
     return _result(
         session,
         status=Status.LOGIN_FAILED,
@@ -860,7 +934,11 @@ def autofill_application(
         # Continue on a sign-in form that is still showing uses saved credentials,
         # then fills the application. It never creates an account. A Create Account
         # pane already returned above.
-        if mode in {"password", "email_first"} and (not opts.human_resolved or sign_in_pane(snapshot)):
+        if mode in {"password", "email_first"} and (
+            not opts.human_resolved
+            or sign_in_pane(snapshot)
+            or _account_sign_in_pane(snapshot, getattr(page, "url", "") or application_url)
+        ):
             context = SiteContext(
                 url=application_url,
                 domain=domain,
@@ -879,6 +957,13 @@ def autofill_application(
                     messages=["No credentials for this candidate and site. Nothing was typed."],
                     login_status="NOT_REQUIRED",
                 )
+            here = getattr(page, "url", "") or application_url
+            if _verify_first(opts, ats_name, here):
+                # RC-V1 (BW 2026-10-27): the account was just created and the
+                # site now shows Sign In. Typing the new password before the
+                # verification email is opened fails ("verify your account")
+                # and counts toward a lockout. Stop on the verify card instead.
+                return _verify_before_sign_in(session, snapshot, here, ats_name)
             outcome, login_steps = run_login(page, creds)
             session.steps.extend(login_steps)
             if login_steps:
@@ -899,6 +984,7 @@ def autofill_application(
                     getattr(page, "url", "") or application_url,
                     ats_name,
                     [value for value in (creds.email, creds.username, creds.password) if value],
+                    verify_card=_protocol_070(opts),
                 )
             login_status = "AUTHENTICATED"
         else:

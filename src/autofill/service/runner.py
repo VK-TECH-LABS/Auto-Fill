@@ -466,6 +466,7 @@ class FillRequest:
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
+    verify_pending: bool = False
 
 
 class FillRunner(Protocol):
@@ -889,6 +890,7 @@ class PlaywrightRunner:
             on_confirmed=request.on_confirmed,
             confirmed_values=request.confirmed_values,
             standard_terms_authorized=request.standard_terms_authorized,
+            verify_pending=request.verify_pending,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
