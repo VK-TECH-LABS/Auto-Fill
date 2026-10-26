@@ -391,11 +391,34 @@ def _account_proof(report: dict) -> dict[str, Any]:
     return extra
 
 
+_ACCOUNT_STEP_STATUSES = frozenset({Status.ACCOUNT_CREATION_REQUIRED, Status.LOGIN_REQUIRED, Status.LOGIN_FAILED})
+
+
 def _finish_account_action(session: ServiceSession, report: dict, resume_run) -> CredentialsOut:
     """Store the classification. A paused session waits for /resume."""
     if report.get("autoConsents"):
         session.auto_consents = list(report["autoConsents"])
     proof = _account_proof(report)
+    recovered = None
+    if (
+        not report.get("ok")
+        and report.get("reason") == "not_at_account_step"
+        and report.get("applicationVisible")
+        and session.status in _ACCOUNT_STEP_STATUSES
+    ):
+        # Stuck account step: the session still says ACCOUNT_*/LOGIN_* but the
+        # employer page already shows the application form (an earlier press
+        # worked, e.g. Aptiv 2026-10-27 after a false 422). Treat it as done and
+        # resume, instead of answering 409 not_at_account_step on every Continue.
+        outcome_now = "registered" if session.status == Status.ACCOUNT_CREATION_REQUIRED else "signed_in"
+        logger.info(
+            "session=%s account_recovered=true previous=%s outcome=%s",
+            session.session_id,
+            session.status,
+            outcome_now,
+        )
+        report = {"ok": True, "outcome": outcome_now, "status": "", "siteErrors": [], "account": None}
+        recovered = True
     if not report.get("ok"):
         reason = str(report.get("reason") or "not_at_account_step")
         if reason in {"site_rejected", "account_exists"}:
@@ -462,13 +485,16 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             sessionId=session.session_id,
             outcome=outcome,
             status=_public_status(session),
+            recovered=recovered,
             **proof,
         )
     if outcome in {"signed_in", "registered", "verification_required"}:
         accepted = resume_run()
         if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED:
             outcome = "verification_required"
-        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=accepted.status, **proof)
+        return CredentialsOut(
+            sessionId=session.session_id, outcome=outcome, status=accepted.status, recovered=recovered, **proof
+        )
     _sync_checkpoint(session)
     return CredentialsOut(
         sessionId=session.session_id,

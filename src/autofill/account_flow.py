@@ -60,6 +60,10 @@ _BUSY_JS = """() => {
   }
   return false;
 }"""
+# A new alert after the press counts only once it has stayed on screen this long
+# (two polls about 0.5 s apart) with no spinner. Workday flashes validation text
+# while it swaps Create Account for My Information (Aptiv, 2026-10-27).
+_ERROR_PERSIST_SECONDS = 0.5
 _VERIFY_FIRST_MESSAGE = (
     "The employer created the account and returned to Sign In. Workday sends a verification "
     "email first; signing in before it is opened can lock the account. Open that email, then press Continue."
@@ -113,7 +117,12 @@ def _perform_account_action(
         return _challenge(snapshot, page.url or "", ats)
     scored = score_account(snapshot, page.url or "")
     if scored.application or scored.mode == "none":
-        return {"ok": False, "reason": "not_at_account_step"}
+        report: dict = {"ok": False, "reason": "not_at_account_step"}
+        if application_form_visible(snapshot):
+            # The site already moved past the account step (an earlier press
+            # worked). The service can resume instead of answering 409.
+            report["applicationVisible"] = True
+        return report
     if mode == "register" and scored.mode == "login":
         if not scored.alternate:
             return {"ok": False, "reason": "mode_mismatch", "detected": "login"}
@@ -197,6 +206,9 @@ def _perform_account_action(
     button = _primary_button(snapshot, mode)
     if button is None:
         return {"ok": False, "reason": "not_at_account_step"}
+    # Alert text already on screen before the press (stale validation, a banner
+    # from an earlier attempt) says nothing about what the press did.
+    baseline = _pre_click_errors(page, secrets)
     try:
         activate_account(
             page,
@@ -216,7 +228,9 @@ def _perform_account_action(
             secrets,
         )
         return _attach_proof(rejected, proof, rows, standard_terms=standard_terms)
-    outcome = _wait_for_outcome(page, mode=mode, ats=ats, alternate=scored.alternate, secrets=secrets)
+    outcome = _wait_for_outcome(
+        page, mode=mode, ats=ats, alternate=scored.alternate, secrets=secrets, baseline=baseline
+    )
     return _attach_proof(outcome, proof, rows, standard_terms=standard_terms)
 
 
@@ -581,10 +595,53 @@ def _page_busy(page) -> bool:
         return False
 
 
-def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secrets: list[str]) -> dict:
+def _confirm_rejection(page, mode: str, secrets: list[str], baseline, seen: set[str]) -> dict | list[str]:
+    """Re-read the page once before reporting a rejection.
+
+    Returns a success dict when the site moved on (application form), an empty
+    list when the account form is gone or the error went away (keep waiting),
+    or the still-visible new errors.
+    """
+    try:
+        fresh = extract_page(page)
+    except Exception:
+        return []
+    if application_form_visible(fresh):
+        _logger.info("account_outcome=%s reason=form_after_alert", _success(mode)["outcome"])
+        return _success(mode)
+    if not fresh.password_present or _page_busy(page):
+        return []
+    return [item for item in _errors(fresh, secrets) if item not in baseline and item in seen]
+
+
+def _pre_click_errors(page, secrets: list[str]) -> frozenset[str]:
+    """Redacted alert text on screen just before the account button is pressed."""
+    try:
+        return frozenset(_errors(extract_page(page), secrets))
+    except Exception:
+        return frozenset()
+
+
+def _success(mode: str) -> dict:
+    outcome = "registered" if mode == "register" else "signed_in"
+    return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
+
+
+def _wait_for_outcome(
+    page,
+    *,
+    mode: str,
+    ats: str | None,
+    alternate: bool,
+    secrets: list[str],
+    baseline: frozenset[str] | set[str] = frozenset(),
+) -> dict:
     deadline = time.monotonic() + _WAIT_SECONDS
     last = extract_page(page)
     clear_since: float | None = None
+    # New alert text first seen at this time; it must persist before it counts.
+    pending_errors: set[str] = set()
+    pending_since: float | None = None
     workday = _is_workday(ats, page.url or "")
     settle = _WORKDAY_SETTLE_SECONDS if workday else _SETTLE_SECONDS
     while True:
@@ -603,9 +660,30 @@ def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secr
             rejected = _rejected(last, page.url or "", ats, mode, alternate, _errors(last, secrets), secrets)
             rejected["reason"] = "account_exists"
             return rejected
-        errors = _errors(last, secrets)
-        if errors and last.password_present:
-            return _rejected(last, page.url or "", ats, mode, alternate, errors, secrets)
+        errors = [item for item in _errors(last, secrets) if item not in baseline]
+        if errors and last.password_present and not _page_busy(page):
+            now = time.monotonic()
+            since = pending_since
+            persisted = since is not None and bool(pending_errors.intersection(errors))
+            if since is not None and persisted and now - since >= _ERROR_PERSIST_SECONDS:
+                confirmed = _confirm_rejection(page, mode, secrets, baseline, set(errors))
+                if isinstance(confirmed, dict):
+                    return confirmed
+                if confirmed:
+                    _logger.info(
+                        "account_outcome=site_rejected mode=%s errors=%s",
+                        mode,
+                        "; ".join(confirmed)[:300],
+                    )
+                    return _rejected(extract_page(page), page.url or "", ats, mode, alternate, confirmed, secrets)
+                pending_errors, pending_since = set(), None
+            elif not persisted:
+                pending_errors, pending_since = set(errors), now
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+            continue
+        pending_errors, pending_since = set(), None
         if mode == "register" and _returned_to_sign_in(last, page.url or ""):
             # Workday accepted the form and went back to Sign In. Signing in
             # now, before the verification email, fails with "wrong email or
@@ -622,8 +700,7 @@ def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secr
             }
         if not last.password_present:
             if mode != "register" or application_form_visible(last):
-                outcome = "registered" if mode == "register" else "signed_in"
-                return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
+                return _success(mode)
             now = time.monotonic()
             if _page_busy(page):
                 # The site is still working; an empty pane now says nothing yet.

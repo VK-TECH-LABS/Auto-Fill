@@ -484,10 +484,15 @@ class CredentialsOut(BaseModel):
     field_proof: dict[str, Any] | None = Field(default=None, alias="fieldProof")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
     consent_rows: list[dict[str, Any]] | None = Field(default=None, alias="consentRows")
+    # True when the engine typed nothing: the page was already past the account
+    # step. The password in this request was never seen by the employer.
+    recovered: bool | None = None
 
     @model_serializer(mode="wrap")
     def _omit_store(self, handler):
         data = handler(self)
+        if not data.get("recovered"):
+            data.pop("recovered", None)
         if not data.get("outcome"):
             data.pop("outcome", None)
         if not data.get("status"):
