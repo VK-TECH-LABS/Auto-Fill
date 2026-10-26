@@ -40,6 +40,8 @@ class Control:
     automation_id: str = ""
     max_length: int | None = None
     phone_adjacent: bool = False
+    # True when this phone box sits beside a separate calling-code control.
+    national_phone: bool = False
     frame_url: str = ""
 
 

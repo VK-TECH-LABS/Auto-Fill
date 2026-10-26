@@ -106,10 +106,51 @@ def _control_blob(control) -> str:
     )
 
 
+_GENERIC_PROMPTS = frozenset(
+    {
+        "search",
+        "type to search",
+        "search options",
+        "select",
+        "please select",
+        "choose",
+        "choose one",
+        "select one",
+        "start typing",
+        "select an option",
+    }
+)
+
+
+def _folded(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").casefold()).strip(" .")
+
+
+def _prompt_search(control) -> bool:
+    """A named question whose box says Search. The site search box is not one.
+
+    Workday prompt widgets keep the placeholder ``Search`` on a required
+    question such as "How did you hear about us?". The label is the question.
+    """
+    label = _folded(control.label or "")
+    if not label or label in _GENERIC_PROMPTS or _SEARCH_RE.search(label):
+        return False
+    placeholder = _folded(control.placeholder or "")
+    aria = _folded(control.aria_label or "")
+    return placeholder in _GENERIC_PROMPTS or aria in _GENERIC_PROMPTS
+
+
+def _site_search(control) -> bool:
+    if _prompt_search(control):
+        return False
+    blob = _control_blob(control)
+    return control.input_type == "search" or bool(_SEARCH_RE.search(blob))
+
+
 def _chrome_control(control) -> bool:
     """A language menu or cookie control is site chrome, not an application field."""
     blob = _control_blob(control)
-    if control.input_type == "search" or _SEARCH_RE.search(blob):
+    if _site_search(control):
         return True
     if _CHROME_CONTROL_RE.search(blob):
         return True
@@ -185,7 +226,7 @@ def application_controls(snapshot: PageSnapshot) -> list[Control]:
             for part in (control.label, control.name, control.placeholder, control.aria_label, control.input_type)
             if part
         )
-        if control.input_type == "search" or _SEARCH_RE.search(blob) or _CHAT_RE.search(blob):
+        if _site_search(control) or _CHAT_RE.search(blob):
             continue
         if control.kind in {"file", "textarea", "select", "radio", "checkbox", "combobox", "buttons"}:
             found.append(control)

@@ -112,9 +112,41 @@ _SCOPED_OPTIONS_JS = r"""
     }
     container = container.parentElement;
   }
-  if (!list) return [];
+  function shown(node) {
+    if (!node || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  if (!list) {
+    // A prompt menu often portals to the document instead of aria-controls.
+    const boxes = document.querySelectorAll("[role='listbox']");
+    for (const candidate of boxes) {
+      if (claimedByOther(candidate) || !shown(candidate)) continue;
+      list = candidate;
+      break;
+    }
+  }
+  const optionNodes = [];
+  const optionSelector = [
+    "[role='option']",
+    "[data-automation-id='promptOption']",
+    "[data-automation-id='promptLeafNode']",
+    "[data-automation-id='menuItem']",
+  ].join(", ");
+  if (list) {
+    for (const option of list.querySelectorAll(optionSelector)) optionNodes.push(option);
+  }
+  if (!optionNodes.length) {
+    const portalSelector = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode']";
+    for (const option of document.querySelectorAll(portalSelector)) {
+      if (shown(option)) optionNodes.push(option);
+    }
+  }
+  if (!optionNodes.length) return [];
   const options = [];
-  for (const option of list.querySelectorAll("[role='option']")) {
+  for (const option of optionNodes) {
     const label = textOf(option);
     if (!label) continue;
     if (!option.id) option.setAttribute("data-autofill-option", String(options.length));
@@ -152,6 +184,10 @@ _COMMIT_JS = r"""
     return text === wanted || text.indexOf(wanted) !== -1 || wanted.indexOf(text) !== -1;
   }
   const field = el.closest(".field, .select, fieldset") || el.parentElement;
+  const promptRoot = el.closest(
+    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  );
+  const fieldRoot = el.closest("[data-automation-id^='formField']");
   let error = el.getAttribute("aria-invalid") === "true";
   if (field) {
     const nodes = field.querySelectorAll("[role='alert'], .field-error, .error-message, .select-error, .error");
@@ -163,7 +199,8 @@ _COMMIT_JS = r"""
   }
   let hiddenOk = false;
   let tracksValue = false;
-  const root = field || el.parentElement || document.body;
+  const root = (promptRoot && fieldRoot) || promptRoot || field || el.parentElement || document.body;
+  if (promptRoot) tracksValue = true;
   function hiddenControl(node) {
     if (!node || node === el) return false;
     const type = (node.getAttribute("type") || "").toLowerCase();
@@ -190,6 +227,18 @@ _COMMIT_JS = r"""
     tracksValue = true;
     const active = document.getElementById(activeId);
     if (active && matches(active.textContent)) ariaOk = true;
+  }
+  const pillSelector = [
+    "[data-automation-id='selectedItem']",
+    "[data-automation-id='selectedItemText']",
+    "[data-automation-id*='selectedItem']",
+  ].join(", ");
+  const pills = root.querySelectorAll(pillSelector);
+  if (pills.length) {
+    tracksValue = true;
+    for (const pill of pills) {
+      if (matches(pill.textContent)) shownOk = true;
+    }
   }
   const picked = root.querySelector("[role='option'][aria-selected='true']");
   if (picked) {

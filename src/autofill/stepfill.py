@@ -49,6 +49,7 @@ from autofill.intents import (
 )
 from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
+    _wants_national_digits,
     acknowledgement_kind,
     haystack,
     is_consent_choice,
@@ -56,6 +57,7 @@ from autofill.mapping import (
     map_field,
     match_field_key,
     mentions_work_history,
+    national_phone_digits,
     normalize,
     record_auto_consent,
     standard_terms_enabled,
@@ -175,8 +177,9 @@ def validation_blob(snapshot: PageSnapshot) -> str:
 
 def flags_for_alerts(blob: str, previous: FillFlags) -> FillFlags:
     """Turn a validation message into a bounded correction."""
+    phone_format = "invalid phone" in blob or ("phone" in blob and "valid format" in blob)
     return FillFlags(
-        digits_phone=previous.digits_phone or "invalid phone" in blob,
+        digits_phone=previous.digits_phone or phone_format,
         us_dates=previous.us_dates or "valid date" in blob,
         aliases=previous.aliases or "select one" in blob or "required" in blob,
     )
@@ -1897,8 +1900,11 @@ def _apply_ask(
         return
     raw_value = response.fields.get(ask.field_key, "")
     text = "" if raw_value is None else str(raw_value)
-    if ask.field_key == "phone" and flags.digits_phone:
-        text = "".join(character for character in text if character.isdigit())
+    # A national box beside a calling-code menu rejects "+1 …". A format alert
+    # on a later pass uses the same rule, so the leading country digit is not
+    # typed again as if it were part of the subscriber number.
+    if ask.field_key == "phone" and (_wants_national_digits(ask.controls[0]) or flags.digits_phone):
+        text = national_phone_digits(text)
     if flags.us_dates and _looks_iso(text):
         text = _force_us_date(text)
     _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
