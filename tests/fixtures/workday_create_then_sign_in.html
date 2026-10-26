@@ -13,6 +13,10 @@
   * "spinnerMs" sets how long the Create Account spinner lasts (default 500; live
     Workday tenants such as Ameren take 2-3 s). "after" = "app" makes Create Account
     land on My Information instead of Sign In (tenants that sign in automatically).
+  * Aptiv 2026-10-27 (false 422 after a successful Create Account):
+    "stale" puts alert text on the Create Account pane before the press;
+    "flash" shows alert text for "holdMs" after the press while the form is still
+    mounted, then the spinner runs; "reject" shows a lasting error and creates nothing.
 -->
 <div data-automation-id="legalNoticeBanner" class="css-7q1x9z"
      style="position:fixed;top:0;left:0;right:0;height:140px;z-index:50;background:#fff;border-bottom:1px solid #999">
@@ -43,6 +47,7 @@ var pane = document.getElementById("pane");
 function createPane() {
   pane.innerHTML = '<div data-automation-id="createAccountPage">'
     + '<h2 data-automation-id="headingText">Create Account</h2>'
+    + '<div id="cerr" role="alert" data-automation-id="errorMessage">' + (localStorage.getItem("stale") || "") + '</div>'
     + '<form onsubmit="return false" novalidate>'
     + '<label for="input-4">Email Address</label>'
     + '<input id="input-4" type="text" data-automation-id="email" autocomplete="email">'
@@ -55,10 +60,20 @@ function createPane() {
     + '<p>Already have an account? <button type="button" data-automation-id="signInLink">Sign In</button></p>'
     + '</div>';
   pane.querySelector("[data-automation-id='createAccountSubmitButton']").addEventListener("click", function () {
+    var cerr = document.getElementById("cerr");
+    if (localStorage.getItem("reject")) {
+      cerr.textContent = localStorage.getItem("reject");
+      return;
+    }
     window.__created += 1;
-    pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
-    var spinnerMs = parseInt(localStorage.getItem("spinnerMs") || "500", 10);
-    setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : signInPane, spinnerMs);
+    function spin() {
+      pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
+      var spinnerMs = parseInt(localStorage.getItem("spinnerMs") || "500", 10);
+      setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : signInPane, spinnerMs);
+    }
+    var holdMs = parseInt(localStorage.getItem("holdMs") || "0", 10);
+    if (localStorage.getItem("flash")) { cerr.textContent = localStorage.getItem("flash"); }
+    if (holdMs > 0) { setTimeout(spin, holdMs); } else { spin(); }
   });
   pane.querySelector("[data-automation-id='signInLink']").addEventListener("click", signInPane);
 }
