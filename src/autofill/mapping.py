@@ -627,7 +627,46 @@ def _alias_set(token: str) -> set[str]:
     return set().union(*matched)
 
 
+_CALLING_CODES = ("44", "1")
+_NANP_WITH_COUNTRY = re.compile(r"^1\d{10}$")
+
+
+def national_phone_digits(phone: str) -> str:
+    """Digits for a national box when the calling code is a separate control.
+
+    ``+1 (555) 010-0199`` and ``1-555-010-0199`` become ``5550100199``.
+    A number that is already national (``555-010-0199``) keeps those digits.
+    An explicit ``+`` / ``00`` prefix drops a known calling code. A punctuated
+    11-digit number that starts with 1 drops that leading 1. Other digit
+    strings are left intact so an unformatted non-NANP number is not truncated.
+    """
+    raw = str(phone or "").strip()
+    compact = re.sub(r"[^\d+]", "", raw)
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    digits = re.sub(r"\D", "", compact)
+    if not digits:
+        return ""
+    if compact.startswith("+"):
+        for code in _CALLING_CODES:
+            rest = digits[len(code) :]
+            if digits.startswith(code) and len(rest) >= 7:
+                return rest
+        return digits
+    if re.search(r"[()\-.]", raw) and _NANP_WITH_COUNTRY.fullmatch(digits):
+        return digits[1:]
+    return digits
+
+
 def _wants_national_digits(control: Control) -> bool:
+    """True when the box wants a national number, not the full profile phone.
+
+    ``tel-national``, a numeric keypad, or copy that says digits / country code
+    are the explicit cases. A phone input beside a separate calling-code menu
+    is the same rule: the country control already carries the prefix.
+    """
+    if control.national_phone:
+        return True
     if control.autocomplete == "tel-national" or control.input_mode == "numeric":
         return True
     blob = haystack(control)
@@ -755,7 +794,7 @@ def _profile_text(
         return personal.email
     if key == "phone":
         if _wants_national_digits(control):
-            return profile.phone_digits()
+            return national_phone_digits(personal.phone)
         return personal.phone
     if key == "address":
         return personal.address
@@ -959,6 +998,16 @@ def _is_referral_question(blob: str) -> bool:
 
 
 _DIAL_CODE = re.compile(r"\+\d{1,4}\b")
+_PHONE_COUNTRY_LABELS = frozenset(
+    {
+        "country code",
+        "phone country",
+        "country phone code",
+        "phone code",
+        "calling code",
+        "dial code",
+    }
+)
 
 
 def _is_phone_country_menu(control: Control) -> bool:
@@ -966,6 +1015,8 @@ def _is_phone_country_menu(control: Control) -> bool:
 
     Rows such as ``United States +1`` are the menu. A closed menu has no rows
     yet, so a Country combobox next to the phone input is the same field.
+    ``Country Phone Code`` is that menu even when it is closed. An address
+    ``Country / Territory`` menu is not.
     """
     hits = 0
     for option in control.options:
@@ -976,6 +1027,8 @@ def _is_phone_country_menu(control: Control) -> bool:
     if control.kind not in {"select", "combobox"}:
         return False
     label = normalize(control.label or control.aria_label)
+    if label in _PHONE_COUNTRY_LABELS:
+        return True
     if label not in {"country", "country code", "phone country"}:
         return False
     if control.phone_adjacent:
@@ -1070,6 +1123,17 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             text=text,
             option_label=text,
             reason=reason or "Country is chosen from the menu.",
+            field_class="PROFILE_FIELD",
+        )
+    # A closed search prompt has no rows until it is opened. Choose the saved
+    # source from that menu instead of leaving the placeholder in the box.
+    if key == "how_heard" and control.kind == "combobox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Source is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
     if control.kind in {"select", "radio"} or (control.kind == "combobox" and control.options):

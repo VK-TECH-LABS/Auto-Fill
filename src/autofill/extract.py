@@ -64,6 +64,135 @@ EXTRACT_JS = r"""
     return folded === "select" || folded === "please select" || folded === "choose" || folded === "choose one";
   }
 
+  function isGenericPrompt(text) {
+    // "Search" is the placeholder on a prompt widget, not the question.
+    const folded = cleanPrompt(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (!folded) return false;
+    if (isPlaceholderPrompt(text)) return true;
+    return (
+      folded === "search" ||
+      folded === "type to search" ||
+      folded === "search options" ||
+      folded === "start typing" ||
+      folded === "select an option"
+    );
+  }
+
+  function fieldQuestionNode(el) {
+    // The question label for a prompt lives on the form field, not on the
+    // inner search box. The nearest form field wins so a later question is
+    // not pulled in.
+    let node = el;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      const auto = (node.getAttribute && node.getAttribute("data-automation-id")) || "";
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (auto.indexOf("formField") !== 0 && tag !== "fieldset") continue;
+      const labels = node.querySelectorAll("label, legend, [data-automation-id='formLabel']");
+      for (const label of labels) {
+        if (label.contains(el)) continue;
+        const text = cleanPrompt(textOf(label));
+        if (!text || isGenericPrompt(text) || isSectionHeading(label, text)) continue;
+        const targetId = label.getAttribute("for") || "";
+        if (targetId && el.id && targetId !== el.id) continue;
+        if (targetId && !el.id) {
+          const target = document.getElementById(targetId);
+          if (target && target !== el && !target.contains(el) && !el.contains(target)) continue;
+        }
+        return label;
+      }
+    }
+    return null;
+  }
+
+  function isPromptWidget(el) {
+    // A multiselect / prompt search box. The site search in the header is not
+    // inside a form field, so it stays a search box.
+    const host = el.closest && el.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    if (host) return true;
+    const auto = (el.getAttribute("data-automation-id") || "").toLowerCase();
+    if (auto === "searchbox" || auto === "monikersearchbox" || auto === "promptsearchbox") {
+      return !!fieldQuestionNode(el);
+    }
+    const parent = el.parentElement;
+    if (
+      parent &&
+      parent.querySelector("[data-automation-id='promptIcon'], [data-automation-id='promptSearchButton']")
+    ) {
+      return !!fieldQuestionNode(el);
+    }
+    return false;
+  }
+
+  function isPhoneInput(el) {
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    const auto = (el.getAttribute("autocomplete") || "").toLowerCase();
+    if (type === "tel" || auto === "tel" || auto === "tel-national" || auto.indexOf("tel") === 0) return true;
+    const id = (
+      (el.id || "") + " " + (el.getAttribute("name") || "") + " " + (el.getAttribute("data-automation-id") || "")
+    ).toLowerCase();
+    return /phone|mobile|telephone/.test(id);
+  }
+
+  function looksLikeCallingCode(node) {
+    if (!node || !node.getAttribute) return false;
+    const blob = (
+      (node.getAttribute("data-automation-id") || "") + " " +
+      (node.id || "") + " " +
+      (node.getAttribute("name") || "")
+    ).toLowerCase();
+    if (
+      /countryphonecode|country-phone-code|phone-country|phonecountry|callingcode|dialcode|countrycode|phone-code|phone_code/.test(
+        blob
+      )
+    ) {
+      return true;
+    }
+    const label = controlLabel(node);
+    return (
+      label === "country code" ||
+      label === "phone country" ||
+      label === "country phone code" ||
+      label === "phone code" ||
+      label === "calling code" ||
+      label === "dial code"
+    );
+  }
+
+  function menuHasDialCode(node) {
+    const bits = [node.value || "", node.getAttribute("aria-label") || "", node.getAttribute("placeholder") || ""];
+    if (node.options) {
+      for (const option of Array.from(node.options).slice(0, 12)) bits.push(option.textContent || "");
+    }
+    return /\+\d{1,4}/.test(bits.join(" "));
+  }
+
+  function nationalPhone(el) {
+    // A phone box that shares a small group with one calling-code menu.
+    // An address Country further down the form is outside that group.
+    if (!isPhoneInput(el)) return false;
+    const auto = (el.getAttribute("autocomplete") || "").toLowerCase();
+    const mode = (el.getAttribute("inputmode") || "").toLowerCase();
+    if (auto === "tel-national" || mode === "numeric") return true;
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "form" || tag === "body" || tag === "html") break;
+      const menus = node.querySelectorAll("select, [role='combobox'], input[role='combobox']");
+      let codes = 0;
+      let menusInScope = 0;
+      for (const menu of menus) {
+        if (menu === el || (menu.contains && menu.contains(el))) continue;
+        menusInScope += 1;
+        if (looksLikeCallingCode(menu) || menuHasDialCode(menu)) codes += 1;
+      }
+      if (codes === 1 && menusInScope <= 2) return true;
+      if (menusInScope > 2) break;
+    }
+    return false;
+  }
+
   function isSectionHeading(node, text) {
     // "ADDITIONAL INFORMATION" is a section title, not a question.
     const cleaned = cleanPrompt(text);
@@ -200,7 +329,7 @@ EXTRACT_JS = r"""
       }
     }
     const aria = el.getAttribute("aria-label");
-    if (aria) bits.push(aria.trim());
+    if (aria && !isGenericPrompt(aria)) bits.push(aria.trim());
     if (!bits.length) {
       const option = optionText(el);
       if (option) bits.push(option);
@@ -228,7 +357,7 @@ EXTRACT_JS = r"""
           const tag = prev.tagName ? prev.tagName.toLowerCase() : "";
           if (tag === "label" || tag === "legend") {
             const text = textOf(prev);
-            if (text && !isSectionHeading(prev, text) && !isPlaceholderPrompt(text)) found = text;
+            if (text && !isSectionHeading(prev, text) && !isGenericPrompt(text)) found = text;
           }
           const blocks =
             tag === "input" ||
@@ -242,7 +371,7 @@ EXTRACT_JS = r"""
             const inner = prev.querySelector && prev.querySelector("label, legend");
             if (inner && !isHidden(inner)) {
               const text = textOf(inner);
-              if (text && !isSectionHeading(inner, text) && !isPlaceholderPrompt(text)) found = text;
+              if (text && !isSectionHeading(inner, text) && !isGenericPrompt(text)) found = text;
             }
           }
           if (!found) {
@@ -252,7 +381,7 @@ EXTRACT_JS = r"""
               text &&
               text.length <= 200 &&
               !isSectionHeading(prev, text) &&
-              !isPlaceholderPrompt(text) &&
+              !isGenericPrompt(text) &&
               (
                 cls.indexOf("question") !== -1 ||
                 cls.indexOf("application-label") !== -1 ||
@@ -268,6 +397,10 @@ EXTRACT_JS = r"""
         }
       }
       if (found) bits.push(found);
+    }
+    if (!bits.length) {
+      const question = fieldQuestionNode(el);
+      if (question) bits.push(textOf(question));
     }
     return dedupeBits(bits);
   }
@@ -410,6 +543,8 @@ EXTRACT_JS = r"""
       if (classToken.indexOf("select__input") !== -1 || (el.closest && el.closest(".select__control"))) {
         kind = "combobox";
       }
+      const promptWidget = isPromptWidget(el);
+      if (promptWidget) kind = "combobox";
 
       let options = [];
       if (tag === "select") {
@@ -445,7 +580,8 @@ EXTRACT_JS = r"""
             el.getAttribute("aria-required") === "true" ||
             (kind === "checkbox" && controlMarkedRequired(el)) ||
             (
-              (role === "combobox" ||
+              (promptWidget ||
+                role === "combobox" ||
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
                 classToken.indexOf("autocomplete") !== -1) &&
               controlMarkedRequired(el)
@@ -464,6 +600,7 @@ EXTRACT_JS = r"""
         automationId: el.getAttribute("data-automation-id") || "",
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
         phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
+        nationalPhone: nationalPhone(el),
       });
     }
 
@@ -595,7 +732,7 @@ EXTRACT_JS = r"""
       const prev = node.previousElementSibling;
       if (prev && prev.tagName && prev.tagName.toLowerCase() === "label") return prev;
     }
-    return null;
+    return fieldQuestionNode(el);
   }
 
   function controlMarkedRequired(el) {
@@ -1243,6 +1380,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 automation_id=str(raw.get("automationId", "") or ""),
                 max_length=_max_length(raw.get("maxLength")),
                 phone_adjacent=bool(raw.get("phoneAdjacent", False)),
+                national_phone=bool(raw.get("nationalPhone", False)),
             )
         )
     buttons = [
