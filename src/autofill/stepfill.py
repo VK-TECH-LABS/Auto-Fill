@@ -4030,7 +4030,9 @@ def _accept_standard_term(page, ask) -> bool:
     """Check one required terms box when the session flag allows it.
 
     Consent choices, marketing, and every unusual attestation stay blockers.
-    The check is ``locator.check``, not a click.
+    The check is the verified ``check_registered`` routine used on account
+    pages (pointer check, forced check, then its label), and the box counts
+    only when the page reports it checked afterwards.
     """
     if ask.consent_choice or not standard_terms_enabled():
         return False
@@ -4042,9 +4044,14 @@ def _accept_standard_term(page, ask) -> bool:
     category = terms_category(control)
     if category not in AUTO_CONSENT_CATEGORIES:
         return False
+    from autofill.account_flow import check_registered
+
     try:
-        page.locator(control.selector).check()
+        verified = check_registered(page, control.selector)
     except Exception:
+        verified = False
+    if not verified:
+        logger.info("auto_consent category=%s result=failed", category)
         return False
     record_auto_consent(control, category)
     return True
