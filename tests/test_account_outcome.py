@@ -222,6 +222,8 @@ def test_stuck_account_step_with_application_visible_resumes(caplog):
         stored = _credentials(client, session_id)
         assert stored.status_code == 200, stored.text
         assert stored.json()["outcome"] == "registered"
+        # The engine typed nothing: Companion must not save this request's password.
+        assert stored.json()["recovered"] is True
         assert runner.runs == 2
         assert stored.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
         assert "account_recovered=true" in caplog.text
@@ -247,3 +249,14 @@ def test_site_rejected_is_unchanged():
         stored = _credentials(client, session_id)
         assert stored.status_code == 422, stored.text
         assert runner.runs == 1
+
+
+def test_normal_register_has_no_recovered_flag():
+    runner = _StuckRunner({"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None})
+    app = create_app(token=TOKEN, runner=runner, run_browser=False)
+    with TestClient(app) as client:
+        session_id = _start(client)
+        stored = _credentials(client, session_id)
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["outcome"] == "registered"
+        assert "recovered" not in stored.json()
