@@ -172,6 +172,19 @@ def test_slow_workday_spinner_into_application_counts_as_registered(workday):
     assert elapsed < 2.5 + 3.0, elapsed
 
 
+def test_register_on_a_sign_in_pane_follows_create_account_and_waits_for_verification(workday):
+    # KLA opens on Sign In. The Companion bridge asks for mode=register; the engine
+    # follows the pane's own Create Account link, registers, and does not sign in.
+    page = workday(start="signin", spinner_ms=2500)
+    result = _action(page, "register")
+    assert result["ok"] is True, result
+    assert result["outcome"] == "registered"
+    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED"
+    assert result["verifyBeforeSignIn"] is True
+    assert page.evaluate("window.__created") == 1
+    assert page.evaluate("window.__signedIn") == 0
+
+
 def test_cookie_banner_is_closed_before_the_account_form(workday):
     page = workday()
     assert page.locator("[data-automation-id='legalNoticeBanner']").is_visible()
