@@ -393,28 +393,43 @@ STANDARD_TERMS_DENY: tuple[str, ...] = (
     "salary",
 )
 # The whole statement, after normalize() drops a final period:
-# (I agree to|I accept|I have read and agree to) the
-# (Terms of Service|Terms and Conditions|Terms of Use|Privacy Policy|Privacy Notice)
-# (and [the] <same document>)*
+# [yes] <verb> [the] <document> (and [the] <document>)* [for|of|at <owner>]
+# for example "I agree to the Terms of Service", "Yes, I have read the Applicant
+# Privacy Policy", "I acknowledge that I have read and understand the Privacy Notice".
+# A bare "terms" is accepted only without an owner tail ("I agree to the terms",
+# "I agree to the terms and privacy policy"); see ``_is_standard_terms``.
+_PRIVACY_OWNER = (
+    r"(?:candidate|applicant|job applicant|recruitment|recruiting|career|careers|global|data"
+    r"|personal data|data protection|employee|hr)"
+)
 _TERMS_DOCUMENT = (
     r"(?:terms of service|terms and conditions|terms conditions|terms of use"
-    r"|(?:(?:candidate|applicant) )?privacy (?:policy|notice|statement))"
+    rf"|(?:{_PRIVACY_OWNER} ){{0,2}}privacy (?:policy|notice|statement)"
+    r"|data protection (?:policy|notice|statement)"
+    r"|terms)"
 )
 # Workday tenants word the Create Account box as, for example,
 # "Yes, I have read and consent to the terms and conditions" or
 # "I understand and acknowledge the terms of use for Example Company (EC)".
 # The optional tail names whose document it is, in at most eight plain words,
 # and never carries another verb or a second promise (checked in code).
+_READ_OBJECT = r"(?:agree to|agree with|accept|consent to|acknowledge|understand|understood)"
 _TERMS_VERB = (
-    r"(?:i have read and (?:agree to|accept|consent to|acknowledge|understand)"
-    r"|i have read and understood|i understand and (?:agree to|accept|acknowledge)"
-    r"|i agree to|i accept|i consent to|i acknowledge)"
+    rf"(?:i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    rf"|i have (?:read|reviewed) understood and {_READ_OBJECT}"
+    rf"|i have (?:read|reviewed) and understood and {_READ_OBJECT}"
+    rf"|i (?:acknowledge|confirm) that i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    r"|i acknowledge receipt of"
+    r"|i understand and (?:agree to|accept|acknowledge)"
+    r"|i agree to|i agree with|i accept|i consent to|i acknowledge)"
 )
 _STANDARD_TERMS_SENTENCE = re.compile(
     rf"(?:yes )?{_TERMS_VERB} (?:the )?{_TERMS_DOCUMENT}"
     rf"(?: and (?:the )?{_TERMS_DOCUMENT})*"
     r"(?P<tail> (?:for|of|at) (?:[a-z0-9]+ ){0,7}[a-z0-9]+)?"
 )
+# "terms" not followed by one of the named documents.
+_BARE_TERMS = re.compile(r"\bterms\b(?! (?:of service|of use|and conditions|conditions)\b)")
 _TERMS_TAIL_STOP = frozenset(
     {"and", "or", "to", "i", "me", "my", "that", "agree", "accept", "consent", "receive", "share", "allow", "use"}
 )
@@ -466,6 +481,9 @@ def _is_standard_terms(statement: str) -> bool:
     if match is None:
         return False
     tail = match.group("tail") or ""
+    if tail and _BARE_TERMS.search(text[: match.start("tail")]):
+        # "I agree to the terms of <anything>" names an unknown document.
+        return False
     return not (set(tail.split()[1:]) & _TERMS_TAIL_STOP)
 
 

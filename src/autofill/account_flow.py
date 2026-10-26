@@ -167,7 +167,22 @@ def _perform_account_action(
         return {"ok": False, "reason": "password_mismatch", "fieldProof": proof}
     rows: list[dict] = []
     if standard_terms:
-        rows = _accept_account_terms(page, snapshot)
+        rows, pending = _accept_account_terms(page, snapshot)
+        if pending:
+            # Never press Create Account over a required box that is still
+            # unchecked: the site only answers "Please check the box" and the
+            # attempt is spent. The person sees the exact statement instead.
+            rejected = _rejected(
+                snapshot,
+                page.url or "",
+                ats,
+                mode,
+                scored.alternate,
+                [f"{_CONSENT_PREFIX}{statement}" for statement in pending],
+                secrets,
+            )
+            rejected["reason"] = "site_rejected"
+            return _attach_proof(rejected, proof, rows, standard_terms=standard_terms)
     elif terms is not None:
         if not check_registered(page, terms.selector):
             return _rejected(
@@ -248,17 +263,31 @@ def _statement(control: Control) -> str:
     return " ".join((control.label or control.prompt or control.group or control.aria_label or "").split())[:160]
 
 
-def _accept_account_terms(page, snapshot: PageSnapshot) -> list[dict]:
-    """Check required plain terms. Every other checkbox stays unchecked."""
+_CONSENT_PREFIX = "Consent needs a person: "
+
+
+def _required_box(control: Control) -> bool:
+    # Workday validates its Create Account box in script, so the input may not
+    # carry ``required``; its automation id says the site needs it.
+    return bool(control.required or control.automation_id == "createAccountCheckbox")
+
+
+def _accept_account_terms(page, snapshot: PageSnapshot) -> tuple[list[dict], list[str]]:
+    """Check required plain terms. Every other checkbox stays unchecked.
+
+    Returns the audit rows and the statements of required boxes that are still
+    unchecked (not standard wording, or the site refused the check). The caller
+    must not press the account button while that list is non-empty.
+    """
     rows: list[dict] = []
+    pending: list[str] = []
     for control in snapshot.controls:
         if control.hidden or control.kind != "checkbox" or not control.selector:
             continue
         category = terms_category(control)
         checked = False
-        # Workday validates its Create Account box in script, so the input may not
-        # carry ``required``; its automation id says the site needs it.
-        required = control.required or control.automation_id == "createAccountCheckbox"
+        required = _required_box(control)
+        already = required and _is_checked(page, control.selector) is True
         if category in AUTO_CONSENT_CATEGORIES and required:
             if check_registered(page, control.selector):
                 record_auto_consent(control, category)
@@ -268,8 +297,12 @@ def _accept_account_terms(page, snapshot: PageSnapshot) -> list[dict]:
                 category = "CONSENT"
         else:
             category = "CONSENT"
+            checked = already
+        if required and not checked:
+            _logger.info("auto_consent category=CONSENT result=manual")
+            pending.append(_statement(control) or "Required checkbox")
         rows.append({"textExcerpt": _statement(control), "category": category, "checked": checked})
-    return rows
+    return rows, pending
 
 
 _CHECKED_JS = """(selector) => {
@@ -309,7 +342,9 @@ def check_registered(page, selector: str) -> bool:
     styled wrapper falls back to its label. At most three attempts, each verified.
     """
     attempts = (
-        lambda: page.locator(selector).check(timeout=3000),
+        # A covered box fails the pointer check until the timeout; keep it short
+        # so the forced check and the label press follow quickly.
+        lambda: page.locator(selector).check(timeout=1500),
         lambda: page.locator(selector).check(force=True, timeout=3000),
         lambda: press_choice_label(page, selector),
     )
@@ -326,8 +361,8 @@ def check_registered(page, selector: str) -> bool:
                 continue
         except Exception:
             continue
-        state = _is_checked(page, selector)
-        if state is None or state:
+        # An unreadable state is not proof: try the next way, then give up.
+        if _is_checked(page, selector) is True:
             return True
     return _is_checked(page, selector) is True
 
