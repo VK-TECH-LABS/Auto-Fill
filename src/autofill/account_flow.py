@@ -43,6 +43,23 @@ _WAIT_SECONDS = 15.0
 # After Create Account the form disappears while the site works. A page without
 # a password box must stay that way this long before it counts as registered.
 _SETTLE_SECONDS = 1.5
+# Workday swaps Create Account for a spinner, then usually for an empty Sign In pane
+# (verification email first). The spinner can run 2-3 s (Ameren, 2026-10-26), so on
+# Workday an empty pane must stay empty, with no spinner, this long before it counts
+# as registered. An application form still ends the wait at once.
+_WORKDAY_SETTLE_SECONDS = 4.0
+_BUSY_JS = """() => {
+  const nodes = document.querySelectorAll(
+    "[data-automation-id*='loadingSpinner' i], [data-automation-id*='spinner' i], [aria-busy='true']");
+  for (const node of nodes) {
+    const box = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    if (box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none') {
+      return true;
+    }
+  }
+  return false;
+}"""
 _VERIFY_FIRST_MESSAGE = (
     "The employer created the account and returned to Sign In. Workday sends a verification "
     "email first; signing in before it is opened can lock the account. Open that email, then press Continue."
@@ -516,10 +533,25 @@ def _returned_to_sign_in(snapshot: PageSnapshot, url: str) -> bool:
     return not scored.application and scored.mode == "login"
 
 
+def _is_workday(ats: str | None, url: str) -> bool:
+    lowered = (url or "").lower()
+    return (ats or "").lower() == "workday" or "myworkdayjobs." in lowered or ".workday.com" in lowered
+
+
+def _page_busy(page) -> bool:
+    """A loading spinner or aria-busy region is on screen."""
+    try:
+        return bool(page.evaluate(_BUSY_JS))
+    except Exception:
+        return False
+
+
 def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secrets: list[str]) -> dict:
     deadline = time.monotonic() + _WAIT_SECONDS
     last = extract_page(page)
     clear_since: float | None = None
+    workday = _is_workday(ats, page.url or "")
+    settle = _WORKDAY_SETTLE_SECONDS if workday else _SETTLE_SECONDS
     while True:
         last = extract_page(page)
         if last.captcha_present:
@@ -558,9 +590,14 @@ def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secr
                 outcome = "registered" if mode == "register" else "signed_in"
                 return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
             now = time.monotonic()
-            clear_since = clear_since if clear_since is not None else now
-            if now - clear_since >= _SETTLE_SECONDS:
-                return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
+            if _page_busy(page):
+                # The site is still working; an empty pane now says nothing yet.
+                clear_since = None
+            else:
+                clear_since = clear_since if clear_since is not None else now
+                if now - clear_since >= settle:
+                    _logger.info("account_outcome=registered next=resume settle_s=%.1f", settle)
+                    return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
         else:
             clear_since = None
         if time.monotonic() >= deadline:
@@ -573,6 +610,19 @@ def _wait_for_outcome(page, *, mode: str, ats: str | None, alternate: bool, secr
             "status": "ACCOUNT_CREATION_REQUIRED" if mode == "register" else "LOGIN_REQUIRED",
             "siteErrors": [],
             "account": _view(last, page.url or "", ats, mode, alternate, []),
+        }
+    if mode == "register" and workday and not application_form_visible(last):
+        # Still no form after the full wait: do not resume into Sign In with the new
+        # password. The person checks the verification email, then presses Continue.
+        _logger.info("account_outcome=registered next=verify_before_sign_in reason=no_settle")
+        return {
+            "ok": True,
+            "outcome": "registered",
+            "status": "EMAIL_VERIFICATION_REQUIRED",
+            "verifyBeforeSignIn": True,
+            "message": _VERIFY_FIRST_MESSAGE,
+            "siteErrors": [],
+            "account": None,
         }
     outcome = "registered" if mode == "register" else "signed_in"
     return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}

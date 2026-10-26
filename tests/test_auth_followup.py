@@ -17,6 +17,7 @@ fake runner, so no employer site is reached and no account is created.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,7 @@ def browser():
 def workday(browser):
     contexts = []
 
-    def open_page(*, start: str = "", locked: bool = False):
+    def open_page(*, start: str = "", locked: bool = False, spinner_ms: int = 500, after: str = ""):
         html = (FIXTURES / "workday_create_then_sign_in.html").read_text()
         context = browser.new_context()
         contexts.append(context)
@@ -73,8 +74,10 @@ def workday(browser):
         page = context.new_page()
         page.goto(URL)
         page.evaluate(
-            "([start, locked]) => { localStorage.setItem('start', start); localStorage.setItem('locked', locked); }",
-            [start, "1" if locked else ""],
+            "([start, locked, spinner, after]) => { localStorage.setItem('start', start);"
+            " localStorage.setItem('locked', locked); localStorage.setItem('spinnerMs', spinner);"
+            " localStorage.setItem('after', after); }",
+            [start, "1" if locked else "", str(spinner_ms), after],
         )
         page.reload()
         return page
@@ -141,6 +144,45 @@ def test_create_account_returning_to_sign_in_waits_for_verification(workday):
     assert page.evaluate("window.__signedIn") == 0
     assert page.locator("#input-15").input_value() == ""
     assert SECRET not in str(result)
+
+
+def test_slow_workday_spinner_still_waits_for_verification(workday):
+    # Ameren 2026-10-26: Workday's spinner ran past 1.5 s, the engine read the empty
+    # pane as "registered", resumed, and signed in before verification (wrong_or_locked).
+    page = workday(spinner_ms=2500)
+    result = _action(page, "register")
+    assert result["ok"] is True, result
+    assert result["outcome"] == "registered"
+    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED", result
+    assert result["verifyBeforeSignIn"] is True
+    assert page.evaluate("window.__signedIn") == 0
+    assert page.locator("#input-15").input_value() == ""
+
+
+def test_slow_workday_spinner_into_application_counts_as_registered(workday):
+    page = workday(spinner_ms=2500, after="app")
+    started = time.monotonic()
+    result = _action(page, "register")
+    elapsed = time.monotonic() - started
+    assert result["ok"] is True, result
+    assert result["outcome"] == "registered"
+    assert result["status"] == ""
+    assert not result.get("verifyBeforeSignIn")
+    # The application form ends the wait at once; no extra settle on top of the spinner.
+    assert elapsed < 2.5 + 3.0, elapsed
+
+
+def test_register_on_a_sign_in_pane_follows_create_account_and_waits_for_verification(workday):
+    # KLA opens on Sign In. The Companion bridge asks for mode=register; the engine
+    # follows the pane's own Create Account link, registers, and does not sign in.
+    page = workday(start="signin", spinner_ms=2500)
+    result = _action(page, "register")
+    assert result["ok"] is True, result
+    assert result["outcome"] == "registered"
+    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED"
+    assert result["verifyBeforeSignIn"] is True
+    assert page.evaluate("window.__created") == 1
+    assert page.evaluate("window.__signedIn") == 0
 
 
 def test_cookie_banner_is_closed_before_the_account_form(workday):
