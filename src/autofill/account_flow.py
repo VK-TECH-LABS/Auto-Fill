@@ -663,8 +663,9 @@ def _wait_for_outcome(
         errors = [item for item in _errors(last, secrets) if item not in baseline]
         if errors and last.password_present and not _page_busy(page):
             now = time.monotonic()
-            persisted = pending_since is not None and pending_errors.intersection(errors)
-            if persisted and now - pending_since >= _ERROR_PERSIST_SECONDS:
+            since = pending_since
+            persisted = since is not None and bool(pending_errors.intersection(errors))
+            if since is not None and persisted and now - since >= _ERROR_PERSIST_SECONDS:
                 confirmed = _confirm_rejection(page, mode, secrets, baseline, set(errors))
                 if isinstance(confirmed, dict):
                     return confirmed
