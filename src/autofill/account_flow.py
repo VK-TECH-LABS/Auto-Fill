@@ -20,6 +20,7 @@ from autofill.login import (
     account_view,
     application_form_visible,
     clear_cookie_banner,
+    login_failure_reason,
     redact_site_error,
     score_account,
     sign_in_switch_target,
@@ -438,7 +439,32 @@ def _password_targets(snapshot: PageSnapshot, mode: str) -> tuple[Control | None
 _PANE_SUBMIT_IDS = {"createAccountSubmitButton": "Create Account", "signInSubmitButton": "Sign In"}
 
 
+# Header / utility controls that open another account dialog. They never submit
+# the pane the person sees (Workday ``utilityButtonSignIn`` opens a second Sign In
+# modal over the page).
+_UTILITY_IDS = frozenset({"utilityButtonSignIn", "utilityMenuButton"})
+
+
+def _pane_candidate(button) -> bool:
+    """A button that belongs to the account pane, not the site header or an ad."""
+    if getattr(button, "in_header", False) or getattr(button, "in_ad", False):
+        return False
+    if getattr(button, "disabled", False):
+        return False
+    return getattr(button, "automation_id", "") not in _UTILITY_IDS
+
+
 def _primary_button(snapshot: PageSnapshot, mode: str):
+    """The account pane's own Create Account / Sign In button.
+
+    RC-L1 (Nordson / Barry-Wehmiller / GE Vernova / Aptiv 2026-10-27): on a Workday
+    Sign In pane the real ``signInSubmitButton`` is aria-hidden under its
+    ``click_filter``, so the name fallback matched the header ``utilityButtonSignIn``
+    first. That click opened a second Sign In modal, nothing was submitted, the
+    pane's password box disappeared, and the press read as ``signed_in``. The
+    resume run then hit two ``click_filter`` overlays (Playwright strict-mode
+    Error, session FAILED). Header and utility buttons are never the primary.
+    """
     wanted = "createAccountSubmitButton" if mode == "register" else "signInSubmitButton"
     for button in snapshot.buttons:
         if button.automation_id == wanted:
@@ -446,9 +472,11 @@ def _primary_button(snapshot: PageSnapshot, mode: str):
     covered = _covered_pane_target(snapshot, wanted)
     prefer = _REGISTER_RE if mode == "register" else _LOGIN_RE
     for button in snapshot.buttons:
-        if prefer.search(button.name):
+        if _pane_candidate(button) and prefer.search(button.name):
             return button
     for button in snapshot.buttons:
+        if not _pane_candidate(button):
+            continue
         folded = button.name.casefold()
         if "save" in folded or "submit" in folded or "apply" in folded:
             continue
@@ -543,6 +571,11 @@ def _rejected(
 ) -> dict:
     cleaned = [redact_site_error(item, secrets) for item in errors if item][:5]
     status = "ACCOUNT_CREATION_REQUIRED" if mode == "register" else "LOGIN_FAILED"
+    if mode == "login" and login_failure_reason(snapshot) == "unverified":
+        # F8 on the saved-login path: "verify your account before you sign in" is
+        # the verify card, not a wrong password. Continue signs in once after the
+        # person opens the verification email; nothing is typed again before that.
+        status = "EMAIL_VERIFICATION_REQUIRED"
     return {
         "ok": False,
         "reason": "account_exists" if account_exists_text(snapshot) else "site_rejected",
@@ -565,13 +598,23 @@ def _challenge(snapshot: PageSnapshot, url: str, ats: str | None) -> dict:
 
 
 def _settled_mode(page, wanted: str, timeout_s: float = 4.0) -> PageSnapshot:
-    """Poll until the account pane shows ``wanted`` mode, or the timeout passes."""
+    """Poll until the account pane shows ``wanted`` mode, or the timeout passes.
+
+    RC-L3 (Aptiv 2026-10-27): right after the pane's Sign In link the old pane is
+    gone and the new one has not rendered, so only the header "Sign In" is on
+    screen and the page already scores as ``login``. The pane is settled only
+    once its password box is there too.
+    """
     deadline = time.monotonic() + timeout_s
     snapshot = extract_page(page)
-    while score_account(snapshot, page.url or "").mode != wanted and time.monotonic() < deadline:
+    while not _pane_settled(snapshot, page.url or "", wanted) and time.monotonic() < deadline:
         time.sleep(0.15)
         snapshot = extract_page(page)
     return snapshot
+
+
+def _pane_settled(snapshot: PageSnapshot, url: str, wanted: str) -> bool:
+    return score_account(snapshot, url).mode == wanted and bool(snapshot.password_present)
 
 
 def _returned_to_sign_in(snapshot: PageSnapshot, url: str) -> bool:
@@ -614,6 +657,20 @@ def _confirm_rejection(page, mode: str, secrets: list[str], baseline, seen: set[
     return [item for item in _errors(fresh, secrets) if item not in baseline and item in seen]
 
 
+_NAVIGATING_NEEDLES = ("context was destroyed", "frame was detached", "navigat")
+
+
+def _read_settling(page) -> PageSnapshot | None:
+    """``extract_page``, or None while the document is being replaced."""
+    try:
+        return extract_page(page)
+    except Exception as exc:
+        text = f"{type(exc).__name__} {exc}".casefold()
+        if "closed" not in text and any(needle in text for needle in _NAVIGATING_NEEDLES):
+            return None
+        raise
+
+
 def _pre_click_errors(page, secrets: list[str]) -> frozenset[str]:
     """Redacted alert text on screen just before the account button is pressed."""
     try:
@@ -645,7 +702,16 @@ def _wait_for_outcome(
     workday = _is_workday(ats, page.url or "")
     settle = _WORKDAY_SETTLE_SECONDS if workday else _SETTLE_SECONDS
     while True:
-        last = extract_page(page)
+        fresh = _read_settling(page)
+        if fresh is None:
+            # The press started a document navigation (a Sign In that reloads
+            # the tenant). Keep waiting; the next read sees the new page.
+            clear_since = None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+            continue
+        last = fresh
         if last.captcha_present:
             return _challenge(last, page.url or "", ats)
         if verification_present(last):
@@ -699,7 +765,9 @@ def _wait_for_outcome(
                 "account": _view(last, page.url or "", ats, "login", False, []),
             }
         if not last.password_present:
-            if mode != "register" or application_form_visible(last):
+            if application_form_visible(last):
+                return _success(mode)
+            if mode != "register" and not workday:
                 return _success(mode)
             now = time.monotonic()
             if _page_busy(page):
@@ -708,6 +776,14 @@ def _wait_for_outcome(
             else:
                 clear_since = clear_since if clear_since is not None else now
                 if now - clear_since >= settle:
+                    if mode != "register":
+                        # RC-L2: a Workday Sign In press clears the pane at once and
+                        # shows its spinner; a wrong-password or "verify your account"
+                        # banner can still come back. Report signed_in only after the
+                        # pane stayed empty and idle, so the resume run never types the
+                        # password a second time into a Sign In that failed.
+                        _logger.info("account_outcome=signed_in next=resume settle_s=%.1f", settle)
+                        return _success(mode)
                     _logger.info("account_outcome=registered next=resume settle_s=%.1f", settle)
                     return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
         else:
