@@ -92,12 +92,14 @@ Profiles are JSON. Load them from a path the caller provides or from `AUTOFILL_P
 
 ### Salary
 
-`resolve_salary` implements this order, and never returns a number below `salary_expectation`:
+`resolve_salary` never returns a number below the saved floor (`salary_expectation`, or `salary_range_min` when that is the only minimum). An empty string means the saved data does not cover the question. Auto-Fill does not invent a maximum and does not turn a minimum into a `min-min` range.
 
-1. A posted range (only if the caller passes `JobContext`) uses the midpoint.
-2. No posted range uses the floor.
-3. A range question uses the posted midpoint ±10%, or `salary_range_min` / `salary_range_max` raised to the floor.
-4. An hourly field divides the annual figure by 2080.
+1. A single salary question, including "Desired salary" and "Minimum salary", uses that floor. A posted range (only if the caller passes both ends on `JobContext`) may raise it to the midpoint.
+2. A range question is answered only when both ends are known: a saved `salary_range_max` above the floor, or a posted band that stays above the floor after the clamp. The text is `low-high` with the high end greater than the low end.
+3. A minimum alone is not a range. The control stays blank. When the field is required, the blocker is a confirm challenge so the Companion can ask the person to complete it. The payload names the related profile keys and does not include the amount. See [HTTP_SERVICE.md](docs/HTTP_SERVICE.md).
+4. An hourly field divides an answer that is already sufficient by 2080.
+
+`minimumSalary` / `salaryMin` load into `salary_range_min`. `salaryRangeMax` / `maximumSalary` load into `salary_range_max`. Those aliases do not copy a minimum into the maximum.
 
 Auto-Fill does not look up the posting. Pass `posted_salary_min` and `posted_salary_max` if the host already knows them.
 

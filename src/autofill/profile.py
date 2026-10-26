@@ -362,9 +362,30 @@ def _accept_extended_shape(data: dict) -> dict:
     merged["personal"] = personal
 
     compensation = dict(_section(merged, "compensation"))
-    if merged.get("salaryExpectation") not in (None, "") and not compensation.get("salary_expectation"):
-        compensation["salary_expectation"] = merged["salaryExpectation"]
-        merged["compensation"] = compensation
+    # A saved minimum is the floor or the low end of a range. It is not a max.
+    _compensation_aliases = {
+        "salaryExpectation": "salary_expectation",
+        "desiredSalary": "salary_expectation",
+        "desired_salary": "salary_expectation",
+        "minimumSalary": "salary_range_min",
+        "minimum_salary": "salary_range_min",
+        "salaryMin": "salary_range_min",
+        "salary_min": "salary_range_min",
+        "salaryRangeMin": "salary_range_min",
+        "salaryRangeMax": "salary_range_max",
+        "maximumSalary": "salary_range_max",
+        "maximum_salary": "salary_range_max",
+        "salaryMax": "salary_range_max",
+        "salary_max": "salary_range_max",
+    }
+    for source, dest in _compensation_aliases.items():
+        incoming = merged.get(source)
+        if incoming not in (None, "") and not compensation.get(dest):
+            compensation[dest] = incoming
+        nested = compensation.get(source)
+        if nested not in (None, "") and not compensation.get(dest):
+            compensation[dest] = nested
+    merged["compensation"] = compensation
 
     work = dict(_section(merged, "work_authorization"))
     raw_auth = merged.get("workAuthorization")

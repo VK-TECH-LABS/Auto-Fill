@@ -268,6 +268,31 @@ Profile mode keeps the earlier statuses. Resolver mode also uses the protocol 0.
 
 `stopped_before_submit` is true on every success body. `loginStatus` is `NOT_REQUIRED`, `LOGIN_REQUIRED`, `AUTHENTICATED`, `LOGIN_FAILED`, or `CAPTCHA_REQUIRED` after a run.
 
+## Related salary questions
+
+A salary question is `SALARY_EXPECTATION` when the label is a salary, pay, compensation, or wage expectation, including "desired salary range", "salary range", "expected pay", and "minimum salary". Exact equality with the saved label is not required.
+
+On each resolver step, a salary question adds two fields the Companion may ignore:
+
+| Field | Meaning |
+| --- | --- |
+| `salaryShape` | `single`, `minimum`, `maximum`, or `range`. |
+| `relatedFields` | `salary_expectation`, `salary_range_min`, `salary_range_max`. Names only. |
+
+Return a value with confidence `HIGH` only when it covers that shape. A single figure covers `single` and `minimum`. `maximum` needs the saved maximum. `range` needs both ends, written `low-high`, with the high end greater than the low end. A minimum alone is not a range. Do not invent a maximum, and do not return `min-min`. When the profile only has a minimum, omit the answer or send confidence below `HIGH`. Auto-Fill will not write a single number into a range field.
+
+The status blocker for that case adds these fields. They are omitted on every other blocker. Amounts are not included.
+
+| Field | Meaning |
+| --- | --- |
+| `challenge` | `confirm`. The person confirms or completes the related salary answer. |
+| `confidence` | `LOW`. |
+| `salaryShape` | The shape that was not covered. `range` is the desired-salary-range case. |
+| `relatedFields` | Profile mode lists the keys that have a saved value. Resolver mode lists the three compensation keys above so the Companion can read them. |
+| `reason` | `salary_range_incomplete` when the question is a range. `salary_needs_confirm` otherwise. |
+
+`kind` stays `MISSING_PROFILE_VALUE` or `QUESTION`. `manualQuestions` is still `{intent, text}` only. The person answers through the existing `/answer` route. Final Submit stays human, and this does not solve a CAPTCHA.
+
 ## Container
 
 The Dockerfile in the repository root builds an image that contains this package and Chromium. It does not contain a service token. Pass `AUTOFILL_SERVICE_TOKEN` at runtime. The image sets `AUTOFILL_RUN_BROWSER=1` and `AUTOFILL_BROWSER_NO_SANDBOX=1`.

@@ -66,6 +66,7 @@ from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice, dismiss_combobox
+from autofill.salary import SALARY_RELATED_FIELDS, salary_fill_allowed, salary_shape
 
 logger = logging.getLogger("autofill.stepfill")
 
@@ -297,6 +298,10 @@ class _Ask:
         }
         if token:
             body["fieldToken"] = token
+        if self.match is not None and self.match.intent == "SALARY_EXPECTATION":
+            # Related compensation keys. Values stay on the Companion side.
+            body["salaryShape"] = salary_shape(text)
+            body["relatedFields"] = list(SALARY_RELATED_FIELDS)
         return body
 
 
@@ -2874,6 +2879,16 @@ def _apply_resume(
         _skip(control, outcome, "resume.file", "Resume file was not attached.")
 
 
+def _salary_answer_ok(match: IntentMatch, answer: ResolverAnswer | None) -> bool:
+    """True when a resolver salary answer is HIGH and covers the question shape."""
+    if answer is None:
+        return False
+    if not (may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)):
+        return False
+    value = answer.value or (answer.values[0] if answer.values else "")
+    return salary_fill_allowed(match.text, value, confidence=answer.confidence)
+
+
 def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
     """TileArc already matched this exact question text to a saved answer."""
     return match.intent is None and answer.confidence == "HIGH" and answer.source == "saved_answer"
@@ -2899,6 +2914,21 @@ def _apply_question(
             match,
             blocking=any(item.required for item in ask.controls),
             controls=ask.controls,
+        )
+        return
+    if match.intent == "SALARY_EXPECTATION" and not _salary_answer_ok(match, answer):
+        # A minimum, or a HIGH single number, is not a range. Ask the person.
+        shape = salary_shape(match.text)
+        _manual(
+            outcome,
+            match,
+            blocking=_question_blocks(ask.controls, answer),
+            controls=ask.controls,
+            challenge="confirm",
+            related_fields=SALARY_RELATED_FIELDS,
+            salary_shape_name=shape,
+            answer_confidence="LOW",
+            challenge_reason="salary_range_incomplete" if shape == "range" else "salary_needs_confirm",
         )
         return
     if answer is None or not (
@@ -3232,6 +3262,11 @@ def _manual(
     kind: str | None = None,
     field_key: str | None = None,
     option_labels: list[str] | None = None,
+    challenge: str = "",
+    related_fields: tuple[str, ...] = (),
+    salary_shape_name: str = "",
+    answer_confidence: str = "",
+    challenge_reason: str = "",
 ) -> None:
     if kind:
         kind = canonical_blocker_kind(kind)
@@ -3266,6 +3301,13 @@ def _manual(
         "selector": primary.selector if primary is not None else "",
         "kind": _item_kind(match.intent, kind, field_key),
     }
+    if challenge:
+        # Names only. The saved salary amount stays off this payload.
+        entry["challenge"] = challenge
+        entry["relatedFields"] = [name for name in related_fields if name]
+        entry["salaryShape"] = salary_shape_name
+        entry["confidence"] = answer_confidence or "LOW"
+        entry["reason"] = challenge_reason
     if not any(_same_question(item, entry) for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
@@ -4120,7 +4162,7 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
             kind = "QUESTION"
     digest = _question_digest(text, primary) or None
     multi = len(controls) > 1 and any(item.kind == "checkbox" for item in controls)
-    return {
+    result = {
         "intent": intent,
         "text": text,
         "blocking": True,
@@ -4133,6 +4175,14 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         "selector": primary.selector,
         "kind": kind,
     }
+    if mapped is not None and mapped.challenge == "confirm":
+        # The profile has a related salary value that does not cover this question.
+        result["challenge"] = "confirm"
+        result["confidence"] = "LOW"
+        result["relatedFields"] = list(mapped.related_fields)
+        result["salaryShape"] = salary_shape(text)
+        result["reason"] = mapped.reason
+    return result
 
 
 def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4162,6 +4212,10 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
             chosen["kind"] = gap.get("kind")
         if not chosen.get("options") and gap.get("options"):
             chosen["options"] = list(gap.get("options") or [])
+        if gap.get("challenge") and not chosen.get("challenge"):
+            for hint in ("challenge", "confidence", "relatedFields", "salaryShape", "reason"):
+                if gap.get(hint):
+                    chosen[hint] = gap.get(hint)
         merged.append(chosen)
     return merged
 

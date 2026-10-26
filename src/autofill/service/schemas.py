@@ -281,6 +281,28 @@ class BlockingOut(BaseModel):
     answer_type: str = Field(default="text", alias="answerType")
     options: list[str] = Field(default_factory=list)
     required: bool = False
+    challenge: str = ""
+    confidence: str = ""
+    related_fields: list[str] = Field(default_factory=list, alias="relatedFields")
+    salary_shape: str = Field(default="", alias="salaryShape")
+    reason: str = ""
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_salary_hint(self, handler):
+        """Salary confirm fields are omitted when this blocker is not one."""
+        data = handler(self)
+        for key in (
+            "challenge",
+            "confidence",
+            "relatedFields",
+            "related_fields",
+            "salaryShape",
+            "salary_shape",
+            "reason",
+        ):
+            if not data.get(key):
+                data.pop(key, None)
+        return data
 
 
 class AnswerIn(BaseModel):

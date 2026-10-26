@@ -23,7 +23,7 @@ from autofill.answers import match_answer
 from autofill.dates import format_for_control
 from autofill.models import Control, JobContext, MappedField, Option
 from autofill.profile import CandidateProfile
-from autofill.salary import resolve_salary
+from autofill.salary import SalaryAssessment, assess_salary, salary_shape, salary_value_covers
 
 _DECLINE_HINTS = ("decline", "prefer not", "do not wish", "not to say", "not to answer")
 _LEGAL_RE = re.compile(
@@ -116,7 +116,14 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("work_permit_type", _compile((r"\bwork permit\b", r"\bvisa status\b"))),
     _Rule(
         "salary_range",
-        _compile((r"\bsalary range\b", r"\bcompensation range\b", r"\bpay range\b")),
+        _compile(
+            (
+                r"\bsalary range\b",
+                r"\bcompensation range\b",
+                r"\bpay range\b",
+                r"\bwage range\b",
+            )
+        ),
     ),
     _Rule(
         "salary",
@@ -126,8 +133,14 @@ _RULES: tuple[_Rule, ...] = (
                 r"\bcompensation\b",
                 r"\bdesired pay\b",
                 r"\bpay expectation\b",
+                r"\bexpected pay\b",
+                r"\bbase pay\b",
+                r"\btarget pay\b",
+                r"\bpay rate\b",
                 r"\bhourly rate\b",
                 r"\bper hour\b",
+                r"\bwage expectation\b",
+                r"\bremuneration\b",
             )
         ),
     ),
@@ -612,6 +625,93 @@ def _row(items: list, cursor: MapCursor | None, kind: str):
     return items[index]
 
 
+def _salary_question_shape(control: Control, key: str) -> str:
+    """Range, minimum, maximum, or a single figure. The rule key breaks a tie.
+
+    The shape comes from the label. A selector such as ``#x`` is not part of
+    the question, so it cannot turn "Salary range minimum" into a full range.
+    """
+    label = " ".join(
+        part
+        for part in (control.label, control.aria_label, control.placeholder, control.prompt)
+        if part
+    )
+    shape = salary_shape(label or haystack(control))
+    if key == "salary_range" and shape == "single":
+        return "range"
+    return shape
+
+
+def _salary_decision(
+    control: Control,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    key: str,
+) -> SalaryAssessment:
+    blob = haystack(control)
+    return assess_salary(
+        profile.compensation,
+        shape=_salary_question_shape(control, key),
+        posted_min=job.posted_salary_min if job else None,
+        posted_max=job.posted_salary_max if job else None,
+        hourly="hourly" in blob or "per hour" in blob,
+    )
+
+
+def _explicit_salary(control: Control, profile: CandidateProfile, shape: str) -> MappedField | None:
+    """An explicit answer for this question, when that answer covers the shape.
+
+    A saved minimum does not satisfy a range question through this path.
+    """
+    approved = _explicit_answer(control, profile)
+    if approved is None or approved.action == "unanswered":
+        return None
+    if not salary_value_covers(approved.text, shape):
+        return None
+    return approved
+
+
+def _map_salary(
+    control: Control,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    key: str,
+) -> MappedField:
+    """Fill a salary question, or ask a person to confirm an incomplete one."""
+    shape = _salary_question_shape(control, key)
+    try:
+        decision = _salary_decision(control, profile, job, key)
+    except ValueError as exc:
+        return MappedField(key=key, action="unanswered", reason=str(exc))
+    if decision.status == "answer":
+        mapped = _from_text(control, key, decision.value)
+        if mapped.action == "unanswered":
+            return mapped
+        mapped.field_class = "PROFILE_FIELD"
+        mapped.confidence = "high"
+        mapped.related_fields = decision.related_fields
+        return mapped
+    explicit = _explicit_salary(control, profile, shape)
+    if explicit is not None:
+        return explicit
+    if decision.status == "confirm":
+        return MappedField(
+            key=key,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            confidence="low",
+            reason=decision.reason,
+            related_fields=decision.related_fields,
+            challenge="confirm",
+        )
+    return MappedField(
+        key=key,
+        action="unanswered",
+        field_class="MANUAL_REVIEW_FIELD",
+        reason="Profile has no salary expectation.",
+    )
+
+
 def _profile_text(
     profile: CandidateProfile,
     key: str,
@@ -677,16 +777,10 @@ def _profile_text(
     if key == "available_for_contract":
         return profile.availability.available_for_contract
     if key in {"salary", "salary_range"}:
-        posted_min = job.posted_salary_min if job else None
-        posted_max = job.posted_salary_max if job else None
-        blob = haystack(control)
-        return resolve_salary(
-            profile.compensation,
-            posted_min=posted_min,
-            posted_max=posted_max,
-            hourly="hourly" in blob or "per hour" in blob,
-            as_range=key == "salary_range" or "range" in blob,
-        )
+        decision = _salary_decision(control, profile, job, key)
+        if decision.status != "answer":
+            return ""
+        return decision.value
     if key == "years_of_experience_total":
         return profile.experience.years_of_experience_total
     if key == "education_level":
@@ -1128,13 +1222,8 @@ def map_field(
             )
         return MappedField(key=key, action="upload", text=cover_letter_path, field_class="PROFILE_FIELD")
 
-    if key in {"salary", "salary_range"} and not profile.compensation.salary_expectation:
-        return MappedField(
-            key=key,
-            action="unanswered",
-            field_class="MANUAL_REVIEW_FIELD",
-            reason="Profile has no salary expectation.",
-        )
+    if key in {"salary", "salary_range"}:
+        return _map_salary(control, profile, job, key)
     # An explicit approved answer beats a screening.* value for the same question.
     # Other profile fields stay as mapped. A question with no approved answer is unchanged.
     if key in _SCREENING_KEYS:

@@ -892,7 +892,7 @@ def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     question_id = item.get("questionId") or None
     question_hash = item.get("questionHash") or question_id
-    return {
+    published: dict[str, Any] = {
         "kind": canonical_blocker_kind(item.get("kind") or "QUESTION"),
         "questionId": question_id,
         "questionHash": question_hash,
@@ -902,6 +902,21 @@ def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
         "options": [str(option) for option in item.get("options") or []],
         "required": bool(item.get("required")),
     }
+    challenge = str(item.get("challenge") or "")
+    if challenge:
+        # Confirm/complete hint. Salary amounts are not part of this object.
+        published["challenge"] = challenge
+        published["confidence"] = str(item.get("confidence") or "LOW")
+        related = [str(name) for name in item.get("relatedFields") or [] if str(name).strip()]
+        if related:
+            published["relatedFields"] = related
+        shape = str(item.get("salaryShape") or "")
+        if shape:
+            published["salaryShape"] = shape
+        reason = str(item.get("reason") or "")
+        if reason:
+            published["reason"] = reason
+    return published
 
 
 def _apply_status_stage(state: RunState, status: str) -> None:
