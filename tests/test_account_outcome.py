@@ -19,10 +19,13 @@ import logging
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 
 from autofill.account_flow import run_account_action
 from autofill.engine import Status
+from autofill.service.app import create_app
+from test_protocol_070 import AUTH, TOKEN, _body, _Runner
 
 FIXTURES = Path(__file__).parent / "fixtures"
 HOST = "example.wd5.myworkdayjobs.com"
@@ -158,3 +161,89 @@ def test_application_page_reports_application_visible(workday):
     assert _register(page)["outcome"] == "registered"
     again = _register(page)
     assert again == {"ok": False, "reason": "not_at_account_step", "applicationVisible": True}
+
+
+# --- F6: service recovery ---------------------------------------------------
+
+
+class _StuckRunner(_Runner):
+    """Session sits at ACCOUNT_CREATION_REQUIRED; the page already shows the form."""
+
+    def __init__(self, report: dict) -> None:
+        super().__init__()
+        self.runs = 0
+        self.report = report
+        self.after_status = ""
+
+    def run(self, request):
+        self.runs += 1
+        result = super().run(request)
+        if self.runs > 1 and self.after_status:
+            result.status = self.after_status
+            result.current_step = self.after_status
+        return result
+
+    def account_action(self, session_id: str, payload: dict) -> dict:
+        return dict(self.report)
+
+
+def _start(client: TestClient) -> str:
+    created = client.post(
+        "/v1/sessions", headers=AUTH, json=_body("0.7.0", "https://boards.greenhouse.io/example/account")
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={"candidateRef": "ref-a"})
+    assert started.json()["status"] == Status.ACCOUNT_CREATION_REQUIRED
+    return session_id
+
+
+def _credentials(client: TestClient, session_id: str, mode: str = "register"):
+    return client.post(
+        f"/v1/sessions/{session_id}/credentials",
+        headers=AUTH,
+        json={
+            "candidateRef": "ref-a",
+            "email": "person@example.com",
+            "password": SECRET,
+            "confirmPassword": SECRET,
+            "mode": mode,
+        },
+    )
+
+
+def test_stuck_account_step_with_application_visible_resumes(caplog):
+    caplog.set_level(logging.INFO)
+    runner = _StuckRunner({"ok": False, "reason": "not_at_account_step", "applicationVisible": True})
+    runner.after_status = Status.MANUAL_ANSWER_REQUIRED
+    app = create_app(token=TOKEN, runner=runner, run_browser=False)
+    with TestClient(app) as client:
+        session_id = _start(client)
+        stored = _credentials(client, session_id)
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["outcome"] == "registered"
+        assert runner.runs == 2
+        assert stored.json()["status"] == Status.MANUAL_ANSWER_REQUIRED
+        assert "account_recovered=true" in caplog.text
+        assert SECRET not in stored.text and SECRET not in caplog.text
+
+
+def test_not_at_account_step_without_application_is_still_409():
+    runner = _StuckRunner({"ok": False, "reason": "not_at_account_step"})
+    app = create_app(token=TOKEN, runner=runner, run_browser=False)
+    with TestClient(app) as client:
+        session_id = _start(client)
+        stored = _credentials(client, session_id)
+        assert stored.status_code == 409, stored.text
+        assert stored.json()["detail"] == {"reason": "not_at_account_step"}
+        assert runner.runs == 1
+
+
+def test_site_rejected_is_unchanged():
+    runner = _StuckRunner({"ok": False, "reason": "site_rejected", "siteErrors": ["Bad"], "account": None})
+    app = create_app(token=TOKEN, runner=runner, run_browser=False)
+    with TestClient(app) as client:
+        session_id = _start(client)
+        stored = _credentials(client, session_id)
+        assert stored.status_code == 422, stored.text
+        assert runner.runs == 1
