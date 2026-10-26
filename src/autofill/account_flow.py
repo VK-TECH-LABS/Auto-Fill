@@ -49,6 +49,16 @@ _SETTLE_SECONDS = 1.5
 # Workday an empty pane must stay empty, with no spinner, this long before it counts
 # as registered. An application form still ends the wait at once.
 _WORKDAY_SETTLE_SECONDS = 4.0
+# RC-S1 (Nordson / Barry-Wehmiller 2026-10-27, after #77): a Workday Sign In pane
+# opened from Create Account ignores its Sign In press for about half a second
+# after it renders. The engine typed the saved login and pressed at once, the site
+# sent nothing, and the wait ended ``pending`` with the password still in the box.
+# After a pane switch the new pane must stay rendered this long before typing.
+_PANE_DWELL_SECONDS = 1.0
+# A press that sent no request and left the pane exactly as it was is pressed once
+# more after this long. Nothing reached the employer, so the retry cannot count as
+# a second sign-in attempt or create a second account.
+_PRESS_CONFIRM_SECONDS = 3.0
 _BUSY_JS = """() => {
   const nodes = document.querySelectorAll(
     "[data-automation-id*='loadingSpinner' i], [data-automation-id*='spinner' i], [aria-busy='true']");
@@ -149,7 +159,7 @@ def _perform_account_action(
             activate_account_switch(page, target.selector, target.name)
         except SubmitBlockedError:
             return {"ok": False, "reason": "mode_mismatch", "detected": "register"}
-        snapshot = _settled_mode(page, "login")
+        snapshot = _settled_mode(page, "login", dwell_s=_PANE_DWELL_SECONDS)
         scored = score_account(snapshot, page.url or "")
         if scored.mode != "login":
             return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "register"}
@@ -211,13 +221,7 @@ def _perform_account_action(
     # from an earlier attempt) says nothing about what the press did.
     baseline = _pre_click_errors(page, secrets)
     try:
-        activate_account(
-            page,
-            button.selector,
-            button.name,
-            control_type=button.control_type,
-            at_point=_covered_pane_button(snapshot, button),
-        )
+        _press_account_button(page, snapshot, button, mode=mode, secrets=secrets, baseline=baseline)
     except SubmitBlockedError:
         rejected = _rejected(
             snapshot,
@@ -597,20 +601,143 @@ def _challenge(snapshot: PageSnapshot, url: str, ats: str | None) -> dict:
     }
 
 
-def _settled_mode(page, wanted: str, timeout_s: float = 4.0) -> PageSnapshot:
+def _settled_mode(page, wanted: str, timeout_s: float = 4.0, *, dwell_s: float = 0.0) -> PageSnapshot:
     """Poll until the account pane shows ``wanted`` mode, or the timeout passes.
 
     RC-L3 (Aptiv 2026-10-27): right after the pane's Sign In link the old pane is
     gone and the new one has not rendered, so only the header "Sign In" is on
     screen and the page already scores as ``login``. The pane is settled only
     once its password box is there too.
+
+    RC-S1: with ``dwell_s`` the settled pane must also stay settled that long, so
+    the press is not made while Workday is still wiring the new pane.
     """
     deadline = time.monotonic() + timeout_s
     snapshot = extract_page(page)
     while not _pane_settled(snapshot, page.url or "", wanted) and time.monotonic() < deadline:
         time.sleep(0.15)
         snapshot = extract_page(page)
-    return snapshot
+    if dwell_s <= 0 or not _pane_settled(snapshot, page.url or "", wanted):
+        return snapshot
+    _pause(page, dwell_s)
+    again = extract_page(page)
+    return again if _pane_settled(again, page.url or "", wanted) else snapshot
+
+
+def _pause(page, seconds: float) -> None:
+    """Wait while still letting Playwright deliver page events (requests)."""
+    wait = getattr(page, "wait_for_timeout", None)
+    if callable(wait):
+        try:
+            wait(seconds * 1000)
+            return
+        except Exception:
+            pass
+    time.sleep(seconds)
+
+
+class _RequestWatch:
+    """Counts non-GET requests and document loads the page starts.
+
+    Disabled (``active`` False) on page objects without ``on`` / ``remove_listener``.
+    """
+
+    def __init__(self, page) -> None:
+        self.count = 0
+        self._page = page
+        self.active = False
+        on = getattr(page, "on", None)
+        if callable(on) and callable(getattr(page, "remove_listener", None)):
+            try:
+                on("request", self._seen)
+                self.active = True
+            except Exception:
+                self.active = False
+
+    def _seen(self, request) -> None:
+        try:
+            method = str(getattr(request, "method", "") or "").upper()
+            kind = str(getattr(request, "resource_type", "") or "")
+        except Exception:
+            method, kind = "", ""
+        if method != "GET" or kind == "document":
+            self.count += 1
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        try:
+            self._page.remove_listener("request", self._seen)
+        except Exception:
+            pass
+        self.active = False
+
+
+def _pane_unchanged(page, before: PageSnapshot, url: str, mode: str, secrets: list[str], baseline) -> bool:
+    """The press did nothing visible: same pane, password still there, no new alert."""
+    if _page_busy(page):
+        return False
+    try:
+        now = extract_page(page)
+    except Exception:
+        return False
+    if (page.url or "") != url or not now.password_present or now.captcha_present:
+        return False
+    if verification_present(now) or application_form_visible(now) or account_exists_text(now):
+        return False
+    if score_account(now, page.url or "").mode not in {mode, score_account(before, url).mode}:
+        return False
+    return not [item for item in _errors(now, secrets) if item not in baseline]
+
+
+def _press_account_button(page, snapshot: PageSnapshot, button, *, mode: str, secrets: list[str], baseline) -> None:
+    """Press the pane button; press once more only if the first press sent nothing.
+
+    RC-S1 (Nordson / Barry-Wehmiller 2026-10-27): a press the site ignored left the
+    typed saved login in a Sign In pane that never submitted. A second press is made
+    only when the page started no request (no POST, no navigation) and still shows
+    the same pane with no new alert, so nothing reached the employer the first time.
+    Never more than two presses.
+    """
+    url = page.url or ""
+    watch = _RequestWatch(page)
+    try:
+        activate_account(
+            page,
+            button.selector,
+            button.name,
+            control_type=button.control_type,
+            at_point=_covered_pane_button(snapshot, button),
+        )
+        if not watch.active:
+            return
+        deadline = time.monotonic() + _PRESS_CONFIRM_SECONDS
+        while time.monotonic() < deadline:
+            _pause(page, 0.25)
+            if watch.count:
+                return
+            if not _pane_unchanged(page, snapshot, url, mode, secrets, baseline):
+                return
+        if watch.count:
+            return
+        fresh = extract_page(page)
+        retry = _primary_button(fresh, mode)
+        if retry is None:
+            return
+        _logger.info("account_press_retry mode=%s reason=no_request", mode)
+        try:
+            activate_account(
+                page,
+                retry.selector,
+                retry.name,
+                control_type=retry.control_type,
+                at_point=_covered_pane_button(fresh, retry),
+            )
+        except SubmitBlockedError:
+            # The first press was allowed; the outcome wait reports what the page shows.
+            _logger.info("account_press_retry mode=%s result=blocked", mode)
+    finally:
+        watch.close()
 
 
 def _pane_settled(snapshot: PageSnapshot, url: str, wanted: str) -> bool:
