@@ -281,6 +281,17 @@ On each resolver step, a salary question adds two fields the Companion may ignor
 
 Return a value with confidence `HIGH` only when it covers that shape. A single figure covers `single` and `minimum`. `maximum` needs the saved maximum. `range` needs both ends, written `low-high`, with the high end greater than the low end. A minimum alone is not a range. Do not invent a maximum, and do not return `min-min`. When the profile only has a minimum, omit the answer or send confidence below `HIGH`. Auto-Fill will not write a single number into a range field.
 
+Profile mode fills a `single` or `minimum` expected-salary question from `jobContext.postedSalaryMin` / `postedSalaryMax` when those name a salary. One listed figure is that figure. A posted band (max above min) uses its midpoint, then:
+
+| Job-description figure | Expected salary |
+| --- | --- |
+| At or below $100,000 | That amount |
+| Above $100,000 and below $130,000 | That amount minus $5,000 |
+| At or above $130,000 | That amount minus $10,000 |
+| Not mentioned, and the profile has no salary floor | $90,000 |
+
+A saved `salary_expectation` or `salary_range_min` is still the answer when the posting is silent. The $90,000 default is one number. It is not written into a range, and a single posted figure is not copied into both ends. A range still needs both ends from the saved maximum or from a posted band. The posted-band range stays the midpoint widened by 10 percent and clamped up to the profile floor.
+
 The status blocker for that case adds these fields. They are omitted on every other blocker. Amounts are not included.
 
 | Field | Meaning |

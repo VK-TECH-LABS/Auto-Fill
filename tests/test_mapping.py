@@ -1,4 +1,7 @@
-"""Field mapping never invents an answer the profile did not give."""
+"""Field mapping uses the profile, and the job-description rules for expected pay.
+
+It does not invent work authorization, a salary-range maximum, or an unrelated answer.
+"""
 
 from pathlib import Path
 
@@ -250,7 +253,7 @@ def test_skill_question_uses_only_listed_skills():
     assert years.key != "years_of_experience_total"
 
 
-def test_salary_uses_profile_floor_and_posted_midpoint():
+def test_salary_uses_profile_floor_and_jd_expectation():
     filled = profile()
     base = map_field(control("Desired salary"), filled)
     assert base.text == "85000"
@@ -259,13 +262,14 @@ def test_salary_uses_profile_floor_and_posted_midpoint():
         filled,
         job=JobContext(posted_salary_min=100000, posted_salary_max=140000),
     )
-    assert posted.text == "120000"
-    below_floor = map_field(
+    # Midpoint 120000 is between 100000 and 130000, so the fill is 115000.
+    assert posted.text == "115000"
+    posted_low = map_field(
         control("Desired salary"),
         filled,
         job=JobContext(posted_salary_min=40000, posted_salary_max=60000),
     )
-    assert below_floor.text == "85000"
+    assert posted_low.text == "50000"
     hourly = map_field(control("Hourly rate"), filled)
     assert hourly.text == str(85000 // 2080)
     ranged = map_field(control("Salary range"), filled)
@@ -279,6 +283,19 @@ def _minimum_only() -> CandidateProfile:
             "compensation": {"salary_expectation": "120000"},
         }
     )
+
+
+def test_jd_single_figure_fills_expected_salary_and_not_a_range():
+    person = _minimum_only()
+    job = JobContext(posted_salary_min=150000)
+    single = map_field(control("Desired salary"), person, job=job)
+    assert single.action == "fill"
+    assert single.text == "140000"
+    ranged = map_field(control("What is your desired salary range?"), person, job=job)
+    assert ranged.action == "unanswered"
+    assert ranged.challenge == "confirm"
+    assert ranged.text == ""
+    assert ranged.text != "140000-140000"
 
 
 def test_related_salary_labels_use_a_saved_minimum():

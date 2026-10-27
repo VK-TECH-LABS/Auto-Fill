@@ -15,7 +15,7 @@ Auto-Fill is [AGPL-3.0-only](LICENSE). The form-filling behavior is adapted from
 | Profile sections ApplyPilot fills from (identity, work authorization, availability, compensation, experience, voluntary EEO), plus employment, education, internships, projects, and explicit answers | Job scraping, search, scoring, resume tailoring, cover-letter generation, dashboards |
 | Label-to-profile mapping, selects, radios, checkboxes, dates, comboboxes, honeypots | CapSolver and every other CAPTCHA or challenge solver. A widget stops the run. |
 | Multi-page Next/Continue/Save and Continue for Workday, Oracle Candidate Experience, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Taleo, SuccessFactors, and Dayforce | Automatic final Submit. ApplyPilot submits. This package cannot. |
-| Salary floor, posted midpoint, range, and hourly (/ 2080), only from an explicit profile value | ApplyPilot's hardcoded $110k senior-title floor |
+| Salary from a posted figure (single number or band midpoint), profile floor when the posting is silent, $90,000 when both are silent, posted range, and hourly (/ 2080) | ApplyPilot's hardcoded $110k senior-title floor |
 | Manual-ATS host `ibegin.tcsapps.com` and the SSO domains ApplyPilot refuses | Stored passwords, account creation, inbox codes, SSO login. A runtime `CredentialProvider` may sign in to an existing ATS account. |
 
 ApplyPilot's apply step is an agent prompt (`src/applypilot/apply/prompt.py`) driving a browser, not a deterministic filler. Auto-Fill is a Python library with an explicit mapper and a Playwright fill routine. It does not copy that prompt.
@@ -80,24 +80,30 @@ Profiles are JSON. Load them from a path the caller provides or from `AUTOFILL_P
 | `personal` | `full_name` (required), `email` (required), `preferred_name`, `phone`, `address`, `city`, `province_state`, `country`, `postal_code`, `linkedin_url`, `github_url`, `portfolio_url`, `website_url` | A "Name" field gets the preferred first name plus the legal last name when they differ. "Legal name" gets `full_name`. Phone fields that ask for digits or a national number get digits only. |
 | `work_authorization` | `legally_authorized_to_work`, `require_sponsorship`, `work_permit_type` | Empty means the control is left unanswered. The mapper does not assume "Yes". |
 | `availability` | `earliest_start_date`, `available_for_full_time`, `available_for_contract` | A value like `Immediately` is not written into `<input type="date">`. |
-| `compensation` | `salary_expectation`, `salary_currency`, `salary_range_min`, `salary_range_max`, `currency_conversion_note` | The expectation is the floor. See salary below. |
+| `compensation` | `salary_expectation`, `salary_currency`, `salary_range_min`, `salary_range_max`, `currency_conversion_note` | Saved expectation is the floor when the posting is silent. See salary below. |
 | `experience` | `years_of_experience_total`, `education_level`, `current_job_title`, `current_company`, `target_role` | "Years of experience with Kubernetes" is not treated as total years. |
 | `skills` | list of strings | "Do you have experience with Python?" is Yes only when Python is in this list. Otherwise it is left for a person. |
 | `screening` | `age_18_or_older`, `willing_background_check`, `felony_conviction`, `previously_employed_here`, `how_heard` | Empty stays empty. ApplyPilot hardcoded several of these; Auto-Fill will not. |
 | `eeo_voluntary` | `gender`, `race_ethnicity`, `veteran_status`, `disability_status` | Never filled, in any mode. A person answers them. They are listed as demographic questions and left blank. |
 | `documents` | `cover_letter_text` | Used only when the caller also passes that text into the API. File uploads are separate arguments. |
-| Extended | `candidateId`, `basics`, `address`, `employment[]`, `education[]`, `internships[]`, `projects[]`, `applicationAnswers[]`, `workAuthorization`, `sponsorship`, `salaryExpectation` | Folded into the sections above. `personal` wins when both `basics` and `personal` set the same key. Unknown questions stay blank. Salary and work authorization are never invented. |
+| Extended | `candidateId`, `basics`, `address`, `employment[]`, `education[]`, `internships[]`, `projects[]`, `applicationAnswers[]`, `workAuthorization`, `sponsorship`, `salaryExpectation` | Folded into the sections above. `personal` wins when both `basics` and `personal` set the same key. Unknown questions stay blank. Work authorization is never invented. A salary range maximum is never invented. |
 
 `currency_conversion_note` and `target_role` are stored for a host app. The filler does not convert currencies or generate prose from the target role.
 
 ### Salary
 
-`resolve_salary` never returns a number below the saved floor (`salary_expectation`, or `salary_range_min` when that is the only minimum). An empty string means the saved data does not cover the question. Auto-Fill does not invent a maximum and does not turn a minimum into a `min-min` range.
+A single or minimum expected-salary question uses the salary on the job description when `posted_salary_min` / `posted_salary_max` name one. One listed number (one end, or both ends equal) is that number. A posted band uses its midpoint, the same figure a single question already took from a posted range, and then:
 
-1. A single salary question, including "Desired salary" and "Minimum salary", uses that floor. A posted range (only if the caller passes both ends on `JobContext`) may raise it to the midpoint.
-2. A range question is answered only when both ends are known: a saved `salary_range_max` above the floor, or a posted band that stays above the floor after the clamp. The text is `low-high` with the high end greater than the low end.
-3. A minimum alone is not a range. The control stays blank. When the field is required, the blocker is a confirm challenge so the Companion can ask the person to complete it. The payload names the related profile keys and does not include the amount. See [HTTP_SERVICE.md](docs/HTTP_SERVICE.md).
-4. An hourly field divides an answer that is already sufficient by 2080.
+1. At or below $100,000, use that amount.
+2. Above $100,000 and below $130,000, subtract $5,000.
+3. At or above $130,000, subtract $10,000.
+4. When the posting does not mention a salary, use the saved floor (`salary_expectation`, or `salary_range_min` when that is the only minimum). When the profile has no salary either, use $90,000.
+
+That JD amount is the single or minimum answer even when it is under the saved floor. An empty string means a range or a maximum the saved data does not cover. Auto-Fill does not invent a maximum and does not turn a minimum into a `min-min` range.
+
+1. A range question is answered only when both ends are known: a saved `salary_range_max` above the floor, or a posted band that stays above the floor after the clamp. The posted-band text is still the midpoint widened by 10 percent (`low-high`, high greater than low). A single JD figure is not the missing end of that range.
+2. A minimum alone is not a range. The control stays blank. When the field is required, the blocker is a confirm challenge so the Companion can ask the person to complete it. The payload names the related profile keys and does not include the amount. See [HTTP_SERVICE.md](docs/HTTP_SERVICE.md).
+3. An hourly field divides an answer that is already sufficient by 2080.
 
 `minimumSalary` / `salaryMin` load into `salary_range_min`. `salaryRangeMax` / `maximumSalary` load into `salary_range_max`. Those aliases do not copy a minimum into the maximum.
 

@@ -1,14 +1,28 @@
-"""Compensation answers derived from the candidate profile.
+"""Compensation answers derived from the candidate profile and the job posting.
 
-The decision order follows ApplyPilot's salary section in
-``src/applypilot/apply/prompt.py`` (floor, posted midpoint, range around
-the midpoint, hourly = annual / 2080). ApplyPilot also hardcoded a senior-title
-floor of $110,000. That number is a personal constant, not a general rule, so
-it is not reproduced here. The floor is the profile's ``salary_expectation``,
-or ``salary_range_min`` when that is the only saved minimum.
+A single or minimum expected-salary question uses the job-description figure
+when one is known. One listed number is that number. A posted band (the high
+end above the low end) uses its midpoint, the same figure a single question
+already took from a posted range. That figure is then adjusted:
 
-A range is answered only when both ends are already known. A minimum by itself
-is not a range: nothing here invents a maximum or a ``min-min`` band.
+- at or below $100,000, use it
+- above $100,000 and below $130,000, subtract $5,000
+- at or above $130,000, subtract $10,000
+
+When the posting does not mention a salary, the floor is the profile's
+``salary_expectation``, or ``salary_range_min`` when that is the only saved
+minimum. When neither the posting nor the profile has a salary, a single or
+minimum question defaults to $90,000.
+
+ApplyPilot hardcoded a senior-title floor of $110,000. That number is a
+personal constant, not a general rule, so it is not reproduced here.
+
+A range is answered only when both ends are already known. The posted-band
+range stays the midpoint widened by 10 percent and clamped up to the profile
+floor. A minimum by itself is not a range: nothing here invents a maximum or
+a ``min-min`` band. A job-description figure is one number and is not used as
+the missing end of a range. Hourly answers divide a sufficient annual figure
+by 2080.
 """
 
 from __future__ import annotations
@@ -19,6 +33,16 @@ from dataclasses import dataclass
 from autofill.profile import Compensation
 
 HOURS_PER_YEAR = 2080
+
+# Expected salary taken from the job description. A listed figure at or below
+# the first threshold is used as-is. Above it and below the high threshold,
+# subtract the near discount. At or above the high threshold, subtract the
+# high discount. No posting and no saved floor uses the unknown default.
+JD_SALARY_SAME_THROUGH = 100_000
+JD_SALARY_HIGH_FROM = 130_000
+JD_SALARY_NEAR_DISCOUNT = 5_000
+JD_SALARY_HIGH_DISCOUNT = 10_000
+JD_SALARY_UNKNOWN = 90_000
 
 # Profile keys a salary question can draw on. Values are never copied into
 # the Companion payload; only these names are.
@@ -140,6 +164,43 @@ def salary_fill_allowed(question: str, value: str, *, confidence: str) -> bool:
     return salary_value_covers(value, salary_shape(question))
 
 
+def _positive_amount(value: int | None) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def jd_salary_figure(posted_min: int | None, posted_max: int | None) -> int | None:
+    """The job-description amount the expectation rules apply to.
+
+    One positive end, or two equal ends, is that listed figure. A band whose
+    high end is above the low end uses the midpoint. An inverted band is not
+    a figure. Missing ends are unknown.
+    """
+    low = _positive_amount(posted_min)
+    high = _positive_amount(posted_max)
+    if low is not None and high is not None:
+        if high < low:
+            return None
+        return (low + high) // 2
+    if low is not None:
+        return low
+    return high
+
+
+def expectation_from_jd_salary(amount: int) -> int:
+    """Expected salary from one job-description figure.
+
+    ``amount`` at or below $100,000 stays. Above that and below $130,000
+    subtracts $5,000. At or above $130,000 subtracts $10,000.
+    """
+    if amount <= JD_SALARY_SAME_THROUGH:
+        return amount
+    if amount < JD_SALARY_HIGH_FROM:
+        return amount - JD_SALARY_NEAR_DISCOUNT
+    return amount - JD_SALARY_HIGH_DISCOUNT
+
+
 def _format_annual(annual: int, *, hourly: bool) -> str:
     if hourly:
         annual //= HOURS_PER_YEAR
@@ -167,8 +228,10 @@ def assess_salary(
 ) -> SalaryAssessment:
     """Decide whether saved compensation covers this question.
 
-    A posted band is used only when the caller supplied both ends and, after
-    the floor is applied, the high end is still above the low end. The profile
+    A posted band answers a range only when the caller supplied both ends and,
+    after the floor is applied, the high end is still above the low end. A
+    single or minimum question uses :func:`expectation_from_jd_salary` on
+    :func:`jd_salary_figure` when the posting names a figure. The profile
     maximum is used only when it is saved and is above the floor. A minimum
     alone confirms a range question instead of becoming ``min-min``.
     """
@@ -237,14 +300,25 @@ def assess_salary(
             return confirm("salary_needs_confirm") if related else missing()
         return answer(rendered, ("salary_range_max",))
 
-    # single or minimum: the saved floor. A posting may raise a single figure.
-    # It does not invent a floor the profile never stored.
+    # single or minimum. A known JD figure is the answer, including when it
+    # sits under the saved floor. The range branch above does not use it as
+    # a second end. No JD figure falls through to the saved floor, then to
+    # the unknown default. A saved maximum alone still confirms: it is not
+    # an expectation, and the default must not replace it.
+    figure = jd_salary_figure(posted_min, posted_max)
+    if figure is not None:
+        rendered = _format_annual(expectation_from_jd_salary(figure), hourly=hourly)
+        if not rendered:
+            return confirm("salary_needs_confirm") if related else missing()
+        return answer(rendered, ())
     if floor is None:
-        return confirm("salary_needs_confirm") if related else missing()
+        if related:
+            return confirm("salary_needs_confirm")
+        rendered = _format_annual(JD_SALARY_UNKNOWN, hourly=hourly)
+        if not rendered:
+            return missing()
+        return answer(rendered, ())
     annual = floor
-    if asked == "single" and posting is not None:
-        low_post, high_post = posting
-        annual = max(floor, (low_post + high_post) // 2)
     used = tuple(name for name in ("salary_expectation", "salary_range_min") if name in related)
     rendered = _format_annual(annual, hourly=hourly)
     if not rendered:
@@ -260,14 +334,18 @@ def resolve_salary(
     hourly: bool = False,
     as_range: bool = False,
 ) -> str:
-    """Return a salary string that is never below the profile floor.
+    """Return a salary string for this question, or empty when it cannot be filled.
 
-    An empty string means the saved data does not cover the question. Callers
-    leave that control for a person. A range is never fabricated from a minimum.
+    A single figure comes from the job description when the posting names one,
+    otherwise from the profile floor, otherwise from the $90,000 default.
+    An empty string means a range (or a maximum) the saved data does not cover.
+    Callers leave that control for a person. A range is never fabricated from
+    a minimum or from the default.
 
     Args:
         compensation: Profile compensation section.
         posted_min: Lower end of a range printed on the job posting, if known.
+            Alone, this is the listed job-description salary.
         posted_max: Upper end of that range, if known.
         hourly: Divide a sufficient annual answer by 2080.
         as_range: The question asks for ``low-high`` instead of one figure.
