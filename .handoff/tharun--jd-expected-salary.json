@@ -1,0 +1,20 @@
+{
+  "task": "jd-expected-salary",
+  "developer": "tharun",
+  "branch": "tharun/jd-expected-salary",
+  "latest_commit": "b52d9d39faaf6ad5da95a2e137bb67b3ad0d4c90",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/79",
+  "files_touched": [
+    "README.md",
+    "docs/HTTP_SERVICE.md",
+    "docs/TILEARC_INTEGRATION.md",
+    "src/autofill/salary.py",
+    "tests/test_flow.py",
+    "tests/test_mapping.py",
+    "tests/test_salary.py"
+  ],
+  "tests": "pytest tests/test_salary.py tests/test_mapping.py tests/test_intents.py tests/test_flow.py::test_unknown_salary_defaults_and_work_auth_is_not_invented tests/test_nav_optional_blockers.py::test_work_status_is_not_a_disability_question_and_base_salary_is_salary",
+  "blockers": "",
+  "next_action": "Review the staging PR. A single or minimum expected salary follows the job-description rules. A range still confirms when only one end is known. Do not invent a max.",
+  "updated_at": "2026-10-27T05:47:34Z"
+}

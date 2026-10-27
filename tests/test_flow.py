@@ -138,13 +138,17 @@ def test_dates_and_country_aliases_and_unknown_questions():
     assert low.action == "unanswered"
 
 
-def test_salary_and_work_auth_are_not_invented():
+def test_unknown_salary_defaults_and_work_auth_is_not_invented():
     empty = CandidateProfile.from_dict(
         {"personal": {"full_name": "Avery Example", "email": "avery.example@example.com"}}
     )
     salary = map_field(Control(kind="text", label="Desired salary"), empty)
-    assert salary.action == "unanswered"
-    assert salary.text == ""
+    assert salary.action == "fill"
+    assert salary.text == "90000"
+    ranged = map_field(Control(kind="text", label="Desired salary range"), empty)
+    assert ranged.action == "unanswered"
+    assert ranged.text == ""
+    assert ranged.text != "90000-90000"
     auth = map_field(
         Control(
             kind="select",
