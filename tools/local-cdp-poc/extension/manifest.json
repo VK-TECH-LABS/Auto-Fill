@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Local tab probe",
+  "version": "0.0.1",
+  "description": "Reads the visible tab through chrome.debugger and reports to 127.0.0.1. Shows Chrome's debugging banner. Holds no service token.",
+  "permissions": ["debugger", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
