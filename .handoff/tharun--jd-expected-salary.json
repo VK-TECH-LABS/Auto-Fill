@@ -3,7 +3,7 @@
   "developer": "tharun",
   "branch": "tharun/jd-expected-salary",
   "latest_commit": "253c91abb9d963c177378e13850a2aab43c00e69",
-  "pr": "",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/79",
   "files_touched": [
     "README.md",
     "docs/HTTP_SERVICE.md",
