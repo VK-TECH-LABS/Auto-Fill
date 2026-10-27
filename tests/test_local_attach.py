@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
     ENV_FLAG,
     DefaultProfileBlocked,
@@ -32,6 +34,7 @@ from autofill.local_attach import (
     stable_chrome_user_data_dir,
     start_fixture_server,
 )
+from autofill.local_helper import LocalHelper
 from autofill.profile import CandidateProfile
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
 
@@ -390,6 +393,110 @@ def test_fill_visible_tab_uses_the_engine_and_does_not_submit(monkeypatch):
                 browser.close()
     finally:
         server.shutdown()
+
+
+class _StatusSession:
+    """Stand-in for DedicatedApplySession. It never clicks Final Submit."""
+
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+        self.owns_chrome = False
+        self.tab = None
+        self.detached = 0
+
+    def fill(self, url: str, profile: object) -> tuple[ApplicationResult, bool]:
+        if self.outcome == "ready":
+            result = ApplicationResult(
+                status=Status.READY_FOR_HUMAN_SUBMIT,
+                ats=None,
+                current_step="done",
+                login_status="NOT_REQUIRED",
+                fields_detected=3,
+                fields_filled=3,
+                stopped_before_submit=True,
+                submit_controls=["Submit application"],
+            )
+            return result, False
+        if self.outcome == "claimed":
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        raise LocalAttachError("Dedicated Chrome did not open CDP.")
+
+    def detach(self) -> None:
+        self.detached += 1
+
+    def stop_launched_chrome(self) -> None:
+        return None
+
+    def browser_running(self) -> bool:
+        return True
+
+
+def _wait_settled(job: Any) -> None:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if job.state not in {"queued", "running"}:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"job stayed {job.state}")
+
+
+def test_status_flag_is_false_only_after_a_reported_submit(monkeypatch):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    profile = CandidateProfile.load(PROFILE)
+    url = "https://boards.greenhouse.io/example/jobs/1"
+
+    ready = _StatusSession("ready")
+    ready_helper = LocalHelper(session=ready, idle_detach_seconds=-1)  # type: ignore[arg-type]
+    try:
+        job = ready_helper.submit(url, profile)
+        _wait_settled(job)
+        body = job.public()
+        assert body["status"] == "READY_FOR_HUMAN_SUBMIT"
+        assert body["submitted"] is False
+        assert body["stopped_before_submit"] is True
+        assert body["fill"]["stopped_before_submit"] is True
+        ready_helper.request_detach(job.session_id)
+        detached = job.public()
+        assert detached["detached"] is True
+        assert detached["status"] == "READY_FOR_HUMAN_SUBMIT"
+        assert detached["submitted"] is False
+        assert detached["stopped_before_submit"] is True
+        assert ready.detached == 1
+    finally:
+        ready_helper.close()
+
+    other = _StatusSession("other")
+    other_helper = LocalHelper(session=other, idle_detach_seconds=-1)  # type: ignore[arg-type]
+    try:
+        job = other_helper.submit(url, profile)
+        _wait_settled(job)
+        body = job.public()
+        assert body["status"] == "FAILED"
+        assert body["submitted"] is None
+        assert body["stopped_before_submit"] is True
+    finally:
+        other_helper.close()
+
+    claimed = _StatusSession("claimed")
+    claimed_helper = LocalHelper(session=claimed, idle_detach_seconds=-1)  # type: ignore[arg-type]
+    try:
+        job = claimed_helper.submit(url, profile)
+        _wait_settled(job)
+        body = job.public()
+        assert body["status"] == "FAILED"
+        assert body["submitted"] is True
+        assert body["stopped_before_submit"] is False
+        assert body["status"] not in {"SUBMITTED", "FILLED"}
+        assert "fill" not in body
+        claimed_helper.request_detach(job.session_id)
+        detached = job.public()
+        assert detached["detached"] is True
+        assert detached["status"] == "FAILED"
+        assert detached["submitted"] is True
+        assert detached["stopped_before_submit"] is False
+        assert claimed.detached == 1
+    finally:
+        claimed_helper.close()
 
 
 def _chrome_ready() -> bool:
