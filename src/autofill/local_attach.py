@@ -1,0 +1,1252 @@
+"""Local same-tab Chrome attach. The hosted Railway service does not import this.
+
+Launching a browser requires ``AUTOFILL_LOCAL_ATTACH=1``. Debugging endpoints
+must be ``http://127.0.0.1:<port>``. The fill path reuses
+:func:`autofill.engine.autofill_application` on the browser's existing context
+and never opens a second context. Clicks go through
+:func:`autofill.safeguards.perform_click`. Final Submit stays human.
+
+This module is original to this AGPL-3.0-only repository. It does not copy
+ApplyPilot source.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from autofill.engine import ApplicationResult, AutofillOptions, autofill_application
+from autofill.profile import CandidateProfile
+from autofill.safeguards import (
+    HUMAN_SUBMIT_ONLY,
+    ActionClass,
+    HumanSubmissionRequired,
+    SubmitBlockedError,
+    action_class,
+    perform_click,
+)
+
+logger = logging.getLogger("autofill.local_attach")
+
+ENV_FLAG = "AUTOFILL_LOCAL_ATTACH"
+LOOPBACK = "127.0.0.1"
+_DAILY_BLOCK_TEXT = "non-default data directory"
+_SCRIPT_PURPOSES = frozenset({"eval", "form_submit", "keyboard_enter", "request_submit"})
+_CONTROL_JS = """(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return null;
+  const name = (el.innerText || el.value || el.getAttribute("aria-label") || "")
+    .replace(/\\s+/g, " ")
+    .trim();
+  return {name, controlType: (el.getAttribute("type") || "").toLowerCase()};
+}"""
+
+
+class LocalAttachError(RuntimeError):
+    """The local attach driver refused or could not complete a step."""
+
+
+class LoopbackRequired(LocalAttachError):
+    """A debugging endpoint was not bound to 127.0.0.1."""
+
+
+class DefaultProfileBlocked(LocalAttachError):
+    """The dedicated launcher was pointed at Chrome's default user-data-dir."""
+
+
+class FeatureDisabled(LocalAttachError):
+    """``AUTOFILL_LOCAL_ATTACH`` is not set. The hosted service leaves it unset."""
+
+
+class DualSessionRefused(LocalAttachError):
+    """Refusing to create a browser context. That would drop the visible tab's cookies."""
+
+
+def feature_enabled() -> bool:
+    return os.environ.get(ENV_FLAG, "").strip() == "1"
+
+
+def require_feature() -> None:
+    if not feature_enabled():
+        raise FeatureDisabled(
+            f"Set {ENV_FLAG}=1 to use the local Chrome attach. The hosted service never sets this."
+        )
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+
+
+def config_home() -> Path:
+    if os.environ.get("CHROME_CONFIG_HOME"):
+        return Path(os.environ["CHROME_CONFIG_HOME"])
+    if os.environ.get("XDG_CONFIG_HOME"):
+        return Path(os.environ["XDG_CONFIG_HOME"])
+    return Path.home() / ".config"
+
+
+def stable_chrome_user_data_dir() -> Path:
+    """The default Google Chrome stable data directory on Linux."""
+    override = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
+    return config_home() / "google-chrome"
+
+
+def default_user_data_dirs() -> list[Path]:
+    root = config_home()
+    names = (
+        "google-chrome",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "google-chrome-canary",
+        "google-chrome-for-testing",
+        "chromium",
+    )
+    dirs = [root / name for name in names]
+    override = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
+    if override:
+        dirs.append(Path(override))
+    return dirs
+
+
+def is_default_user_data_dir(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser()
+    for candidate in default_user_data_dirs():
+        try:
+            other = candidate.expanduser().resolve()
+        except OSError:
+            other = candidate.expanduser()
+        if resolved == other:
+            return True
+    return False
+
+
+def parse_endpoint(endpoint: str) -> tuple[str, int]:
+    """Accept only ``http`` or ``ws`` on ``127.0.0.1`` with an explicit port."""
+    parsed = urlparse((endpoint or "").strip())
+    if parsed.scheme not in {"http", "ws"}:
+        raise LoopbackRequired("The debugging endpoint must be http://127.0.0.1:<port> or ws://127.0.0.1:<port>.")
+    if parsed.username or parsed.password:
+        raise LoopbackRequired("The debugging endpoint must not carry credentials.")
+    host = parsed.hostname or ""
+    if host != LOOPBACK:
+        raise LoopbackRequired(f"Refusing debugging endpoint host {host!r}. Only 127.0.0.1 is allowed.")
+    if parsed.port is None:
+        raise LoopbackRequired("The debugging endpoint needs a port.")
+    return host, parsed.port
+
+
+def endpoint_for_port(port: int) -> str:
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise LoopbackRequired("Debugging port must be an integer from 1 to 65535.")
+    return f"http://{LOOPBACK}:{port}"
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((LOOPBACK, 0))
+        return int(sock.getsockname()[1])
+
+
+def _ipv4_from_proc(hex_ip: str) -> str:
+    raw = bytes.fromhex(hex_ip)
+    return ".".join(str(part) for part in raw[::-1])
+
+
+def _ipv6_from_proc(hex_ip: str) -> str:
+    raw = bytes.fromhex(hex_ip)
+    words = [raw[index : index + 4][::-1] for index in range(0, 16, 4)]
+    addr = b"".join(words)
+    if addr == b"\x00" * 15 + b"\x01":
+        return "::1"
+    if addr == b"\x00" * 16:
+        return "::"
+    return ":".join(f"{addr[index]:02x}{addr[index + 1]:02x}" for index in range(0, 16, 2))
+
+
+def listening_hosts(port: int) -> list[str]:
+    """Hosts with a TCP listener on ``port``, from ``/proc/net/tcp``."""
+    hosts: list[str] = []
+    for path, width, decode in (
+        (Path("/proc/net/tcp"), 8, _ipv4_from_proc),
+        (Path("/proc/net/tcp6"), 32, _ipv6_from_proc),
+    ):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] != "0A":
+                continue
+            local = parts[1]
+            ip_hex, port_hex = local.split(":")
+            if len(ip_hex) != width or int(port_hex, 16) != port:
+                continue
+            hosts.append(decode(ip_hex))
+    return hosts
+
+
+def assert_loopback_listen(port: int) -> list[str]:
+    hosts = listening_hosts(port)
+    if not hosts:
+        raise LocalAttachError(f"Nothing is listening on port {port}.")
+    bad = [host for host in hosts if host not in {LOOPBACK, "::1"}]
+    if bad:
+        raise LoopbackRequired(f"Debugging port {port} is listening on {bad}. Refusing to attach.")
+    return hosts
+
+
+def find_chrome(explicit: str | None = None) -> str:
+    if explicit:
+        if not Path(explicit).is_file():
+            raise LocalAttachError(f"Chrome executable not found: {explicit}")
+        return explicit
+    for candidate in (
+        os.environ.get("CHROME_BIN", ""),
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/local/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise LocalAttachError("Google Chrome is not installed.")
+
+
+def chrome_version(executable: str) -> str:
+    try:
+        completed = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LocalAttachError("Could not read the Chrome version.") from exc
+    line = (completed.stdout or completed.stderr or "").strip().splitlines()
+    if not line or not line[0].strip():
+        raise LocalAttachError("Chrome did not report a version.")
+    return line[0].strip()
+
+
+def fetch_version(port: int, timeout: float = 1.0) -> dict[str, Any] | None:
+    url = f"http://{LOOPBACK}:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            body = response.read(65536)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def dedicated_launch_args(
+    *,
+    executable: str,
+    user_data_dir: Path,
+    port: int,
+    start_url: str,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    """Argv for a dedicated profile. The default user-data-dir is refused."""
+    if is_default_user_data_dir(user_data_dir):
+        raise DefaultProfileBlocked(
+            "Chrome 136+ ignores remote debugging on the default user-data-dir. "
+            "The dedicated launcher will not point --user-data-dir at that directory."
+        )
+    endpoint_for_port(port)
+    args = [
+        executable,
+        f"--remote-debugging-port={port}",
+        f"--remote-debugging-address={LOOPBACK}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-popup-blocking",
+    ]
+    # No viewport and no window size. The Railway runner's 1280x800 context is a
+    # different browser; forcing it here changes the page the employee sees.
+    if headless:
+        args.extend(["--headless=new", "--disable-gpu"])
+    for item in extra_args or []:
+        if "remote-debugging-address" in item and LOOPBACK not in item:
+            raise LoopbackRequired(f"Refusing Chrome argument {item!r}.")
+        lowered = item.replace(" ", "")
+        if "0.0.0.0" in lowered or lowered.endswith("=*"):
+            raise LoopbackRequired(f"Refusing Chrome argument {item!r}.")
+        args.append(item)
+    args.append(start_url)
+    return args
+
+
+@dataclass
+class ChromeProcess:
+    """A Chrome this driver started. ``stop`` ends that process, not an unrelated one."""
+
+    process: subprocess.Popen[str]
+    user_data_dir: Path | None
+    port: int | None
+    endpoint: str
+    log_path: Path
+
+    def poll(self) -> int | None:
+        return self.process.poll()
+
+    def stderr_text(self, limit: int = 8000) -> str:
+        if not self.log_path.exists():
+            return ""
+        text = self.log_path.read_text(encoding="utf-8", errors="replace")
+        if len(text) <= limit:
+            return text
+        return text[-limit:]
+
+    def stop(self) -> None:
+        proc = self.process
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.terminate()
+        if self.user_data_dir is not None:
+            subprocess.run(
+                ["pkill", "-f", f"--user-data-dir={self.user_data_dir}"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+def _spawn(args: list[str], log_path: Path) -> subprocess.Popen[str]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = log_path.open("w", encoding="utf-8")
+    try:
+        return subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=handle,
+            start_new_session=True,
+            text=True,
+        )
+    finally:
+        handle.close()
+
+
+def _wait_cdp(port: int, proc: subprocess.Popen[str], timeout: float) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        found = fetch_version(port, timeout=0.4)
+        if found is not None:
+            return found
+        if proc.poll() is not None:
+            return None
+        time.sleep(0.2)
+    return fetch_version(port, timeout=0.4)
+
+
+def launch_dedicated_chrome(
+    *,
+    user_data_dir: Path,
+    port: int,
+    start_url: str,
+    executable: str | None = None,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> ChromeProcess:
+    """Launch Chrome with a non-default profile and a loopback debugging port."""
+    require_feature()
+    exe = find_chrome(executable)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    args = dedicated_launch_args(
+        executable=exe,
+        user_data_dir=user_data_dir,
+        port=port,
+        start_url=start_url,
+        headless=headless,
+        extra_args=extra_args,
+    )
+    log_path = user_data_dir / "chrome-stderr.log"
+    proc = _spawn(args, log_path)
+    return ChromeProcess(
+        process=proc,
+        user_data_dir=user_data_dir,
+        port=port,
+        endpoint=endpoint_for_port(port),
+        log_path=log_path,
+    )
+
+
+def _pick_page(pages: list[Any], url_prefix: str) -> Any | None:
+    usable: list[Any] = []
+    for page in pages:
+        try:
+            url = page.url or ""
+        except Exception:
+            continue
+        if url.startswith(("devtools://", "chrome-extension://")):
+            continue
+        usable.append(page)
+    if url_prefix:
+        for page in usable:
+            if (page.url or "").startswith(url_prefix):
+                return page
+    for page in reversed(usable):
+        url = page.url or ""
+        if url.startswith(("http://", "https://")):
+            return page
+    if not usable:
+        return None
+    return usable[-1]
+
+
+def _target_id(context: Any, page: Any) -> str:
+    session = context.new_cdp_session(page)
+    try:
+        info = session.send("Target.getTargetInfo")
+    finally:
+        detach = getattr(session, "detach", None)
+        if detach is not None:
+            detach()
+    target = info.get("targetInfo") if isinstance(info, dict) else None
+    if not isinstance(target, dict):
+        return ""
+    return str(target.get("targetId") or "")
+
+
+@dataclass
+class VisibleTab:
+    """The existing tab in ``contexts[0]``. No new context was created."""
+
+    browser: Any
+    context: Any
+    page: Any
+    endpoint: str
+    target_id: str
+    page_url: str
+    context_count: int
+    page_urls: list[str]
+
+    def disconnect(self) -> None:
+        """Drop this CDP client. Leaves the Chrome process running."""
+        detach_cdp_client(self.browser)
+
+
+def attach_visible_tab(playwright: Any, endpoint: str, *, url_prefix: str = "") -> VisibleTab:
+    """Connect over CDP and drive the existing context. ``new_context`` is not called."""
+    require_feature()
+    host, port = parse_endpoint(endpoint)
+    assert_loopback_listen(port)
+    browser = playwright.chromium.connect_over_cdp(f"http://{host}:{port}")
+    contexts = list(browser.contexts)
+    if not contexts:
+        raise DualSessionRefused(
+            "Chrome exposed no existing context. Refusing to create one; a new context is not the visible tab."
+        )
+    context = contexts[0]
+    pages = list(context.pages)
+    chosen = _pick_page(pages, url_prefix)
+    if chosen is None:
+        raise LocalAttachError("The existing context has no page to drive.")
+    urls: list[str] = []
+    for page in pages:
+        try:
+            urls.append(str(page.url or ""))
+        except Exception:
+            urls.append("")
+    return VisibleTab(
+        browser=browser,
+        context=context,
+        page=chosen,
+        endpoint=f"http://{host}:{port}",
+        target_id=_target_id(context, chosen),
+        page_url=str(chosen.url or ""),
+        context_count=len(contexts),
+        page_urls=urls,
+    )
+
+
+def detach_cdp_client(browser: Any) -> None:
+    """Stop the Playwright CDP client without closing Chrome.
+
+    ``connect_over_cdp`` leaves ``_should_close_connection_on_close`` false, and
+    closing the browser object then asks the driver to tear that browser down.
+    Idle detach only stops this client's pipe. The Chrome window stays so a
+    person can review it and click Submit.
+    """
+    impl = getattr(browser, "_impl_obj", None)
+    connection = getattr(impl, "_connection", None)
+    sync = getattr(browser, "_sync", None)
+    if connection is None or sync is None:
+        return
+    sync(connection.stop_async())
+
+
+def validate_application_url(application_url: str) -> str:
+    """Accept an http(s) employer or fixture URL. The CDP port is still loopback-only."""
+    parsed = urlparse((application_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise LocalAttachError("The application URL must be http or https with a host.")
+    if parsed.username or parsed.password:
+        raise LocalAttachError("The application URL must not carry credentials.")
+    return application_url.strip()
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def same_document(current: str, wanted: str) -> bool:
+    """True when both URLs are the same document, ignoring the fragment."""
+    left, right = urlparse(current), urlparse(wanted)
+    if left.scheme != right.scheme:
+        return False
+    if (left.hostname or "").casefold() != (right.hostname or "").casefold():
+        return False
+    if (left.port or _default_port(left.scheme)) != (right.port or _default_port(right.scheme)):
+        return False
+    return left.path.rstrip("/") == right.path.rstrip("/")
+
+
+def adopt_employer_tab(context: Any, application_url: str) -> Any:
+    """Use the tab already on this URL, or navigate an existing tab in ``contexts[0]``.
+
+    This does not create a browser context, does not set a viewport, and does
+    not install request blocking.
+    """
+    validate_application_url(application_url)
+    pages = list(getattr(context, "pages", []) or [])
+    for page in pages:
+        try:
+            current = str(page.url or "")
+        except Exception:
+            continue
+        if same_document(current, application_url):
+            return page
+    chosen = _pick_page(pages, "")
+    if chosen is None and pages:
+        chosen = pages[0]
+    if chosen is None:
+        raise DualSessionRefused("The existing context has no tab. Refusing to create a context.")
+    chosen.goto(application_url, wait_until="domcontentloaded", timeout=45000)
+    return chosen
+
+
+def _optional_submitted(page: Any) -> bool | None:
+    try:
+        value = page.evaluate("() => window.__submitted")
+    except Exception:
+        return None
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def fill_visible_tab(page: Any, application_url: str, profile: CandidateProfile) -> ApplicationResult:
+    """Fill the already-open tab with the existing engine. The page is not replaced."""
+    require_feature()
+    validate_application_url(application_url)
+    return autofill_application(
+        application_url,
+        profile,
+        options=AutofillOptions(page=page, headless=False, max_pages=1),
+    )
+
+
+class DedicatedApplySession:
+    """One dedicated profile. Call it from a single thread.
+
+    ``detach`` drops the CDP client and leaves Chrome running. ``stop_launched_chrome``
+    is the only way this object kills a process, and only a process it launched.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_data_dir: Path,
+        debug_port: int | None = None,
+        headless: bool = False,
+        executable: str | None = None,
+    ) -> None:
+        self.user_data_dir = user_data_dir
+        self.debug_port = free_port() if debug_port is None else debug_port
+        self.headless = headless
+        self.executable = executable
+        self.endpoint = endpoint_for_port(self.debug_port)
+        self.chrome: ChromeProcess | None = None
+        self.owns_chrome = False
+        self.tab: VisibleTab | None = None
+        self._playwright: Any = None
+
+    def ensure(self, application_url: str) -> VisibleTab:
+        """Launch the dedicated profile if needed, then adopt the employer tab."""
+        require_feature()
+        validate_application_url(application_url)
+        if is_default_user_data_dir(self.user_data_dir):
+            raise DefaultProfileBlocked(
+                "The dedicated Apply profile cannot be Chrome's default user-data-dir."
+            )
+        if self.tab is not None:
+            page = adopt_employer_tab(self.tab.context, application_url)
+            self.tab.page = page
+            self.tab.page_url = str(page.url or "")
+            self.tab.target_id = _target_id(self.tab.context, page)
+            return self.tab
+        live = fetch_version(self.debug_port, timeout=0.4)
+        if live is None:
+            self.user_data_dir.mkdir(parents=True, exist_ok=True)
+            self.chrome = launch_dedicated_chrome(
+                user_data_dir=self.user_data_dir,
+                port=self.debug_port,
+                start_url=application_url,
+                executable=self.executable,
+                headless=self.headless,
+            )
+            self.owns_chrome = True
+            opened = _wait_cdp(self.debug_port, self.chrome.process, 20)
+            if opened is None:
+                detail = self.chrome.stderr_text()[:500]
+                self.stop_launched_chrome()
+                raise LocalAttachError(f"Dedicated Chrome did not open CDP. {detail}")
+        elif self.chrome is None:
+            self.owns_chrome = False
+        assert_loopback_listen(self.debug_port)
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        try:
+            tab = attach_visible_tab(self._playwright, self.endpoint, url_prefix=application_url)
+            page = adopt_employer_tab(tab.context, application_url)
+            tab.page = page
+            tab.page_url = str(page.url or "")
+            tab.target_id = _target_id(tab.context, page)
+        except BaseException:
+            self.detach()
+            if self.owns_chrome:
+                self.stop_launched_chrome()
+            raise
+        self.tab = tab
+        return tab
+
+    def fill(self, application_url: str, profile: CandidateProfile) -> tuple[ApplicationResult, bool | None]:
+        """Fill the adopted tab. A page that reports ``__submitted`` is a failure."""
+        tab = self.ensure(application_url)
+        result = fill_visible_tab(tab.page, application_url, profile)
+        submitted = _optional_submitted(tab.page)
+        if submitted is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        return result, submitted
+
+    def detach(self) -> None:
+        """Idle detach. Chrome keeps running whether or not this process launched it.
+
+        Stops the Playwright driver. Does not close the browser object, because
+        that close is how a CDP client asks Chrome to exit.
+        """
+        self.tab = None
+        playwright = self._playwright
+        self._playwright = None
+        if playwright is None:
+            return
+        try:
+            playwright.stop()
+        except Exception:
+            return
+
+    def stop_launched_chrome(self) -> None:
+        """Kill Chrome only when this object launched it. Detach does not call this."""
+        self.detach()
+        chrome = self.chrome
+        self.chrome = None
+        if self.owns_chrome and chrome is not None:
+            chrome.stop()
+        self.owns_chrome = False
+
+    def browser_running(self) -> bool:
+        if self.owns_chrome and self.chrome is not None:
+            return self.chrome.poll() is None
+        return fetch_version(self.debug_port, timeout=0.4) is not None
+
+
+def describe_control(page: Any, selector: str) -> tuple[str, str]:
+    raw = page.evaluate(_CONTROL_JS, selector)
+    if not isinstance(raw, dict):
+        raise LocalAttachError(f"No control matches {selector!r}.")
+    return str(raw.get("name") or ""), str(raw.get("controlType") or "")
+
+
+def drive_control(page: Any, selector: str, claimed_name: str, *, purpose: str) -> None:
+    """Only click entry. A final Submit is refused from the DOM label, not the caller's label.
+
+    Script, form, and keyboard submit purposes are refused before any input is sent.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if purpose in _SCRIPT_PURPOSES:
+        raise HumanSubmissionRequired(
+            f"Refusing {purpose} on {selector!r}. The local driver has no script, form, or keyboard submit path."
+        )
+    actual_name, actual_type = describe_control(page, selector)
+    for label in (actual_name, claimed_name):
+        if action_class(label, control_type=actual_type) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+            shown = actual_name or claimed_name
+            raise HumanSubmissionRequired(
+                f"Refusing to activate {shown!r}. A person must click the final Submit or Apply control."
+            )
+    perform_click(
+        page,
+        selector,
+        actual_name or claimed_name,
+        control_type=actual_type,
+        purpose=purpose,
+    )
+
+
+def attempt_alternate_submits(page: Any, attempts: list[tuple[str, str, str]]) -> list[str]:
+    """Try each ``(selector, claimed_name, purpose)``. Every one must be refused."""
+    refusals: list[str] = []
+    for selector, claimed_name, purpose in attempts:
+        try:
+            drive_control(page, selector, claimed_name, purpose=purpose)
+        except (HumanSubmissionRequired, SubmitBlockedError) as exc:
+            refusals.append(f"{purpose} {selector}: {exc}")
+            continue
+        raise LocalAttachError(
+            f"Submit path was not refused: selector={selector!r} name={claimed_name!r} purpose={purpose!r}."
+        )
+    return refusals
+
+
+def _devtools_active_port(user_data_dir: Path | None) -> str:
+    if user_data_dir is None:
+        return ""
+    path = user_data_dir / "DevToolsActivePort"
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace").strip()
+
+
+def _probe_note(mode: str, *, cdp_open: bool, stderr_text: str) -> tuple[bool, str]:
+    blocked = _DAILY_BLOCK_TEXT in stderr_text
+    if mode in {"headed_daily", "explicit_default"}:
+        if cdp_open:
+            return True, "CDP opened on the default profile. The Chrome 136+ block did not apply to this binary."
+        detail = "Chrome logged that a non-default data directory is required." if blocked else "The port did not open."
+        return False, f"Daily-profile debugging was not available. {detail}"
+    if mode == "headless_omitted":
+        if cdp_open:
+            return False, (
+                "Headless Chrome without --user-data-dir opened CDP. Headless uses a temporary data directory, "
+                "not the employee's daily profile. This is not silent attach to an already-open daily Chrome."
+            )
+        return False, "Headless Chrome without --user-data-dir did not open CDP in this run."
+    if mode == "dedicated":
+        if cdp_open:
+            return False, "A non-default --user-data-dir accepted the debugging port."
+        return False, "The dedicated profile did not open CDP."
+    raise LocalAttachError(f"Unknown probe mode {mode!r}.")
+
+
+def probe_debug_port(
+    mode: str,
+    *,
+    executable: str | None = None,
+    timeout: float = 6.0,
+    work_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Launch Chrome and report whether ``/json/version`` answers.
+
+    ``headed_daily`` omits ``--user-data-dir`` so Chrome uses the real default profile.
+    ``explicit_default`` passes that same directory. ``headless_omitted`` is the false
+    positive: headless without a data dir is not the daily profile. ``dedicated`` uses
+    a fresh directory.
+    """
+    require_feature()
+    if mode not in {"headed_daily", "explicit_default", "headless_omitted", "dedicated"}:
+        raise LocalAttachError(f"Unknown probe mode {mode!r}.")
+    exe = find_chrome(executable)
+    version = chrome_version(exe)
+    port = free_port()
+    headless = mode != "headed_daily"
+    user_data: Path | None
+    if mode == "dedicated":
+        root = work_dir or Path(tempfile.mkdtemp(prefix="t172-probe-"))
+        user_data = root / "dedicated-profile"
+        user_data.mkdir(parents=True, exist_ok=True)
+    elif mode == "explicit_default":
+        user_data = stable_chrome_user_data_dir()
+    else:
+        user_data = None
+    args = [exe, f"--remote-debugging-port={port}", f"--remote-debugging-address={LOOPBACK}"]
+    if user_data is not None:
+        args.append(f"--user-data-dir={user_data}")
+    args.extend(
+        [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-gpu",
+            "--window-size=900,700",
+        ]
+    )
+    if headless:
+        args.append("--headless=new")
+    args.append("about:blank")
+    if user_data is not None and mode != "explicit_default":
+        log_parent = user_data
+    else:
+        log_parent = Path(tempfile.mkdtemp(prefix="t172-log-"))
+    log_path = log_parent / f"{mode}.log"
+    proc = _spawn(args, log_path)
+    chrome = ChromeProcess(
+        process=proc,
+        user_data_dir=user_data if mode != "headed_daily" else stable_chrome_user_data_dir(),
+        port=port,
+        endpoint=endpoint_for_port(port),
+        log_path=log_path,
+    )
+    # headed_daily's stop() must be allowed to signal the default-profile process.
+    if mode == "headed_daily":
+        chrome.user_data_dir = None
+    version_payload: dict[str, Any] | None = None
+    listen: list[str] = []
+    try:
+        version_payload = _wait_cdp(port, proc, timeout)
+        if version_payload is not None:
+            listen = assert_loopback_listen(port)
+            socket_url = str(version_payload.get("webSocketDebuggerUrl") or "")
+            if socket_url and not socket_url.startswith(f"ws://{LOOPBACK}:"):
+                raise LoopbackRequired(f"Chrome advertised a non-loopback websocket: {socket_url}")
+    finally:
+        stderr_text = chrome.stderr_text()
+        active = _devtools_active_port(user_data if mode != "headed_daily" else stable_chrome_user_data_dir())
+        chrome.stop()
+    cdp_open = version_payload is not None
+    daily_attach, note = _probe_note(mode, cdp_open=cdp_open, stderr_text=stderr_text)
+    browser_field = ""
+    websocket_url = ""
+    if version_payload is not None:
+        browser_field = str(version_payload.get("Browser") or "")
+        websocket_url = str(version_payload.get("webSocketDebuggerUrl") or "")
+    logger.info("probe mode=%s cdp_open=%s daily_attach=%s", mode, cdp_open, daily_attach)
+    return {
+        "mode": mode,
+        "chrome_version": version,
+        "executable": exe,
+        "headless": headless,
+        "user_data_dir": "" if user_data is None else str(user_data),
+        "default_profile": mode != "dedicated",
+        "port": port,
+        "cdp_open": cdp_open,
+        "listen_hosts": listen,
+        "browser": browser_field,
+        "webSocketDebuggerUrl": websocket_url,
+        "devtools_active_port": active,
+        "stderr_excerpt": _excerpt(stderr_text),
+        "daily_profile_attach": daily_attach,
+        "note": note,
+    }
+
+
+def _excerpt(text: str, limit: int = 500) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    interesting = [line for line in lines if "DevTools" in line or "load-extension" in line or "user-data" in line]
+    chosen = interesting or lines[-4:]
+    excerpt = " | ".join(chosen)
+    return excerpt[:limit]
+
+
+class _FixtureServer(ThreadingHTTPServer):
+    html: bytes
+    evidence: list[dict[str, Any]]
+
+
+class _FixtureHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        server = self.server
+        if path != "/t172-local-tab.html" or not isinstance(server, _FixtureServer):
+            self.send_error(404)
+            return
+        body = server.html
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        server = self.server
+        if path != "/extension-evidence" or not isinstance(server, _FixtureServer):
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length") or "0")
+        if length < 0 or length > 65536:
+            self.send_error(413)
+            return
+        raw = self.rfile.read(length)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            parsed = {"unparsed": True}
+        if isinstance(parsed, dict) and len(server.evidence) < 20:
+            server.evidence.append(parsed)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def start_fixture_server(html: bytes) -> _FixtureServer:
+    server = _FixtureServer((LOOPBACK, 0), _FixtureHandler)
+    server.html = html
+    server.evidence = []
+    threading.Thread(target=server.serve_forever, name="t172-fixture", daemon=True).start()
+    return server
+
+
+def _cookie_value(page: Any) -> str:
+    value = page.evaluate("() => document.cookie")
+    return value if isinstance(value, str) else ""
+
+
+def _field_values(page: Any) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field_id in ("first", "last", "email"):
+        try:
+            values[field_id] = str(page.locator(f"#{field_id}").input_value())
+        except Exception:
+            values[field_id] = ""
+    return values
+
+
+def _result_brief(result: ApplicationResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "fields_detected": result.fields_detected,
+        "fields_filled": result.fields_filled,
+        "fields_skipped": result.fields_skipped,
+        "stopped_before_submit": result.stopped_before_submit,
+        "submit_controls": list(result.submit_controls),
+    }
+
+
+def read_inspect_surface(page: Any) -> dict[str, Any]:
+    """Open ``chrome://inspect/#remote-debugging`` in a tab this driver already controls."""
+    try:
+        page.goto("chrome://inspect/#remote-debugging", wait_until="domcontentloaded", timeout=10000)
+    except Exception as exc:
+        return {"opened": False, "error": type(exc).__name__}
+    try:
+        text = page.evaluate("() => document.body ? document.body.innerText.slice(0, 2000) : ''")
+    except Exception as exc:
+        return {"opened": True, "url": str(page.url or ""), "error": type(exc).__name__}
+    return {"opened": True, "url": str(page.url or ""), "text": text if isinstance(text, str) else ""}
+
+
+def demonstrate_dedicated_fill(
+    *,
+    fixture_html: Path,
+    profile_path: Path,
+    work_dir: Path,
+    screenshot_path: Path,
+    headless: bool = True,
+    executable: str | None = None,
+) -> dict[str, Any]:
+    """Open a local form in a dedicated Chrome profile and fill that same tab.
+
+    The hosted service is not involved. A second browser context is not created
+    for the fill. Reconnecting must observe the same target id and cookie.
+    """
+    require_feature()
+    html = fixture_html.read_bytes()
+    server = start_fixture_server(html)
+    port = int(server.server_address[1])
+    form_url = f"http://{LOOPBACK}:{port}/t172-local-tab.html"
+    user_data = work_dir / "chrome-profile"
+    debug_port = free_port()
+    chrome = launch_dedicated_chrome(
+        user_data_dir=user_data,
+        port=debug_port,
+        start_url=form_url,
+        executable=executable,
+        headless=headless,
+    )
+    from playwright.sync_api import sync_playwright
+
+    try:
+        version_payload = _wait_cdp(debug_port, chrome.process, 20)
+        if version_payload is None:
+            raise LocalAttachError(f"Dedicated Chrome did not open CDP. {chrome.stderr_text()[:500]}")
+        listen = assert_loopback_listen(debug_port)
+        socket_url = str(version_payload.get("webSocketDebuggerUrl") or "")
+        if not socket_url.startswith(f"ws://{LOOPBACK}:"):
+            raise LoopbackRequired(f"Chrome advertised a non-loopback websocket: {socket_url}")
+        playwright = sync_playwright().start()
+        try:
+            first = attach_visible_tab(playwright, chrome.endpoint, url_prefix=form_url)
+            first_target = first.target_id
+            first_cookie = _cookie_value(first.page)
+            first_context_count = first.context_count
+        finally:
+            playwright.stop()
+        alive = chrome.poll() is None
+        playwright = sync_playwright().start()
+        try:
+            second = attach_visible_tab(playwright, chrome.endpoint, url_prefix=form_url)
+            profile = CandidateProfile.load(profile_path)
+            result = fill_visible_tab(second.page, form_url, profile)
+            values = _field_values(second.page)
+            submitted = bool(second.page.evaluate("() => window.__submitted"))
+            cookie_after = _cookie_value(second.page)
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            second.page.screenshot(path=str(screenshot_path), full_page=True)
+            inspect_page = second.context.new_page()
+            inspect = read_inspect_surface(inspect_page)
+        finally:
+            playwright.stop()
+        return {
+            "mode": "dedicated_fill",
+            "chrome_version": chrome_version(find_chrome(executable)),
+            "headless": headless,
+            "endpoint": chrome.endpoint,
+            "listen_hosts": listen,
+            "browser": str(version_payload.get("Browser") or ""),
+            "webSocketDebuggerUrl_host_ok": socket_url.startswith(f"ws://{LOOPBACK}:"),
+            "user_data_dir_is_default": is_default_user_data_dir(user_data),
+            "created_new_context_for_fill": False,
+            "context_count": first_context_count,
+            "target_id": first_target,
+            "target_id_after_reconnect": second.target_id,
+            "same_target": bool(first_target) and first_target == second.target_id,
+            "chrome_alive_after_disconnect": alive,
+            "cookie_before": first_cookie,
+            "cookie_after_fill": cookie_after,
+            "cookie_preserved": "t172_visible=same-tab" in first_cookie and "t172_visible=same-tab" in cookie_after,
+            "values": values,
+            "submitted": submitted,
+            "fill": _result_brief(result),
+            "screenshot": str(screenshot_path),
+            "inspect_surface": inspect,
+        }
+    finally:
+        chrome.stop()
+        server.shutdown()
+
+
+def probe_branded_load_extension(
+    extension_dir: Path,
+    *,
+    executable: str | None = None,
+    timeout: float = 4.0,
+) -> dict[str, Any]:
+    """Record whether branded Chrome honors ``--load-extension``. It should not."""
+    require_feature()
+    exe = find_chrome(executable)
+    version = chrome_version(exe)
+    work = Path(tempfile.mkdtemp(prefix="t172-brand-ext-"))
+    user_data = work / "profile"
+    log_path = work / "chrome.log"
+    args = [
+        exe,
+        f"--user-data-dir={user_data}",
+        f"--load-extension={extension_dir}",
+        "--disable-features=DisableLoadExtensionCommandLineSwitch",
+        "--enable-logging=stderr",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--headless=new",
+        "--disable-gpu",
+        "about:blank",
+    ]
+    proc = _spawn(args, log_path)
+    chrome = ChromeProcess(process=proc, user_data_dir=user_data, port=None, endpoint="", log_path=log_path)
+    try:
+        time.sleep(timeout)
+        stderr_text = chrome.stderr_text()
+    finally:
+        chrome.stop()
+    ignored = "--load-extension is not allowed in Google Chrome" in stderr_text
+    return {
+        "mode": "branded_load_extension",
+        "chrome_version": version,
+        "executable": exe,
+        "load_extension_ignored": ignored,
+        "stderr_excerpt": _excerpt(stderr_text),
+        "note": (
+            "Branded Google Chrome ignored --load-extension. An employee must install an unpacked "
+            "extension from chrome://extensions. That is a consent step, not a silent attach."
+            if ignored
+            else "Branded Chrome did not log the load-extension refusal. See the excerpt."
+        ),
+    }
+
+
+def probe_extension_debugger(
+    extension_dir: Path,
+    *,
+    executable: str,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Load the probe extension without a remote-debugging port and read the tab cookie.
+
+    ``executable`` is Chrome for Testing when branded Chrome refuses ``--load-extension``.
+    The extension reports to the fixture origin on 127.0.0.1 and does not receive a service token.
+    """
+    require_feature()
+    version = chrome_version(executable)
+    html_path = extension_dir.parent / "fixture" / "application.html"
+    if not html_path.is_file():
+        raise LocalAttachError(f"Missing fixture next to the extension: {html_path}")
+    server = start_fixture_server(html_path.read_bytes())
+    port = int(server.server_address[1])
+    form_url = f"http://{LOOPBACK}:{port}/t172-local-tab.html"
+    work = Path(tempfile.mkdtemp(prefix="t172-ext-"))
+    user_data = work / "profile"
+    log_path = work / "chrome.log"
+    args = [
+        executable,
+        f"--user-data-dir={user_data}",
+        f"--load-extension={extension_dir}",
+        f"--disable-extensions-except={extension_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-gpu",
+        "--headless=new",
+        form_url,
+    ]
+    if "--remote-debugging-port" in " ".join(args):
+        raise LoopbackRequired("The extension probe must not open a remote debugging port.")
+    proc = _spawn(args, log_path)
+    chrome = ChromeProcess(process=proc, user_data_dir=user_data, port=None, endpoint="", log_path=log_path)
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not server.evidence:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        evidence = list(server.evidence)
+        stderr_text = chrome.stderr_text()
+    finally:
+        chrome.stop()
+        server.shutdown()
+    attached = next((item for item in evidence if item.get("attached") is True), None)
+    return {
+        "mode": "extension_debugger",
+        "chrome_version": version,
+        "executable": executable,
+        "remote_debugging_port": False,
+        "reports": evidence,
+        "attached": attached is not None,
+        "cookie": "" if attached is None else str(attached.get("cookie") or ""),
+        "cookie_visible": attached is not None and "t172_visible=same-tab" in str(attached.get("cookie") or ""),
+        "stderr_excerpt": _excerpt(stderr_text),
+        "note": (
+            "chrome.debugger attached inside the browser and read the visible tab's cookie. "
+            "No remote-debugging port was passed. Branded Chrome still requires a manual install."
+            if attached is not None
+            else "The extension did not report an attach. See reports and the Chrome log excerpt."
+        ),
+    }
+
+
+def probe_inspect_consent_cold(
+    *,
+    executable: str | None = None,
+    timeout: float = 4.0,
+) -> dict[str, Any]:
+    """Open the inspect page without a debugging flag. Consent is not granted from here.
+
+    A person has to enable remote debugging and allow the connection. This probe
+    only records that the port file stays absent when nobody does that.
+    """
+    require_feature()
+    exe = find_chrome(executable)
+    version = chrome_version(exe)
+    work = Path(tempfile.mkdtemp(prefix="t172-inspect-"))
+    user_data = work / "profile"
+    log_path = work / "chrome.log"
+    args = [
+        exe,
+        f"--user-data-dir={user_data}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-gpu",
+        "--headless=new",
+        "chrome://inspect/#remote-debugging",
+    ]
+    proc = _spawn(args, log_path)
+    chrome = ChromeProcess(process=proc, user_data_dir=user_data, port=None, endpoint="", log_path=log_path)
+    try:
+        time.sleep(timeout)
+        active = _devtools_active_port(user_data)
+        stderr_text = chrome.stderr_text()
+    finally:
+        chrome.stop()
+    return {
+        "mode": "inspect_consent_cold",
+        "chrome_version": version,
+        "devtools_active_port_present": bool(active),
+        "devtools_active_port": active,
+        "stderr_excerpt": _excerpt(stderr_text),
+        "note": (
+            "Chrome was opened on chrome://inspect/#remote-debugging with no debugging flag and no Allow click. "
+            "DevToolsActivePort was not written, so nothing could attach. Chrome 144+ still requires the person "
+            "to enable remote debugging and approve each connection."
+            if not active
+            else "DevToolsActivePort appeared without an Allow click. Inspect the file before treating that as consent."
+        ),
+    }
+
+
+# Kept so a caller can see every probe the PoC knows about.
+PROBE_MODES = ("headed_daily", "explicit_default", "headless_omitted", "dedicated")
+
+
+@dataclass
+class EvidenceBundle:
+    """JSON-serializable results from one PoC run."""
+
+    probes: list[dict[str, Any]] = field(default_factory=list)
+    dedicated_fill: dict[str, Any] | None = None
+    branded_extension: dict[str, Any] | None = None
+    extension_debugger: dict[str, Any] | None = None
+    inspect_consent: dict[str, Any] | None = None

@@ -23,6 +23,7 @@ dev = ["pytest>=8.0", "ruff>=0.8", "mypy>=1.13", "httpx>=0.27"]
 [project.scripts]
 autofill = "autofill.cli:main"
 autofill-serve = "autofill.service.server:main"
+autofill-local = "autofill.local_helper:main"
 
 [project.urls]
 Homepage = "https://github.com/VK-TECH-LABS/Auto-Fill"

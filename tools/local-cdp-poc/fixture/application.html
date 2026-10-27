@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>t172-local-tab</title>
+</head>
+<body>
+  <h1>Local apply fixture</h1>
+  <p id="cookie-banner"></p>
+  <form id="application" action="/submit" method="post" onsubmit="window.__submitted = true; return false;">
+    <label for="first">First name</label>
+    <input id="first" name="first_name" autocomplete="given-name">
+
+    <label for="last">Last name</label>
+    <input id="last" name="last_name" autocomplete="family-name">
+
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" autocomplete="email">
+
+    <button type="submit" id="submit">Submit application</button>
+  </form>
+  <script>
+    window.__submitted = false;
+    document.cookie = "t172_visible=same-tab; path=/";
+    document.getElementById("cookie-banner").textContent = document.cookie;
+  </script>
+</body>
+</html>
