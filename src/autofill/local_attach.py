@@ -288,11 +288,11 @@ def dedicated_launch_args(
         "--disable-background-networking",
         "--disable-component-update",
         "--disable-popup-blocking",
-        "--disable-gpu",
-        "--window-size=1100,800",
     ]
+    # No viewport and no window size. The Railway runner's 1280x800 context is a
+    # different browser; forcing it here changes the page the employee sees.
     if headless:
-        args.append("--headless=new")
+        args.extend(["--headless=new", "--disable-gpu"])
     for item in extra_args or []:
         if "remote-debugging-address" in item and LOOPBACK not in item:
             raise LoopbackRequired(f"Refusing Chrome argument {item!r}.")
@@ -459,9 +459,8 @@ class VisibleTab:
     page_urls: list[str]
 
     def disconnect(self) -> None:
-        close = getattr(self.browser, "close", None)
-        if close is not None:
-            close()
+        """Drop this CDP client. Leaves the Chrome process running."""
+        detach_cdp_client(self.browser)
 
 
 def attach_visible_tab(playwright: Any, endpoint: str, *, url_prefix: str = "") -> VisibleTab:
@@ -472,7 +471,6 @@ def attach_visible_tab(playwright: Any, endpoint: str, *, url_prefix: str = "") 
     browser = playwright.chromium.connect_over_cdp(f"http://{host}:{port}")
     contexts = list(browser.contexts)
     if not contexts:
-        browser.close()
         raise DualSessionRefused(
             "Chrome exposed no existing context. Refusing to create one; a new context is not the visible tab."
         )
@@ -480,7 +478,6 @@ def attach_visible_tab(playwright: Any, endpoint: str, *, url_prefix: str = "") 
     pages = list(context.pages)
     chosen = _pick_page(pages, url_prefix)
     if chosen is None:
-        browser.close()
         raise LocalAttachError("The existing context has no page to drive.")
     urls: list[str] = []
     for page in pages:
@@ -500,21 +497,210 @@ def attach_visible_tab(playwright: Any, endpoint: str, *, url_prefix: str = "") 
     )
 
 
-def _loopback_http_url(application_url: str) -> None:
-    parsed = urlparse(application_url)
-    if parsed.scheme != "http" or parsed.hostname != LOOPBACK:
-        raise LocalAttachError("This PoC fills only an http://127.0.0.1 fixture. It does not open an employer site.")
+def detach_cdp_client(browser: Any) -> None:
+    """Stop the Playwright CDP client without closing Chrome.
+
+    ``connect_over_cdp`` leaves ``_should_close_connection_on_close`` false, and
+    closing the browser object then asks the driver to tear that browser down.
+    Idle detach only stops this client's pipe. The Chrome window stays so a
+    person can review it and click Submit.
+    """
+    impl = getattr(browser, "_impl_obj", None)
+    connection = getattr(impl, "_connection", None)
+    sync = getattr(browser, "_sync", None)
+    if connection is None or sync is None:
+        return
+    sync(connection.stop_async())
+
+
+def validate_application_url(application_url: str) -> str:
+    """Accept an http(s) employer or fixture URL. The CDP port is still loopback-only."""
+    parsed = urlparse((application_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise LocalAttachError("The application URL must be http or https with a host.")
+    if parsed.username or parsed.password:
+        raise LocalAttachError("The application URL must not carry credentials.")
+    return application_url.strip()
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def same_document(current: str, wanted: str) -> bool:
+    """True when both URLs are the same document, ignoring the fragment."""
+    left, right = urlparse(current), urlparse(wanted)
+    if left.scheme != right.scheme:
+        return False
+    if (left.hostname or "").casefold() != (right.hostname or "").casefold():
+        return False
+    if (left.port or _default_port(left.scheme)) != (right.port or _default_port(right.scheme)):
+        return False
+    return left.path.rstrip("/") == right.path.rstrip("/")
+
+
+def adopt_employer_tab(context: Any, application_url: str) -> Any:
+    """Use the tab already on this URL, or navigate an existing tab in ``contexts[0]``.
+
+    This does not create a browser context, does not set a viewport, and does
+    not install request blocking.
+    """
+    validate_application_url(application_url)
+    pages = list(getattr(context, "pages", []) or [])
+    for page in pages:
+        try:
+            current = str(page.url or "")
+        except Exception:
+            continue
+        if same_document(current, application_url):
+            return page
+    chosen = _pick_page(pages, "")
+    if chosen is None and pages:
+        chosen = pages[0]
+    if chosen is None:
+        raise DualSessionRefused("The existing context has no tab. Refusing to create a context.")
+    chosen.goto(application_url, wait_until="domcontentloaded", timeout=45000)
+    return chosen
+
+
+def _optional_submitted(page: Any) -> bool | None:
+    try:
+        value = page.evaluate("() => window.__submitted")
+    except Exception:
+        return None
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def fill_visible_tab(page: Any, application_url: str, profile: CandidateProfile) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced."""
     require_feature()
-    _loopback_http_url(application_url)
+    validate_application_url(application_url)
     return autofill_application(
         application_url,
         profile,
         options=AutofillOptions(page=page, headless=False, max_pages=1),
     )
+
+
+class DedicatedApplySession:
+    """One dedicated profile. Call it from a single thread.
+
+    ``detach`` drops the CDP client and leaves Chrome running. ``stop_launched_chrome``
+    is the only way this object kills a process, and only a process it launched.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_data_dir: Path,
+        debug_port: int | None = None,
+        headless: bool = False,
+        executable: str | None = None,
+    ) -> None:
+        self.user_data_dir = user_data_dir
+        self.debug_port = free_port() if debug_port is None else debug_port
+        self.headless = headless
+        self.executable = executable
+        self.endpoint = endpoint_for_port(self.debug_port)
+        self.chrome: ChromeProcess | None = None
+        self.owns_chrome = False
+        self.tab: VisibleTab | None = None
+        self._playwright: Any = None
+
+    def ensure(self, application_url: str) -> VisibleTab:
+        """Launch the dedicated profile if needed, then adopt the employer tab."""
+        require_feature()
+        validate_application_url(application_url)
+        if is_default_user_data_dir(self.user_data_dir):
+            raise DefaultProfileBlocked(
+                "The dedicated Apply profile cannot be Chrome's default user-data-dir."
+            )
+        if self.tab is not None:
+            page = adopt_employer_tab(self.tab.context, application_url)
+            self.tab.page = page
+            self.tab.page_url = str(page.url or "")
+            self.tab.target_id = _target_id(self.tab.context, page)
+            return self.tab
+        live = fetch_version(self.debug_port, timeout=0.4)
+        if live is None:
+            self.user_data_dir.mkdir(parents=True, exist_ok=True)
+            self.chrome = launch_dedicated_chrome(
+                user_data_dir=self.user_data_dir,
+                port=self.debug_port,
+                start_url=application_url,
+                executable=self.executable,
+                headless=self.headless,
+            )
+            self.owns_chrome = True
+            opened = _wait_cdp(self.debug_port, self.chrome.process, 20)
+            if opened is None:
+                detail = self.chrome.stderr_text()[:500]
+                self.stop_launched_chrome()
+                raise LocalAttachError(f"Dedicated Chrome did not open CDP. {detail}")
+        elif self.chrome is None:
+            self.owns_chrome = False
+        assert_loopback_listen(self.debug_port)
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        try:
+            tab = attach_visible_tab(self._playwright, self.endpoint, url_prefix=application_url)
+            page = adopt_employer_tab(tab.context, application_url)
+            tab.page = page
+            tab.page_url = str(page.url or "")
+            tab.target_id = _target_id(tab.context, page)
+        except BaseException:
+            self.detach()
+            if self.owns_chrome:
+                self.stop_launched_chrome()
+            raise
+        self.tab = tab
+        return tab
+
+    def fill(self, application_url: str, profile: CandidateProfile) -> tuple[ApplicationResult, bool | None]:
+        """Fill the adopted tab. A page that reports ``__submitted`` is a failure."""
+        tab = self.ensure(application_url)
+        result = fill_visible_tab(tab.page, application_url, profile)
+        submitted = _optional_submitted(tab.page)
+        if submitted is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        return result, submitted
+
+    def detach(self) -> None:
+        """Idle detach. Chrome keeps running whether or not this process launched it.
+
+        Stops the Playwright driver. Does not close the browser object, because
+        that close is how a CDP client asks Chrome to exit.
+        """
+        self.tab = None
+        playwright = self._playwright
+        self._playwright = None
+        if playwright is None:
+            return
+        try:
+            playwright.stop()
+        except Exception:
+            return
+
+    def stop_launched_chrome(self) -> None:
+        """Kill Chrome only when this object launched it. Detach does not call this."""
+        self.detach()
+        chrome = self.chrome
+        self.chrome = None
+        if self.owns_chrome and chrome is not None:
+            chrome.stop()
+        self.owns_chrome = False
+
+    def browser_running(self) -> bool:
+        if self.owns_chrome and self.chrome is not None:
+            return self.chrome.poll() is None
+        return fetch_version(self.debug_port, timeout=0.4) is not None
 
 
 def describe_control(page: Any, selector: str) -> tuple[str, str]:
@@ -834,13 +1020,17 @@ def demonstrate_dedicated_fill(
         socket_url = str(version_payload.get("webSocketDebuggerUrl") or "")
         if not socket_url.startswith(f"ws://{LOOPBACK}:"):
             raise LoopbackRequired(f"Chrome advertised a non-loopback websocket: {socket_url}")
-        with sync_playwright() as playwright:
+        playwright = sync_playwright().start()
+        try:
             first = attach_visible_tab(playwright, chrome.endpoint, url_prefix=form_url)
             first_target = first.target_id
             first_cookie = _cookie_value(first.page)
             first_context_count = first.context_count
-            first.disconnect()
-            alive = chrome.poll() is None
+        finally:
+            playwright.stop()
+        alive = chrome.poll() is None
+        playwright = sync_playwright().start()
+        try:
             second = attach_visible_tab(playwright, chrome.endpoint, url_prefix=form_url)
             profile = CandidateProfile.load(profile_path)
             result = fill_visible_tab(second.page, form_url, profile)
@@ -851,7 +1041,8 @@ def demonstrate_dedicated_fill(
             second.page.screenshot(path=str(screenshot_path), full_page=True)
             inspect_page = second.context.new_page()
             inspect = read_inspect_surface(inspect_page)
-            second.disconnect()
+        finally:
+            playwright.stop()
         return {
             "mode": "dedicated_fill",
             "chrome_version": chrome_version(find_chrome(executable)),

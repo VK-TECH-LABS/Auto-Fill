@@ -1,6 +1,6 @@
 # T172 local same-tab PoC
 
-This is a proof of concept, not the product path. It answers one question: which architecture can drive the same visible Chrome tab an employee is looking at for an employer Apply flow, using this repository's Auto-Fill engine, without a Companion JPEG stream, without a second employer login, without exposing Chrome DevTools to Railway or the public internet, and without clicking Final Submit.
+Phase 1 answered which architecture can drive the same visible Chrome tab an employee is looking at for an employer Apply flow, using this repository's Auto-Fill engine, without a Companion JPEG stream, without a second employer login, without exposing Chrome DevTools to Railway or the public internet, and without clicking Final Submit. Phase 2 keeps only the path that worked.
 
 The hosted Railway runner is unchanged. Companion is unchanged. Nothing here is deployed.
 
@@ -17,7 +17,28 @@ An extension using `chrome.debugger` can read the same tab's cookie without a re
 - `src/autofill/service/runner.py` still launches headless Chromium with `browser.new_context()`. It does not import `autofill.local_attach` and it does not call `connect_over_cdp`.
 - `HUMAN_SUBMIT_ONLY` is still true. There is still no switch that enables Final Submit.
 - No Companion code was removed. No Railway config, Dockerfile, or service route was edited.
-- The local driver runs only when `AUTOFILL_LOCAL_ATTACH=1`. The hosted process does not set that variable.
+- The local driver runs only when `AUTOFILL_LOCAL_ATTACH=1`. The hosted process does not set that variable. Setting it on Railway does not switch the hosted runner to CDP. A test calls `_SharedDriver.browser()` with the variable unset and set to `1`; both calls are `chromium.launch(headless=True)` with the existing launch args and no debugging port.
+
+## Phase 2
+
+The working path is now a local helper, still behind the flag.
+
+| Piece | Behavior |
+| --- | --- |
+| Driver | `DedicatedApplySession` in `src/autofill/local_attach.py`. Dedicated non-default profile, `--remote-debugging-address=127.0.0.1`, `connect_over_cdp`, existing `contexts[0]`. |
+| Fill | `autofill_application` with `AutofillOptions.page` set to that tab. Clicks still go through `perform_click`. |
+| Employer URL | http or https with a host. `file:`, `javascript:`, `chrome:`, and URLs with credentials are refused. The debugging port stays on `127.0.0.1`. |
+| Helper | `python -m autofill.local_helper` or `autofill-local`. `ThreadingHTTPServer` bound to `127.0.0.1` only (`AUTOFILL_LOCAL_HELPER_PORT`, default 9410). |
+| Status | `GET /health`, `POST /v1/sessions` (`applicationUrl`, `profile`), `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/detach`. Every body has `stopped_before_submit: true`. A page that sets `window.__submitted` fails the job. |
+| Flag off | The helper exits 2 and does not bind. Railway's runner is a different process and still launches headless Chromium. |
+| Idle detach | Stops the Playwright driver. It does not close the browser object and it does not kill Chrome, including a Chrome this process did not launch (`ownsBrowser` is false when the port was already open). |
+| Visible window | The dedicated launch does not set a window size and does not call `_block_heavy`. The hosted runner still uses a 1280×800 context and request blocking. Headless is only for the CLI env `AUTOFILL_LOCAL_HEADLESS=1` and for tests. |
+| Profile | `AUTOFILL_LOCAL_PROFILE_DIR`, or `~/.local/share/auto-fill/apply-profile`. The default Chrome directory is refused. |
+| Token | The helper does not read `AUTOFILL_SERVICE_TOKEN`. The extension directory still has none. |
+
+`POST /v1/sessions` returns 202 and runs the fill on one worker thread. Playwright's sync client is not shared across threads. A second fill while one is running returns 409. After the fill, an idle timer (`AUTOFILL_LOCAL_IDLE_DETACH_SECONDS`, default 30) detaches. The Chrome window stays so the employee can click Submit. Tests call `stop_launched_chrome` only in teardown, and only for a process this object started.
+
+Phase 2 does not install the extension, does not click Allow on `chrome://inspect`, and does not attach to daily Chrome. Those phase-1 results are unchanged.
 
 ## Chrome under test
 
@@ -144,9 +165,12 @@ pip install -e ".[dev]"
 python -m playwright install chromium
 export AUTOFILL_LOCAL_ATTACH=1
 export T172_RUN_CHROME_POC=1   # also probes the real default profile
-pytest tests/test_local_attach.py
+pytest tests/test_local_attach.py tests/test_local_helper.py
 python tools/local-cdp-poc/run_poc.py
+python -m autofill.local_helper
 ```
+
+`autofill-local` is the same entry. It listens on `http://127.0.0.1:9410` unless `AUTOFILL_LOCAL_HELPER_PORT` is set. Without `AUTOFILL_LOCAL_ATTACH=1` it exits 2. Railway does not run this command.
 
 `T172_RUN_CHROME_POC=1` launches branded Chrome against the machine's real default user-data-dir long enough to see the port refused. Do not set it on a machine whose daily Chrome you cannot interrupt. The other tests use a temporary profile or Playwright's Chrome for Testing.
 

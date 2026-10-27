@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -101,6 +102,7 @@ def test_hosted_service_does_not_import_the_local_driver():
     ):
         text = (ROOT / relative).read_text(encoding="utf-8")
         assert "local_attach" not in text
+        assert "local_helper" not in text
         assert "connect_over_cdp" not in text
     runner = (ROOT / "src/autofill/service/runner.py").read_text(encoding="utf-8")
     assert "chromium.launch" in runner
@@ -123,7 +125,14 @@ def test_fill_path_does_not_open_a_new_context_or_click_directly():
     source = inspect.getsource(local_attach.attach_visible_tab) + inspect.getsource(local_attach.fill_visible_tab)
     assert "new_context(" not in source
     module = Path(local_attach.__file__).read_text(encoding="utf-8")
+    helper = (ROOT / "src" / "autofill" / "local_helper.py").read_text(encoding="utf-8")
     assert ".click(" not in module
+    assert ".click(" not in helper
+    assert "browser.close(" not in module
+    assert "browser.close(" not in helper
+    assert "_block_heavy" not in module
+    assert "_block_heavy" not in helper
+    assert "AUTOFILL_SERVICE_TOKEN" not in helper
 
 
 def test_endpoint_rejects_anything_but_loopback():
@@ -212,11 +221,122 @@ def test_probe_notes_do_not_treat_headless_as_daily_chrome():
     assert explicit is False
 
 
-def test_fill_refuses_a_public_application_url(monkeypatch):
-    monkeypatch.setenv(ENV_FLAG, "1")
-    profile = CandidateProfile.load(PROFILE)
-    with pytest.raises(LocalAttachError):
-        fill_visible_tab(object(), "https://boards.greenhouse.io/example/jobs/1", profile)
+def test_application_url_allows_an_employer_site_and_rejects_non_http():
+    from autofill.local_attach import validate_application_url
+
+    assert validate_application_url("https://boards.greenhouse.io/example/jobs/1").startswith("https://")
+    assert validate_application_url("http://127.0.0.1:9/t172-local-tab.html")
+    for url in ("file:///tmp/form.html", "javascript:alert(1)", "chrome://inspect", "https://user:pass@example.com/"):
+        with pytest.raises(LocalAttachError):
+            validate_application_url(url)
+
+
+def test_dedicated_launch_does_not_force_the_hosted_viewport(tmp_path):
+    args = dedicated_launch_args(
+        executable="/usr/bin/google-chrome-stable",
+        user_data_dir=tmp_path / "profile",
+        port=9222,
+        start_url="https://example.com/apply",
+        headless=False,
+    )
+    joined = " ".join(args)
+    assert "--window-size" not in joined
+    assert "1280" not in joined
+    assert "--disable-gpu" not in joined
+    assert "--remote-debugging-address=127.0.0.1" in args
+
+
+def test_flag_off_and_on_still_launch_headless_chromium(monkeypatch):
+    """Railway's driver does not switch to CDP when the local-attach flag changes."""
+    import playwright.sync_api as sync_api
+
+    from autofill.service.runner import DEFAULT_LAUNCH_ARGS, PlaywrightRunner, _SessionContext, _SharedDriver
+
+    calls: list[tuple[Any, ...]] = []
+
+    class _Browser:
+        def close(self) -> None:
+            calls.append(("browser.close",))
+
+    class _Chromium:
+        def launch(self, *, headless: bool, args: list[str]) -> _Browser:
+            calls.append(("launch", headless, list(args)))
+            return _Browser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+        def stop(self) -> None:
+            calls.append(("playwright.stop",))
+
+    class _Manager:
+        def start(self) -> _Playwright:
+            return _Playwright()
+
+    monkeypatch.setattr(sync_api, "sync_playwright", lambda: _Manager())
+    for value in ("", "1"):
+        monkeypatch.setenv(ENV_FLAG, value)
+        calls.clear()
+        driver = _SharedDriver(headless=True, launch_args=list(DEFAULT_LAUNCH_ARGS))
+        driver.browser()
+        kind, headless, args = calls[0]
+        assert kind == "launch"
+        assert headless is True
+        assert not any("remote-debugging" in item or "user-data-dir" in item for item in args)
+        assert "connect_over_cdp" not in inspect.getsource(_SharedDriver.browser)
+        driver.stop()
+    runner = PlaywrightRunner(workers=1)
+    try:
+        assert runner.headless is True
+        opened = inspect.getsource(_SessionContext.open)
+        assert "chromium.launch" in inspect.getsource(_SharedDriver.browser)
+        assert "new_context(" in opened
+        assert "1280" in opened
+        assert "_block_heavy" in opened
+    finally:
+        runner.shutdown()
+
+
+def test_detach_stops_the_pipe_and_does_not_close_the_browser():
+    from autofill.local_attach import DedicatedApplySession, detach_cdp_client
+
+    closed: list[str] = []
+    stopped: list[str] = []
+
+    class _Connection:
+        def stop_async(self) -> None:
+            stopped.append("pipe")
+
+    class _Impl:
+        _connection = _Connection()
+
+    class _Browser:
+        _impl_obj = _Impl()
+
+        def _sync(self, awaitable: object) -> object:
+            return awaitable
+
+        def close(self) -> None:
+            closed.append("browser")
+
+    detach_cdp_client(_Browser())
+    assert stopped == ["pipe"]
+    assert closed == []
+
+    class _Playwright:
+        def stop(self) -> None:
+            stopped.append("driver")
+
+        def close(self) -> None:
+            closed.append("playwright")
+
+    session = DedicatedApplySession(user_data_dir=Path("/tmp/t172-not-created"), debug_port=9)
+    session._playwright = _Playwright()
+    session.owns_chrome = False
+    session.detach()
+    session.stop_launched_chrome()
+    assert "driver" in stopped
+    assert closed == []
 
 
 def test_alternate_submit_paths_never_fire(monkeypatch):
