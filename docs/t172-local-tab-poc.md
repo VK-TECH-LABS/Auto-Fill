@@ -29,14 +29,37 @@ The working path is now a local helper, still behind the flag.
 | Fill | `autofill_application` with `AutofillOptions.page` set to that tab. Clicks still go through `perform_click`. |
 | Employer URL | http or https with a host. `file:`, `javascript:`, `chrome:`, and URLs with credentials are refused. The debugging port stays on `127.0.0.1`. |
 | Helper | `python -m autofill.local_helper` or `autofill-local`. `ThreadingHTTPServer` bound to `127.0.0.1` only (`AUTOFILL_LOCAL_HELPER_PORT`, default 9410). |
-| Status | `GET /health`, `POST /v1/sessions` (`applicationUrl`, `profile`), `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/detach`. `READY_FOR_HUMAN_SUBMIT`, detach, and other refusals keep `stopped_before_submit: true`. A page that sets `window.__submitted` fails the job (`FAILED`, `submitted: true`) and that body sets `stopped_before_submit: false`. The flag is a report only: the helper still does not click Final Submit and does not mark the job applied. |
+| Status | `GET /health`, `POST /v1/sessions` (`applicationUrl`, `profile`), `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/answer`, `POST /v1/sessions/{id}/detach`. `READY_FOR_HUMAN_SUBMIT`, detach, and other refusals keep `stopped_before_submit: true`. A page that sets `window.__submitted` fails the job (`FAILED`, `submitted: true`) and that body sets `stopped_before_submit: false`. The flag is a report only: the helper still does not click Final Submit and does not mark the job applied. |
 | Flag off | The helper exits 2 and does not bind. Railway's runner is a different process and still launches headless Chromium. |
 | Idle detach | Stops the Playwright driver. It does not close the browser object and it does not kill Chrome, including a Chrome this process did not launch (`ownsBrowser` is false when the port was already open). |
 | Visible window | The dedicated launch does not set a window size and does not call `_block_heavy`. The hosted runner still uses a 1280×800 context and request blocking. Headless is only for the CLI env `AUTOFILL_LOCAL_HEADLESS=1` and for tests. |
 | Profile | `AUTOFILL_LOCAL_PROFILE_DIR`, or `~/.local/share/auto-fill/apply-profile`. The default Chrome directory is refused. |
 | Token | The helper does not read `AUTOFILL_SERVICE_TOKEN`. The extension directory still has none. |
 
-`POST /v1/sessions` returns 202 and runs the fill on one worker thread. Playwright's sync client is not shared across threads. A second fill while one is running returns 409. After the fill, an idle timer (`AUTOFILL_LOCAL_IDLE_DETACH_SECONDS`, default 30) detaches. The Chrome window stays so the employee can click Submit. Tests call `stop_launched_chrome` only in teardown, and only for a process this object started.
+`POST /v1/sessions` returns 202 and runs the fill on one worker thread. Playwright's sync client is not shared across threads. A second fill while one is running returns 409. After the fill, an idle timer (`AUTOFILL_LOCAL_IDLE_DETACH_SECONDS`, default 30) detaches, unless the fill stopped on a question. The Chrome window stays so the employee can click Submit. Tests call `stop_launched_chrome` only in teardown, and only for a process this object started.
+
+## Unknown questions
+
+A profile fill that stops on `MANUAL_ANSWER_REQUIRED` puts the current question on `GET /v1/sessions/{id}`:
+
+```json
+{
+  "question": {
+    "id": "questionId, otherwise questionHash, otherwise the field key",
+    "prompt": "What is your favorite color?",
+    "type": "single_select",
+    "options": ["Red", "Blue"]
+  }
+}
+```
+
+`id`, `prompt`, `type`, and `options` are the stable shape. `type` and `options` are the engine's `answerType` and option labels when the page has them. `options` is `[]` for free text. The selector, the profile, and any typed answer are not on this object. Login, captcha, account, verification, resume, and no-form stops are not questions. While `question` is present the idle timer waits, so the dedicated tab stays attached.
+
+`POST /v1/sessions/{id}/answer` accepts that `id` (also `questionId`, `questionHash`, or `fieldKey`) and the employee's `value` or `answer`. It writes the value in the same Chrome tab, through the same visible commit the hosted runner uses, then reads the page again. The response is `{verified, filled, stopped_before_submit, status, ...}`. `filled` is true only when `verified` is true. `verified` is true only when the control holds the value after the write. The value is not echoed and is not logged.
+
+Callers persist that answer as `confirmedByEmployee` only when `verified` is true. `verified: false` means the control did not keep it (`not_committed`, a wrong option, a stale id, or a consent box without `confirm`). Do not persist those. This helper does not store `confirmedByEmployee` and does not read `AUTOFILL_SERVICE_TOKEN`.
+
+A verified answer that leaves another required field empty returns the next `question` and stays on `MANUAL_ANSWER_REQUIRED`. When nothing required is left, `question` is absent and the idle detach runs. The route never clicks Final Submit. A page that sets `window.__submitted` fails the answer (`FAILED`, `submitted: true`, `stopped_before_submit: false`). `READY_FOR_HUMAN_SUBMIT` and detach stay `stopped_before_submit: true`. The hosted Railway runner is a different process and is unchanged.
 
 Phase 2 does not install the extension, does not click Allow on `chrome://inspect`, and does not attach to daily Chrome. Those phase-1 results are unchanged.
 

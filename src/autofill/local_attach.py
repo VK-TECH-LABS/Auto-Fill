@@ -567,6 +567,46 @@ def adopt_employer_tab(context: Any, application_url: str) -> Any:
     return chosen
 
 
+def apply_visible_answer(page: Any, target: dict[str, Any]) -> dict[str, Any]:
+    """Commit one value on the open page and report whether it stuck.
+
+    A location field uses the suggestion commit. Every other field uses the
+    same visible commit as the hosted runner. Neither path clicks Final Submit.
+    ``verified`` is true only when that commit check passed. The value is not
+    copied into the result.
+    """
+    require_feature()
+    from autofill.dom_ui import commit_visible, control_committed
+    from autofill.stepfill import commit_location_answer, is_location_answer
+
+    if is_location_answer(page, target):
+        report = commit_location_answer(page, target)
+    else:
+        report = commit_visible(page, target)
+        selector = str(target.get("selector") or "")
+        if report.get("filled") and selector and not control_committed(page, selector):
+            report = {"filled": False, "reason": "not_committed"}
+    if _optional_submitted(page) is True:
+        raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+    if report.get("reason") == "needs_option":
+        return {
+            "filled": False,
+            "verified": False,
+            "reason": "needs_option",
+            "options": [str(option) for option in report.get("options") or []],
+        }
+    verified = bool(report.get("filled"))
+    if "verified" in report:
+        verified = bool(report.get("verified")) and bool(report.get("filled"))
+    body: dict[str, Any] = {"filled": verified, "verified": verified}
+    if not verified:
+        body["reason"] = str(report.get("reason") or "not_committed")
+        options = [str(option) for option in report.get("options") or [] if str(option).strip()]
+        if options:
+            body["options"] = options
+    return body
+
+
 def _optional_submitted(page: Any) -> bool | None:
     try:
         value = page.evaluate("() => window.__submitted")
@@ -612,6 +652,8 @@ class DedicatedApplySession:
         self.owns_chrome = False
         self.tab: VisibleTab | None = None
         self._playwright: Any = None
+        self._page_mark: Any = None
+        self._held: set[str] = set()
 
     def ensure(self, application_url: str) -> VisibleTab:
         """Launch the dedicated profile if needed, then adopt the employer tab."""
@@ -670,7 +712,80 @@ class DedicatedApplySession:
         submitted = _optional_submitted(tab.page)
         if submitted is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        self._remember_mark(tab.page)
         return result, submitted
+
+    def apply_answer(
+        self,
+        application_url: str,
+        profile: CandidateProfile,
+        target: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Write one employee answer on the open tab and read what is still empty.
+
+        ``verified`` is true only when the control holds the value afterwards.
+        Callers persist confirmedByEmployee only in that case. Final Submit is
+        not clicked. The answer text is not returned.
+        """
+        require_feature()
+        page = self._page_for_answer(application_url)
+        report = apply_visible_answer(page, target)
+        if not report.get("verified"):
+            return report
+        selector = str(target.get("selector") or "")
+        if selector:
+            self._held.add(selector)
+        followed = self._follow_answer(page, application_url, profile)
+        followed["verified"] = True
+        followed["filled"] = True
+        return followed
+
+    def _page_for_answer(self, application_url: str) -> Any:
+        """Use the tab fill already adopted. Reconnect only after a detach."""
+        if self.tab is not None and self._playwright is not None:
+            return self.tab.page
+        return self.ensure(application_url).page
+
+    def _remember_mark(self, page: Any) -> None:
+        try:
+            from autofill.follow import read_page_mark
+
+            self._page_mark, _snapshot = read_page_mark(page)
+        except Exception:
+            self._page_mark = None
+
+    def _follow_answer(self, page: Any, application_url: str, profile: CandidateProfile) -> dict[str, Any]:
+        """The next empty required field, or a full fill when the page changed."""
+        from autofill.follow import follow_answer
+
+        follow = follow_answer(
+            page,
+            profile=profile,
+            job=None,
+            held=set(self._held),
+            prior=[],
+            previous=self._page_mark,
+        )
+        if _optional_submitted(page) is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        if follow.changed:
+            result = fill_visible_tab(page, application_url, profile)
+            if _optional_submitted(page) is True:
+                raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+            self._remember_mark(page)
+            return {
+                "status": result.status,
+                "open_items": list(result.open_items),
+                "blocking": result.blocking,
+                "result": result,
+            }
+        if follow.mark is not None:
+            self._page_mark = follow.mark
+        return {
+            "status": follow.status,
+            "open_items": list(follow.open_items),
+            "blocking": follow.blocking,
+        }
 
     def detach(self) -> None:
         """Idle detach. Chrome keeps running whether or not this process launched it.
