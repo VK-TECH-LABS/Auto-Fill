@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -141,6 +142,7 @@ def test_idle_detach_does_not_stop_chrome_or_submit(monkeypatch):
         server.shutdown()
 
 
+@pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
 def test_dedicated_helper_fills_without_clicking_submit(monkeypatch, tmp_path):
     monkeypatch.setenv(ENV_FLAG, "1")
     try:

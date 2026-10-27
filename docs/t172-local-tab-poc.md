@@ -172,6 +172,4 @@ python -m autofill.local_helper
 
 `autofill-local` is the same entry. It listens on `http://127.0.0.1:9410` unless `AUTOFILL_LOCAL_HELPER_PORT` is set. Without `AUTOFILL_LOCAL_ATTACH=1` it exits 2. Railway does not run this command.
 
-`T172_RUN_CHROME_POC=1` launches branded Chrome against the machine's real default user-data-dir long enough to see the port refused. Do not set it on a machine whose daily Chrome you cannot interrupt. The other tests use a temporary profile or Playwright's Chrome for Testing.
-
-The default-profile test is skipped unless that variable is set, so CI does not need Google Chrome. CI does install Playwright Chromium, and the extension cookie test runs there.
+Default `pytest` does not launch Chrome. `T172_RUN_CHROME_POC=1` enables the probes that do: the daily-profile port refusal, the dedicated-profile fill, the branded `--load-extension` refusal, the Chrome-for-Testing extension cookie check, and the helper integration fill. Do not set it on a machine whose daily Chrome you cannot interrupt. The daily-profile probe is the only one that touches the real default user-data-dir. CI does not set the variable. The flag-off headless-launch test fakes Playwright and always runs.

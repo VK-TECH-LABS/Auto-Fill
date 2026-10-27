@@ -431,6 +431,7 @@ def test_daily_profile_debugging_port_is_ignored(tmp_path, monkeypatch):
     assert str(dedicated["webSocketDebuggerUrl"]).startswith("ws://127.0.0.1:")
 
 
+@pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
 @pytest.mark.skipif(not _chrome_ready(), reason="Google Chrome is not installed")
 def test_dedicated_profile_fills_the_same_tab(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
@@ -455,6 +456,7 @@ def test_dedicated_profile_fills_the_same_tab(tmp_path, monkeypatch):
     assert Path(str(evidence["screenshot"])).is_file()
 
 
+@pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
 @pytest.mark.skipif(not _chrome_ready(), reason="Google Chrome is not installed")
 def test_branded_chrome_ignores_load_extension(monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
@@ -462,6 +464,7 @@ def test_branded_chrome_ignores_load_extension(monkeypatch):
     assert result["load_extension_ignored"] is True
 
 
+@pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
 @pytest.mark.skipif(_testing_chrome() is None, reason="Chrome for Testing is not installed")
 def test_extension_debugger_reads_the_same_tab_cookie(monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
