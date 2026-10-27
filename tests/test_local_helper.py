@@ -15,6 +15,7 @@ from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
     ENV_FLAG,
     FeatureDisabled,
+    LocalAttachError,
     LoopbackRequired,
     fetch_version,
     find_chrome,
@@ -84,6 +85,13 @@ def test_flag_off_refuses_to_bind(monkeypatch):
     assert main() == 2
 
 
+class _ReportedSubmitSession(_FakeSession):
+    def fill(self, url: str, profile: object) -> tuple[ApplicationResult, bool]:
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+
+
 def test_helper_refuses_a_public_bind(monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
     with pytest.raises(LoopbackRequired):
@@ -136,6 +144,47 @@ def test_idle_detach_does_not_stop_chrome_or_submit(monkeypatch):
         assert body["fill"]["fields_filled"] == 3
         assert body["browserRunning"] is True
         assert fake.detached >= 1
+        assert fake.stopped == 0
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_reported_submit_is_failed_and_not_stopped_before_submit(monkeypatch):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    fake = _ReportedSubmitSession()
+    helper = LocalHelper(session=fake, idle_detach_seconds=0)  # type: ignore[arg-type]
+    server = serve(port=0, helper=helper)
+    port = int(server.server_address[1])
+    profile = json.loads(PROFILE.read_text(encoding="utf-8"))
+    try:
+        status, created = _request(
+            port,
+            "POST",
+            "/v1/sessions",
+            {"applicationUrl": "https://boards.greenhouse.io/example/jobs/1", "profile": profile},
+        )
+        assert status == 202
+        assert created["status"] == "queued"
+        assert created["stopped_before_submit"] is True
+        assert created["submitted"] is None
+        assert fake.started.wait(timeout=5)
+        fake.release.set()
+        session_id = created["sessionId"]
+        body: dict = {}
+        for _ in range(50):
+            code, body = _request(port, "GET", f"/v1/sessions/{session_id}")
+            if body.get("detached"):
+                break
+            threading.Event().wait(0.05)
+        assert code == 200
+        assert body["status"] == "FAILED"
+        assert body["submitted"] is True
+        assert body["stopped_before_submit"] is False
+        assert body["status"] not in {"SUBMITTED", "FILLED"}
+        assert body["error"] == "LocalAttachError"
+        assert "fill" not in body
+        assert body["detached"] is True
         assert fake.stopped == 0
     finally:
         helper.close()

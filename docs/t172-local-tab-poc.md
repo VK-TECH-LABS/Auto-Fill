@@ -29,7 +29,7 @@ The working path is now a local helper, still behind the flag.
 | Fill | `autofill_application` with `AutofillOptions.page` set to that tab. Clicks still go through `perform_click`. |
 | Employer URL | http or https with a host. `file:`, `javascript:`, `chrome:`, and URLs with credentials are refused. The debugging port stays on `127.0.0.1`. |
 | Helper | `python -m autofill.local_helper` or `autofill-local`. `ThreadingHTTPServer` bound to `127.0.0.1` only (`AUTOFILL_LOCAL_HELPER_PORT`, default 9410). |
-| Status | `GET /health`, `POST /v1/sessions` (`applicationUrl`, `profile`), `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/detach`. Every body has `stopped_before_submit: true`. A page that sets `window.__submitted` fails the job. |
+| Status | `GET /health`, `POST /v1/sessions` (`applicationUrl`, `profile`), `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/detach`. `READY_FOR_HUMAN_SUBMIT`, detach, and other refusals keep `stopped_before_submit: true`. A page that sets `window.__submitted` fails the job (`FAILED`, `submitted: true`) and that body sets `stopped_before_submit: false`. The flag is a report only: the helper still does not click Final Submit and does not mark the job applied. |
 | Flag off | The helper exits 2 and does not bind. Railway's runner is a different process and still launches headless Chromium. |
 | Idle detach | Stops the Playwright driver. It does not close the browser object and it does not kill Chrome, including a Chrome this process did not launch (`ownsBrowser` is false when the port was already open). |
 | Visible window | The dedicated launch does not set a window size and does not call `_block_heavy`. The hosted runner still uses a 1280×800 context and request blocking. Headless is only for the CLI env `AUTOFILL_LOCAL_HEADLESS=1` and for tests. |
@@ -123,7 +123,7 @@ A separate branded Chrome was started with no debugging flag, pointed at that UR
 
 `drive_control` is the only click entry in the local driver. It reads the control's own text and `type` from the DOM. A caller who labels a Submit button "Next" or "Save and continue" is still refused, because the DOM name is classified with `action_class`. These purposes are refused before any key or script is sent: `eval`, `form_submit`, `keyboard_enter`, `request_submit`. Every other purpose goes through `perform_click`, which raises `HumanSubmissionRequired` for a final Submit or Apply.
 
-`tests/test_local_attach.py` loads a page whose Submit, Apply now, and Send application buttons set `window.__submitted`, and whose email field records Enter. It runs those labels under navigation, login, account, account_switch, the script purposes, and an unknown purpose. The flags stay false. A real "Save and continue" button still clicks, and that click does not submit. The dedicated-profile fill asserts `submitted` is false and `stopped_before_submit` is true.
+`tests/test_local_attach.py` loads a page whose Submit, Apply now, and Send application buttons set `window.__submitted`, and whose email field records Enter. It runs those labels under navigation, login, account, account_switch, the script purposes, and an unknown purpose. The flags stay false. A real "Save and continue" button still clicks, and that click does not submit. The dedicated-profile fill asserts `submitted` is false and `stopped_before_submit` is true. A reported submit is `FAILED` with `submitted` true and `stopped_before_submit` false. `READY_FOR_HUMAN_SUBMIT` and detach stay true.
 
 There is no flag in this driver that turns Final Submit on.
 

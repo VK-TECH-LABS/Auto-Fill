@@ -49,7 +49,13 @@ def default_profile_dir() -> Path:
 
 
 class LocalJob:
-    """One fill request. ``stopped_before_submit`` stays true in every response."""
+    """One fill request.
+
+    ``stopped_before_submit`` stays true unless this job observed a submit
+    (``submitted is True``). That report is status ``FAILED`` with the flag
+    false. The helper still never clicks Final Submit and never marks the
+    job applied.
+    """
 
     def __init__(self, session_id: str, application_url: str) -> None:
         self.session_id = session_id
@@ -63,16 +69,21 @@ class LocalJob:
         self.owns_browser = False
         self.browser_running = False
 
+    def submit_claimed(self) -> bool:
+        """True only when the page reported a submit. A missing flag is not a claim."""
+        return self.submitted is True
+
     def public(self) -> dict[str, Any]:
         status = self.state
         if self.result is not None and not self.error:
             status = str(self.result.get("status") or status)
         if self.error:
             status = "FAILED"
+        stopped_before_submit = not self.submit_claimed()
         body: dict[str, Any] = {
             "sessionId": self.session_id,
             "status": status,
-            "stopped_before_submit": True,
+            "stopped_before_submit": stopped_before_submit,
             "applicationUrl": self.application_url,
             "targetId": self.target_id,
             "submitted": self.submitted,
@@ -82,7 +93,7 @@ class LocalJob:
         }
         if self.result is not None:
             body["fill"] = dict(self.result)
-            body["fill"]["stopped_before_submit"] = True
+            body["fill"]["stopped_before_submit"] = stopped_before_submit
         if self.error:
             body["error"] = self.error
         return body
@@ -193,17 +204,17 @@ class LocalHelper:
         job.state = "running"
         try:
             result, submitted = self._session.fill(job.application_url, profile)
-            job.result = _result_brief(result)
-            job.result["stopped_before_submit"] = True
             job.submitted = submitted
+            job.result = _result_brief(result)
+            job.result["stopped_before_submit"] = submitted is not True
             job.target_id = self._session.tab.target_id if self._session.tab is not None else ""
             job.state = "done"
         except Exception as exc:
-            job.error = type(exc).__name__
-            job.state = "error"
             reported_submit = isinstance(exc, LocalAttachError) and "reported a submit" in str(exc)
             if reported_submit:
                 job.submitted = True
+            job.error = type(exc).__name__
+            job.state = "error"
         finally:
             job.owns_browser = self._session.owns_chrome
             job.browser_running = self._session.browser_running()
