@@ -178,3 +178,47 @@ def test_switch_waits_for_sign_in_pane_to_render(workday):
     assert report["outcome"] == "signed_in", report
     assert page.evaluate("window.__paneSignIn") == 1
     assert page.evaluate("window.__modalOpened") == 0
+
+
+# RC-S1 (Nordson / Barry-Wehmiller smoke after #77, 2026-10-27): Companion skipped
+# register for a saved login and sent mode=login. The engine opened Sign In from
+# Create Account, typed the saved login, and pressed at once. Live Workday ignores
+# that press for about 0.5 s after the pane renders: no POST, the password stayed
+# in the box, and the wait ended ``pending`` (Companion outcome=pending saved=no).
+
+
+def test_saved_login_waits_for_new_sign_in_pane_before_pressing(workday):
+    page = workday(armMs="600")
+    report = _login(page)
+    assert report["ok"] is True and report["outcome"] == "signed_in", report
+    assert page.evaluate("window.__swallowed") == 0
+    assert page.evaluate("window.__paneSignIn") == 1
+    assert page.evaluate("window.__loginPosts") == 1
+    assert page.locator("[data-automation-id='applyFlowMyInfoPage']").count() == 1
+
+
+def test_ignored_press_is_pressed_once_more(workday):
+    page = workday(armMs="1800")
+    report = _login(page)
+    assert report["ok"] is True and report["outcome"] == "signed_in", report
+    assert page.evaluate("window.__swallowed") == 1
+    assert page.evaluate("window.__presses") == 2
+    assert page.evaluate("window.__loginPosts") == 1
+
+
+def test_press_that_sent_a_request_is_never_repeated(workday):
+    """A Sign In that reached the employer is one attempt, even if the pane stays."""
+    page = workday(result="silent")
+    report = _login(page)
+    assert page.evaluate("window.__presses") == 1
+    assert page.evaluate("window.__loginPosts") == 1
+    assert report.get("outcome") != "signed_in", report
+
+
+def test_never_more_than_two_presses(workday):
+    page = workday(armMs="600000")
+    report = _login(page)
+    assert page.evaluate("window.__presses") == 2
+    assert page.evaluate("window.__loginPosts") == 0
+    assert report["ok"] is True and report["outcome"] == "pending", report
+    assert report["status"] == "LOGIN_REQUIRED"

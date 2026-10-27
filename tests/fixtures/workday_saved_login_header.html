@@ -15,6 +15,10 @@
     (start=app) after the spinner, like a tenant that re-renders after sign-in.
   * localStorage "switchMs": the pane's Sign In link empties the pane and
     renders the Sign In pane only after that delay.
+  * localStorage "armMs" (RC-S1, live barrywehmiller.wd1 with POSTs blocked): a
+    Sign In press within armMs of the Sign In pane rendering is ignored (no
+    request, pane unchanged). A press that counts POSTs /login first.
+  * localStorage "result": "silent" POSTs /login and leaves the pane as it is.
 -->
 <header data-automation-id="header">
   <button type="button" data-automation-id="utilityButtonSignIn">Sign In</button>
@@ -30,6 +34,9 @@
 <div id="modal"></div>
 <script>
 window.__paneSignIn = 0;
+window.__presses = 0;
+window.__swallowed = 0;
+window.__loginPosts = 0;
 window.__modalOpened = 0;
 var pane = document.getElementById("pane");
 function overlayButton(id, label) {
@@ -75,9 +82,16 @@ function signInPane() {
     + '</form>'
     + '<p>Don\'t have an account yet? <button type="button" data-automation-id="createAccountLink">Create Account</button></p>'
     + '</div>';
+  var renderedAt = Date.now();
   pane.querySelector("[data-automation-id='click_filter']").addEventListener("click", function () {
+    window.__presses += 1;
+    var arm = parseInt(localStorage.getItem("armMs") || "0", 10);
+    if (arm && Date.now() - renderedAt < arm) { window.__swallowed += 1; return; }
     window.__paneSignIn += 1;
+    window.__loginPosts += 1;
+    fetch(location.origin + "/login", { method: "POST", body: "x" }).catch(function () {});
     var result = localStorage.getItem("result") || "app";
+    if (result === "silent") return;
     pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
     setTimeout(function () {
       if (result === "unverified") {
