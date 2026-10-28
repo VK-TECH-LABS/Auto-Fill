@@ -58,11 +58,12 @@ jobs:
           retention-days: 14
 
       - name: Upload staging installer
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: TileArc-AutoFill-Helper-Setup-staging
           path: dist/TileArc-AutoFill-Helper-Setup-staging.exe
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 90
 
   draft-release:

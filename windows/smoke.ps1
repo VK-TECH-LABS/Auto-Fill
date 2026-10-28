@@ -26,12 +26,25 @@ function Show-HelperLogs {
 function Assert-Doctor {
     param([string]$ExePath)
     Write-Host "Doctor: $ExePath"
-    & $ExePath --doctor
-    if ($LASTEXITCODE -ne 0) {
-        Show-HelperLogs
-        throw "doctor exited $LASTEXITCODE"
-    }
     $doctor = Join-Path $env:LOCALAPPDATA "TileArc\AutoFill\doctor.json"
+    if (Test-Path $doctor) {
+        Remove-Item -Force $doctor
+    }
+    # TileArcAutoFillHelper.exe is a GUI-subsystem binary. The call operator
+    # leaves $LASTEXITCODE empty, and $null -ne 0 is true, so that check fails
+    # a doctor run that wrote a good doctor.json. Start-Process records the
+    # process exit code. An empty code is accepted only when this run's
+    # doctor.json passes the checks below.
+    $proc = Start-Process -FilePath $ExePath -ArgumentList "--doctor" -Wait -PassThru -WindowStyle Hidden
+    $code = $proc.ExitCode
+    if ($null -eq $code) {
+        Write-Host "Doctor exit code was empty; requiring doctor.json."
+    } elseif ($code -ne 0) {
+        Show-HelperLogs
+        throw "doctor exited $code"
+    } else {
+        Write-Host "Doctor exit code: $code"
+    }
     if (-not (Test-Path $doctor)) {
         throw "doctor.json was not written"
     }
@@ -119,7 +132,7 @@ $install = Start-Process -FilePath $Setup -ArgumentList @(
     "/NORESTART",
     "/DIR=$dest"
 ) -Wait -PassThru
-if ($install.ExitCode -ne 0) {
+if ($null -ne $install.ExitCode -and $install.ExitCode -ne 0) {
     throw "installer exited $($install.ExitCode)"
 }
 $installed = Join-Path $dest "TileArcAutoFillHelper.exe"

@@ -273,3 +273,6 @@ def test_staging_installer_name_is_the_vinayaka_contract():
     assert "127.0.0.1:9410" in smoke
     assert "auto-fill-local" in smoke
     assert "dedicated-profile" in smoke
+    assert 'Start-Process -FilePath $ExePath -ArgumentList "--doctor"' in smoke
+    assert "& $ExePath" not in smoke
+    assert "if: always()" in workflow
