@@ -12,7 +12,8 @@ Now:
   pane instead of calling ``run_login``;
 * a LOGIN_FAILED whose banner says the account is not verified becomes the same
   verify card (protocol 0.7.0), so Continue signs in once after the person verifies;
-* Continue (humanResolved) clears ``verify_pending``; reaching the application clears it.
+* Continue with ``humanResolved`` *and* ``verified`` clears ``verify_pending`` (R4: humanResolved
+  alone keeps it); reaching the application clears it.
 
 Synthetic fixtures only. No real employer account.
 """
@@ -280,7 +281,7 @@ def test_service_resume_after_register_is_verify_pending_and_keeps_outcome_regis
         resumed = client.post(
             f"/v1/sessions/{session_id}/continue",
             headers=AUTH,
-            json={"candidateRef": "ref-a", "humanResolved": True},
+            json={"candidateRef": "ref-a", "humanResolved": True, "verified": True},
         )
         assert resumed.status_code == 200, resumed.text
         assert runner.requests[-1].verify_pending is False
