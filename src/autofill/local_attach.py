@@ -18,6 +18,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -105,35 +106,62 @@ def stable_chrome_user_data_dir() -> Path:
     return config_home() / "google-chrome"
 
 
-def default_user_data_dirs() -> list[Path]:
-    root = config_home()
+def _windows_user_data_dirs() -> list[Path]:
+    """Daily Chrome data directories on Windows. Not used as the Apply profile."""
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local:
+        local = str(Path.home() / "AppData" / "Local")
+    base = Path(local)
     names = (
-        "google-chrome",
-        "google-chrome-beta",
-        "google-chrome-unstable",
-        "google-chrome-canary",
-        "google-chrome-for-testing",
-        "chromium",
+        Path("Google") / "Chrome" / "User Data",
+        Path("Google") / "Chrome Beta" / "User Data",
+        Path("Google") / "Chrome Dev" / "User Data",
+        Path("Google") / "Chrome SxS" / "User Data",
+        Path("Chromium") / "User Data",
     )
-    dirs = [root / name for name in names]
+    return [base / name for name in names]
+
+
+def default_user_data_dirs() -> list[Path]:
+    """Directories Chrome treats as the daily profile. The dedicated launcher refuses these."""
+    if sys.platform == "win32":
+        dirs = _windows_user_data_dirs()
+    else:
+        root = config_home()
+        names = (
+            "google-chrome",
+            "google-chrome-beta",
+            "google-chrome-unstable",
+            "google-chrome-canary",
+            "google-chrome-for-testing",
+            "chromium",
+        )
+        dirs = [root / name for name in names]
     override = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
     if override:
         dirs.append(Path(override))
     return dirs
 
 
-def is_default_user_data_dir(path: Path) -> bool:
+def _resolved(path: Path) -> Path:
     try:
-        resolved = path.expanduser().resolve()
+        return path.expanduser().resolve()
     except OSError:
-        resolved = path.expanduser()
+        return path.expanduser()
+
+
+def is_default_user_data_dir(path: Path) -> bool:
+    """True for a daily Chrome data directory or anything inside it."""
+    resolved = _resolved(path)
     for candidate in default_user_data_dirs():
-        try:
-            other = candidate.expanduser().resolve()
-        except OSError:
-            other = candidate.expanduser()
+        other = _resolved(candidate)
         if resolved == other:
             return True
+        try:
+            resolved.relative_to(other)
+        except ValueError:
+            continue
+        return True
     return False
 
 
@@ -211,18 +239,73 @@ def assert_loopback_listen(port: int) -> list[str]:
     return hosts
 
 
+def _registry_chrome_paths() -> list[str]:
+    """App Paths entries for chrome.exe. Empty off Windows."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    keys = (
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        ),
+    )
+    found: list[str] = []
+    for hive, subkey in keys:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _kind = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        text = str(value or "").strip().strip('"')
+        if text:
+            found.append(text)
+    return found
+
+
+def _windows_chrome_paths() -> list[Path]:
+    paths = [Path(raw) for raw in _registry_chrome_paths()]
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    paths.append(Path(program_files) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    paths.append(Path(program_files_x86) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        root = Path(local)
+        paths.append(root / "Google" / "Chrome" / "Application" / "chrome.exe")
+        paths.append(root / "Google" / "Chrome SxS" / "Application" / "chrome.exe")
+    return paths
+
+
+def chrome_search_paths() -> list[Path]:
+    """Well-known Google Chrome binaries. This does not search PATH."""
+    if sys.platform == "win32":
+        return _windows_chrome_paths()
+    return [
+        Path("/usr/bin/google-chrome-stable"),
+        Path("/usr/bin/google-chrome"),
+        Path("/usr/local/bin/google-chrome"),
+        Path("/opt/google/chrome/chrome"),
+    ]
+
+
 def find_chrome(explicit: str | None = None) -> str:
     if explicit:
         if not Path(explicit).is_file():
             raise LocalAttachError(f"Chrome executable not found: {explicit}")
         return explicit
-    for candidate in (
-        os.environ.get("CHROME_BIN", ""),
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/usr/local/bin/google-chrome",
-        "/opt/google/chrome/chrome",
-    ):
+    candidates: list[str] = []
+    env = os.environ.get("CHROME_BIN", "").strip()
+    if env:
+        candidates.append(env)
+    candidates.extend(str(path) for path in chrome_search_paths())
+    for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     raise LocalAttachError("Google Chrome is not installed.")
@@ -327,6 +410,9 @@ class ChromeProcess:
 
     def stop(self) -> None:
         proc = self.process
+        if sys.platform == "win32":
+            _stop_windows_process(proc)
+            return
         if proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -349,17 +435,43 @@ class ChromeProcess:
             proc.wait(timeout=5)
 
 
+def _stop_windows_process(proc: subprocess.Popen[str]) -> None:
+    """End the Chrome process tree this helper started. No pkill and no killpg."""
+    if proc.poll() is None:
+        flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return
+
+
 def _spawn(args: list[str], log_path: Path) -> subprocess.Popen[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handle = log_path.open("w", encoding="utf-8")
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": handle,
+        "text": True,
+    }
+    # Windows rejects start_new_session. A new process group lets taskkill /T
+    # stop the dedicated Chrome without touching the employee's other windows.
+    if sys.platform == "win32":
+        kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kwargs["start_new_session"] = True
     try:
-        return subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=handle,
-            start_new_session=True,
-            text=True,
-        )
+        return subprocess.Popen(args, **kwargs)
     finally:
         handle.close()
 

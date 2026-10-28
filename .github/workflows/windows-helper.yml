@@ -1,0 +1,111 @@
+# Staging Windows installer for the loopback Auto-Fill helper.
+# Employees download TileArc-AutoFill-Helper-Setup-staging.exe. They do not install Python.
+name: Windows helper (staging)
+
+on:
+  pull_request:
+    branches: [staging]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-helper-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    name: Build Setup.exe
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build installer
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File windows/build.ps1
+
+      - name: Smoke test health on 127.0.0.1:9410
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File windows/smoke.ps1
+
+      - name: Collect helper logs
+        if: failure()
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "smoke-logs"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $dir = Join-Path $env:LOCALAPPDATA "TileArc\AutoFill"
+          foreach ($name in @("helper.log", "doctor.json")) {
+            $path = Join-Path $dir $name
+            if (Test-Path $path) { Copy-Item $path $dest }
+          }
+
+      - name: Upload helper log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tilearc-helper-smoke-log
+          path: smoke-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload staging installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging
+          path: dist/TileArc-AutoFill-Helper-Setup-staging.exe
+          if-no-files-found: error
+          retention-days: 90
+
+  draft-release:
+    name: Draft staging release
+    needs: installer
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/staging' &&
+      github.repository == 'VK-TECH-LABS/Auto-Fill'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging
+          path: dist
+
+      - name: Update draft staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=tilearc-autofill-helper-staging
+          file=dist/TileArc-AutoFill-Helper-Setup-staging.exe
+          test -f "$file"
+          notes="$(cat <<'EOF'
+          Staging-only Windows installer for the TileArc Auto-Fill local helper.
+
+          Asset: TileArc-AutoFill-Helper-Setup-staging.exe
+
+          This is not a production release. The helper listens on 127.0.0.1:9410, sets AUTOFILL_LOCAL_ATTACH for that process, and uses a dedicated Chrome profile. It does not attach to daily Chrome. Final Submit stays human.
+
+          Employees: docs/WINDOWS_EMPLOYEE.md
+          Download link notes: windows/BUILD.md
+          EOF
+          )"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$file" --clobber
+          else
+            gh release create "$tag" "$file" \
+              --draft \
+              --title "TileArc Auto-Fill Helper (STAGING)" \
+              --notes "$notes"
+          fi
