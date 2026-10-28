@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -67,9 +68,20 @@ class AnswerRejected(LocalAttachError):
 
 
 def default_profile_dir() -> Path:
+    """Dedicated Apply profile. Never Chrome's default user-data-dir.
+
+    Windows uses ``%LOCALAPPDATA%\\TileArc\\AutoFill\\apply-profile``. Other
+    platforms keep ``~/.local/share/auto-fill/apply-profile``.
+    ``AUTOFILL_LOCAL_PROFILE_DIR`` overrides both. ``LocalHelper`` still
+    refuses a path that is the daily Chrome directory.
+    """
     override = os.environ.get("AUTOFILL_LOCAL_PROFILE_DIR", "").strip()
     if override:
         return Path(override)
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(local) if local else Path.home() / "AppData" / "Local"
+        return root / "TileArc" / "AutoFill" / "apply-profile"
     return Path.home() / ".local" / "share" / "auto-fill" / "apply-profile"
 
 
