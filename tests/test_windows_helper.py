@@ -276,3 +276,9 @@ def test_staging_installer_name_is_the_vinayaka_contract():
     assert 'Start-Process -FilePath $ExePath -ArgumentList "--doctor"' in smoke
     assert "& $ExePath" not in smoke
     assert "if: always()" in workflow
+    draft = workflow.split("draft-release:", 1)[1]
+    assert "actions/checkout@v4" in draft
+    assert '-R "$repo"' in draft
+    assert 'repo=VK-TECH-LABS/Auto-Fill' in draft
+    assert "--target" in draft
+    assert "github.sha" in draft
