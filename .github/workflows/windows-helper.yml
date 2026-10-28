@@ -78,6 +78,10 @@ jobs:
       actions: read
       contents: write
     steps:
+      # Checkout first. download-artifact must follow it: checkout cleans the workspace.
+      # gh still gets -R so it does not depend on discovering a git remote.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: TileArc-AutoFill-Helper-Setup-staging
@@ -88,6 +92,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          repo=VK-TECH-LABS/Auto-Fill
           tag=tilearc-autofill-helper-staging
           file=dist/TileArc-AutoFill-Helper-Setup-staging.exe
           test -f "$file"
@@ -102,11 +107,14 @@ jobs:
           Download link notes: windows/BUILD.md
           EOF
           )"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$file" --clobber
+          if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
+            gh release upload "$tag" "$file" --clobber -R "$repo"
           else
             gh release create "$tag" "$file" \
               --draft \
+              --latest=false \
+              --target "${{ github.sha }}" \
               --title "TileArc Auto-Fill Helper (STAGING)" \
-              --notes "$notes"
+              --notes "$notes" \
+              -R "$repo"
           fi
