@@ -474,6 +474,9 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
         # it. Continue (humanResolved) signs in once after the person verifies.
         session.status = Status.EMAIL_VERIFICATION_REQUIRED
         session.pending_resume = False
+        # R4 (t182u, KLA 2026-10-27): keep the run "verify first" so a Continue
+        # without an explicit verified confirmation never types this password.
+        session.verify_pending = True
         _sync_checkpoint(session)
         return CredentialsOut(
             sessionId=session.session_id,
@@ -1171,6 +1174,14 @@ def _follow_verified_resume(
     threading.Thread(target=follow, name=f"resume-follow-{session.session_id[:8]}", daemon=True).start()
 
 
+def _verify_card(session: ServiceSession) -> bool:
+    """The session stopped on the employer verify card (protocol 0.7.0 only)."""
+    if not _is_070(session) or session.status != Status.EMAIL_VERIFICATION_REQUIRED:
+        return False
+    account = session.account if isinstance(session.account, dict) else None
+    return bool(account and account.get("verifyBeforeSignIn"))
+
+
 def _run(
     session: ServiceSession,
     store: ServiceSessionStore,
@@ -1180,6 +1191,7 @@ def _run(
     resume_uploaded: bool,
     human_resolved: bool = False,
     answers_updated: bool = False,
+    verified: bool = False,
 ) -> RunStatusOut:
     try:
         session = store.begin_run(session.session_id)
@@ -1191,10 +1203,20 @@ def _run(
     # calls keep that confirmation instead of asking again.
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
     session.human_resolved = session.human_resolved or human_resolved
-    if human_resolved:
-        # A person pressed Continue after registering (e.g. after opening the
-        # verification email). Sign In may now use the saved login once.
+    if human_resolved and verified:
+        # The person confirmed they opened the verification email (Continue with
+        # verified=true). Sign In may now use the registered login once.
+        if session.verify_pending:
+            logger.info("session=%s verify_pending=cleared reason=human_verified", session.session_id)
         session.verify_pending = False
+    elif human_resolved and session.verify_pending:
+        # R4 (t182u, KLA 2026-10-27): Continue alone is not proof of verification.
+        # It cleared this flag and the engine typed a password registered seconds
+        # earlier into Sign In (wrong_or_locked). The run now re-checks the page:
+        # a Sign In pane parks on the verify card again (nothing typed); a page the
+        # person already signed into in the live view goes on to the application,
+        # which clears the flag below.
+        logger.info("session=%s verify_pending=kept reason=continue_without_verified", session.session_id)
     previous = session.status
     # Later runs add to these totals. A resume upload must not zero the clicks
     # from the run that opened the form.
@@ -1218,6 +1240,10 @@ def _run(
             accepted = _accept_result(session, result)
             if session.status not in _VERIFY_PENDING_STATUSES:
                 session.verify_pending = False
+            elif _verify_card(session):
+                # The run parked on the verify card (verify first, or an "unverified"
+                # Sign In banner). Stay verify first until the person confirms.
+                session.verify_pending = True
         except HTTPException:
             session.status = previous
             raise
@@ -1533,6 +1559,18 @@ def create_app(
         _reject_expired(session)
         return _status_out(session)
 
+    def _continue_run(session: ServiceSession, body: ContinueIn) -> RunStatusOut:
+        """A person pressed Continue. ``verified`` is their "I opened the verification email" (R4)."""
+        return _run(
+            session,
+            store,
+            active_runner,
+            limits,
+            resume_uploaded=False,
+            human_resolved=True,
+            verified=body.verified,
+        )
+
     @router.post("/sessions/{session_id}/continue", response_model=RunStatusOut, tags=["sessions"])
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
@@ -1541,7 +1579,7 @@ def create_app(
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
             if _is_070(session) and session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
                 found = _probe_challenge(session, active_runner)
                 if found in {"captcha", "verification"}:
@@ -1550,9 +1588,9 @@ def create_app(
                     raise HTTPException(status_code=409, detail={"reason": reason})
             if session.status == Status.MANUAL_ANSWER_REQUIRED and session.stuck_manual:
                 session.stuck_manual = False
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
             if _consent_stop(session):
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
             allowed = {
                 Status.LOGIN_REQUIRED,
                 Status.CAPTCHA_REQUIRED,
@@ -1572,7 +1610,7 @@ def create_app(
                 allowed.add(Status.ACCOUNT_CREATION_REQUIRED)
             if session.status not in allowed:
                 raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
-            return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+            return _continue_run(session, body)
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
             return _run(session, store, active_runner, limits, resume_uploaded=False)

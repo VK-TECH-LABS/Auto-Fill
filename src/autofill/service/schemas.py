@@ -137,6 +137,10 @@ class ContinueIn(BaseModel):
     resume_uploaded: bool = Field(default=False, alias="resumeUploaded")
     answers_updated: bool = Field(default=False, alias="answersUpdated")
     human_resolved: bool = Field(default=False, alias="humanResolved")
+    # R4 (t182u): the person confirms they opened the employer's verification email.
+    # Only this (with humanResolved) lets the engine type a just-registered password
+    # into Sign In. humanResolved alone re-checks the page and types nothing.
+    verified: bool = Field(default=False, alias="verified")
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
     candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
 
