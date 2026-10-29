@@ -14,5 +14,5 @@
   "tests": "pytest tests/test_local_attach.py tests/test_local_helper.py",
   "blockers": "",
   "next_action": "",
-  "updated_at": "2026-10-29T18:36:05Z"
+  "updated_at": "2026-10-29T18:36:10Z"
 }
