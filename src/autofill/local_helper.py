@@ -873,7 +873,7 @@ class LocalHelper:
             return
         values = list(read.get("values") or [])
         item = _match_item(job, {"id": job.question["id"]})
-        reason, canonical = ("needs_option", [])
+        reason, canonical = ("needs_option", list[str]())
         if item is not None and values and read.get("questionId") == job.question["id"]:
             reason, canonical = fit_choice_values(item, values)
         if reason != "ok" or not canonical:
