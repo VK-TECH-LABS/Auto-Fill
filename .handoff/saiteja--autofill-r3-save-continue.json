@@ -2,8 +2,8 @@
   "task": "autofill-r3-save-continue",
   "developer": "saiteja",
   "branch": "saiteja/autofill-r3-save-continue",
-  "latest_commit": "27d9049179d7c6ed29a12a15f95e0311f09db281",
-  "pr": "",
+  "latest_commit": "b125b5a0a0a787dcf5c54df3f128c92c049ffb5d",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/91",
   "files_touched": [
     "src/autofill/answer_popup.py",
     "src/autofill/local_attach.py",
@@ -14,5 +14,5 @@
   "tests": "pytest tests/test_save_continue.py",
   "blockers": "",
   "next_action": "",
-  "updated_at": "2026-10-29T22:15:26Z"
+  "updated_at": "2026-10-29T22:18:21Z"
 }
