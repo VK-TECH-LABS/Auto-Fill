@@ -119,11 +119,11 @@ def _expires_epoch(value: Any) -> float | None:
         return number / 1000 if number > 10_000_000_000 else number
     text = str(value).strip()
     try:
-        number = float(text)
+        as_number = float(text)
     except ValueError:
-        number = None
-    if number is not None:
-        return number / 1000 if number > 10_000_000_000 else number
+        as_number = None
+    if as_number is not None:
+        return as_number / 1000 if as_number > 10_000_000_000 else as_number
     from datetime import datetime
 
     try:
