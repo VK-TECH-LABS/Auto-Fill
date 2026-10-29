@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
+import socket
+import subprocess
+import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +40,7 @@ from autofill.local_attach import (
     stable_chrome_user_data_dir,
     start_fixture_server,
 )
-from autofill.local_helper import LocalHelper
+from autofill.local_helper import LocalHelper, serve
 from autofill.profile import CandidateProfile
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
 
@@ -188,6 +194,307 @@ def test_launch_requires_the_feature_flag(monkeypatch, tmp_path):
 
     with pytest.raises(FeatureDisabled):
         launch_dedicated_chrome(user_data_dir=tmp_path / "profile", port=9222, start_url="about:blank")
+
+
+def _ipv4_listen_blob(rows: list[tuple[int, bytes, int]]) -> bytes:
+    from autofill.local_attach import _IPV4_ROW_SIZE
+
+    body = b"".join(
+        state.to_bytes(4, "little")
+        + ip
+        + socket.htons(port).to_bytes(4, "little")
+        + b"\x00" * (_IPV4_ROW_SIZE - 12)
+        for state, ip, port in rows
+    )
+    return len(rows).to_bytes(4, "little") + body
+
+
+def test_windows_tcp_table_sees_loopback_and_ignores_other_rows():
+    from autofill.local_attach import _TCP_STATE_LISTEN, _hosts_from_ipv4_table, _hosts_from_ipv6_table
+
+    blob = _ipv4_listen_blob(
+        [
+            (_TCP_STATE_LISTEN, b"\x7f\x00\x00\x01", 9222),
+            (5, b"\x0a\x00\x00\x05", 9222),
+            (_TCP_STATE_LISTEN, b"\x00\x00\x00\x00", 80),
+        ]
+    )
+    assert _hosts_from_ipv4_table(blob, 9222) == ["127.0.0.1"]
+    public = _ipv4_listen_blob([(_TCP_STATE_LISTEN, b"\x00\x00\x00\x00", 9222)])
+    assert _hosts_from_ipv4_table(public, 9222) == ["0.0.0.0"]
+    addr = b"\x00" * 15 + b"\x01"
+    raw_port = socket.htons(9222).to_bytes(4, "little")
+    row = addr + b"\x00" * 4 + raw_port + b"\x00" * 16 + b"\x00" * 4 + b"\x00" * 4
+    row += (2).to_bytes(4, "little") + b"\x00" * 4
+    assert len(row) == 56
+    assert _hosts_from_ipv6_table((1).to_bytes(4, "little") + row, 9222) == ["::1"]
+
+
+def test_listen_text_parses_lsof_and_macos_netstat():
+    from autofill.local_attach import _endpoints_from_listen_text
+
+    lsof = "\n".join(
+        [
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME",
+            "Google  9 user  20u  IPv4 0x1  0t0  TCP 127.0.0.1:9222 (LISTEN)",
+            "Google  9 user  21u  IPv6 0x2  0t0  TCP [::1]:9222 (LISTEN)",
+            "Google  9 user  22u  IPv4 0x3  0t0  TCP *:80 (LISTEN)",
+        ]
+    )
+    assert _endpoints_from_listen_text(lsof) == [
+        ("127.0.0.1", 9222),
+        ("::1", 9222),
+        ("0.0.0.0", 80),
+    ]
+    netstat = "\n".join(
+        [
+            "tcp4       0      0  127.0.0.1.9222         *.*                    LISTEN",
+            "tcp6       0      0  ::1.9222               *.*                    LISTEN",
+            "tcp4       0      0  *.9222                 *.*                    LISTEN",
+        ]
+    )
+    assert _endpoints_from_listen_text(netstat) == [
+        ("127.0.0.1", 9222),
+        ("::1", 9222),
+        ("0.0.0.0", 9222),
+    ]
+
+
+def test_darwin_without_proc_uses_lsof_and_refuses_a_wildcard(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("autofill.local_attach._proc_tcp_present", lambda: False)
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "lsof"
+        text = "Google  1 user  20u  IPv4 0x1  0t0  TCP 127.0.0.1:9222 (LISTEN)\n"
+        return subprocess.CompletedProcess(command, 0, stdout=text, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert listening_hosts(9222) == ["127.0.0.1"]
+
+    def wildcard(command, **kwargs):
+        text = "Google  1 user  20u  IPv4 0x1  0t0  TCP *:9222 (LISTEN)\n"
+        return subprocess.CompletedProcess(command, 0, stdout=text, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", wildcard)
+    with pytest.raises(LoopbackRequired):
+        assert_loopback_listen(9222)
+
+
+def test_windows_listener_check_does_not_read_proc(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def fail_proc(port: int) -> list[str]:
+        raise AssertionError(f"proc must not be read for port {port}")
+
+    monkeypatch.setattr("autofill.local_attach._listening_hosts_proc", fail_proc)
+    monkeypatch.setattr("autofill.local_attach._listening_hosts_windows", lambda port: ["127.0.0.1"])
+    assert listening_hosts(9222) == ["127.0.0.1"]
+    assert assert_loopback_listen(9222) == ["127.0.0.1"]
+    monkeypatch.setattr(
+        "autofill.local_attach._listening_hosts_windows",
+        lambda port: ["0.0.0.0"],
+    )
+    with pytest.raises(LoopbackRequired):
+        assert_loopback_listen(9222)
+
+
+def _helper_request(port: int, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def _drive_session(monkeypatch, tmp_path, *, listeners: list[str]) -> tuple[list[str], dict]:
+    """POST /v1/sessions against a dedicated session whose Chrome launch is fake.
+
+    ``listeners`` is what a Windows or macOS listener check reports. The
+    employer window opening is recorded separately from the fill call.
+    ``ChromeProcess.stop`` is stubbed so a refused port cannot signal a real pid.
+    """
+    from autofill.local_attach import ChromeProcess, DedicatedApplySession, VisibleTab
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+    events: list[str] = []
+    launched = {"value": False}
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    def fake_launch(**kwargs: object) -> ChromeProcess:
+        events.append("browser_open")
+        launched["value"] = True
+        return ChromeProcess(
+            process=_Proc(),  # type: ignore[arg-type]
+            user_data_dir=kwargs["user_data_dir"],  # type: ignore[arg-type]
+            port=int(kwargs["port"]),  # type: ignore[arg-type]
+            endpoint=f"http://127.0.0.1:{kwargs['port']}",
+            log_path=tmp_path / "chrome.log",
+        )
+
+    def fake_fetch(port: int, timeout: float = 1.0) -> dict | None:
+        if not launched["value"]:
+            return None
+        return {
+            "Browser": "Chrome/120.0.0.0",
+            "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc",
+        }
+
+    class _Page:
+        url = "https://boards.greenhouse.io/example/jobs/1"
+
+        def evaluate(self, script: str) -> bool:
+            return False
+
+    page = _Page()
+
+    class _Driver:
+        def start(self) -> _Driver:
+            events.append("playwright")
+            return self
+
+        def stop(self) -> None:
+            events.append("playwright_stop")
+
+    def fake_attach(playwright: object, endpoint: str, *, url_prefix: str = "") -> VisibleTab:
+        events.append("attach")
+        return VisibleTab(
+            browser=object(),
+            context=object(),
+            page=page,
+            endpoint=endpoint,
+            target_id="target-1",
+            page_url=page.url,
+            context_count=1,
+            page_urls=[page.url],
+        )
+
+    def fake_fill(page_obj: object, application_url: str, profile: CandidateProfile) -> ApplicationResult:
+        events.append("fill")
+        assert page_obj is page
+        assert application_url.startswith("https://boards.greenhouse.io/")
+        assert profile.personal.full_name == "Casey Example"
+        return ApplicationResult(
+            status=Status.READY_FOR_HUMAN_SUBMIT,
+            ats=None,
+            current_step="done",
+            login_status="NOT_REQUIRED",
+            fields_detected=3,
+            fields_filled=3,
+            stopped_before_submit=True,
+            submit_controls=["Submit application"],
+        )
+
+    def fake_stop(self: ChromeProcess) -> None:
+        events.append("chrome_stopped")
+
+    monkeypatch.setattr("autofill.local_attach.launch_dedicated_chrome", fake_launch)
+    monkeypatch.setattr("autofill.local_attach.fetch_version", fake_fetch)
+    monkeypatch.setattr(ChromeProcess, "stop", fake_stop)
+    monkeypatch.setattr(
+        "autofill.local_attach.listening_hosts",
+        lambda port: events.append("loopback_checked") or list(listeners),
+    )
+    monkeypatch.setattr("autofill.local_attach.attach_visible_tab", fake_attach)
+    monkeypatch.setattr("autofill.local_attach.adopt_employer_tab", lambda context, url: page)
+    monkeypatch.setattr("autofill.local_attach._target_id", lambda context, page_obj: "target-1")
+    monkeypatch.setattr("autofill.local_attach.fill_visible_tab", fake_fill)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _Driver())
+
+    session = DedicatedApplySession(user_data_dir=tmp_path / "apply-profile", debug_port=9222, headless=True)
+    helper = LocalHelper(session=session, idle_detach_seconds=-1)  # type: ignore[arg-type]
+    server = serve(port=0, helper=helper)
+    bound = int(server.server_address[1])
+    profile = json.loads(PROFILE.read_text(encoding="utf-8"))
+    url = "https://boards.greenhouse.io/example/jobs/1"
+    try:
+        status, created = _helper_request(bound, "POST", "/v1/sessions", {"applicationUrl": url, "profile": profile})
+        assert status == 202
+        body: dict = {}
+        for _ in range(50):
+            _code, body = _helper_request(bound, "GET", f"/v1/sessions/{created['sessionId']}")
+            if body.get("status") not in {"queued", "running"}:
+                break
+            time.sleep(0.02)
+        return events, body
+    finally:
+        helper.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_create_fills_after_the_window_opens_on_windows(monkeypatch, tmp_path):
+    """CDP answering and the employer window opening are not a fill.
+
+    Windows has no /proc/net/tcp. The old check treated that as a closed port,
+    raised before Playwright started, and left the dedicated window idle.
+    """
+    events, body = _drive_session(monkeypatch, tmp_path, listeners=["127.0.0.1"])
+    assert events.index("browser_open") < events.index("loopback_checked")
+    assert events.index("loopback_checked") < events.index("playwright")
+    assert events.index("playwright") < events.index("attach")
+    assert events.index("attach") < events.index("fill")
+    assert "chrome_stopped" not in events
+    assert body["status"] == "READY_FOR_HUMAN_SUBMIT"
+    assert body["fill"]["fields_filled"] == 3
+    assert body["stopped_before_submit"] is True
+    assert body["submitted"] is False
+    assert body["targetId"] == "target-1"
+
+
+def test_missing_windows_listeners_do_not_leave_an_idle_window(monkeypatch, tmp_path):
+    events, body = _drive_session(monkeypatch, tmp_path, listeners=[])
+    assert "browser_open" in events
+    assert "loopback_checked" in events
+    assert "playwright" not in events
+    assert "fill" not in events
+    assert "chrome_stopped" in events
+    assert body["status"] == "FAILED"
+    assert body["error"] == "LocalAttachError"
+    assert "fill" not in body
+
+
+def test_fill_visible_tab_uses_the_hosted_page_budget(monkeypatch):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    captured: dict[str, Any] = {}
+
+    def fake_autofill(url, profile, credential_provider=None, options=None):
+        captured["max_pages"] = options.max_pages
+        captured["page"] = options.page
+        return ApplicationResult(
+            status=Status.READY_FOR_HUMAN_SUBMIT,
+            ats=None,
+            current_step="done",
+            login_status="NOT_REQUIRED",
+            fields_filled=1,
+            stopped_before_submit=True,
+        )
+
+    monkeypatch.setattr("autofill.local_attach.autofill_application", fake_autofill)
+    page = object()
+    result = fill_visible_tab(page, "https://boards.greenhouse.io/example/jobs/1", CandidateProfile.load(PROFILE))
+    assert captured["page"] is page
+    assert captured["max_pages"] == 8
+    assert result.fields_filled == 1
+    assert result.stopped_before_submit is True
 
 
 def test_public_bind_is_refused_and_loopback_is_visible():

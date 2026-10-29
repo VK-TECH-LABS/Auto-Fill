@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -224,7 +225,7 @@ def _ipv6_from_proc(hex_ip: str) -> str:
     return ":".join(f"{addr[index]:02x}{addr[index + 1]:02x}" for index in range(0, 16, 2))
 
 
-def listening_hosts(port: int) -> list[str]:
+def _listening_hosts_proc(port: int) -> list[str]:
     """Hosts with a TCP listener on ``port``, from ``/proc/net/tcp``."""
     hosts: list[str] = []
     for path, width, decode in (
@@ -243,6 +244,214 @@ def listening_hosts(port: int) -> list[str]:
                 continue
             hosts.append(decode(ip_hex))
     return hosts
+
+
+def _proc_tcp_present() -> bool:
+    return Path("/proc/net/tcp").is_file() or Path("/proc/net/tcp6").is_file()
+
+
+# MIB_TCP_STATE_LISTEN. Same value for the IPv4 and IPv6 tables.
+_TCP_STATE_LISTEN = 2
+_AF_INET = 2
+_AF_INET6 = 23
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+_ERROR_INSUFFICIENT_BUFFER = 122
+# IPv4 MIB_TCPROW_OWNER_PID is 6 DWORDs. IPv6 MIB_TCP6ROW_OWNER_PID is 56 bytes
+# and stores dwState after the addresses, not before them.
+_IPV4_ROW_SIZE = 24
+_IPV6_ROW_SIZE = 56
+_LISTEN_ENDPOINT = re.compile(
+    r"(?P<host>\[::1\]|\[::\]|::1|::|\*|0\.0\.0\.0|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3})"
+    r"[.:]"
+    r"(?P<port>\d+)"
+)
+
+
+def _normalize_listen_host(host: str) -> str:
+    """Map a tool's bind address to the form ``assert_loopback_listen`` checks."""
+    if host == "*":
+        return "0.0.0.0"
+    if host in {"[::]", "::"}:
+        return "::"
+    if host == "[::1]":
+        return "::1"
+    return host
+
+
+def _endpoints_from_listen_text(text: str) -> list[tuple[str, int]] | None:
+    """Parse ``lsof``, ``ss``, or ``netstat`` listen lines.
+
+    ``None`` means a LISTEN line was not understood. An empty list means the
+    tool reported no listeners.
+    """
+    found: list[tuple[str, int]] = []
+    for line in text.splitlines():
+        if "LISTEN" not in line.upper():
+            continue
+        matches = list(_LISTEN_ENDPOINT.finditer(line))
+        if not matches:
+            return None
+        for match in matches:
+            found.append((_normalize_listen_host(match.group("host")), int(match.group("port"))))
+    return found
+
+
+def _listening_hosts_tool(port: int) -> list[str]:
+    """Listeners from ``lsof`` or ``netstat`` when ``/proc/net/tcp`` is absent.
+
+    macOS has no proc tcp table. Treating that as an empty listener list made
+    ``assert_loopback_listen`` raise after Chrome had opened the employer URL.
+    """
+    commands = (
+        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+        ["ss", "-H", "-ltn", f"sport = :{port}"],
+        ["netstat", "-an"],
+    )
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        parsed = _endpoints_from_listen_text(f"{completed.stdout or ''}\n{completed.stderr or ''}")
+        if parsed is None:
+            continue
+        if parsed or completed.returncode == 0:
+            return [host for host, bound in parsed if bound == port]
+    raise LocalAttachError(
+        "Could not read TCP listeners to confirm the debugging port is on 127.0.0.1."
+    )
+
+
+def _windows_tcp_table(family: int) -> bytes:
+    """Raw ``GetExtendedTcpTable`` listener blob. Windows only."""
+    import ctypes
+    from ctypes import wintypes
+
+    # WinDLL exists on Windows. typeshed omits it when typechecking on other platforms.
+    load_library = getattr(ctypes, "WinDLL", None)
+    if load_library is None:
+        raise OSError("The Windows TCP table is only available on Windows.")
+    iphlpapi = load_library("iphlpapi")
+    get_table = iphlpapi.GetExtendedTcpTable
+    get_table.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.ULONG,
+    ]
+    get_table.restype = wintypes.DWORD
+    size = wintypes.DWORD(0)
+    status = int(get_table(None, ctypes.byref(size), False, family, _TCP_TABLE_OWNER_PID_LISTENER, 0))
+    if status == 0 and size.value == 0:
+        return b""
+    if status not in (0, _ERROR_INSUFFICIENT_BUFFER):
+        raise OSError(status)
+    for _attempt in range(3):
+        if size.value <= 0:
+            return b""
+        buffer = ctypes.create_string_buffer(size.value)
+        status = int(
+            get_table(
+                ctypes.addressof(buffer),
+                ctypes.byref(size),
+                False,
+                family,
+                _TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        )
+        if status == 0:
+            return buffer.raw[: size.value]
+        if status != _ERROR_INSUFFICIENT_BUFFER:
+            raise OSError(status)
+    raise OSError(_ERROR_INSUFFICIENT_BUFFER)
+
+
+def _hosts_from_ipv4_table(blob: bytes, port: int) -> list[str]:
+    """Decode an IPv4 ``TCP_TABLE_OWNER_PID_LISTENER`` blob for ``port``."""
+    if len(blob) < 4:
+        return []
+    count = int.from_bytes(blob[:4], "little")
+    hosts: list[str] = []
+    for index in range(count):
+        start = 4 + index * _IPV4_ROW_SIZE
+        row = blob[start : start + _IPV4_ROW_SIZE]
+        if len(row) < _IPV4_ROW_SIZE:
+            break
+        state = int.from_bytes(row[0:4], "little")
+        if state != _TCP_STATE_LISTEN:
+            continue
+        raw_port = int.from_bytes(row[8:12], "little")
+        if socket.ntohs(raw_port & 0xFFFF) != port:
+            continue
+        addr = int.from_bytes(row[4:8], "little")
+        hosts.append(".".join(str(part) for part in addr.to_bytes(4, "little")))
+    return hosts
+
+
+def _hosts_from_ipv6_table(blob: bytes, port: int) -> list[str]:
+    """Decode an IPv6 ``TCP_TABLE_OWNER_PID_LISTENER`` blob for ``port``."""
+    if len(blob) < 4:
+        return []
+    count = int.from_bytes(blob[:4], "little")
+    hosts: list[str] = []
+    for index in range(count):
+        start = 4 + index * _IPV6_ROW_SIZE
+        row = blob[start : start + _IPV6_ROW_SIZE]
+        if len(row) < _IPV6_ROW_SIZE:
+            break
+        state = int.from_bytes(row[48:52], "little")
+        if state != _TCP_STATE_LISTEN:
+            continue
+        raw_port = int.from_bytes(row[20:24], "little")
+        if socket.ntohs(raw_port & 0xFFFF) != port:
+            continue
+        hosts.append(_format_ipv6(row[0:16]))
+    return hosts
+
+
+def _format_ipv6(addr: bytes) -> str:
+    """Render a network-order IPv6 address. ``::`` and ``::1`` stay short."""
+    if addr == b"\x00" * 16:
+        return "::"
+    if addr == b"\x00" * 15 + b"\x01":
+        return "::1"
+    return ":".join(f"{addr[index]:02x}{addr[index + 1]:02x}" for index in range(0, 16, 2))
+
+
+def _listening_hosts_windows(port: int) -> list[str]:
+    """Listeners from the Windows TCP table. ``/proc/net/tcp`` does not exist there."""
+    try:
+        ipv4 = _windows_tcp_table(_AF_INET)
+        ipv6 = _windows_tcp_table(_AF_INET6)
+    except OSError as exc:
+        raise LocalAttachError(
+            "Could not read Windows TCP listeners to confirm the debugging port is on 127.0.0.1."
+        ) from exc
+    return _hosts_from_ipv4_table(ipv4, port) + _hosts_from_ipv6_table(ipv6, port)
+
+
+def listening_hosts(port: int) -> list[str]:
+    """Hosts with a TCP listener on ``port``.
+
+    Linux reads ``/proc/net/tcp``. Windows and macOS do not have that file.
+    Missing proc used to look like "nothing is listening", so a dedicated
+    Chrome that had already opened the employer URL never received a
+    Playwright session.
+    """
+    if sys.platform == "win32":
+        return _listening_hosts_windows(port)
+    if _proc_tcp_present():
+        return _listening_hosts_proc(port)
+    return _listening_hosts_tool(port)
 
 
 def assert_loopback_listen(port: int) -> list[str]:
@@ -763,18 +972,28 @@ def _optional_submitted(page: Any) -> bool | None:
 
 
 def fill_visible_tab(page: Any, application_url: str, profile: CandidateProfile) -> ApplicationResult:
-    """Fill the already-open tab with the existing engine. The page is not replaced."""
+    """Fill the already-open tab with the existing engine. The page is not replaced.
+
+    The page budget matches the hosted runner. A cap of one page filled the
+    PoC fixture and then left the next employer page untouched. Final Submit
+    stays refused inside the engine.
+    """
     require_feature()
     validate_application_url(application_url)
     return autofill_application(
         application_url,
         profile,
-        options=AutofillOptions(page=page, headless=False, max_pages=1),
+        options=AutofillOptions(page=page, headless=False, max_pages=8),
     )
 
 
 class DedicatedApplySession:
     """One dedicated profile. Call it from a single thread.
+
+    The separate window is intentional. Chrome 136+ ignores remote debugging
+    on the default user-data-dir, so the employee's daily browser is not a
+    connected session. This object launches ``--user-data-dir`` at the TileArc
+    apply profile and drives that window over loopback CDP.
 
     ``detach`` drops the CDP client and leaves Chrome running. ``stop_launched_chrome``
     is the only way this object kills a process, and only a process it launched.
@@ -832,11 +1051,14 @@ class DedicatedApplySession:
                 raise LocalAttachError(f"Dedicated Chrome did not open CDP. {detail}")
         elif self.chrome is None:
             self.owns_chrome = False
-        assert_loopback_listen(self.debug_port)
-        from playwright.sync_api import sync_playwright
-
-        self._playwright = sync_playwright().start()
+        # This check used to run outside the cleanup below. On Windows and
+        # macOS it raised "Nothing is listening" (no /proc/net/tcp) after
+        # Chrome had opened the employer URL, and the window was left idle.
         try:
+            assert_loopback_listen(self.debug_port)
+            from playwright.sync_api import sync_playwright
+
+            self._playwright = sync_playwright().start()
             tab = attach_visible_tab(self._playwright, self.endpoint, url_prefix=application_url)
             page = adopt_employer_tab(tab.context, application_url)
             tab.page = page

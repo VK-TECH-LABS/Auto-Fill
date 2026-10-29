@@ -21,6 +21,7 @@ open tab.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -51,6 +52,8 @@ from autofill.local_attach import (
 from autofill.mapping import option_stance
 from autofill.profile import CandidateProfile, ProfileError
 from autofill.safeguards import HumanSubmissionRequired
+
+logger = logging.getLogger("autofill.local_helper")
 
 HELPER_PORT = 9410
 _MAX_BODY = 1_048_576
@@ -302,6 +305,7 @@ class LocalHelper:
                 job.submitted = True
             job.error = type(exc).__name__
             job.state = "error"
+            logger.info("session=%s fill_failed error=%s detail=%s", job.session_id, type(exc).__name__, exc)
         finally:
             self._finish_active(job)
 
