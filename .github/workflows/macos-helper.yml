@@ -1,0 +1,88 @@
+# Staging macOS disk image for the loopback Auto-Fill helper.
+# Employees download TileArc-AutoFill-Helper-Setup-staging.dmg. They do not install Python.
+# A push to staging adds that disk image to draft tag tilearc-autofill-helper-staging.
+name: macOS helper (staging)
+
+on:
+  pull_request:
+    branches: [staging]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-helper-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    name: Build Setup.dmg
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build disk image
+        run: bash macos/build.sh
+
+      - name: Smoke test health on 127.0.0.1:9410
+        run: bash macos/smoke.sh
+
+      - name: Collect helper logs
+        if: failure()
+        run: |
+          mkdir -p smoke-logs
+          dir="$HOME/Library/Application Support/TileArc/AutoFill"
+          if [[ -f "$dir/helper.log" ]]; then cp "$dir/helper.log" smoke-logs/; fi
+          if [[ -f "$dir/doctor.json" ]]; then cp "$dir/doctor.json" smoke-logs/; fi
+
+      - name: Upload helper log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tilearc-helper-macos-smoke-log
+          path: smoke-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload staging disk image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging-macos
+          path: dist/TileArc-AutoFill-Helper-Setup-staging.dmg
+          if-no-files-found: ignore
+          retention-days: 90
+
+  draft-release:
+    name: Add macOS asset to draft release
+    needs: installer
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/staging' &&
+      github.repository == 'VK-TECH-LABS/Auto-Fill'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Checkout first. download-artifact must follow it: checkout cleans the workspace.
+      # gh still gets -R so it does not depend on discovering a git remote.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging-macos
+          path: dist
+
+      - name: Upload dmg to draft staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash macos/publish-draft.sh

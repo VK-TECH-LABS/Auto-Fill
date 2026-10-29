@@ -31,6 +31,7 @@ from autofill.win_launcher import (
     doctor_report,
     helper_is_healthy,
     packaged_profile_dir,
+    playwright_driver_node,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -253,6 +254,19 @@ def test_helper_is_healthy_reads_the_extension_contract(monkeypatch):
         server.shutdown()
         server.server_close()
         helper.close()
+
+
+def test_frozen_windows_driver_stays_beside_the_exe(monkeypatch, tmp_path):
+    exe = tmp_path / "TileArcAutoFillHelper.exe"
+    node = tmp_path / "playwright" / "driver" / "node.exe"
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    assert playwright_driver_node() == node
 
 
 def test_staging_installer_name_is_the_vinayaka_contract():

@@ -70,9 +70,10 @@ class AnswerRejected(LocalAttachError):
 def default_profile_dir() -> Path:
     """Dedicated Apply profile. Never Chrome's default user-data-dir.
 
-    Windows uses ``%LOCALAPPDATA%\\TileArc\\AutoFill\\apply-profile``. Other
-    platforms keep ``~/.local/share/auto-fill/apply-profile``.
-    ``AUTOFILL_LOCAL_PROFILE_DIR`` overrides both. ``LocalHelper`` still
+    Windows uses ``%LOCALAPPDATA%\\TileArc\\AutoFill\\apply-profile``.
+    macOS uses ``~/Library/Application Support/TileArc/AutoFill/apply-profile``.
+    Other platforms keep ``~/.local/share/auto-fill/apply-profile``.
+    ``AUTOFILL_LOCAL_PROFILE_DIR`` overrides these. ``LocalHelper`` still
     refuses a path that is the daily Chrome directory.
     """
     override = os.environ.get("AUTOFILL_LOCAL_PROFILE_DIR", "").strip()
@@ -82,6 +83,8 @@ def default_profile_dir() -> Path:
         local = os.environ.get("LOCALAPPDATA", "").strip()
         root = Path(local) if local else Path.home() / "AppData" / "Local"
         return root / "TileArc" / "AutoFill" / "apply-profile"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TileArc" / "AutoFill" / "apply-profile"
     return Path.home() / ".local" / "share" / "auto-fill" / "apply-profile"
 
 
