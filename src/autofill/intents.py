@@ -300,6 +300,63 @@ _WORK_AUTH_RE = re.compile(
 )
 
 
+# Intents whose answer depends on the country the question asks about.
+JURISDICTION_INTENTS = frozenset(
+    {
+        "US_WORK_AUTHORIZATION",
+        "AUTHORIZED_ANY_EMPLOYER",
+        "AUTHORIZED_WITHOUT_SPONSORSHIP",
+        "SPONSORSHIP_NOW",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "SPONSORSHIP_FUTURE",
+    }
+)
+
+_COUNTRIES: tuple[tuple[str, str], ...] = (
+    ("united states", "US"),
+    ("america", "US"),
+    ("canada", "CA"),
+    ("canadian", "CA"),
+    ("united kingdom", "UK"),
+    ("uk", "UK"),
+    ("great britain", "UK"),
+    ("britain", "UK"),
+    ("england", "UK"),
+    ("european union", "EU"),
+    ("eu", "EU"),
+    ("european economic area", "EU"),
+    ("eea", "EU"),
+    ("australia", "AU"),
+    ("new zealand", "NZ"),
+    ("india", "IN"),
+    ("ireland", "IE"),
+    ("germany", "DE"),
+    ("france", "FR"),
+    ("netherlands", "NL"),
+    ("spain", "ES"),
+    ("poland", "PL"),
+    ("switzerland", "CH"),
+    ("sweden", "SE"),
+    ("mexico", "MX"),
+    ("brazil", "BR"),
+    ("singapore", "SG"),
+    ("japan", "JP"),
+    ("china", "CN"),
+    ("israel", "IL"),
+    ("philippines", "PH"),
+)
+
+def jurisdiction(text: str) -> frozenset[str]:
+    """Countries named in a question. None named means the United States."""
+    folded = normalize_question(text)
+    found = {
+        code
+        for phrase, code in _COUNTRIES
+        if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", folded)
+    }
+    return frozenset(found or {"US"})
+
+
 def normalize_question(text: str) -> str:
     """Case, punctuation, and U.S. / USA abbreviations folded to one form."""
     folded = normalize(text)
@@ -497,9 +554,18 @@ def classify_question(
     if not sanitized:
         return IntentMatch(None, "unknown", "none", "")
     level1 = _level1(sanitized)
+    if level1 in JURISDICTION_INTENTS and jurisdiction(sanitized) != frozenset({"US"}):
+        # "Authorized to work in Canada?" is not the U.S. question. No U.S. answer is reused for it.
+        return IntentMatch(None, "unknown", "jurisdiction", sanitized)
     if level1 is not None:
         return _planned(IntentMatch(level1, "HIGH", "level1", sanitized))
     semantic = _level2(sanitized)
+    if (
+        semantic is not None
+        and semantic.intent in JURISDICTION_INTENTS
+        and jurisdiction(sanitized) != frozenset({"US"})
+    ):
+        semantic = None
     if semantic is not None and semantic.confidence == "HIGH":
         return IntentMatch(semantic.intent, semantic.confidence, semantic.source, sanitized)
     if hook is not None:

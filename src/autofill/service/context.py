@@ -52,7 +52,7 @@ def apply_approved_answers(profile: CandidateProfile, answers: list[ApprovedAnsw
             continue
         if key not in merged:
             order.append(key)
-        merged[key] = ApplicationAnswer(question=existing.question, answer=existing.answer)
+        merged[key] = ApplicationAnswer(question=existing.question, answer=existing.answer, intent=existing.intent)
     for approved in answers:
         key = approved.question.casefold().strip()
         if key not in merged:

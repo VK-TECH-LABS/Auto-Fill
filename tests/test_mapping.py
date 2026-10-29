@@ -162,8 +162,8 @@ def test_blank_screening_answer_is_not_invented():
     assert mapped.text == ""
 
 
-def test_approved_answer_overrides_screening_for_the_same_question():
-    """Session approved Q&A wins over screening.* when both match. Other questions stay put."""
+def test_screening_uses_the_profile_first_and_asks_when_an_approved_answer_disagrees():
+    """t60u Req2: Application Profile first, then approved answers. A disagreement is not guessed."""
     person = profile()
     assert person.screening.how_heard == "Online job board"
     assert person.screening.age_18_or_older == "Yes"
@@ -171,11 +171,12 @@ def test_approved_answer_overrides_screening_for_the_same_question():
     person.application_answers = [
         ApplicationAnswer(question="Where did you hear about this role?", answer="Employee referral"),
         ApplicationAnswer(question="Are you age 18 or older?", answer="No"),
+        ApplicationAnswer(question="Have you been convicted of a felony?", answer="No"),
     ]
     heard = map_field(control("How did you hear about this role?"), person)
-    assert heard.action == "fill"
-    assert heard.text == "Employee referral"
-    assert heard.field_class == "APPROVED_QUESTION"
+    assert heard.action == "unanswered"
+    assert heard.field_class == "MANUAL_REVIEW_FIELD"
+    assert "disagree" in heard.reason
     age = map_field(
         control(
             "Are you age 18 or older?",
@@ -184,16 +185,28 @@ def test_approved_answer_overrides_screening_for_the_same_question():
         ),
         person,
     )
-    assert age.action == "select"
-    assert age.option_label == "No"
-    assert age.field_class == "APPROVED_QUESTION"
+    assert age.action == "unanswered"
+    assert age.field_class == "MANUAL_REVIEW_FIELD"
     felony = map_field(control("Have you been convicted of a felony?", kind="checkbox"), person)
     assert felony.action == "uncheck"
     assert felony.text == "No"
+    assert felony.field_class == "PROFILE_FIELD"
     unknown = map_field(control("What is your favorite color?"), person)
     assert unknown.action == "unanswered"
     assert unknown.text == ""
     assert unknown.field_class == "UNKNOWN_FIELD"
+
+
+def test_screening_uses_an_approved_answer_when_the_profile_is_blank():
+    person = profile()
+    person.screening.how_heard = ""
+    person.application_answers = [
+        ApplicationAnswer(question="Where did you hear about this role?", answer="Employee referral"),
+    ]
+    heard = map_field(control("How did you hear about this role?"), person)
+    assert heard.action == "fill"
+    assert heard.text == "Employee referral"
+    assert heard.field_class == "APPROVED_QUESTION"
 
 
 def test_eeo_decline_is_not_selected():

@@ -599,12 +599,13 @@ def match_option(desired: str, options: list[Option]) -> Option | None:
         for option in options:
             if yes_no(option.label) == answer or yes_no(option.value) == answer:
                 return option
-        for option in options:
-            label = normalize(option.label)
-            if answer == "yes" and label.startswith("yes"):
-                return option
-            if answer == "no" and label.startswith("no"):
-                return option
+        # "Yes, I am authorized" for Yes. Two such options ("Yes, ..." and
+        # "Yes, but ...") are a choice for the employee, not a guess.
+        leading = [option for option in options if normalize(option.label).split(" ")[:1] == [answer]]
+        if len(leading) == 1:
+            return leading[0]
+        if len(leading) > 1:
+            return None
     if any(hint in target for hint in _DECLINE_HINTS):
         for option in options:
             label = normalize(option.label)
@@ -1136,7 +1137,7 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason or "Source is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
-    if control.kind in {"select", "radio"} or (control.kind == "combobox" and control.options):
+    if control.kind in {"select", "radio"} or (control.kind in {"combobox", "buttons"} and control.options):
         option = match_option(text, control.options)
         if option is None:
             return MappedField(
@@ -1306,16 +1307,23 @@ def map_field(
 
     if key in {"salary", "salary_range"}:
         return _map_salary(control, profile, job, key)
-    # An explicit approved answer beats a screening.* value for the same question.
-    # Other profile fields stay as mapped. A question with no approved answer is unchanged.
-    if key in _SCREENING_KEYS:
-        approved = _explicit_answer(control, profile)
-        if approved is not None and approved.action != "unanswered":
-            return approved
+    if key in {"legally_authorized_to_work", "require_sponsorship"}:
+        semantic = _map_work_authorization(control, profile, key)
+        if semantic is not None:
+            return semantic
     try:
         text = _profile_text(profile, key, control, job, cursor)
     except ValueError as exc:
         return MappedField(key=key, action="unanswered", reason=str(exc))
+    # Screening questions: the Application Profile first, then an approved answer
+    # for the same question. When both exist and disagree, the employee decides.
+    if key in _SCREENING_KEYS:
+        approved = _explicit_answer(control, profile)
+        if approved is not None and approved.action != "unanswered":
+            if text and not _same_answer(text, approved.text):
+                return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
+            if not text:
+                return approved
     if not text:
         answered = _explicit_answer(control, profile)
         if answered is not None and answered.action != "unanswered":
@@ -1341,10 +1349,109 @@ def _retarget_date(key: str, cursor: MapCursor | None) -> str:
     return key
 
 
+def _question_texts(control: Control) -> list[str]:
+    """The control's question wording, most specific first."""
+    texts: list[str] = []
+    for part in (control.label, control.prompt, control.aria_label, control.group, control.placeholder):
+        cleaned = (part or "").strip()
+        if cleaned and cleaned not in texts:
+            texts.append(cleaned)
+    return texts
+
+
+def _same_answer(left: str, right: str) -> bool:
+    left_flag, right_flag = yes_no(left), yes_no(right)
+    if left_flag or right_flag:
+        return left_flag == right_flag
+    return normalize(left) == normalize(right)
+
+
+def _ask_person(key: str | None, reason: str) -> MappedField:
+    """Leave the field for the employee. A required one becomes MANUAL_ANSWER_REQUIRED."""
+    return MappedField(
+        key=key,
+        action="unanswered",
+        field_class="MANUAL_REVIEW_FIELD",
+        confidence="low",
+        reason=reason,
+    )
+
+
+def _work_value(intent: str, text: str, authorized: str, sponsorship: str) -> str | None:
+    """The answer to one work-authorization intent from the two profile facts.
+
+    ``sponsorship`` is TileArc's "needs sponsorship (now or later)" fact. None
+    means the profile does not answer this exact question.
+    """
+    from autofill.intents import combine_authorized_without, compound_plan
+
+    auth_flag, sponsor_flag = yes_no(authorized), yes_no(sponsorship)
+    if intent == "US_WORK_AUTHORIZATION":
+        return authorized
+    if intent == "AUTHORIZED_ANY_EMPLOYER":
+        if auth_flag == "no":
+            return authorized
+        if sponsor_flag == "yes":
+            return None
+        return authorized
+    if intent in {"SPONSORSHIP_FUTURE", "SPONSORSHIP_NOW_OR_FUTURE"}:
+        return sponsorship
+    if intent == "SPONSORSHIP_NOW":
+        # Needing sponsorship later does not say whether it is needed today.
+        return None if sponsor_flag == "yes" else sponsorship
+    if intent == "AUTHORIZED_WITHOUT_SPONSORSHIP":
+        components, _ = compound_plan(text, intent)
+        if sponsor_flag == "yes" and "SPONSORSHIP_FUTURE" not in components:
+            return None
+        authorizations = [("HIGH", authorized)] if authorized else []
+        sponsorships = [("HIGH", sponsorship)] if sponsorship else []
+        return combine_authorized_without(authorizations, sponsorships)
+    return ""
+
+
+def _map_work_authorization(control: Control, profile: CandidateProfile, key: str) -> MappedField | None:
+    """Answer the work-authorization question that is actually asked.
+
+    Returns None when the question has no known intent; the caller then maps the
+    profile field as before.
+    """
+    from autofill.answers import _JURISDICTION_INTENTS, jurisdiction, question_intent
+
+    texts = _question_texts(control)
+    approved = _explicit_answer(control, profile)
+    if approved is not None and approved.action == "unanswered":
+        approved = None
+    if texts and jurisdiction(texts[0]) != frozenset({"US"}):
+        # The profile's work facts are for the United States only.
+        if approved is not None:
+            return approved
+        return _ask_person(key, "This question asks about a country other than the United States.")
+    intent, text = question_intent(texts)
+    if intent not in _JURISDICTION_INTENTS:
+        return None
+    authorized = profile.work_authorization.legally_authorized_to_work.strip()
+    sponsorship = profile.work_authorization.require_sponsorship.strip()
+    value = _work_value(intent, text, authorized, sponsorship)
+    if value is None:
+        if approved is not None:
+            return approved
+        return _ask_person(key, "The Application Profile does not answer this exact work-authorization question.")
+    if not value:
+        if approved is not None:
+            return approved
+        return _ask_person(key, "Profile has no value for this field.")
+    if approved is not None and not _same_answer(value, approved.text):
+        return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
+    mapped = _from_text(control, key, value)
+    mapped.field_class = "PROFILE_FIELD" if mapped.action != "unanswered" else "MANUAL_REVIEW_FIELD"
+    return mapped
+
+
 def _explicit_answer(control: Control, profile: CandidateProfile) -> MappedField | None:
     if not profile.application_answers:
         return None
-    text = match_answer(haystack(control), profile.application_answers, normalize=normalize)
+    texts = [*_question_texts(control), haystack(control)]
+    text = match_answer(texts, profile.application_answers, normalize=normalize)
     if text is None:
         return None
     mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")
