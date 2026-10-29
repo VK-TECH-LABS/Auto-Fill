@@ -387,7 +387,9 @@ def _drive_session(monkeypatch, tmp_path, *, listeners: list[str]) -> tuple[list
             page_urls=[page.url],
         )
 
-    def fake_fill(page_obj: object, application_url: str, profile: CandidateProfile) -> ApplicationResult:
+    def fake_fill(
+        page_obj: object, application_url: str, profile: CandidateProfile, *, cancel: object = None
+    ) -> ApplicationResult:
         events.append("fill")
         assert page_obj is page
         assert application_url.startswith("https://boards.greenhouse.io/")

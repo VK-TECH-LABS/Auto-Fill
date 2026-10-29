@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from autofill.dom_ui import PauseGate
 from autofill.engine import ApplicationResult, AutofillOptions, autofill_application
 from autofill.profile import CandidateProfile
 from autofill.safeguards import (
@@ -971,19 +972,76 @@ def _optional_submitted(page: Any) -> bool | None:
     return None
 
 
-def fill_visible_tab(page: Any, application_url: str, profile: CandidateProfile) -> ApplicationResult:
+class FillCancelled(BaseException):
+    """A newer Apply replaced this fill, or the employee cancelled it.
+
+    ``BaseException`` on purpose: the engine catches ``Exception`` around
+    field writes, and a cancel must not be swallowed there and keep typing
+    the previous candidate. ``finally`` blocks still run.
+    """
+
+
+class CancelGate(PauseGate):
+    """Field-boundary pause gate that can also cancel one fill.
+
+    The engine calls ``wait`` before every field (``dom_ui.checkpoint``) and
+    ``check`` between pages and before Next/entry clicks. After ``cancel``
+    both raise ``FillCancelled``; a paused wait wakes up and raises too.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancelled = threading.Event()
+        self.reason = ""
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        if not self._cancelled.is_set():
+            self.reason = reason
+            self._cancelled.set()
+        self.resume()
+
+    def check(self) -> None:
+        if self._cancelled.is_set():
+            raise FillCancelled(self.reason or "cancelled")
+
+    def wait(self) -> None:
+        self.check()
+        super().wait()
+        self.check()
+
+
+def fill_visible_tab(
+    page: Any,
+    application_url: str,
+    profile: CandidateProfile,
+    *,
+    cancel: CancelGate | None = None,
+) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
     The page budget matches the hosted runner. A cap of one page filled the
     PoC fixture and then left the next employer page untouched. Final Submit
-    stays refused inside the engine.
+    stays refused inside the engine. ``cancel`` stops the fill at the next
+    field or page boundary by raising ``FillCancelled``.
     """
     require_feature()
     validate_application_url(application_url)
+    if cancel is not None:
+        cancel.check()
     return autofill_application(
         application_url,
         profile,
-        options=AutofillOptions(page=page, headless=False, max_pages=8),
+        options=AutofillOptions(
+            page=page,
+            headless=False,
+            max_pages=8,
+            pause_gate=cancel,
+            cancel_check=cancel.check if cancel is not None else None,
+        ),
     )
 
 
@@ -1072,10 +1130,32 @@ class DedicatedApplySession:
         self.tab = tab
         return tab
 
-    def fill(self, application_url: str, profile: CandidateProfile) -> tuple[ApplicationResult, bool | None]:
-        """Fill the adopted tab. A page that reports ``__submitted`` is a failure."""
+    def fill(
+        self,
+        application_url: str,
+        profile: CandidateProfile,
+        *,
+        cancel: CancelGate | None = None,
+        fresh: bool = False,
+    ) -> tuple[ApplicationResult, bool | None]:
+        """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
+
+        ``fresh`` reloads the employer URL first and forgets held selectors.
+        The helper sets it when an earlier Apply already wrote into this
+        window, so the previous candidate's values are not kept: the engine
+        does not overwrite a field that already holds a value.
+        """
+        if cancel is not None:
+            cancel.check()
         tab = self.ensure(application_url)
-        result = fill_visible_tab(tab.page, application_url, profile)
+        if fresh:
+            self._held.clear()
+            self._page_mark = None
+            tab.page.goto(application_url, wait_until="domcontentloaded", timeout=45000)
+            tab.page_url = str(tab.page.url or "")
+            if cancel is not None:
+                cancel.check()
+        result = fill_visible_tab(tab.page, application_url, profile, cancel=cancel)
         submitted = _optional_submitted(tab.page)
         if submitted is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
@@ -1087,6 +1167,8 @@ class DedicatedApplySession:
         application_url: str,
         profile: CandidateProfile,
         target: dict[str, Any],
+        *,
+        cancel: CancelGate | None = None,
     ) -> dict[str, Any]:
         """Write one employee answer on the open tab and read what is still empty.
 
@@ -1095,6 +1177,8 @@ class DedicatedApplySession:
         not clicked. The answer text is not returned.
         """
         require_feature()
+        if cancel is not None:
+            cancel.check()
         page = self._page_for_answer(application_url)
         report = apply_visible_answer(page, target)
         if not report.get("verified"):
@@ -1102,7 +1186,7 @@ class DedicatedApplySession:
         selector = str(target.get("selector") or "")
         if selector:
             self._held.add(selector)
-        followed = self._follow_answer(page, application_url, profile)
+        followed = self._follow_answer(page, application_url, profile, cancel=cancel)
         followed["verified"] = True
         followed["filled"] = True
         return followed
@@ -1121,7 +1205,14 @@ class DedicatedApplySession:
         except Exception:
             self._page_mark = None
 
-    def _follow_answer(self, page: Any, application_url: str, profile: CandidateProfile) -> dict[str, Any]:
+    def _follow_answer(
+        self,
+        page: Any,
+        application_url: str,
+        profile: CandidateProfile,
+        *,
+        cancel: CancelGate | None = None,
+    ) -> dict[str, Any]:
         """The next empty required field, or a full fill when the page changed."""
         from autofill.follow import follow_answer
 
@@ -1136,7 +1227,9 @@ class DedicatedApplySession:
         if _optional_submitted(page) is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
         if follow.changed:
-            result = fill_visible_tab(page, application_url, profile)
+            if cancel is not None:
+                cancel.check()
+            result = fill_visible_tab(page, application_url, profile, cancel=cancel)
             if _optional_submitted(page) is True:
                 raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
             self._remember_mark(page)

@@ -161,6 +161,9 @@ class AutofillOptions:
     # The service registered a Workday account in this session and no person has
     # pressed Continue since. A Sign In pane now means "verify the email first".
     verify_pending: bool = False
+    # Local helper: called between pages and before Next/entry clicks. It
+    # raises when a newer Apply replaced this fill. The hosted runner leaves it unset.
+    cancel_check: Any = None
 
 
 @dataclass
@@ -715,6 +718,13 @@ def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_nam
     return result
 
 
+def _cancel_point(opts: AutofillOptions) -> None:
+    """Stop a superseded local fill. The hook raises; nothing is clicked after it."""
+    hook = getattr(opts, "cancel_check", None)
+    if hook is not None:
+        hook()
+
+
 def _maybe_reattach(page, opts: AutofillOptions) -> None:
     if opts.resume_prepared and not opts.resume_uploaded:
         return
@@ -1013,6 +1023,7 @@ def autofill_application(
         resume_seen = False
         nav_block: tuple | None = None
         for index in range(opts.max_pages):
+            _cancel_point(opts)
             _maybe_reattach(page, opts)
             snapshot = _timed_extract(page, opts, run_started, inspect_state)
             if snapshot.captcha_present:
@@ -1638,6 +1649,7 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
         except Exception as exc:
             if is_browser_crash(exc) or is_ats_timeout(exc):
                 raise
+        _cancel_point(opts)
         try:
             new_page = activate_entry(
                 page,
@@ -1702,6 +1714,7 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     """
     before = navigation_signature(page, snapshot)
     next_started = time.perf_counter()
+    _cancel_point(opts)
     activate(page, button.selector, button.name, control_type=button.control_type, frame_url=button.frame_url)
     advanced, fresh = _confirm_move(page, before, opts, started, state)
     _add_ms(opts, "nextMs", next_started)
@@ -1868,6 +1881,7 @@ def _run_resolver_pages(
 
     nav_block: tuple | None = None
     for index in range(opts.max_pages):
+        _cancel_point(opts)
         _maybe_reattach(page, opts)
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if snapshot.captcha_present:
