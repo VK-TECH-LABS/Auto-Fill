@@ -1218,7 +1218,7 @@ def test_staged_resume_reaches_the_engine_and_is_not_in_status(monkeypatch):
             "resume": {"resumeRef": staged["resumeRef"]},
         })
         assert code == 202
-        assert a["resume"] == "held"
+        assert a["resume"]["state"] == "held"
         assert _wait(lambda: fake.resumes)
         name, size, uploaded = fake.resumes[0]
         # Basename only, safe charset, still a PDF. No path from the header survives.
@@ -1359,7 +1359,7 @@ def test_resume_bytes_are_dropped_on_cancel_replace_and_detach(monkeypatch):
         assert job_b.resume.held
         # Cancel drops B's file.
         code, body = _request(port, "POST", f"/v1/sessions/{b['sessionId']}/cancel")
-        assert code == 200 and body["resume"] == "dropped"
+        assert code == 200 and body["resume"]["state"] == "dropped"
         assert job_b.resume.data == b""
         # Detach after a finished fill drops the file as well.
         fake.release.set()
@@ -1369,7 +1369,7 @@ def test_resume_bytes_are_dropped_on_cancel_replace_and_detach(monkeypatch):
         assert job_c.resume.held
         code, body = _request(port, "POST", f"/v1/sessions/{c['sessionId']}/detach")
         assert code == 200
-        assert job_c.resume.data == b"" and body["resume"] == "dropped"
+        assert job_c.resume.data == b"" and body["resume"]["state"] == "dropped"
     finally:
         fake.release.set()
         server.shutdown()
@@ -1470,3 +1470,100 @@ def test_real_chrome_attaches_the_selected_resume_and_does_not_submit(monkeypatc
                 browser.close()
     finally:
         server.shutdown()
+
+
+class _ResumeStopSession(_ResumeSession):
+    """Stops at RESUME_UPLOAD_REQUIRED with an employer rejection, then accepts a retry."""
+
+    def __init__(self, accept: bool = True) -> None:
+        super().__init__()
+        self.accept = accept
+        self.modes: list[str] = []
+
+    def fill(self, url: str, profile, *, cancel: CancelGate | None = None, resume=None):
+        if resume is not None:
+            resume.failure = {"reason": "ats_rejected", "siteErrors": ["File type not supported"]}
+        result = ApplicationResult(status=Status.RESUME_UPLOAD_REQUIRED, ats=None,
+                                   current_step=Status.RESUME_UPLOAD_REQUIRED, login_status="NOT_REQUIRED")
+        return result, False
+
+    def resume_action(self, url, profile, resume, mode, *, cancel=None):
+        self.modes.append(mode)
+        if not self.accept:
+            resume.failure = {"reason": "not_confirmed", "siteErrors": []}
+            return {"verified": False, "reason": "not_confirmed", "siteErrors": []}
+        resume.uploaded = True
+        resume.failure = None
+        result = ApplicationResult(status=Status.READY_FOR_HUMAN_SUBMIT, ats=None, current_step="done",
+                                   login_status="NOT_REQUIRED")
+        return {"verified": True, "status": result.status, "open_items": [], "blocking": None, "result": result}
+
+
+def _resume_stop(port: int) -> dict:
+    _code, staged = _stage(port, _PDF)
+    code, body = _request(port, "POST", "/v1/sessions", {
+        "applicationUrl": _URL,
+        "profile": _profile("Avery Alpha", "avery@example.com"),
+        "binding": _binding("sess-a", "101"),
+        "resume": {"resumeRef": staged["resumeRef"]},
+    })
+    assert code == 202
+    return body
+
+
+def test_resume_failure_reason_is_public_and_retry_continues(monkeypatch):
+    fake = _ResumeStopSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _resume_stop(port)
+        sid = created["sessionId"]
+        assert _wait(lambda: _request(port, "GET", f"/v1/sessions/{sid}")[1]["status"] == Status.RESUME_UPLOAD_REQUIRED)
+        _code, status = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert status["resume"] == {"state": "failed", "reason": "ats_rejected", "siteErrors": ["File type not supported"]}
+        assert "Avery_Alpha_Resume" not in json.dumps(status)
+        code, bad = _request(port, "POST", f"/v1/sessions/{sid}/resume", {"action": "upload_anything"})
+        assert code == 422 and bad["reason"] == "action_required"
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/resume", {"action": "retry"})
+        assert code == 200 and body["verified"] is True
+        assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT and body["resume"] == {"state": "uploaded"}
+        assert body["stopped_before_submit"] is True and fake.modes == ["retry"]
+        # Not at the resume stop any more.
+        code, again = _request(port, "POST", f"/v1/sessions/{sid}/resume", {"action": "confirm_manual"})
+        assert code == 409 and again["reason"] == "not_at_resume_stop"
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_manual_confirm_needs_the_verifier(monkeypatch):
+    fake = _ResumeStopSession(accept=False)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        sid = _resume_stop(port)["sessionId"]
+        assert _wait(lambda: _request(port, "GET", f"/v1/sessions/{sid}")[1]["status"] == Status.RESUME_UPLOAD_REQUIRED)
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/resume", {"action": "confirm_manual"})
+        assert code == 200 and body["verified"] is False and body["reason"] == "not_confirmed"
+        assert body["status"] == Status.RESUME_UPLOAD_REQUIRED
+        assert body["resume"]["state"] == "failed" and body["resume"]["reason"] == "not_confirmed"
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_fill_visible_tab_keeps_the_failure_reason(monkeypatch):
+    from autofill import local_attach
+    from autofill.engine import resume_failure_view
+    from autofill.profile import CandidateProfile
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+
+    def fake_autofill(url, profile, credential_provider=None, options=None):
+        options.resume_failure = resume_failure_view({"reason": "weird", "siteErrors": ["x" * 500]})
+        return ApplicationResult(status=Status.RESUME_UPLOAD_REQUIRED, ats=None, current_step="r",
+                                 login_status="NOT_REQUIRED")
+
+    monkeypatch.setattr("autofill.local_attach.autofill_application", fake_autofill)
+    resume = local_attach.LocalResume(name="A.pdf", mime="application/pdf", data=_PDF)
+    local_attach.fill_visible_tab(object(), _URL, CandidateProfile.load(PROFILE), resume=resume)
+    assert resume.uploaded is False
+    assert resume.failure["reason"] == "not_confirmed" and len(resume.failure["siteErrors"][0]) == 200

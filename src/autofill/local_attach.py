@@ -1028,6 +1028,9 @@ class LocalResume:
     mime: str
     data: bytes = field(repr=False)
     uploaded: bool = False
+    # Last failed attach on the employer page: {"reason", "siteErrors"}. Cleared
+    # once the verifier accepts the file. Never holds the name or the bytes.
+    failure: dict[str, Any] | None = None
 
     @property
     def held(self) -> bool:
@@ -1097,8 +1100,12 @@ def fill_visible_tab(
     try:
         return autofill_application(application_url, profile, options=options)
     finally:
-        if resume is not None and options.resume_uploaded:
-            resume.uploaded = True
+        if resume is not None:
+            if options.resume_uploaded:
+                resume.uploaded = True
+                resume.failure = None
+            elif options.resume_failure is not None:
+                resume.failure = dict(options.resume_failure)
 
 
 class DedicatedApplySession:
@@ -1252,6 +1259,62 @@ class DedicatedApplySession:
         followed["verified"] = True
         followed["filled"] = True
         return followed
+
+    def resume_action(
+        self,
+        application_url: str,
+        profile: CandidateProfile,
+        resume: LocalResume,
+        mode: str,
+        *,
+        cancel: CancelGate | None = None,
+    ) -> dict[str, Any]:
+        """Retry the held resume, or re-verify one the employee attached by hand.
+
+        ``retry`` attaches the held bytes again through ``attach_and_confirm``.
+        ``confirm_manual`` only reads the page with ``confirm_current``: a click
+        on "I uploaded it" alone never passes. When the verifier accepts the
+        file, the same fill continues from this page. Final Submit stays refused.
+        """
+        from autofill.engine import resume_failure_view
+        from autofill.resume_manual import attach_and_confirm, confirm_current
+        from autofill.stepfill import post_upload_refill
+
+        require_feature()
+        if cancel is not None:
+            cancel.check()
+        page = self._page_for_answer(application_url)
+        from autofill.answer_popup import close_popup
+
+        close_popup(page)
+        if mode == "retry":
+            if not resume.held:
+                return {"verified": False, "reason": "not_held", "siteErrors": []}
+            report = attach_and_confirm(page, name=resume.name, data=resume.data)
+        else:
+            report = confirm_current(page)
+        if _optional_submitted(page) is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        if not report.get("verified"):
+            resume.failure = resume_failure_view(report)
+            return {"verified": False, **resume.failure}
+        resume.uploaded = True
+        resume.failure = None
+        post_upload_refill(page)
+        if cancel is not None:
+            cancel.check()
+        result = fill_visible_tab(page, application_url, profile, cancel=cancel, resume=resume)
+        if _optional_submitted(page) is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        self._remember_mark(page)
+        return {
+            "verified": True,
+            "status": result.status,
+            "open_items": list(result.open_items),
+            "blocking": result.blocking,
+            "result": result,
+            "continued": True,
+        }
 
     def _page_for_answer(self, application_url: str) -> Any:
         """Use the tab fill already adopted. Reconnect only after a detach."""

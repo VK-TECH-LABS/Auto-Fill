@@ -152,6 +152,9 @@ class AutofillOptions:
     resume_prepared: bool = False
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    # Why the last prepared attach failed: {"reason", "siteErrors"}. None when it
+    # was not tried or the verifier accepted the file. No file name, no bytes.
+    resume_failure: dict[str, Any] | None = None
     on_paint: Any = None
     on_page: Any = None
     on_navigation: Any = None
@@ -194,6 +197,7 @@ class ApplicationResult:
     completed_keys: list[str] = field(default_factory=list)
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    resume_failure: dict[str, Any] | None = None
     page_type: str = ""
     auto_consents: list[dict[str, Any]] = field(default_factory=list)
     entry_clicks: int = 0
@@ -266,6 +270,8 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     if active is not None:
         kwargs.setdefault("resume_verified_now", active.resume_verified_now)
         kwargs.setdefault("resume_site_errors", list(active.resume_site_errors))
+        if active.resume_failure is not None:
+            kwargs.setdefault("resume_failure", dict(active.resume_failure))
     pending = _PENDING_ACCOUNT.get()
     if pending is not None:
         _PENDING_ACCOUNT.set(None)
@@ -741,6 +747,19 @@ def _maybe_reattach(page, opts: AutofillOptions) -> None:
     )
 
 
+RESUME_FAILURE_REASONS = ("no_upload_control", "ats_rejected", "not_confirmed")
+
+
+def resume_failure_view(report: dict | None) -> dict[str, Any]:
+    """Public failure reason for a resume attach. Strings capped, nothing identifying."""
+    report = report or {}
+    reason = str(report.get("reason") or "")
+    if reason not in RESUME_FAILURE_REASONS:
+        reason = "not_confirmed"
+    errors = [str(item).strip()[:200] for item in report.get("siteErrors") or [] if str(item).strip()][:5]
+    return {"reason": reason, "siteErrors": errors}
+
+
 def _attach_prepared(page, opts: AutofillOptions) -> str:
     """Attach a file held before the control appeared.
 
@@ -761,9 +780,11 @@ def _attach_prepared(page, opts: AutofillOptions) -> str:
         opts.resume_uploaded = True
         opts.resume_verified_now = True
         opts.resume_prepared = False
+        opts.resume_failure = None
         post_upload_refill(page, session_id=opts.session_id)
         return "attached"
     opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
+    opts.resume_failure = resume_failure_view(report)
     return "failed"
 
 
