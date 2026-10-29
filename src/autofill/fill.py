@@ -194,6 +194,45 @@ def _verified_or_blank(control: Control, mapped: MappedField, locator, expected:
     return _outcome(control, mapped, detail="filled")
 
 
+_CHOICE_STATE_JS = r"""(el) => {
+  function selected(node) {
+    if (!node || !node.getAttribute) return false;
+    for (const name of ["aria-pressed", "aria-selected", "aria-checked"]) {
+      if (node.getAttribute(name) === "true") return true;
+    }
+    if (node.checked === true) return true;
+    const cls = String(node.className || "").toLowerCase();
+    return /(^|\s)(selected|is-selected|active|is-active|checked)(\s|$)/.test(cls);
+  }
+  return selected(el) || selected(el.querySelector("input[type='radio'], input[type='checkbox']"));
+}"""
+
+
+def _choice_selected(target, selector: str) -> bool:
+    """True when the clicked Yes/No button itself reads as chosen.
+
+    A page double without ``evaluate`` counts as chosen, like ``control_committed``.
+    """
+    locator = target.locator(selector)
+    evaluate = getattr(locator, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate(_CHOICE_STATE_JS))
+    except Exception:
+        return False
+
+
+def _file_attached(locator) -> bool:
+    evaluate = getattr(locator, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate("el => !!(el.files && el.files.length)"))
+    except Exception:
+        return False
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
@@ -244,6 +283,8 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 from autofill.safeguards import click_choice
 
                 click_choice(target, mapped.option_selector, mapped.option_label)
+                if not _choice_selected(target, mapped.option_selector):
+                    return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
                 remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
                 refresh_preview(page)
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
@@ -277,6 +318,8 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             return _outcome(control, mapped, detail="unchecked")
         if mapped.action == "upload":
             locator.set_input_files(mapped.text)
+            if not _file_attached(locator):
+                return _outcome(control, mapped, action="unanswered", detail="File did not stay on the page.")
             return _outcome(control, mapped, detail=Path(mapped.text).name)
     except Exception as exc:
         return _outcome(control, mapped, action="error", detail=str(exc))

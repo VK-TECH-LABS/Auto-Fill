@@ -193,6 +193,9 @@ class ApplicationAnswer:
 
     question: str
     answer: str
+    # TileArc's canonical intent for this saved answer (e.g. SPONSORSHIP_FUTURE),
+    # when known. It is checked against the question text before it is used.
+    intent: str = ""
 
 
 @dataclass
@@ -460,6 +463,10 @@ def _project_list(raw: object) -> list[Project]:
 
 def _answer_list(raw: object) -> list[ApplicationAnswer]:
     return [
-        ApplicationAnswer(question=_text(entry, "question"), answer=_text(entry, "answer"))
+        ApplicationAnswer(
+            question=_text(entry, "question"),
+            answer=_text(entry, "answer"),
+            intent=_text(entry, "intent")[:64],
+        )
         for entry in _objects(raw, "applicationAnswers")
     ]
