@@ -17,7 +17,7 @@ GitHub Actions workflow: `.github/workflows/macos-helper.yml` (`macos-latest`, A
 | File name | `TileArc-AutoFill-Helper-Setup-staging.dmg` |
 | App inside the disk image | `TileArc Auto-Fill Helper (STAGING).app` |
 | Actions artifact name | `TileArc-AutoFill-Helper-Setup-staging-macos` |
-| Architecture | `arm64` (the `macos-latest` runner; `Build-arch.txt` on the disk records `uname -m`) |
+| Architecture | `arm64` (the `macos-latest` runner; `Build-arch.txt` on the disk records `uname -m`). Intel Macs stay on the hosted companion. |
 | Content type | `application/x-apple-diskimage` |
 | Workflow | https://github.com/VK-TECH-LABS/Auto-Fill/actions/workflows/macos-helper.yml |
 | Draft release tag | `tilearc-autofill-helper-staging` (same draft as the Windows exe) |

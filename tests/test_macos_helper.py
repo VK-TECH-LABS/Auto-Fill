@@ -273,6 +273,9 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert "Open Anyway" in employee
     assert "xattr -dr com.apple.quarantine" in employee
     assert "Apple Silicon" in employee
+    assert "Intel" in employee
+    assert "hosted TileArc companion" in employee
+    assert "Intel Macs stay on the hosted companion" in build
     assert "vinayaka/fillo-extension" in employee
     assert "Final Submit" in employee
     assert MACOS_LOGIN_LABEL in employee
