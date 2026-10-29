@@ -99,10 +99,12 @@ def config_home() -> Path:
 
 
 def stable_chrome_user_data_dir() -> Path:
-    """The default Google Chrome stable data directory on Linux."""
+    """Google Chrome's daily profile directory on this operating system."""
     override = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
     if override:
         return Path(override)
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
     return config_home() / "google-chrome"
 
 
@@ -122,10 +124,24 @@ def _windows_user_data_dirs() -> list[Path]:
     return [base / name for name in names]
 
 
+def _darwin_user_data_dirs() -> list[Path]:
+    """Daily Chrome data directories on macOS. Not used as the Apply profile."""
+    root = Path.home() / "Library" / "Application Support"
+    names = (
+        Path("Google") / "Chrome",
+        Path("Google") / "Chrome Beta",
+        Path("Google") / "Chrome Canary",
+        Path("Chromium"),
+    )
+    return [root / name for name in names]
+
+
 def default_user_data_dirs() -> list[Path]:
     """Directories Chrome treats as the daily profile. The dedicated launcher refuses these."""
     if sys.platform == "win32":
         dirs = _windows_user_data_dirs()
+    elif sys.platform == "darwin":
+        dirs = _darwin_user_data_dirs()
     else:
         root = config_home()
         names = (
@@ -283,10 +299,27 @@ def _windows_chrome_paths() -> list[Path]:
     return paths
 
 
+def _darwin_chrome_paths() -> list[Path]:
+    """Well-known Google Chrome.app binaries. The stable app is first."""
+    bundles = (
+        ("Google Chrome.app", "Google Chrome"),
+        ("Google Chrome Beta.app", "Google Chrome Beta"),
+        ("Google Chrome Canary.app", "Google Chrome Canary"),
+    )
+    roots = (Path("/Applications"), Path.home() / "Applications")
+    paths: list[Path] = []
+    for root in roots:
+        for bundle, binary in bundles:
+            paths.append(root / bundle / "Contents" / "MacOS" / binary)
+    return paths
+
+
 def chrome_search_paths() -> list[Path]:
     """Well-known Google Chrome binaries. This does not search PATH."""
     if sys.platform == "win32":
         return _windows_chrome_paths()
+    if sys.platform == "darwin":
+        return _darwin_chrome_paths()
     return [
         Path("/usr/bin/google-chrome-stable"),
         Path("/usr/bin/google-chrome"),

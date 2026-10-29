@@ -39,3 +39,7 @@ powershell -ExecutionPolicy Bypass -File windows/smoke.ps1
 ```
 
 Output: `dist/TileArc-AutoFill-Helper-Setup-staging.exe`.
+
+## macOS
+
+Employees on macOS install `TileArc-AutoFill-Helper-Setup-staging.dmg` (Apple Silicon). That asset is added to the same draft tag `tilearc-autofill-helper-staging`. See `macos/BUILD.md` and `docs/MACOS_EMPLOYEE.md`. The Windows Setup.exe stays the Windows download.

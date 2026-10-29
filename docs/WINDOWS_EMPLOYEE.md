@@ -2,6 +2,8 @@
 
 This installs the staging helper on your Windows PC. You do not need Python or PowerShell.
 
+On a Mac, install `TileArc-AutoFill-Helper-Setup-staging.dmg` instead. The steps are in [MACOS_EMPLOYEE.md](MACOS_EMPLOYEE.md).
+
 Use this only for **TileArc staging**. It is not the production installer.
 
 The helper runs on this computer at `http://127.0.0.1:9410`. It opens a **separate Chrome profile** for applications. It does not use your everyday Chrome, and it does not click Final Submit. You still submit the application yourself.
