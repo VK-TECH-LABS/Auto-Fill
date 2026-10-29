@@ -20,8 +20,10 @@ open tab.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import re
 import os
 import sys
 import threading
@@ -38,9 +40,11 @@ from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
     ENV_FLAG,
     LOOPBACK,
+    CancelGate,
     DedicatedApplySession,
     DefaultProfileBlocked,
     FeatureDisabled,
+    FillCancelled,
     LocalAttachError,
     LoopbackRequired,
     _result_brief,
@@ -59,6 +63,105 @@ HELPER_PORT = 9410
 _MAX_BODY = 1_048_576
 _ANSWER_WAIT_SECONDS = 60
 _NON_QUESTION_KINDS = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
+# Finished and replaced jobs kept so a late status/answer gets 410, not a fill.
+_MAX_JOBS = 8
+_BINDING_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+REPLACED = "REPLACED"
+CANCELLED = "CANCELLED"
+
+
+class BindingError(ValueError):
+    """The create body carried a binding the helper cannot trust."""
+
+
+def parse_binding(raw: Any) -> dict[str, str] | None:
+    """TileArc Apply binding: session, candidate, job, profile fingerprint, expiry.
+
+    Returns ``None`` when the caller sent no binding (older pages). A binding
+    that is present but malformed or already expired is refused. Values are
+    ids and digests only; no candidate PII is accepted here.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise BindingError("binding must be an object.")
+    out: dict[str, str] = {}
+    for key, required in (
+        ("tilearcSessionId", True),
+        ("candidateId", True),
+        ("jobId", False),
+        ("profileFingerprint", True),
+        ("employeeIdHash", False),
+    ):
+        value = raw.get(key)
+        text = "" if value is None or isinstance(value, bool) else str(value).strip()
+        if not text:
+            if required:
+                raise BindingError(f"binding.{key} is required.")
+            continue
+        if not _BINDING_ID.match(text):
+            raise BindingError(f"binding.{key} is not a valid id.")
+        out[key] = text
+    expires = _expires_epoch(raw.get("expiresAt"))
+    if expires is not None:
+        if expires <= time.time():
+            raise BindingError("binding expired.")
+        out["expiresAt"] = str(int(expires))
+    return out
+
+
+def _expires_epoch(value: Any) -> float | None:
+    """Epoch seconds from epoch ms, epoch seconds, or an ISO-8601 string."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000 if number > 10_000_000_000 else number
+    text = str(value).strip()
+    try:
+        number = float(text)
+    except ValueError:
+        number = None
+    if number is not None:
+        return number / 1000 if number > 10_000_000_000 else number
+    from datetime import datetime
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BindingError("binding.expiresAt is not a date.") from exc
+    if parsed.tzinfo is None:
+        raise BindingError("binding.expiresAt needs a timezone.")
+    return parsed.timestamp()
+
+
+def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
+    if not left or not right:
+        return False
+    return all(
+        left.get(key, "") == right.get(key, "")
+        for key in ("tilearcSessionId", "candidateId", "jobId", "profileFingerprint")
+    )
+
+
+def _binding_expired(binding: dict[str, str] | None) -> bool:
+    if not binding or not binding.get("expiresAt"):
+        return False
+    try:
+        return float(binding["expiresAt"]) <= time.time()
+    except ValueError:
+        return True
+
+
+def _accepts(fn: Any, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _accepts_cancel(fn: Any) -> bool:
+    return _accepts(fn, "cancel")
 
 
 class AnswerRejected(LocalAttachError):
@@ -104,10 +207,20 @@ class LocalJob:
     is returned.
     """
 
-    def __init__(self, session_id: str, application_url: str, profile: CandidateProfile | None = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        application_url: str,
+        profile: CandidateProfile | None = None,
+        binding: dict[str, str] | None = None,
+    ) -> None:
         self.session_id = session_id
         self.application_url = application_url
         self.profile = profile
+        self.binding = dict(binding) if binding else None
+        self.gate = CancelGate()
+        # "replaced" (a newer Apply) or "cancelled" (the page asked). Empty while live.
+        self.ended = ""
         self.state = "queued"
         self.result: dict[str, Any] | None = None
         self.error = ""
@@ -124,12 +237,28 @@ class LocalJob:
         """True only when the page reported a submit. A missing flag is not a claim."""
         return self.submitted is True
 
+    @property
+    def superseded(self) -> bool:
+        return bool(self.ended)
+
+    def end(self, reason: str) -> None:
+        """Stop this job for good. The profile and the pending question are dropped."""
+        if not self.ended:
+            self.ended = reason
+        self.gate.cancel(reason)
+        self.profile = None
+        self.question = None
+        self.blocking = None
+        self.open_items = []
+
     def public(self) -> dict[str, Any]:
         status = self.state
         if self.result is not None and not self.error:
             status = str(self.result.get("status") or status)
         if self.error:
             status = "FAILED"
+        if self.ended and not self.submit_claimed():
+            status = REPLACED if self.ended == "replaced" else CANCELLED
         stopped_before_submit = not self.submit_claimed()
         body: dict[str, Any] = {
             "sessionId": self.session_id,
@@ -142,6 +271,14 @@ class LocalJob:
             "ownsBrowser": self.owns_browser,
             "browserRunning": self.browser_running,
         }
+        if self.binding:
+            body["binding"] = {
+                key: self.binding[key]
+                for key in ("tilearcSessionId", "candidateId", "jobId", "profileFingerprint")
+                if key in self.binding
+            }
+        if self.ended:
+            body["ended"] = self.ended
         if self.result is not None:
             body["fill"] = dict(self.result)
             body["fill"]["stopped_before_submit"] = stopped_before_submit
@@ -184,7 +321,11 @@ class LocalHelper:
             executable=executable,
         )
         self._jobs: dict[str, LocalJob] = {}
+        # The worker's job (fill or answer). The newest live job is ``_current``.
         self._active: str | None = None
+        self._current: str | None = None
+        # True after any fill reached the window; the next job reloads first.
+        self._window_used = False
         self._generation = 0
         self._lock = threading.Lock()
         self._queue: Queue[tuple[str, dict[str, Any]] | None] = Queue()
@@ -192,15 +333,50 @@ class LocalHelper:
         self._thread = threading.Thread(target=self._loop, name="autofill-local-attach", daemon=True)
         self._thread.start()
 
-    def submit(self, application_url: str, profile: CandidateProfile) -> LocalJob:
+    def submit(
+        self,
+        application_url: str,
+        profile: CandidateProfile,
+        binding: dict[str, str] | None = None,
+    ) -> LocalJob:
+        """Queue one fill. A bound create replaces the previous job.
+
+        Same binding and URL as the live job: that job is returned (a double
+        click does not start a second fill). Different binding: the previous
+        job is cancelled at its next field or page, marked ``replaced``, and
+        its profile is dropped. An unbound create keeps the old rule and is
+        refused while a live fill runs.
+        """
         url = validate_application_url(application_url)
         with self._lock:
-            if self._active is not None:
+            current = self._jobs.get(self._current) if self._current else None
+            if (
+                binding is not None
+                and current is not None
+                and not current.superseded
+                and current.application_url == url
+                and same_binding(current.binding, binding)
+                and current.state not in {"error"}
+            ):
+                return current
+            active = self._jobs.get(self._active) if self._active else None
+            if active is not None and not active.superseded and binding is None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
+            for old in {job.session_id: job for job in (current, active) if job is not None}.values():
+                if not old.superseded:
+                    old.end("replaced")
+                    logger.info("session=%s superseded reason=replaced", old.session_id)
             self._generation += 1
-            job = LocalJob(uuid.uuid4().hex, url, profile)
+            job = LocalJob(uuid.uuid4().hex, url, profile, binding)
             self._jobs[job.session_id] = job
+            self._current = job.session_id
             self._active = job.session_id
+            self._prune()
+        logger.info(
+            "session=%s created bound=%s",
+            job.session_id,
+            "1" if binding else "0",
+        )
         timer = self._timer
         if timer is not None:
             timer.cancel()
@@ -211,12 +387,56 @@ class LocalHelper:
         with self._lock:
             return self._jobs.get(session_id)
 
+    def cancel(self, session_id: str) -> LocalJob:
+        """Stop one job at its next field or page. Idempotent. Chrome stays up."""
+        with self._lock:
+            job = self._jobs.get(session_id)
+            if job is None:
+                raise LocalAttachError("No such session.")
+            if not job.superseded:
+                job.end("cancelled")
+                logger.info("session=%s superseded reason=cancelled", job.session_id)
+            if self._current == session_id:
+                self._current = None
+        return job
+
+    def _prune(self) -> None:
+        """Drop the oldest ended or finished jobs. Call with the lock held."""
+        keep = {self._current, self._active}
+        removable = [
+            sid
+            for sid, job in self._jobs.items()
+            if sid not in keep and (job.superseded or job.state in {"done", "error", "replaced"})
+        ]
+        excess = len(self._jobs) - _MAX_JOBS
+        for sid in removable[: max(0, excess)]:
+            self._jobs.pop(sid, None)
+
     def request_answer(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Apply one employee answer on the worker thread. The value is not logged."""
+        """Apply one employee answer on the worker thread. The value is not logged.
+
+        Only the current job takes answers. A replaced, cancelled, or expired
+        job gets 410 and nothing is written. A binding on the answer must
+        match the job's candidate and TileArc session.
+        """
         job = self.get(session_id)
         if job is None:
             raise LocalAttachError("No such session.")
         with self._lock:
+            if job.superseded or (self._current is not None and self._current != session_id):
+                raise AnswerRejected(410, _failure(job, "replaced"))
+            if _binding_expired(job.binding):
+                job.end("cancelled")
+                if self._current == session_id:
+                    self._current = None
+                raise AnswerRejected(410, _failure(job, "expired"))
+            claimed = payload.get("binding")
+            if claimed is not None and job.binding:
+                if not isinstance(claimed, dict) or any(
+                    str(claimed.get(key) or "").strip() != job.binding.get(key, "")
+                    for key in ("tilearcSessionId", "candidateId")
+                ):
+                    raise AnswerRejected(409, _failure(job, "binding_mismatch"))
             if self._active is not None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
             if job.state in {"queued", "running"}:
@@ -246,6 +466,9 @@ class LocalHelper:
         job = self.get(session_id)
         if job is None:
             raise LocalAttachError("No such session.")
+        if job.superseded:
+            # The CDP client may belong to the newer job. Leave it alone.
+            return job
         if job.state in {"queued", "running"}:
             raise LocalAttachError("The fill is still running.")
         done = threading.Event()
@@ -292,13 +515,31 @@ class LocalHelper:
                     payload["done"].set()
 
     def _run_fill(self, job: LocalJob, profile: CandidateProfile) -> None:
+        if job.superseded:
+            job.state = "replaced"
+            self._finish_active(job)
+            return
         job.state = "running"
         try:
-            result, submitted = self._session.fill(job.application_url, profile)
+            fill = self._session.fill
+            kwargs: dict[str, Any] = {}
+            if _accepts_cancel(fill):
+                kwargs["cancel"] = job.gate
+            if _accepts(fill, "fresh"):
+                # An earlier job wrote into this window. Start from a clean page.
+                kwargs["fresh"] = self._window_used
+            self._window_used = True
+            result, submitted = fill(job.application_url, profile, **kwargs)
             job.submitted = submitted
-            self._remember_result(job, result)
+            if job.superseded:
+                job.state = "replaced"
+            else:
+                self._remember_result(job, result)
+                job.state = "done"
             job.target_id = self._session.tab.target_id if self._session.tab is not None else ""
-            job.state = "done"
+        except FillCancelled:
+            job.state = "replaced"
+            logger.info("session=%s fill_stopped reason=%s", job.session_id, job.ended or "cancelled")
         except Exception as exc:
             reported_submit = isinstance(exc, LocalAttachError) and "reported a submit" in str(exc)
             if reported_submit:
@@ -314,6 +555,8 @@ class LocalHelper:
         box: dict[str, Any] = payload["box"]
         try:
             box["body"] = self._answer_job(job, payload["payload"])
+        except FillCancelled:
+            box["error"] = AnswerRejected(410, _failure(job, "replaced"))
         except AnswerRejected as exc:
             box["error"] = exc
         except HumanSubmissionRequired:
@@ -333,6 +576,8 @@ class LocalHelper:
 
     def _answer_job(self, job: LocalJob, payload: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
+        if job.superseded:
+            raise AnswerRejected(410, _failure(job, "replaced"))
         if job.profile is None or job.question is None or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
             raise AnswerRejected(409, _failure(job, "not_at_human_stop"))
         if not _has_identifier(payload):
@@ -346,7 +591,12 @@ class LocalHelper:
         apply = getattr(self._session, "apply_answer", None)
         if apply is None:
             raise AnswerRejected(409, _failure(job, "element_not_found"))
-        report = apply(job.application_url, job.profile, target)
+        if _accepts_cancel(apply):
+            report = apply(job.application_url, job.profile, target, cancel=job.gate)
+        else:
+            report = apply(job.application_url, job.profile, target)
+        if job.superseded:
+            raise AnswerRejected(410, _failure(job, "replaced"))
         if not isinstance(report, dict):
             report = {"verified": False, "filled": False, "reason": "not_committed"}
         if _optional_submit_flag(report):
@@ -404,6 +654,12 @@ class LocalHelper:
             job.result["stopped_before_submit"] = not job.submit_claimed()
 
     def _finish_active(self, job: LocalJob) -> None:
+        if job.superseded:
+            job.end(job.ended)
+            with self._lock:
+                if self._active == job.session_id:
+                    self._active = None
+            return
         job.owns_browser = self._session.owns_chrome
         job.browser_running = self._session.browser_running()
         tab = getattr(self._session, "tab", None)
@@ -492,7 +748,7 @@ class _Handler(BaseHTTPRequestHandler):
         if job is None:
             self._send(404, {"detail": "Not found"})
             return
-        self._send(200, job.public())
+        self._send(410 if job.superseded else 200, job.public())
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -502,6 +758,15 @@ class _Handler(BaseHTTPRequestHandler):
         session_id = _action_id(path, "answer")
         if session_id is not None:
             self._answer(session_id)
+            return
+        session_id = _action_id(path, "cancel")
+        if session_id is not None:
+            try:
+                job = self.server.helper.cancel(session_id)
+            except LocalAttachError:
+                self._send(404, {"detail": "Not found", "stopped_before_submit": True})
+                return
+            self._send(200, job.public())
             return
         session_id = _detach_id(path)
         if session_id is None:
@@ -522,8 +787,9 @@ class _Handler(BaseHTTPRequestHandler):
             profile_raw = payload.get("profile")
             if not isinstance(profile_raw, dict):
                 raise LocalAttachError("profile must be an object.")
+            binding = parse_binding(payload.get("binding"))
             profile = CandidateProfile.from_dict(profile_raw)
-            job = self.server.helper.submit(url, profile)
+            job = self.server.helper.submit(url, profile, binding)
         except LocalAttachError as exc:
             busy = "already running" in str(exc)
             self._send(409 if busy else 400, {"detail": str(exc), "stopped_before_submit": True})
@@ -571,7 +837,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _session_id(path: str) -> str | None:
     prefix = "/v1/sessions/"
-    if not path.startswith(prefix) or path.endswith("/detach") or path.endswith("/answer"):
+    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel")):
         return None
     session_id = path[len(prefix) :]
     if not session_id or "/" in session_id:
