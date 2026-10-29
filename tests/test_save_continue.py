@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +12,6 @@ import pytest
 from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import ENV_FLAG, DedicatedApplySession, find_chrome, start_fixture_server
 from autofill.local_helper import serve
-
 from test_local_helper import (
     _COLOR,
     _AnswerSession,
@@ -211,7 +209,10 @@ def test_stale_popup_save_reopens_with_an_error(monkeypatch):
 def test_multi_select_value_from_the_panel_is_split(monkeypatch):
     from autofill.local_helper import LocalJob, _prepared_target
 
-    item = dict(_COLOR, answerType="multi_select", options=["Red", "Blue", "Green"], questionId="q-multi", questionHash="q-multi")
+    item = dict(
+        _COLOR, answerType="multi_select", options=["Red", "Blue", "Green"],
+        questionId="q-multi", questionHash="q-multi",
+    )
     job = LocalJob("sid", "https://jobs.example.com/apply")
     job.open_items = [item]
     job.question = {"id": "q-multi", "prompt": item["text"], "type": "multi_select", "options": item["options"]}

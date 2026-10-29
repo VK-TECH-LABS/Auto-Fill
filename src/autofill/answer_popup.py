@@ -56,8 +56,10 @@ _SHOW_JS = r"""(args) => {
     .q{font-weight:600;margin:8px 0 4px}
     .help{font-size:12px;color:#475569;margin:0 0 8px;white-space:pre-wrap}
     .opt{display:flex;gap:8px;align-items:flex-start;margin:4px 0;cursor:pointer}
-    textarea{width:100%;box-sizing:border-box;min-height:64px;border:1px solid #cbd5e1;border-radius:8px;padding:6px;font:inherit}
-    button{margin-top:10px;width:100%;background:#0f766e;color:#fff;border:0;border-radius:8px;padding:8px 10px;font:inherit;font-weight:600;cursor:pointer}
+    textarea{width:100%;box-sizing:border-box;min-height:64px;border:1px solid #cbd5e1;
+      border-radius:8px;padding:6px;font:inherit}
+    button{margin-top:10px;width:100%;background:#0f766e;color:#fff;border:0;border-radius:8px;
+      padding:8px 10px;font:inherit;font-weight:600;cursor:pointer}
     button[disabled]{opacity:.5;cursor:default}
     .msg{font-size:12px;margin-top:8px;color:#334155}
     .msg.err{color:#b91c1c}
@@ -99,7 +101,8 @@ _SHOW_JS = r"""(args) => {
       if (!parts.length) {
         const box = el.closest("fieldset, [role=group], [role=radiogroup], .field, .form-group, .question, li");
         if (box) {
-          for (const node of box.querySelectorAll("small, .help, .hint, .description, [class*=help], [class*=hint], [class*=description], p")) {
+          const hints = "small, .help, .hint, .description, [class*=help], [class*=hint], [class*=description], p";
+          for (const node of box.querySelectorAll(hints)) {
             if (node.closest("label") || node.querySelector("input,select,textarea")) continue;
             if (node.textContent) parts.push(node.textContent);
             if (parts.length >= 3) break;
@@ -158,7 +161,8 @@ _SHOW_JS = r"""(args) => {
   card.appendChild(msg);
   const note = document.createElement("div");
   note.className = "note";
-  note.textContent = "Saved to this candidate's Application Answers in TileArc, then filled here. You still click the final Submit yourself.";
+  note.textContent = "Saved to this candidate's Application Answers in TileArc, then filled here. "
+    + "You still click the final Submit yourself.";
   card.appendChild(note);
   root.appendChild(card);
   function picked() {

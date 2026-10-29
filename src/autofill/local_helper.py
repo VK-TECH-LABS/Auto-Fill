@@ -41,6 +41,7 @@ from queue import Queue
 from typing import Any
 from urllib.parse import urlparse
 
+from autofill.answer_popup import new_nonce
 from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item
 from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
@@ -61,7 +62,6 @@ from autofill.local_attach import (
     validate_application_url,
 )
 from autofill.mapping import option_stance
-from autofill.answer_popup import new_nonce
 from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
 from autofill.resume_fetch import MAX_RESUME_BYTES, resume_filename
 from autofill.safeguards import HumanSubmissionRequired
@@ -855,7 +855,10 @@ class LocalHelper:
             if time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS:
                 self._present_popup(
                     job,
-                    message="TileArc did not confirm the save. Keep the TileArc tab open, then click Save & Continue again.",
+                    message=(
+                        "TileArc did not confirm the save. Keep the TileArc tab open, "
+                        "then click Save & Continue again."
+                    ),
                     error=True,
                 )
             return
@@ -876,7 +879,12 @@ class LocalHelper:
         if reason != "ok" or not canonical:
             message = getattr(self._session, "question_popup_message", None)
             if message is not None:
-                message(popup["nonce"], "Pick one of the choices shown, then click Save & Continue.", error=True, reopen=True)
+                message(
+                    popup["nonce"],
+                    "Pick one of the choices shown, then click Save & Continue.",
+                    error=True,
+                    reopen=True,
+                )
             return
         popup["state"] = "answered"
         popup["values"] = [str(value) for value in canonical]
