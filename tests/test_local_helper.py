@@ -1026,7 +1026,12 @@ def test_fill_visible_tab_hands_the_gate_to_the_engine(monkeypatch):
     def fake_autofill(url, profile, credential_provider=None, options=None):
         captured["pause_gate"] = options.pause_gate
         captured["cancel_check"] = options.cancel_check
-        return ApplicationResult(status=Status.READY_FOR_HUMAN_SUBMIT, ats=None, current_step="done", login_status="NOT_REQUIRED")
+        return ApplicationResult(
+            status=Status.READY_FOR_HUMAN_SUBMIT,
+            ats=None,
+            current_step="done",
+            login_status="NOT_REQUIRED",
+        )
 
     monkeypatch.setattr("autofill.local_attach.autofill_application", fake_autofill)
     gate = CancelGate()
