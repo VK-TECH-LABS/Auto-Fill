@@ -1014,12 +1014,62 @@ class CancelGate(PauseGate):
         self.check()
 
 
+@dataclass
+class LocalResume:
+    """The selected TileArc resume for one helper job, held in memory only.
+
+    The helper never writes it to disk and never serves it back. ``uploaded``
+    turns true once the engine's verifier accepted the file on the employer
+    page, so a later page or a Save & Fill follow-up does not attach it twice.
+    ``drop`` clears the bytes when the job is cancelled, replaced, or detached.
+    """
+
+    name: str
+    mime: str
+    data: bytes = field(repr=False)
+    uploaded: bool = False
+
+    @property
+    def held(self) -> bool:
+        return bool(self.data)
+
+    def drop(self) -> None:
+        self.data = b""
+
+
+def _resume_options(resume: LocalResume | None) -> dict[str, Any]:
+    """Engine options for a held resume. The engine attaches it at the resume control."""
+    if resume is None or not resume.held:
+        return {}
+    if resume.uploaded:
+        # Already accepted on an earlier page or run. Keep the bytes for a
+        # verified re-attach after a parse, but do not upload it again.
+        return {
+            "resume_uploaded": True,
+            "resume_name": resume.name,
+            "resume_mime": resume.mime,
+            "resume_bytes": resume.data,
+        }
+    return {
+        "resume_prepared": True,
+        "resume_name": resume.name,
+        "resume_mime": resume.mime,
+        "resume_bytes": resume.data,
+    }
+
+
+def _resume_kwargs(resume: LocalResume | None) -> dict[str, Any]:
+    """Pass ``resume`` only when there is one, so older fill seams keep working."""
+    return {"resume": resume} if resume is not None else {}
+
+
 def fill_visible_tab(
     page: Any,
     application_url: str,
     profile: CandidateProfile,
     *,
     cancel: CancelGate | None = None,
+    resume: LocalResume | None = None,
 ) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
@@ -1027,22 +1077,28 @@ def fill_visible_tab(
     PoC fixture and then left the next employer page untouched. Final Submit
     stays refused inside the engine. ``cancel`` stops the fill at the next
     field or page boundary by raising ``FillCancelled``.
+
+    ``resume`` is the selected TileArc resume. The engine attaches it at the
+    resume control through the same verifier the hosted resume upload uses.
+    Without it a resume control stays a human checkpoint.
     """
     require_feature()
     validate_application_url(application_url)
     if cancel is not None:
         cancel.check()
-    return autofill_application(
-        application_url,
-        profile,
-        options=AutofillOptions(
-            page=page,
-            headless=False,
-            max_pages=8,
-            pause_gate=cancel,
-            cancel_check=cancel.check if cancel is not None else None,
-        ),
+    options = AutofillOptions(
+        page=page,
+        headless=False,
+        max_pages=8,
+        pause_gate=cancel,
+        cancel_check=cancel.check if cancel is not None else None,
+        **_resume_options(resume),
     )
+    try:
+        return autofill_application(application_url, profile, options=options)
+    finally:
+        if resume is not None and options.resume_uploaded:
+            resume.uploaded = True
 
 
 class DedicatedApplySession:
@@ -1137,6 +1193,7 @@ class DedicatedApplySession:
         *,
         cancel: CancelGate | None = None,
         fresh: bool = False,
+        resume: LocalResume | None = None,
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
@@ -1155,7 +1212,7 @@ class DedicatedApplySession:
             tab.page_url = str(tab.page.url or "")
             if cancel is not None:
                 cancel.check()
-        result = fill_visible_tab(tab.page, application_url, profile, cancel=cancel)
+        result = fill_visible_tab(tab.page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
         submitted = _optional_submitted(tab.page)
         if submitted is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
@@ -1169,6 +1226,7 @@ class DedicatedApplySession:
         target: dict[str, Any],
         *,
         cancel: CancelGate | None = None,
+        resume: LocalResume | None = None,
     ) -> dict[str, Any]:
         """Write one employee answer on the open tab and read what is still empty.
 
@@ -1186,7 +1244,7 @@ class DedicatedApplySession:
         selector = str(target.get("selector") or "")
         if selector:
             self._held.add(selector)
-        followed = self._follow_answer(page, application_url, profile, cancel=cancel)
+        followed = self._follow_answer(page, application_url, profile, cancel=cancel, resume=resume)
         followed["verified"] = True
         followed["filled"] = True
         return followed
@@ -1212,6 +1270,7 @@ class DedicatedApplySession:
         profile: CandidateProfile,
         *,
         cancel: CancelGate | None = None,
+        resume: LocalResume | None = None,
     ) -> dict[str, Any]:
         """The next empty required field, or a full fill when the page changed."""
         from autofill.follow import follow_answer
@@ -1229,7 +1288,7 @@ class DedicatedApplySession:
         if follow.changed:
             if cancel is not None:
                 cancel.check()
-            result = fill_visible_tab(page, application_url, profile, cancel=cancel)
+            result = fill_visible_tab(page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
             if _optional_submitted(page) is True:
                 raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
             self._remember_mark(page)

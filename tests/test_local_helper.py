@@ -1159,3 +1159,314 @@ def test_a_later_apply_reloads_the_page_so_old_values_do_not_stay(monkeypatch):
     finally:
         server.shutdown()
         helper.close()
+
+
+# --- t60u req1 gap B: selected resume on the local path ---------------------
+
+_PDF = b"%PDF-1.4\n" + b"0" * 2048 + b"\n%%EOF\n"
+
+
+def _stage(port: int, data: bytes, *, session: str = "sess-a", candidate: str = "101",
+           name: str = "Avery_Alpha_Resume.pdf", ctype: str = "application/pdf") -> tuple[int, dict]:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/resumes",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": ctype,
+            "X-Resume-Filename": name,
+            "X-TileArc-Session": session,
+            "X-TileArc-Candidate": candidate,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+class _ResumeSession(_FieldSession):
+    """Records the resume the helper hands to the engine."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resumes: list[tuple[str, int, bool]] = []
+        self.answer_resumes: list[object] = []
+
+    def fill(self, url: str, profile, *, cancel: CancelGate | None = None, resume=None):
+        if resume is not None:
+            self.resumes.append((resume.name, len(resume.data), resume.uploaded))
+        return super().fill(url, profile, cancel=cancel)
+
+    def apply_answer(self, url: str, profile, target: dict, *, cancel: CancelGate | None = None, resume=None) -> dict:
+        self.answer_resumes.append(resume)
+        return super().apply_answer(url, profile, target, cancel=cancel)
+
+
+def test_staged_resume_reaches_the_engine_and_is_not_in_status(monkeypatch):
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, staged = _stage(port, _PDF, name="../../etc/Avery Alpha Résumé.pdf")
+        assert code == 201
+        assert set(staged) == {"resumeRef", "size", "stopped_before_submit"}
+        code, a = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+            "resume": {"resumeRef": staged["resumeRef"]},
+        })
+        assert code == 202
+        assert a["resume"] == "held"
+        assert _wait(lambda: fake.resumes)
+        name, size, uploaded = fake.resumes[0]
+        # Basename only, safe charset, still a PDF. No path from the header survives.
+        assert "/" not in name and ".." not in name and name.endswith(".pdf")
+        assert size == len(_PDF) and uploaded is False
+        assert "Avery_Alpha_Resume" not in json.dumps(a) and "%PDF" not in json.dumps(a)
+        # Single use: the ref cannot start a second fill.
+        code, again = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a2", "101"),
+            "resume": {"resumeRef": staged["resumeRef"]},
+        })
+        assert code == 400
+        # The Save & Fill follow-up gets the same held file.
+        fake.release.set()
+        _wait_status(port, a["sessionId"], lambda body: body.get("status") == "MANUAL_ANSWER_REQUIRED")
+        code, _ = _request(port, "POST", f"/v1/sessions/{a['sessionId']}/answer", {"id": "q-color", "value": "Blue"})
+        assert code == 200
+        assert fake.answer_resumes and fake.answer_resumes[0] is helper.get(a["sessionId"]).resume
+    finally:
+        fake.release.set()
+        server.shutdown()
+        helper.close()
+
+
+def test_resume_for_another_candidate_or_session_is_refused(monkeypatch):
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        _code, staged = _stage(port, _PDF, session="sess-a", candidate="101")
+        for binding in (_binding("sess-a", "202"), _binding("sess-b", "101")):
+            code, body = _request(port, "POST", "/v1/sessions", {
+                "applicationUrl": _URL,
+                "profile": _profile("Blake Beta", "blake@example.com"),
+                "binding": binding,
+                "resume": {"resumeRef": staged["resumeRef"]},
+            })
+            assert code == 400, binding
+            assert body["stopped_before_submit"] is True
+        # A mismatched claim burns the ref; it cannot be retried with the right binding.
+        code, _ = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+            "resume": {"resumeRef": staged["resumeRef"]},
+        })
+        assert code == 400
+        # A resume without a binding is refused too.
+        _code, staged = _stage(port, _PDF)
+        code, _ = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "resume": {"resumeRef": staged["resumeRef"]},
+        })
+        assert code == 400
+        assert fake.calls == []
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_stage_rejects_non_pdf_oversize_and_unbound(monkeypatch):
+    from autofill.resume_fetch import MAX_RESUME_BYTES
+
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        assert _stage(port, b"hello world")[0] == 400
+        assert _stage(port, _PDF, ctype="application/octet-stream")[0] == 400
+        assert _stage(port, _PDF, session="")[0] == 400
+        assert _stage(port, _PDF, candidate="1 2")[0] == 400
+        big = b"%PDF-" + b"0" * MAX_RESUME_BYTES
+        try:
+            assert _stage(port, big)[0] == 400
+        except urllib.error.URLError:
+            pass  # refused before the body was read; the socket closed mid-upload
+        assert helper.staged_count() == 0
+        code, body = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+            "resume": {"resumeRef": "not-hex"},
+        })
+        assert code == 400
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_staged_resume_expires(monkeypatch):
+    from autofill import local_helper
+
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        _code, staged = _stage(port, _PDF)
+        assert helper.staged_count() == 1
+        monkeypatch.setattr(local_helper, "_STAGED_RESUME_TTL_SECONDS", -1)
+        assert helper.staged_count() == 0
+        code, _ = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+            "resume": {"resumeRef": staged["resumeRef"]},
+        })
+        assert code == 400
+        assert fake.calls == []
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def _start_with_resume(port: int, session: str, candidate: str, name: str) -> dict:
+    _code, staged = _stage(port, _PDF, session=session, candidate=candidate)
+    code, body = _request(port, "POST", "/v1/sessions", {
+        "applicationUrl": _URL,
+        "profile": _profile(name, f"{candidate}@example.com"),
+        "binding": _binding(session, candidate),
+        "resume": {"resumeRef": staged["resumeRef"]},
+    })
+    assert code == 202
+    return body
+
+
+def test_resume_bytes_are_dropped_on_cancel_replace_and_detach(monkeypatch):
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        a = _start_with_resume(port, "sess-a", "101", "Avery Alpha")
+        assert fake.ticks.wait(timeout=5)
+        job_a = helper.get(a["sessionId"])
+        assert job_a.resume is not None and job_a.resume.held
+        # Replaced by another candidate: A's file is gone, B holds its own.
+        b = _start_with_resume(port, "sess-b", "202", "Blake Beta")
+        assert job_a.resume.data == b"" and job_a.resume_state() == "dropped"
+        job_b = helper.get(b["sessionId"])
+        assert job_b.resume.held
+        # Cancel drops B's file.
+        code, body = _request(port, "POST", f"/v1/sessions/{b['sessionId']}/cancel")
+        assert code == 200 and body["resume"] == "dropped"
+        assert job_b.resume.data == b""
+        # Detach after a finished fill drops the file as well.
+        fake.release.set()
+        c = _start_with_resume(port, "sess-c", "303", "Casey Gamma")
+        _wait_status(port, c["sessionId"], lambda row: row.get("status") == "MANUAL_ANSWER_REQUIRED")
+        job_c = helper.get(c["sessionId"])
+        assert job_c.resume.held
+        code, body = _request(port, "POST", f"/v1/sessions/{c['sessionId']}/detach")
+        assert code == 200
+        assert job_c.resume.data == b"" and body["resume"] == "dropped"
+    finally:
+        fake.release.set()
+        server.shutdown()
+        helper.close()
+
+
+def test_unclaimed_staged_files_are_capped(monkeypatch):
+    fake = _ResumeSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        refs = [_stage(port, _PDF, session=f"sess-{i}")[1]["resumeRef"] for i in range(5)]
+        assert helper.staged_count() == 2
+        assert set(helper._staged) == set(refs[-2:])
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_fill_visible_tab_passes_the_resume_as_prepared(monkeypatch):
+    from autofill import local_attach
+    from autofill.profile import CandidateProfile
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+    seen: list[dict] = []
+
+    def fake_autofill(url, profile, credential_provider=None, options=None):
+        seen.append({
+            "prepared": options.resume_prepared,
+            "uploaded": options.resume_uploaded,
+            "name": options.resume_name,
+            "bytes": options.resume_bytes,
+        })
+        options.resume_uploaded = True  # the engine's verifier accepted it
+        return ApplicationResult(status=Status.READY_FOR_HUMAN_SUBMIT, ats=None, current_step="done",
+                                 login_status="NOT_REQUIRED")
+
+    monkeypatch.setattr("autofill.local_attach.autofill_application", fake_autofill)
+    resume = local_attach.LocalResume(name="A_B_Resume.pdf", mime="application/pdf", data=_PDF)
+    profile = CandidateProfile.load(PROFILE)
+    local_attach.fill_visible_tab(object(), _URL, profile, resume=resume)
+    assert seen[0] == {"prepared": True, "uploaded": False, "name": "A_B_Resume.pdf", "bytes": _PDF}
+    assert resume.uploaded is True
+    # Next page: not attached again.
+    local_attach.fill_visible_tab(object(), _URL, profile, resume=resume)
+    assert seen[1]["prepared"] is False and seen[1]["uploaded"] is True
+    # No resume keeps the human checkpoint.
+    local_attach.fill_visible_tab(object(), _URL, profile)
+    assert seen[2]["prepared"] is False and seen[2]["bytes"] is None
+    assert "%PDF" not in repr(resume)
+
+
+_RESUME_FORM = b"""<!doctype html><html><body><h1>Apply</h1>
+<form id="f" onsubmit="window.__submitted=true;return false">
+<label for="first">First Name</label><input id="first" name="first" required>
+<label for="last">Last Name</label><input id="last" name="last" required>
+<label for="email">Email</label><input id="email" type="email" name="email" required>
+<label for="resume">Resume/CV</label><input id="resume" type="file" name="resume" accept=".pdf" required>
+<div id="chip" class="file-name"></div>
+<button type="submit">Submit application</button></form>
+<script>document.getElementById('resume').addEventListener('change', (e) => {
+  const f = e.target.files[0]; document.getElementById('chip').textContent = f ? f.name : '';
+});</script></body></html>"""
+
+
+@pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
+def test_real_chrome_attaches_the_selected_resume_and_does_not_submit(monkeypatch):
+    """Headless Chromium, real engine: the held file lands in the resume input."""
+    from playwright.sync_api import sync_playwright
+
+    from autofill.local_attach import LocalResume, fill_visible_tab
+    from autofill.profile import CandidateProfile
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+    server = start_fixture_server(_RESUME_FORM)
+    url = f"http://127.0.0.1:{server.server_address[1]}/t172-local-tab.html"
+    read = "() => { const f = document.getElementById('resume').files[0];" \
+        " return {name: f ? f.name : null, size: f ? f.size : 0, submitted: !!window.__submitted}; }"
+    profile = CandidateProfile.load(PROFILE)
+    try:
+        with sync_playwright() as driver:
+            browser = driver.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(url)
+                resume = LocalResume(name="Casey_Example_Resume.pdf", mime="application/pdf", data=_PDF)
+                result = fill_visible_tab(page, url, profile, resume=resume)
+                seen = page.evaluate(read)
+                assert seen == {"name": "Casey_Example_Resume.pdf", "size": len(_PDF), "submitted": False}
+                assert result.status == Status.READY_FOR_HUMAN_SUBMIT
+                assert result.stopped_before_submit is True
+                assert resume.uploaded is True
+                # Without a resume the control stays a human checkpoint.
+                page.goto(url)
+                result = fill_visible_tab(page, url, profile)
+                assert page.evaluate(read)["name"] is None
+                assert result.status == Status.RESUME_UPLOAD_REQUIRED
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()

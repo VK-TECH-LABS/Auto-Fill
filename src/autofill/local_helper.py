@@ -46,6 +46,7 @@ from autofill.local_attach import (
     FeatureDisabled,
     FillCancelled,
     LocalAttachError,
+    LocalResume,
     LoopbackRequired,
     _result_brief,
     feature_enabled,
@@ -55,6 +56,7 @@ from autofill.local_attach import (
 )
 from autofill.mapping import option_stance
 from autofill.profile import CandidateProfile, ProfileError
+from autofill.resume_fetch import MAX_RESUME_BYTES, resume_filename
 from autofill.safeguards import HumanSubmissionRequired
 
 logger = logging.getLogger("autofill.local_helper")
@@ -68,6 +70,43 @@ _MAX_JOBS = 8
 _BINDING_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 REPLACED = "REPLACED"
 CANCELLED = "CANCELLED"
+# A staged resume must be claimed by a create within this window.
+_STAGED_RESUME_TTL_SECONDS = 120
+_MAX_STAGED_RESUMES = 2
+_RESUME_REF = re.compile(r"^[a-f0-9]{32}$")
+
+
+class StagedResume:
+    """Resume bytes the extension posted for the next bound create. Memory only.
+
+    The extension fetched them from TileArc with the employee's session. The
+    helper keeps them until a create with the same TileArc session and
+    candidate claims them, or until the TTL ends. They are never written to
+    disk, never returned by any route, and never logged.
+    """
+
+    def __init__(self, ref: str, name: str, data: bytes, tilearc_session_id: str, candidate_id: str) -> None:
+        self.ref = ref
+        self.name = name
+        self.data = data
+        self.tilearc_session_id = tilearc_session_id
+        self.candidate_id = candidate_id
+        self.created = time.monotonic()
+
+    def expired(self, now: float | None = None) -> bool:
+        return ((now if now is not None else time.monotonic()) - self.created) > _STAGED_RESUME_TTL_SECONDS
+
+
+def parse_resume_claim(raw: Any) -> str | None:
+    """``resume`` on a create: ``{"resumeRef": <hex>}``. Absent means no resume."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise BindingError("resume must be an object.")
+    ref = str(raw.get("resumeRef") or "").strip()
+    if not _RESUME_REF.match(ref):
+        raise BindingError("resume.resumeRef is not valid.")
+    return ref
 
 
 class BindingError(ValueError):
@@ -213,11 +252,14 @@ class LocalJob:
         application_url: str,
         profile: CandidateProfile | None = None,
         binding: dict[str, str] | None = None,
+        resume: LocalResume | None = None,
     ) -> None:
         self.session_id = session_id
         self.application_url = application_url
         self.profile = profile
         self.binding = dict(binding) if binding else None
+        # Selected TileArc resume. Dropped on end, detach, and prune.
+        self.resume = resume
         self.gate = CancelGate()
         # "replaced" (a newer Apply) or "cancelled" (the page asked). Empty while live.
         self.ended = ""
@@ -247,9 +289,22 @@ class LocalJob:
             self.ended = reason
         self.gate.cancel(reason)
         self.profile = None
+        self.drop_resume()
         self.question = None
         self.blocking = None
         self.open_items = []
+
+    def drop_resume(self) -> None:
+        if self.resume is not None:
+            self.resume.drop()
+
+    def resume_state(self) -> str:
+        """``none`` (no file sent), ``held``, ``uploaded`` (verifier accepted it), or ``dropped``."""
+        if self.resume is None:
+            return "none"
+        if self.resume.uploaded:
+            return "uploaded"
+        return "held" if self.resume.held else "dropped"
 
     def public(self) -> dict[str, Any]:
         status = self.state
@@ -270,6 +325,8 @@ class LocalJob:
             "detached": self.detached,
             "ownsBrowser": self.owns_browser,
             "browserRunning": self.browser_running,
+            # State only. The file name and bytes are not part of the status.
+            "resume": self.resume_state(),
         }
         if self.binding:
             body["binding"] = {
@@ -321,6 +378,7 @@ class LocalHelper:
             executable=executable,
         )
         self._jobs: dict[str, LocalJob] = {}
+        self._staged: dict[str, StagedResume] = {}
         # The worker's job (fill or answer). The newest live job is ``_current``.
         self._active: str | None = None
         self._current: str | None = None
@@ -338,8 +396,14 @@ class LocalHelper:
         application_url: str,
         profile: CandidateProfile,
         binding: dict[str, str] | None = None,
+        resume_ref: str | None = None,
     ) -> LocalJob:
         """Queue one fill. A bound create replaces the previous job.
+
+        ``resume_ref`` claims a resume staged by ``stage_resume``. It needs a
+        binding with the same TileArc session and candidate the file was
+        staged for. An unknown, expired, or mismatched ref is refused and no
+        fill starts.
 
         Same binding and URL as the live job: that job is returned (a double
         click does not start a second fill). Different binding: the previous
@@ -348,6 +412,8 @@ class LocalHelper:
         refused while a live fill runs.
         """
         url = validate_application_url(application_url)
+        if resume_ref is not None and binding is None:
+            raise BindingError("A resume needs a TileArc binding.")
         with self._lock:
             current = self._jobs.get(self._current) if self._current else None
             if (
@@ -358,7 +424,11 @@ class LocalHelper:
                 and same_binding(current.binding, binding)
                 and current.state not in {"error"}
             ):
+                if resume_ref is not None:
+                    # A double click restaged the same file. The live job keeps its copy.
+                    self._staged.pop(resume_ref, None)
                 return current
+            resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
             active = self._jobs.get(self._active) if self._active else None
             if active is not None and not active.superseded and binding is None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
@@ -367,21 +437,69 @@ class LocalHelper:
                     old.end("replaced")
                     logger.info("session=%s superseded reason=replaced", old.session_id)
             self._generation += 1
-            job = LocalJob(uuid.uuid4().hex, url, profile, binding)
+            job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
             self._jobs[job.session_id] = job
             self._current = job.session_id
             self._active = job.session_id
             self._prune()
         logger.info(
-            "session=%s created bound=%s",
+            "session=%s created bound=%s resume=%s",
             job.session_id,
             "1" if binding else "0",
+            job.resume_state(),
         )
         timer = self._timer
         if timer is not None:
             timer.cancel()
         self._queue.put(("fill", {"job": job, "profile": profile}))
         return job
+
+    def stage_resume(self, data: bytes, filename: str, tilearc_session_id: str, candidate_id: str) -> StagedResume:
+        """Hold one resume for the next bound create. PDF only, 10 MB cap, memory only."""
+        if not data or len(data) > MAX_RESUME_BYTES:
+            raise BindingError("resume must be a PDF up to 10 MB.")
+        if not data.startswith(b"%PDF-"):
+            raise BindingError("resume must be a PDF.")
+        if not _BINDING_ID.match(tilearc_session_id or "") or not _BINDING_ID.match(candidate_id or ""):
+            raise BindingError("resume needs the TileArc session and candidate.")
+        name = resume_filename(filename)
+        if not name.lower().endswith(".pdf"):
+            name = "Resume.pdf"
+        staged = StagedResume(uuid.uuid4().hex, name, bytes(data), tilearc_session_id, candidate_id)
+        with self._lock:
+            self._sweep_staged()
+            # A newer file for another Apply replaces older staged copies first.
+            while len(self._staged) >= _MAX_STAGED_RESUMES:
+                oldest = min(self._staged.values(), key=lambda row: row.created)
+                self._staged.pop(oldest.ref, None)
+            self._staged[staged.ref] = staged
+        logger.info("resume staged size_kb=%s", max(1, len(data) // 1024))
+        return staged
+
+    def _sweep_staged(self) -> None:
+        """Drop expired staged files. Call with the lock held."""
+        now = time.monotonic()
+        for ref in [ref for ref, row in self._staged.items() if row.expired(now)]:
+            self._staged.pop(ref, None)
+
+    def staged_count(self) -> int:
+        with self._lock:
+            self._sweep_staged()
+            return len(self._staged)
+
+    def _claim_resume(self, ref: str, binding: dict[str, str] | None) -> LocalResume:
+        """Single use. Call with the lock held."""
+        self._sweep_staged()
+        staged = self._staged.pop(ref, None)
+        if staged is None:
+            raise BindingError("resume expired or unknown.")
+        if (
+            not binding
+            or staged.tilearc_session_id != binding.get("tilearcSessionId")
+            or staged.candidate_id != binding.get("candidateId")
+        ):
+            raise BindingError("resume belongs to another Apply.")
+        return LocalResume(name=staged.name, mime="application/pdf", data=staged.data)
 
     def get(self, session_id: str) -> LocalJob | None:
         with self._lock:
@@ -410,7 +528,9 @@ class LocalHelper:
         ]
         excess = len(self._jobs) - _MAX_JOBS
         for sid in removable[: max(0, excess)]:
-            self._jobs.pop(sid, None)
+            gone = self._jobs.pop(sid, None)
+            if gone is not None:
+                gone.drop_resume()
 
     def request_answer(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Apply one employee answer on the worker thread. The value is not logged.
@@ -528,6 +648,8 @@ class LocalHelper:
             if _accepts(fill, "fresh"):
                 # An earlier job wrote into this window. Start from a clean page.
                 kwargs["fresh"] = self._window_used
+            if job.resume is not None and _accepts(fill, "resume"):
+                kwargs["resume"] = job.resume
             self._window_used = True
             result, submitted = fill(job.application_url, profile, **kwargs)
             job.submitted = submitted
@@ -591,10 +713,12 @@ class LocalHelper:
         apply = getattr(self._session, "apply_answer", None)
         if apply is None:
             raise AnswerRejected(409, _failure(job, "element_not_found"))
+        kwargs: dict[str, Any] = {}
         if _accepts_cancel(apply):
-            report = apply(job.application_url, job.profile, target, cancel=job.gate)
-        else:
-            report = apply(job.application_url, job.profile, target)
+            kwargs["cancel"] = job.gate
+        if job.resume is not None and _accepts(apply, "resume"):
+            kwargs["resume"] = job.resume
+        report = apply(job.application_url, job.profile, target, **kwargs)
         if job.superseded:
             raise AnswerRejected(410, _failure(job, "replaced"))
         if not isinstance(report, dict):
@@ -716,6 +840,7 @@ class LocalHelper:
             if job.state in {"queued", "running"}:
                 continue
             job.detached = True
+            job.drop_resume()
             job.browser_running = running
             job.owns_browser = self._session.owns_chrome
 
@@ -755,6 +880,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/v1/sessions":
             self._create()
             return
+        if path == "/v1/resumes":
+            self._stage_resume()
+            return
         session_id = _action_id(path, "answer")
         if session_id is not None:
             self._answer(session_id)
@@ -788,8 +916,12 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(profile_raw, dict):
                 raise LocalAttachError("profile must be an object.")
             binding = parse_binding(payload.get("binding"))
+            resume_ref = parse_resume_claim(payload.get("resume"))
             profile = CandidateProfile.from_dict(profile_raw)
-            job = self.server.helper.submit(url, profile, binding)
+            if resume_ref is None:
+                job = self.server.helper.submit(url, profile, binding)
+            else:
+                job = self.server.helper.submit(url, profile, binding, resume_ref)
         except LocalAttachError as exc:
             busy = "already running" in str(exc)
             self._send(409 if busy else 400, {"detail": str(exc), "stopped_before_submit": True})
@@ -798,6 +930,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, {"detail": str(exc), "stopped_before_submit": True})
             return
         self._send(202, job.public())
+
+    def _stage_resume(self) -> None:
+        """``POST /v1/resumes``: raw PDF body. Returns a single-use ``resumeRef``.
+
+        Only the extension background posts here, right before a bound create.
+        Nothing is written to disk and no route returns the bytes.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        try:
+            if length <= 0 or length > MAX_RESUME_BYTES:
+                # Do not read an oversize body. The connection closes after the reply.
+                self.close_connection = True
+                raise BindingError("resume must be a PDF up to 10 MB.")
+            data = self.rfile.read(length)
+            ctype = str(self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/pdf":
+                raise BindingError("resume must be application/pdf.")
+            staged = self.server.helper.stage_resume(
+                data,
+                str(self.headers.get("X-Resume-Filename") or ""),
+                str(self.headers.get("X-TileArc-Session") or "").strip(),
+                str(self.headers.get("X-TileArc-Candidate") or "").strip(),
+            )
+        except (BindingError, ValueError) as exc:
+            self._send(400, {"detail": str(exc), "stopped_before_submit": True})
+            return
+        self._send(201, {"resumeRef": staged.ref, "size": len(staged.data), "stopped_before_submit": True})
 
     def _answer(self, session_id: str) -> None:
         try:
