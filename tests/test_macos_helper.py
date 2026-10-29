@@ -19,6 +19,7 @@ from autofill.local_attach import (
     chrome_search_paths,
     dedicated_launch_args,
     is_default_user_data_dir,
+    listening_hosts,
     stable_chrome_user_data_dir,
 )
 from autofill.local_helper import HELPER_PORT, default_profile_dir
@@ -298,3 +299,17 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert "MACOS_EMPLOYEE.md" in windows_employee
     assert MACOS_INSTALLER_BASENAME in windows_build
     assert "pyinstaller==6.16.0" in script
+
+
+def test_macos_debug_port_is_visible_without_proc(monkeypatch):
+    """macOS has no /proc/net/tcp. A loopback CDP port must still count as listening."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("autofill.local_attach._proc_tcp_present", lambda: False)
+
+    def fake_run(command, **kwargs):
+        assert command[:2] == ["lsof", "-nP"]
+        text = "Google Chrome  4 user  12u  IPv4 0xabc  0t0  TCP 127.0.0.1:9333 (LISTEN)\n"
+        return subprocess.CompletedProcess(command, 0, stdout=text, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert listening_hosts(9333) == ["127.0.0.1"]
