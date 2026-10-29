@@ -1,0 +1,16 @@
+{
+  "task": "autofill-r1-local-resume",
+  "developer": "saiteja",
+  "branch": "saiteja/autofill-r1-local-resume",
+  "latest_commit": "d913414f72f0d8e4c6c87d3b9bcb5551402a8eb7",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/89",
+  "files_touched": [
+    "src/autofill/local_attach.py",
+    "src/autofill/local_helper.py",
+    "tests/test_local_helper.py"
+  ],
+  "tests": "pytest tests/test_local_helper.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-10-29T19:07:42Z"
+}
