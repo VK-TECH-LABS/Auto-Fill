@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from autofill.dom_ui import PauseGate
-from autofill.engine import ApplicationResult, AutofillOptions, autofill_application
+from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application
 from autofill.profile import CandidateProfile
 from autofill.safeguards import (
     HUMAN_SUBMIT_ONLY,
@@ -1238,6 +1238,10 @@ class DedicatedApplySession:
         if cancel is not None:
             cancel.check()
         page = self._page_for_answer(application_url)
+        # The Save & Continue popup leaves before the engine writes or navigates.
+        from autofill.answer_popup import close_popup
+
+        close_popup(page)
         report = apply_visible_answer(page, target)
         if not report.get("verified"):
             return report
@@ -1298,6 +1302,25 @@ class DedicatedApplySession:
                 "blocking": result.blocking,
                 "result": result,
             }
+        if follow.status == Status.FILLED and not follow.open_items:
+            # Every required field on this page now holds a value and this is
+            # not the final review. Continue the same application from here:
+            # the engine keeps the values already on the page, presses the
+            # page's Next, and fills the following pages. Final Submit stays
+            # refused inside the engine.
+            if cancel is not None:
+                cancel.check()
+            result = fill_visible_tab(page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
+            if _optional_submitted(page) is True:
+                raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+            self._remember_mark(page)
+            return {
+                "status": result.status,
+                "open_items": list(result.open_items),
+                "blocking": result.blocking,
+                "result": result,
+                "continued": True,
+            }
         if follow.mark is not None:
             self._page_mark = follow.mark
         return {
@@ -1305,6 +1328,63 @@ class DedicatedApplySession:
             "open_items": list(follow.open_items),
             "blocking": follow.blocking,
         }
+
+    def _popup_page(self) -> Any:
+        if self.tab is None or self._playwright is None:
+            return None
+        return self.tab.page
+
+    def show_question_popup(
+        self,
+        question: dict[str, Any],
+        *,
+        nonce: str,
+        selector: str = "",
+        candidate: str = "",
+        message: str = "",
+        error: bool = False,
+        force: bool = False,
+    ) -> bool:
+        """Save & Continue popup on the employer tab. Not shown after a detach."""
+        page = self._popup_page()
+        if page is None:
+            return False
+        from autofill.answer_popup import show_popup
+
+        return show_popup(
+            page,
+            question,
+            nonce=nonce,
+            selector=selector,
+            candidate=candidate,
+            message=message,
+            error=error,
+            force=force,
+        )
+
+    def read_question_popup(self, nonce: str) -> dict[str, Any]:
+        page = self._popup_page()
+        if page is None:
+            return {"present": False, "detached": True}
+        from autofill.answer_popup import read_popup
+
+        return read_popup(page, nonce)
+
+    def question_popup_message(self, nonce: str, message: str, *, error: bool = False, reopen: bool = False) -> bool:
+        page = self._popup_page()
+        if page is None:
+            return False
+        from autofill.answer_popup import popup_message
+
+        return popup_message(page, nonce, message, error=error, reopen=reopen)
+
+    def close_question_popup(self) -> None:
+        page = self._popup_page()
+        if page is None:
+            return
+        from autofill.answer_popup import close_popup
+
+        close_popup(page)
 
     def detach(self) -> None:
         """Idle detach. Chrome keeps running whether or not this process launched it.

@@ -6,7 +6,13 @@ binds ``127.0.0.1`` only, fills through ``autofill_application``, and never
 clicks Final Submit.
 
 When a fill stops on ``MANUAL_ANSWER_REQUIRED``, ``GET /v1/sessions/{id}``
-includes ``question`` (``id``, ``prompt``, ``type``, ``options``).
+includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``).
+The helper also shows a Save & Continue popup on the employer tab
+(:mod:`autofill.answer_popup`). ``question.popup.state`` is ``shown`` while it
+waits, and ``answered`` with ``values`` once the employee clicked Save &
+Continue. The TileArc panel saves that answer to Application Answers, checks
+the save, and then posts it to the answer route below. The helper never
+stores an answer in TileArc itself.
 ``POST /v1/sessions/{id}/answer`` writes that answer in the same Chrome tab
 and returns ``verified``. Callers persist ``confirmedByEmployee`` only when
 ``verified`` is true. This process does not store that flag.
@@ -35,6 +41,7 @@ from queue import Queue
 from typing import Any
 from urllib.parse import urlparse
 
+from autofill.answer_popup import new_nonce
 from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item
 from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
@@ -55,7 +62,7 @@ from autofill.local_attach import (
     validate_application_url,
 )
 from autofill.mapping import option_stance
-from autofill.profile import CandidateProfile, ProfileError
+from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
 from autofill.resume_fetch import MAX_RESUME_BYTES, resume_filename
 from autofill.safeguards import HumanSubmissionRequired
 
@@ -64,6 +71,9 @@ logger = logging.getLogger("autofill.local_helper")
 HELPER_PORT = 9410
 _MAX_BODY = 1_048_576
 _ANSWER_WAIT_SECONDS = 60
+# A popup answer TileArc has not confirmed by then reopens the popup with an error.
+_POPUP_SAVE_TIMEOUT_SECONDS = 45
+_POPUP_SYNC_WAIT_SECONDS = 1.5
 _NON_QUESTION_KINDS = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
 # Finished and replaced jobs kept so a late status/answer gets 410, not a fill.
 _MAX_JOBS = 8
@@ -274,6 +284,8 @@ class LocalJob:
         self.open_items: list[dict[str, Any]] = []
         self.blocking: dict[str, Any] | None = None
         self.question: dict[str, Any] | None = None
+        # Employer-tab Save & Continue popup: nonce, questionId, state, values, answeredAt.
+        self.popup: dict[str, Any] | None = None
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -291,6 +303,7 @@ class LocalJob:
         self.profile = None
         self.drop_resume()
         self.question = None
+        self.popup = None
         self.blocking = None
         self.open_items = []
 
@@ -346,6 +359,9 @@ class LocalJob:
                 "type": self.question["type"],
                 "options": list(self.question["options"]),
             }
+            popup = _popup_view(self)
+            if popup is not None:
+                body["question"]["popup"] = popup
         if self.error:
             body["error"] = self.error
         return body
@@ -385,6 +401,7 @@ class LocalHelper:
         # True after any fill reached the window; the next job reloads first.
         self._window_used = False
         self._generation = 0
+        self._peeking = False
         self._lock = threading.Lock()
         self._queue: Queue[tuple[str, dict[str, Any]] | None] = Queue()
         self._timer: threading.Timer | None = None
@@ -625,6 +642,15 @@ class LocalHelper:
                 self._run_fill(payload["job"], payload["profile"])
             elif kind == "answer":
                 self._run_answer(payload)
+            elif kind == "popup":
+                try:
+                    self._sync_popup(payload["job"])
+                except Exception as exc:
+                    logger.info("session=%s popup_sync_failed error=%s", payload["job"].session_id, type(exc).__name__)
+                finally:
+                    with self._lock:
+                        self._peeking = False
+                    payload["done"].set()
             elif kind == "detach":
                 self._detach(payload.get("session_id"), payload.get("generation"))
                 payload["done"].set()
@@ -658,6 +684,7 @@ class LocalHelper:
             else:
                 self._remember_result(job, result)
                 job.state = "done"
+                self._present_popup(job)
             job.target_id = self._session.tab.target_id if self._session.tab is not None else ""
         except FillCancelled:
             job.state = "replaced"
@@ -730,12 +757,142 @@ class LocalHelper:
             raise AnswerRejected(409, _failure(job, "submit_reported"))
         if not report.get("verified"):
             code = 422 if report.get("reason") == "needs_option" else 200
+            job.popup = None
+            self._present_popup(
+                job,
+                message="The employer page did not accept that answer. Check it and click Save & Continue again.",
+                error=True,
+            )
             body = _answer_body(job, report, started)
             if code != 200:
                 raise AnswerRejected(code, body)
             return body
+        _remember_answer(job, item, target)
         self._adopt_follow(job, report, target)
+        job.popup = None
+        self._present_popup(job)
         return _answer_body(job, report, started)
+
+    def refresh_popup(self, session_id: str) -> None:
+        """Status poll hook: let the worker read or re-show the employer-tab popup.
+
+        Runs only while the current job waits on a question and the worker is
+        idle. Waits briefly so the same status response carries a fresh
+        ``question.popup``. Never starts a fill.
+        """
+        if not hasattr(self._session, "read_question_popup"):
+            return
+        with self._lock:
+            job = self._jobs.get(session_id)
+            if (
+                job is None
+                or job.superseded
+                or self._current != session_id
+                or self._active is not None
+                or self._peeking
+                or job.state != "done"
+                or job.question is None
+            ):
+                return
+            self._peeking = True
+        done = threading.Event()
+        self._queue.put(("popup", {"job": job, "done": done}))
+        done.wait(timeout=_POPUP_SYNC_WAIT_SECONDS)
+
+    def _present_popup(
+        self,
+        job: LocalJob,
+        *,
+        message: str = "",
+        error: bool = False,
+    ) -> None:
+        """Worker thread. Show the popup for ``job.question`` or remove it."""
+        show = getattr(self._session, "show_question_popup", None)
+        close = getattr(self._session, "close_question_popup", None)
+        question = job.question if _public_status(job) == Status.MANUAL_ANSWER_REQUIRED else None
+        if question is None or job.superseded or job.profile is None:
+            job.popup = None
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+            return
+        if show is None:
+            # No employer tab to draw on: the TileArc panel's own Save & Fill stays the path.
+            job.popup = None
+            return
+        popup = job.popup
+        if popup is None or popup.get("questionId") != question["id"] or popup.get("state") == "unavailable":
+            popup = {"nonce": new_nonce(), "questionId": question["id"], "state": "shown"}
+        item = _match_item(job, {"id": question["id"]}) or {}
+        try:
+            shown = show(
+                question,
+                nonce=popup["nonce"],
+                selector=str(item.get("selector") or ""),
+                candidate=_candidate_label(job),
+                message=message,
+                error=error,
+                force=True,
+            )
+        except Exception:
+            shown = False
+        popup["state"] = "shown" if shown else "unavailable"
+        popup.pop("values", None)
+        popup.pop("answeredAt", None)
+        job.popup = popup
+
+    def _sync_popup(self, job: LocalJob) -> None:
+        """Worker thread. Pick up a Save & Continue click, re-show a lost popup, time out a stale save."""
+        if job.superseded or job.question is None or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
+            return
+        popup = job.popup
+        if popup is None or popup.get("state") == "unavailable" or popup.get("questionId") != job.question["id"]:
+            self._present_popup(job)
+            return
+        if popup.get("state") == "answered":
+            if time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS:
+                self._present_popup(
+                    job,
+                    message=(
+                        "TileArc did not confirm the save. Keep the TileArc tab open, "
+                        "then click Save & Continue again."
+                    ),
+                    error=True,
+                )
+            return
+        read = self._session.read_question_popup(popup["nonce"])
+        if read.get("detached"):
+            return
+        if not read.get("present"):
+            # The page re-rendered or navigated. Same question, same nonce: show it again.
+            self._present_popup(job)
+            return
+        if read.get("state") != "answered":
+            return
+        values = list(read.get("values") or [])
+        item = _match_item(job, {"id": job.question["id"]})
+        reason, canonical = ("needs_option", list[str]())
+        if item is not None and values and read.get("questionId") == job.question["id"]:
+            reason, canonical = fit_choice_values(item, values)
+        if reason != "ok" or not canonical:
+            message = getattr(self._session, "question_popup_message", None)
+            if message is not None:
+                message(
+                    popup["nonce"],
+                    "Pick one of the choices shown, then click Save & Continue.",
+                    error=True,
+                    reopen=True,
+                )
+            return
+        popup["state"] = "answered"
+        popup["values"] = [str(value) for value in canonical]
+        popup["answeredAt"] = time.monotonic()
+        logger.info("session=%s popup_answered values=%s", job.session_id, len(canonical))
+        timer = threading.Timer(_POPUP_SAVE_TIMEOUT_SECONDS + 1, self.refresh_popup, args=(job.session_id,))
+        timer.daemon = True
+        timer.start()
 
     def _remember_result(self, job: LocalJob, result: ApplicationResult) -> None:
         job.result = _result_brief(result)
@@ -873,6 +1030,8 @@ class _Handler(BaseHTTPRequestHandler):
         if job is None:
             self._send(404, {"detail": "Not found"})
             return
+        if not job.superseded:
+            self.server.helper.refresh_popup(session_id)
         self._send(410 if job.superseded else 200, job.public())
 
     def do_POST(self) -> None:
@@ -1076,6 +1235,57 @@ def pending_question(
     return view
 
 
+def _popup_view(job: LocalJob) -> dict[str, Any] | None:
+    """Public popup state. ``values`` only after the employee clicked Save & Continue."""
+    popup = job.popup
+    if not popup or job.question is None or popup.get("questionId") != job.question["id"]:
+        return None
+    state = str(popup.get("state") or "")
+    view: dict[str, Any] = {"state": state, "source": "employer_tab"}
+    if state == "answered" and popup.get("values"):
+        view["nonce"] = str(popup.get("nonce") or "")
+        view["values"] = list(popup["values"])
+    return view
+
+
+def _candidate_label(job: LocalJob) -> str:
+    profile = job.profile
+    if profile is None:
+        return ""
+    try:
+        return str(profile.personal.full_name or "").strip()[:80]
+    except Exception:
+        return ""
+
+
+_NO_SESSION_REUSE_KINDS = frozenset({"CONSENT", "CONSENT_CHOICE", "DEMOGRAPHIC", "MISSING_PROFILE_VALUE"})
+
+
+def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]) -> None:
+    """A verified answer is offered to later pages of this same fill.
+
+    Same candidate only (it lives on this job's profile, which is dropped on
+    replace or cancel). Reuse still goes through the Req2 matcher, which
+    refuses demographic intents and anything it cannot match with confidence.
+    Consent and missing-profile values are not reused.
+    """
+    profile = job.profile
+    if profile is None:
+        return
+    if canonical_blocker_kind(item.get("kind")) in _NO_SESSION_REUSE_KINDS:
+        return
+    question = str(item.get("text") or "").strip()
+    values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+    if not question or len(values) != 1:
+        return
+    answers = getattr(profile, "application_answers", None)
+    if not isinstance(answers, list):
+        return
+    if any(str(getattr(row, "question", "")).strip().casefold() == question.casefold() for row in answers):
+        return
+    answers.append(ApplicationAnswer(question=question, answer=values[0], intent=str(item.get("intent") or "")))
+
+
 def _public_status(job: LocalJob) -> str:
     return str(job.public()["status"])
 
@@ -1210,6 +1420,13 @@ def _prepared_target(job: LocalJob, item: dict[str, Any], payload: dict[str, Any
         target["check"] = True
         return target
     values = _answer_values(job, payload)
+    if (
+        str(item.get("answerType") or "") == "multi_select"
+        and len(values) == 1
+        and " | " in values[0]
+    ):
+        # The TileArc panel sends a multi-select answer as one "A | B" value.
+        values = [part.strip() for part in values[0].split(" | ") if part.strip()]
     if not values:
         raise AnswerRejected(422, _failure(job, "needs_option", options=listed))
     reason, canonical = fit_choice_values(item, values)
