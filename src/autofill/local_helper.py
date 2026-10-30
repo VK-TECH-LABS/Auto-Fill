@@ -312,12 +312,25 @@ class LocalJob:
             self.resume.drop()
 
     def resume_state(self) -> str:
-        """``none`` (no file sent), ``held``, ``uploaded`` (verifier accepted it), or ``dropped``."""
+        """``none`` (no file sent), ``held``, ``failed`` (held, the employer did not
+        accept it), ``uploaded`` (verifier accepted it), or ``dropped``."""
         if self.resume is None:
             return "none"
         if self.resume.uploaded:
             return "uploaded"
-        return "held" if self.resume.held else "dropped"
+        if not self.resume.held:
+            return "dropped"
+        return "failed" if self.resume.failure else "held"
+
+    def resume_view(self) -> dict[str, Any]:
+        """``{state, reason, siteErrors}``. No file name and no bytes."""
+        state = self.resume_state()
+        view: dict[str, Any] = {"state": state}
+        failure = self.resume.failure if self.resume is not None else None
+        if state == "failed" and failure:
+            view["reason"] = str(failure.get("reason") or "not_confirmed")
+            view["siteErrors"] = [str(item)[:200] for item in failure.get("siteErrors") or []][:5]
+        return view
 
     def public(self) -> dict[str, Any]:
         status = self.state
@@ -338,8 +351,8 @@ class LocalJob:
             "detached": self.detached,
             "ownsBrowser": self.owns_browser,
             "browserRunning": self.browser_running,
-            # State only. The file name and bytes are not part of the status.
-            "resume": self.resume_state(),
+            # State and failure reason only. The file name and bytes are not part of the status.
+            "resume": self.resume_view(),
         }
         if self.binding:
             body["binding"] = {
@@ -599,6 +612,109 @@ class LocalHelper:
             raise LocalAttachError("The answer did not finish.")
         return body
 
+    def request_resume(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """``retry`` or ``confirm_manual`` at a RESUME_UPLOAD_REQUIRED stop, on the worker."""
+        mode = str(payload.get("action") or "").strip()
+        job = self.get(session_id)
+        if job is None:
+            raise LocalAttachError("No such session.")
+        if mode not in {"retry", "confirm_manual"}:
+            raise AnswerRejected(422, _failure(job, "action_required"))
+        with self._lock:
+            if job.superseded or (self._current is not None and self._current != session_id):
+                raise AnswerRejected(410, _failure(job, "replaced"))
+            if _binding_expired(job.binding):
+                job.end("cancelled")
+                if self._current == session_id:
+                    self._current = None
+                raise AnswerRejected(410, _failure(job, "expired"))
+            claimed = payload.get("binding")
+            if claimed is not None and job.binding:
+                if not isinstance(claimed, dict) or any(
+                    str(claimed.get(key) or "").strip() != job.binding.get(key, "")
+                    for key in ("tilearcSessionId", "candidateId")
+                ):
+                    raise AnswerRejected(409, _failure(job, "binding_mismatch"))
+            if self._active is not None:
+                raise LocalAttachError("A fill is already running on this dedicated profile.")
+            if job.state in {"queued", "running"}:
+                raise LocalAttachError("The fill is still running.")
+            self._generation += 1
+            self._active = job.session_id
+        timer = self._timer
+        if timer is not None:
+            timer.cancel()
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        self._queue.put(("resume", {"job": job, "mode": mode, "done": done, "box": box}))
+        if not done.wait(timeout=_ANSWER_WAIT_SECONDS):
+            with self._lock:
+                if self._active == job.session_id:
+                    self._active = None
+            raise LocalAttachError("The resume check did not finish.")
+        error = box.get("error")
+        if isinstance(error, Exception):
+            raise error
+        body = box.get("body")
+        if not isinstance(body, dict):
+            raise LocalAttachError("The resume check did not finish.")
+        return body
+
+    def _run_resume(self, payload: dict[str, Any]) -> None:
+        job: LocalJob = payload["job"]
+        box: dict[str, Any] = payload["box"]
+        try:
+            box["body"] = self._resume_job(job, payload["mode"])
+        except FillCancelled:
+            box["error"] = AnswerRejected(410, _failure(job, "replaced"))
+        except AnswerRejected as exc:
+            box["error"] = exc
+        except Exception as exc:
+            if isinstance(exc, LocalAttachError) and "reported a submit" in str(exc):
+                job.submitted = True
+                job.error = type(exc).__name__
+                job.state = "error"
+                box["error"] = AnswerRejected(409, _failure(job, "submit_reported"))
+            else:
+                box["error"] = AnswerRejected(409, _failure(job, type(exc).__name__))
+        finally:
+            self._finish_active(job)
+            payload["done"].set()
+
+    def _resume_job(self, job: LocalJob, mode: str) -> dict[str, Any]:
+        if job.superseded:
+            raise AnswerRejected(410, _failure(job, "replaced"))
+        if job.profile is None or _public_status(job) != Status.RESUME_UPLOAD_REQUIRED:
+            raise AnswerRejected(409, _failure(job, "not_at_resume_stop"))
+        if job.resume is None or (mode == "retry" and not job.resume.held):
+            raise AnswerRejected(409, _failure(job, "not_held"))
+        action = getattr(self._session, "resume_action", None)
+        if action is None:
+            raise AnswerRejected(409, _failure(job, "unsupported"))
+        kwargs: dict[str, Any] = {}
+        if _accepts_cancel(action):
+            kwargs["cancel"] = job.gate
+        report = action(job.application_url, job.profile, job.resume, mode, **kwargs)
+        if job.superseded:
+            raise AnswerRejected(410, _failure(job, "replaced"))
+        if not isinstance(report, dict):
+            report = {"verified": False, "reason": "not_confirmed"}
+        if _optional_submit_flag(report):
+            job.submitted = True
+            job.error = "LocalAttachError"
+            job.state = "error"
+            raise AnswerRejected(409, _failure(job, "submit_reported"))
+        verified = bool(report.get("verified"))
+        if verified:
+            self._adopt_follow(job, report, {})
+            job.popup = None
+            self._present_popup(job)
+        body = job.public()
+        body["verified"] = verified
+        if not verified:
+            body["reason"] = str(report.get("reason") or "not_confirmed")
+        return body
+
     def request_detach(self, session_id: str) -> LocalJob:
         job = self.get(session_id)
         if job is None:
@@ -642,6 +758,8 @@ class LocalHelper:
                 self._run_fill(payload["job"], payload["profile"])
             elif kind == "answer":
                 self._run_answer(payload)
+            elif kind == "resume":
+                self._run_resume(payload)
             elif kind == "popup":
                 try:
                     self._sync_popup(payload["job"])
@@ -1046,6 +1164,10 @@ class _Handler(BaseHTTPRequestHandler):
         if session_id is not None:
             self._answer(session_id)
             return
+        session_id = _action_id(path, "resume")
+        if session_id is not None:
+            self._resume(session_id)
+            return
         session_id = _action_id(path, "cancel")
         if session_id is not None:
             try:
@@ -1143,6 +1265,22 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body)
 
+    def _resume(self, session_id: str) -> None:
+        """``POST /v1/sessions/{id}/resume`` with ``{"action": "retry"|"confirm_manual"}``."""
+        try:
+            payload = _read_json(self)
+            body = self.server.helper.request_resume(session_id, payload)
+        except AnswerRejected as exc:
+            self._send(exc.status, exc.body)
+            return
+        except LocalAttachError as exc:
+            missing = "No such" in str(exc)
+            busy = "already running" in str(exc) or "still running" in str(exc) or "did not finish" in str(exc)
+            code = 404 if missing else 409 if busy else 400
+            self._send(code, {"detail": str(exc), "verified": False, "stopped_before_submit": True})
+            return
+        self._send(200, body)
+
     def _send(self, status: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -1158,7 +1296,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _session_id(path: str) -> str | None:
     prefix = "/v1/sessions/"
-    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel")):
+    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel", "/resume")):
         return None
     session_id = path[len(prefix) :]
     if not session_id or "/" in session_id:
