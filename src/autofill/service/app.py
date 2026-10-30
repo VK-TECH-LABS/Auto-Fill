@@ -615,7 +615,10 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
     )
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
-    if result is None or (session.busy and not final):
+    # Status is published before ``busy`` clears. A poll in that window must
+    # still carry the blocker for the result that just finished.
+    result_current = result is not None and result.status == session.status
+    if result is None or (session.busy and not final and not result_current):
         progress = dict(session.progress or empty_progress())
     else:
         progress = dict(result.progress or session.progress or empty_progress())

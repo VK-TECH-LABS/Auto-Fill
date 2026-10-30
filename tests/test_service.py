@@ -211,6 +211,59 @@ def test_create_start_and_status(client: TestClient, runner: RecordingRunner):
     assert again.json()["stopped_before_submit"] is True
 
 
+def test_status_keeps_the_question_blocker_while_the_run_is_still_busy(client: TestClient):
+    """Status is published before busy clears. The blocker must survive that window."""
+    created = _create(client)
+    session = client.app.state.store.get(created["sessionId"])
+    assert session is not None
+    session.busy = True
+    session.progress = {
+        "stage": "OPENING",
+        "requiredTotal": 0,
+        "requiredDone": 0,
+        "percent": 5,
+        "currentLabel": "Opening",
+    }
+    session.result = ApplicationResult(
+        status=Status.MANUAL_ANSWER_REQUIRED,
+        ats=None,
+        current_step="FILL_PAGE",
+        login_status="NOT_REQUIRED",
+        blocking={
+            "kind": "QUESTION",
+            "questionId": None,
+            "questionHash": "color-hash",
+            "text": "What is your favorite color?",
+            "fieldKey": None,
+            "answerType": "text",
+            "options": [],
+            "required": True,
+        },
+        progress={
+            "stage": "QUESTIONS",
+            "requiredTotal": 3,
+            "requiredDone": 2,
+            "percent": 66,
+            "currentLabel": "Questions",
+        },
+    )
+    session.status = Status.MANUAL_ANSWER_REQUIRED
+    shown = client.get(f"/v1/sessions/{created['sessionId']}/status", headers=AUTH)
+    assert shown.status_code == 200, shown.text
+    body = shown.json()
+    assert body["blocking"]["kind"] == "QUESTION"
+    assert "favorite color" in body["blocking"]["text"].lower()
+    assert body["progress"]["requiredDone"] == 2
+    assert body["progress"]["requiredTotal"] == 3
+    # A new run is STARTED while the previous result is still stored. Do not
+    # publish that old blocker as if it belonged to the run in progress.
+    session.status = Status.STARTED
+    opening = client.get(f"/v1/sessions/{created['sessionId']}/status", headers=AUTH)
+    assert opening.status_code == 200, opening.text
+    assert opening.json()["status"] == Status.STARTED
+    assert opening.json()["blocking"] is None
+
+
 def test_start_accepts_standard_terms_authorized(client: TestClient):
     granted = create_body()
     granted["standardTermsAuthorized"] = True
