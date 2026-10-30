@@ -230,6 +230,26 @@ def test_packaged_environment_forces_the_extension_port(monkeypatch, tmp_path):
         assert doctor_ok(report)
 
 
+def test_packaged_environment_pins_a_live_devtools_port(monkeypatch, tmp_path):
+    profile = tmp_path / "TileArc" / "AutoFill" / "apply-profile"
+    profile.mkdir(parents=True)
+    (profile / "DevToolsActivePort").write_text("9555\n/devtools/browser/abc\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv(ENV_FLAG, "0")
+    monkeypatch.delenv("AUTOFILL_LOCAL_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("AUTOFILL_LOCAL_CDP_PORT", raising=False)
+    monkeypatch.setattr(
+        "autofill.local_attach.fetch_version",
+        lambda port, timeout=1.0: {"Browser": "Chrome"} if port == 9555 else None,
+    )
+    try:
+        apply_packaged_environment()
+        assert os.environ["AUTOFILL_LOCAL_CDP_PORT"] == "9555"
+    finally:
+        monkeypatch.delenv("AUTOFILL_LOCAL_CDP_PORT", raising=False)
+
+
 def test_packaged_environment_refuses_daily_chrome(monkeypatch, tmp_path):
     daily = tmp_path / "Google" / "Chrome" / "User Data"
     daily.mkdir(parents=True)

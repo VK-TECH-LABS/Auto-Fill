@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from autofill.dom_ui import PauseGate
-from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application
+from autofill.engine import ApplicationResult, AutofillOptions, Status, autofill_application, is_browser_crash
 from autofill.profile import CandidateProfile
 from autofill.safeguards import (
     HUMAN_SUBMIT_ONLY,
@@ -889,33 +889,74 @@ def _default_port(scheme: str) -> int | None:
 def same_document(current: str, wanted: str) -> bool:
     """True when both URLs are the same document, ignoring the fragment."""
     left, right = urlparse(current), urlparse(wanted)
-    if left.scheme != right.scheme:
-        return False
-    if (left.hostname or "").casefold() != (right.hostname or "").casefold():
-        return False
-    if (left.port or _default_port(left.scheme)) != (right.port or _default_port(right.scheme)):
+    if not _same_site(left, right):
         return False
     return left.path.rstrip("/") == right.path.rstrip("/")
 
 
-def adopt_employer_tab(context: Any, application_url: str) -> Any:
-    """Use the tab already on this URL, or navigate an existing tab in ``contexts[0]``.
+def same_site(current: str, wanted: str) -> bool:
+    """True when both URLs are the same scheme, host, and port."""
+    return _same_site(urlparse(current), urlparse(wanted))
 
-    This does not create a browser context, does not set a viewport, and does
-    not install request blocking.
+
+def _same_site(left: Any, right: Any) -> bool:
+    if left.scheme not in {"http", "https"} or left.scheme != right.scheme:
+        return False
+    if (left.hostname or "").casefold() != (right.hostname or "").casefold():
+        return False
+    return (left.port or _default_port(left.scheme)) == (right.port or _default_port(right.scheme))
+
+
+def _tab_is_posting(page: Any) -> bool:
+    """True when the tab is still a job posting or an Apply entry, not the form."""
+    try:
+        from autofill.extract import extract_page
+        from autofill.pagewait import classify_page
+
+        snapshot = extract_page(page)
+        kind = classify_page(snapshot, url=str(getattr(page, "url", "") or ""))
+    except Exception:
+        return False
+    return kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}
+
+
+def adopt_employer_tab(context: Any, application_url: str) -> Any:
+    """Use the open application tab. Do not rewind a later step of the same site.
+
+    A tab already on the Apply URL is used as-is. A later path on the same
+    host is kept when it is no longer a job posting. ``goto`` runs only when
+    the host differs or the tab is still a posting. This does not create a
+    browser context, does not set a viewport, and does not install request
+    blocking.
     """
     validate_application_url(application_url)
     pages = list(getattr(context, "pages", []) or [])
+    readable: list[tuple[Any, str]] = []
     for page in pages:
         try:
             current = str(page.url or "")
         except Exception:
             continue
+        readable.append((page, current))
+    for page, current in readable:
         if same_document(current, application_url):
             return page
-    chosen = _pick_page(pages, "")
-    if chosen is None and pages:
-        chosen = pages[0]
+    advanced = [
+        (page, current)
+        for page, current in readable
+        if same_site(current, application_url) and not _tab_is_posting(page)
+    ]
+    if advanced:
+        wanted = urlparse(application_url).path.rstrip("/")
+
+        def _rank(item: tuple[Any, str]) -> tuple[bool, int]:
+            path = urlparse(item[1]).path.rstrip("/")
+            return (bool(wanted) and path.startswith(wanted), len(path))
+
+        return max(advanced, key=_rank)[0]
+    chosen = _pick_page([page for page, _current in readable], "")
+    if chosen is None and readable:
+        chosen = readable[0][0]
     if chosen is None:
         raise DualSessionRefused("The existing context has no tab. Refusing to create a context.")
     chosen.goto(application_url, wait_until="domcontentloaded", timeout=45000)
@@ -1021,7 +1062,9 @@ class LocalResume:
     The helper never writes it to disk and never serves it back. ``uploaded``
     turns true once the engine's verifier accepted the file on the employer
     page, so a later page or a Save & Fill follow-up does not attach it twice.
-    ``drop`` clears the bytes when the job is cancelled, replaced, or detached.
+    ``drop`` clears the bytes when the job is cancelled, replaced, or the
+    binding does not match. Idle detach keeps them while that job can still
+    continue.
     """
 
     name: str
@@ -1073,6 +1116,12 @@ def fill_visible_tab(
     *,
     cancel: CancelGate | None = None,
     resume: LocalResume | None = None,
+    session_id: str = "",
+    candidate_id: str = "",
+    job_id: str = "",
+    on_observed: Any = None,
+    on_nav_block: Any = None,
+    nav_block: tuple | None = None,
 ) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
@@ -1093,8 +1142,14 @@ def fill_visible_tab(
         page=page,
         headless=False,
         max_pages=8,
+        session_id=session_id,
+        candidate_id=candidate_id or None,
+        job_id=job_id,
         pause_gate=cancel,
         cancel_check=cancel.check if cancel is not None else None,
+        on_observed=on_observed,
+        on_nav_block=on_nav_block,
+        nav_block=nav_block,
         **_resume_options(resume),
     )
     try:
@@ -1129,7 +1184,8 @@ class DedicatedApplySession:
         executable: str | None = None,
     ) -> None:
         self.user_data_dir = user_data_dir
-        self.debug_port = free_port() if debug_port is None else debug_port
+        pinned = listening_devtools_port(user_data_dir) if debug_port is None else None
+        self.debug_port = pinned if pinned is not None else (free_port() if debug_port is None else debug_port)
         self.headless = headless
         self.executable = executable
         self.endpoint = endpoint_for_port(self.debug_port)
@@ -1139,9 +1195,20 @@ class DedicatedApplySession:
         self._playwright: Any = None
         self._page_mark: Any = None
         self._held: set[str] = set()
+        # One dead-pipe reconnect per process. A helper restart starts at zero.
+        self._cdp_reconnects = 0
+        self._identity: dict[str, str] = {"session_id": "", "candidate_id": "", "job_id": ""}
+        self._observe: Any = None
+        self._nav_hook: Any = None
+        self._nav_block: tuple | None = None
 
     def ensure(self, application_url: str) -> VisibleTab:
-        """Launch the dedicated profile if needed, then adopt the employer tab."""
+        """Launch the dedicated profile if needed, then adopt the employer tab.
+
+        A dead page drops this CDP client and connects again on the same port.
+        That reconnect happens once. A Chrome already listening on this profile
+        is reused. This method does not start a second Chrome for that profile.
+        """
         require_feature()
         validate_application_url(application_url)
         if is_default_user_data_dir(self.user_data_dir):
@@ -1149,11 +1216,11 @@ class DedicatedApplySession:
                 "The dedicated Apply profile cannot be Chrome's default user-data-dir."
             )
         if self.tab is not None:
-            page = adopt_employer_tab(self.tab.context, application_url)
-            self.tab.page = page
-            self.tab.page_url = str(page.url or "")
-            self.tab.target_id = _target_id(self.tab.context, page)
-            return self.tab
+            if _page_responds(self.tab.page):
+                return self._adopt_open_tab(application_url)
+            self._reconnect_cdp()
+        if self._reuse_listening_chrome():
+            pass
         live = fetch_version(self.debug_port, timeout=0.4)
         if live is None:
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
@@ -1193,6 +1260,59 @@ class DedicatedApplySession:
         self.tab = tab
         return tab
 
+    def _adopt_open_tab(self, application_url: str) -> VisibleTab:
+        tab = self.tab
+        if tab is None:
+            raise LocalAttachError("No Chrome tab is attached.")
+        page = adopt_employer_tab(tab.context, application_url)
+        tab.page = page
+        tab.page_url = str(page.url or "")
+        tab.target_id = _target_id(tab.context, page)
+        return tab
+
+    def _reuse_listening_chrome(self) -> bool:
+        """Pin the port Chrome already opened for this profile. Do not launch another."""
+        port = listening_devtools_port(self.user_data_dir)
+        if port is None:
+            return False
+        self.debug_port = port
+        self.endpoint = endpoint_for_port(port)
+        if self.chrome is None:
+            self.owns_chrome = False
+        return True
+
+    def _reconnect_cdp(self) -> None:
+        """Drop the dead pipe and allow one ``connect_over_cdp`` on the same port."""
+        if self._cdp_reconnects >= 1:
+            raise LocalAttachError("CDP reconnect limit reached.")
+        self._cdp_reconnects += 1
+        self._drop_client()
+
+    def _drop_client(self) -> None:
+        """Stop the Playwright pipe. Chrome and the debugging port stay."""
+        self.tab = None
+        playwright = self._playwright
+        self._playwright = None
+        if playwright is None:
+            return
+        try:
+            playwright.stop()
+        except Exception:
+            return
+
+    def live_identity(self) -> tuple[str, str]:
+        """Target id and URL of the attached tab. This does not navigate."""
+        tab = self.tab
+        if tab is None or tab.page is None:
+            return "", ""
+        try:
+            url = str(tab.page.url or "")
+        except Exception as exc:
+            if is_browser_crash(exc):
+                return "", ""
+            raise
+        return str(tab.target_id or ""), url
+
     def fill(
         self,
         application_url: str,
@@ -1201,25 +1321,53 @@ class DedicatedApplySession:
         cancel: CancelGate | None = None,
         fresh: bool = False,
         resume: LocalResume | None = None,
+        session_id: str = "",
+        candidate_id: str = "",
+        job_id: str = "",
+        on_observed: Any = None,
+        on_nav_block: Any = None,
+        nav_block: tuple | None = None,
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
         ``fresh`` reloads the employer URL first and forgets held selectors.
-        The helper sets it when an earlier Apply already wrote into this
-        window, so the previous candidate's values are not kept: the engine
-        does not overwrite a field that already holds a value.
+        The helper sets it when a different candidate's Apply already wrote
+        into this window, so the previous candidate's values are not kept.
+        A continue after a crash does not reload. ``nav_block`` is a Next
+        this recovery already pressed. A reload clears it.
         """
         if cancel is not None:
             cancel.check()
+        self._identity = {
+            "session_id": session_id,
+            "candidate_id": candidate_id,
+            "job_id": job_id,
+        }
+        self._observe = on_observed
+        self._nav_hook = on_nav_block
+        self._nav_block = None if fresh else nav_block
         tab = self.ensure(application_url)
         if fresh:
             self._held.clear()
             self._page_mark = None
+            self._nav_block = None
             tab.page.goto(application_url, wait_until="domcontentloaded", timeout=45000)
             tab.page_url = str(tab.page.url or "")
             if cancel is not None:
                 cancel.check()
-        result = fill_visible_tab(tab.page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
+        result = fill_visible_tab(
+            tab.page,
+            application_url,
+            profile,
+            cancel=cancel,
+            on_observed=self._observe,
+            on_nav_block=self._bridge_nav_block,
+            nav_block=self._nav_block,
+            session_id=session_id,
+            candidate_id=candidate_id,
+            job_id=job_id,
+            **_resume_kwargs(resume),
+        )
         submitted = _optional_submitted(tab.page)
         if submitted is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
@@ -1303,7 +1451,16 @@ class DedicatedApplySession:
         post_upload_refill(page)
         if cancel is not None:
             cancel.check()
-        result = fill_visible_tab(page, application_url, profile, cancel=cancel, resume=resume)
+        result = fill_visible_tab(
+            page,
+            application_url,
+            profile,
+            cancel=cancel,
+            resume=resume,
+            session_id=getattr(self, "_identity", {}).get("session_id", ""),
+            candidate_id=getattr(self, "_identity", {}).get("candidate_id", ""),
+            job_id=getattr(self, "_identity", {}).get("job_id", ""),
+        )
         if _optional_submitted(page) is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
         self._remember_mark(page)
@@ -1355,7 +1512,7 @@ class DedicatedApplySession:
         if follow.changed:
             if cancel is not None:
                 cancel.check()
-            result = fill_visible_tab(page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
+            result = self._continue_fill(page, application_url, profile, cancel=cancel, resume=resume)
             if _optional_submitted(page) is True:
                 raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
             self._remember_mark(page)
@@ -1373,7 +1530,7 @@ class DedicatedApplySession:
             # refused inside the engine.
             if cancel is not None:
                 cancel.check()
-            result = fill_visible_tab(page, application_url, profile, cancel=cancel, **_resume_kwargs(resume))
+            result = self._continue_fill(page, application_url, profile, cancel=cancel, resume=resume)
             if _optional_submitted(page) is True:
                 raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
             self._remember_mark(page)
@@ -1449,21 +1606,49 @@ class DedicatedApplySession:
 
         close_popup(page)
 
+    def _continue_fill(
+        self,
+        page: Any,
+        application_url: str,
+        profile: CandidateProfile,
+        *,
+        cancel: Any,
+        resume: Any,
+    ) -> ApplicationResult:
+        """Fill the open page with this session's binding ids and recovery block."""
+        identity = getattr(self, "_identity", {})
+        return fill_visible_tab(
+            page,
+            application_url,
+            profile,
+            cancel=cancel,
+            on_observed=getattr(self, "_observe", None),
+            on_nav_block=self._bridge_nav_block,
+            nav_block=getattr(self, "_nav_block", None),
+            session_id=identity.get("session_id", ""),
+            candidate_id=identity.get("candidate_id", ""),
+            job_id=identity.get("job_id", ""),
+            **_resume_kwargs(resume),
+        )
+
+    def _bridge_nav_block(self, block: tuple) -> None:
+        """Keep the latest Next on this session and tell the helper."""
+        self._nav_block = block
+        hook = getattr(self, "_nav_hook", None)
+        if hook is None:
+            return
+        try:
+            hook(block)
+        except Exception:
+            return
+
     def detach(self) -> None:
         """Idle detach. Chrome keeps running whether or not this process launched it.
 
         Stops the Playwright driver. Does not close the browser object, because
         that close is how a CDP client asks Chrome to exit.
         """
-        self.tab = None
-        playwright = self._playwright
-        self._playwright = None
-        if playwright is None:
-            return
-        try:
-            playwright.stop()
-        except Exception:
-            return
+        self._drop_client()
 
     def stop_launched_chrome(self) -> None:
         """Kill Chrome only when this object launched it. Detach does not call this."""
@@ -1527,6 +1712,39 @@ def attempt_alternate_submits(page: Any, attempts: list[tuple[str, str, str]]) -
             f"Submit path was not refused: selector={selector!r} name={claimed_name!r} purpose={purpose!r}."
         )
     return refusals
+
+
+def listening_devtools_port(user_data_dir: Path | None) -> int | None:
+    """The loopback port in ``DevToolsActivePort`` when Chrome is still answering.
+
+    A stale file whose port is closed returns ``None`` so the helper can launch.
+    A live port is reused. A second Chrome is not started for that profile.
+    """
+    text = _devtools_active_port(user_data_dir)
+    if not text:
+        return None
+    line = text.splitlines()[0].strip()
+    if not line.isdigit():
+        return None
+    port = int(line)
+    if not 1 <= port <= 65535:
+        return None
+    if fetch_version(port, timeout=0.4) is None:
+        return None
+    return port
+
+
+def _page_responds(page: Any) -> bool:
+    """False when the CDP target is gone. Other failures are not treated as a dead pipe."""
+    if page is None:
+        return False
+    try:
+        page.evaluate("() => 1")
+    except Exception as exc:
+        if is_browser_crash(exc):
+            return False
+        raise
+    return True
 
 
 def _devtools_active_port(user_data_dir: Path | None) -> str:

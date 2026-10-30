@@ -56,6 +56,12 @@ def apply_packaged_environment() -> Path:
     os.environ["AUTOFILL_LOCAL_HELPER_PORT"] = str(HELPER_PORT)
     profile = packaged_profile_dir()
     os.environ["AUTOFILL_LOCAL_PROFILE_DIR"] = str(profile)
+    from autofill.local_attach import listening_devtools_port
+
+    pinned = listening_devtools_port(profile)
+    if pinned is not None:
+        # Chrome is already open on this profile. Pin its port so we do not launch another.
+        os.environ["AUTOFILL_LOCAL_CDP_PORT"] = str(pinned)
     return profile
 
 

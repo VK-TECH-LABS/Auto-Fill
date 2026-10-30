@@ -1369,7 +1369,8 @@ def test_resume_bytes_are_dropped_on_cancel_replace_and_detach(monkeypatch):
         assert job_c.resume.held
         code, body = _request(port, "POST", f"/v1/sessions/{c['sessionId']}/detach")
         assert code == 200
-        assert job_c.resume.data == b"" and body["resume"]["state"] == "dropped"
+        # The application can still continue, so detach keeps the bytes.
+        assert job_c.resume.held and body["resume"]["state"] == "held"
     finally:
         fake.release.set()
         server.shutdown()
@@ -1571,3 +1572,215 @@ def test_fill_visible_tab_keeps_the_failure_reason(monkeypatch):
     local_attach.fill_visible_tab(object(), _URL, CandidateProfile.load(PROFILE), resume=resume)
     assert resume.uploaded is False
     assert resume.failure["reason"] == "not_confirmed" and len(resume.failure["siteErrors"][0]) == 200
+
+
+class _StepPage:
+    def __init__(self, url: str, step: str, selectors: list[str], target_id: str) -> None:
+        self.url = url
+        self.step = step
+        self.selectors = selectors
+        self.target_id = target_id
+
+
+class _RecoverySession(_FakeSession):
+    """One crash, then the open page. Records fresh and whether Next was handed back."""
+
+    def __init__(self, crashes: int = 1) -> None:
+        super().__init__()
+        self.fresh: list[bool] = []
+        self.fills = 0
+        self.crashes_left = crashes
+        self.nav_blocks: list[object] = []
+        self.page = _StepPage(
+            "https://boards.greenhouse.io/example/jobs/1/step-2",
+            "experience",
+            ["#company"],
+            "target-1",
+        )
+        self.tab = type("Tab", (), {"target_id": "target-1", "page": self.page})()
+        self.live_target = "target-1"
+        self.live_url = self.page.url
+
+    def live_identity(self) -> tuple[str, str]:
+        return self.live_target, self.live_url
+
+    def fill(self, url, profile, *, cancel=None, fresh=False, resume=None, on_observed=None,
+             on_nav_block=None, nav_block=None, **_kwargs):
+        self.fresh.append(bool(fresh))
+        self.fills += 1
+        self.nav_blocks.append(nav_block)
+        if on_observed is not None:
+            on_observed(self.page)
+        if on_nav_block is not None and self.fills == 1:
+            on_nav_block(("#next", "Next", ("page-1",)))
+        if self.crashes_left:
+            self.crashes_left -= 1
+            raise RuntimeError("Target closed")
+        return ApplicationResult(
+            status=Status.READY_FOR_HUMAN_SUBMIT,
+            ats=None,
+            current_step="done",
+            login_status="NOT_REQUIRED",
+            fields_detected=2,
+            fields_filled=2,
+            stopped_before_submit=True,
+            submit_controls=["Submit application"],
+        ), False
+
+
+def _wait_job(port: int, session_id: str) -> dict:
+    return _wait_status(port, session_id, lambda row: row.get("status") not in {"queued", "running", None})
+
+
+def test_same_binding_after_a_crash_does_not_reload(monkeypatch):
+    fake = _RecoverySession(crashes=1)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        failed = _wait_job(port, created["sessionId"])
+        assert failed["status"] == "FAILED"
+        job = helper.get(created["sessionId"])
+        assert job is not None and job.progress is not None
+        assert job.progress.target_id == "target-1"
+        assert job.progress.url.endswith("/step-2")
+        assert job.progress.step == "experience"
+        assert job.progress.binding["candidateId"] == "101"
+        assert job.progress.binding["tilearcSessionId"] == "sess-a"
+        assert job.progress.selectors == frozenset({"#company"})
+        assert failed["progress"]["targetId"] == "target-1"
+        assert "selectors" not in failed["progress"]
+        code, again = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202 and again["sessionId"] == created["sessionId"]
+        ready = _wait_job(port, created["sessionId"])
+        assert ready["status"] == "READY_FOR_HUMAN_SUBMIT"
+        assert ready["stopped_before_submit"] is True
+        assert ready["submitted"] is not True
+        assert "Submit application" in ready["fill"]["submit_controls"]
+        code, other = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Blake Beta", "blake@example.com"),
+            "binding": _binding("sess-b", "202"),
+        })
+        assert code == 202 and other["sessionId"] != created["sessionId"]
+        _wait_job(port, other["sessionId"])
+        assert fake.fresh == [False, False, True]
+        assert fake.nav_blocks[1] == ("#next", "Next", ("page-1",))
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_continue_stops_when_the_tab_or_binding_does_not_match(monkeypatch):
+    fake = _RecoverySession(crashes=1)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        assert _wait_job(port, created["sessionId"])["status"] == "FAILED"
+        sid = created["sessionId"]
+        fake.live_url = "https://jobs.lever.co/other/1"
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 200 and body["reason"] == "progress_mismatch"
+        assert body["stopped_before_submit"] is True
+        assert fake.fills == 1
+        fake.live_url = fake.page.url
+        fake.live_target = "target-other"
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 200 and body["reason"] == "progress_mismatch"
+        assert fake.fills == 1
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "202")})
+        assert code == 409 and body["reason"] == "binding_mismatch"
+        assert fake.fills == 1
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_continue_stops_at_the_cap(monkeypatch):
+    fake = _RecoverySession(crashes=9)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = created["sessionId"]
+        assert _wait_job(port, sid)["status"] == "FAILED"
+        for _ in range(2):
+            code, _body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+            assert code == 409
+            assert _wait_job(port, sid)["status"] == "FAILED"
+        assert fake.fills == 3
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 409 and body["reason"] == "continue_limit"
+        assert fake.fills == 3
+        assert body["stopped_before_submit"] is True
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_resume_bytes_survive_detach_and_drop_on_cancel(monkeypatch):
+    fake = _RecoverySession(crashes=1)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start_with_resume(port, "sess-a", "101", "Avery Alpha")
+        sid = created["sessionId"]
+        assert _wait_job(port, sid)["status"] == "FAILED"
+        job = helper.get(sid)
+        assert job is not None and job.resume is not None and job.resume.held
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/detach")
+        assert code == 200
+        assert job.resume.held and body["resume"]["state"] == "held"
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/cancel")
+        assert code == 200 and body["resume"]["state"] == "dropped"
+        assert job.resume.data == b""
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_fill_visible_tab_passes_the_binding_ids(monkeypatch):
+    from autofill import local_attach
+    from autofill.profile import CandidateProfile
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+    seen: dict[str, str] = {}
+
+    def fake_autofill(url, profile, credential_provider=None, options=None):
+        seen["session"] = options.session_id
+        seen["candidate"] = options.candidate_id or ""
+        seen["job"] = options.job_id
+        return ApplicationResult(
+            status=Status.READY_FOR_HUMAN_SUBMIT,
+            ats=None,
+            current_step="done",
+            login_status="NOT_REQUIRED",
+            stopped_before_submit=True,
+        )
+
+    monkeypatch.setattr("autofill.local_attach.autofill_application", fake_autofill)
+    local_attach.fill_visible_tab(
+        object(),
+        _URL,
+        CandidateProfile.load(PROFILE),
+        session_id="sess-a",
+        candidate_id="101",
+        job_id="11",
+    )
+    assert seen == {"session": "sess-a", "candidate": "101", "job": "11"}
