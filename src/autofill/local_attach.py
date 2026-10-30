@@ -2213,6 +2213,23 @@ def demonstrate_dedicated_fill(
         server.shutdown()
 
 
+_LOAD_EXTENSION_REFUSAL = "--load-extension is not allowed in Google Chrome"
+
+
+def load_extension_refused(stderr_text: str) -> bool:
+    """True when branded Chrome logged that it ignored ``--load-extension``.
+
+    The sentence can sit at the start of a long log. A tail window is not enough.
+    """
+    return _LOAD_EXTENSION_REFUSAL in (stderr_text or "")
+
+
+def _log_file_text(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def probe_branded_load_extension(
     extension_dir: Path,
     *,
@@ -2241,11 +2258,18 @@ def probe_branded_load_extension(
     proc = _spawn(args, log_path)
     chrome = ChromeProcess(process=proc, user_data_dir=user_data, port=None, endpoint="", log_path=log_path)
     try:
-        time.sleep(timeout)
-        stderr_text = chrome.stderr_text()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if load_extension_refused(_log_file_text(log_path)):
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
     finally:
+        # Stop first so Chrome flushes the refusal line, then read the whole file.
         chrome.stop()
-    ignored = "--load-extension is not allowed in Google Chrome" in stderr_text
+    stderr_text = _log_file_text(log_path)
+    ignored = load_extension_refused(stderr_text)
     return {
         "mode": "branded_load_extension",
         "chrome_version": version,
