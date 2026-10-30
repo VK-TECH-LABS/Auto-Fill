@@ -2,8 +2,8 @@
   "task": "autofill-r4-resume-upload",
   "developer": "saiteja",
   "branch": "saiteja/autofill-r4-resume-upload",
-  "latest_commit": "05dc7c31b0beaef352adc5de7107cc2e0f3f4a18",
-  "pr": "",
+  "latest_commit": "451e2f863f19a58554cf480f940b8bcccd3d8558",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/92",
   "files_touched": [
     "src/autofill/engine.py",
     "src/autofill/local_attach.py",
@@ -13,5 +13,5 @@
   "tests": "pytest tests/test_local_helper.py",
   "blockers": "",
   "next_action": "",
-  "updated_at": "2026-10-30T05:26:48Z"
+  "updated_at": "2026-10-30T05:27:04Z"
 }
