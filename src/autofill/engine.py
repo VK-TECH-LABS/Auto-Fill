@@ -19,7 +19,7 @@ from typing import Any
 
 from autofill.adapters import adapter_for, page_step
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats, site_domain
-from autofill.credentials import CredentialProvider, SiteContext
+from autofill.credentials import CredentialProvider, SiteContext, credential_scope
 from autofill.dom_ui import (
     attach_page,
     begin_run,
@@ -977,7 +977,7 @@ def autofill_application(
         ):
             context = SiteContext(
                 url=application_url,
-                domain=domain,
+                domain=credential_scope(application_url, ats_name),
                 ats=ats_name,
                 candidate_id=session.candidate_id,
                 session_id=session.session_id,

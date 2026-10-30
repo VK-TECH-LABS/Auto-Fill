@@ -15,8 +15,7 @@ from fastapi.testclient import TestClient
 from tests.helpers import empty_credentials as _empty_credentials
 from tests.helpers import job_context as _job_object
 
-from autofill.ats import site_domain
-from autofill.credentials import SiteContext
+from autofill.credentials import SiteContext, credential_scope
 from autofill.engine import ApplicationResult, Status
 from autofill.safeguards import HumanSubmissionRequired
 from autofill.service.app import create_app
@@ -74,7 +73,7 @@ class RecordingRunner:
 
     def run(self, request: FillRequest) -> ApplicationResult:
         self.calls.append((request.session_id, request.resume_uploaded))
-        domain = site_domain(request.application_url)
+        domain = credential_scope(request.application_url)
         creds = request.credentials.get_credentials(
             SiteContext(url=request.application_url, domain=domain, candidate_id=request.candidate_id),
             request.candidate_id,

@@ -614,6 +614,9 @@ def dedicated_launch_args(
         "--disable-background-networking",
         "--disable-component-update",
         "--disable-popup-blocking",
+        # The dedicated profile must not offer to save an employer password.
+        "--disable-save-password-bubble",
+        "--disable-features=PasswordManagerOnboarding",
     ]
     # No viewport and no window size. The Railway runner's 1280x800 context is a
     # different browser; forcing it here changes the page the employee sees.
@@ -731,6 +734,82 @@ def _wait_cdp(port: int, proc: subprocess.Popen[str], timeout: float) -> dict[st
     return fetch_version(port, timeout=0.4)
 
 
+def disarm_password_manager(user_data_dir: Path) -> None:
+    """Turn Chrome's password manager off for this profile directory.
+
+    Writes preference flags only. No employer secret is written. An already
+    running Chrome keeps its previous settings until the next launch.
+    """
+    default = user_data_dir / "Default"
+    default.mkdir(parents=True, exist_ok=True)
+    path = default / "Preferences"
+    current: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            current = loaded
+    current["credentials_enable_service"] = False
+    current["credentials_enable_autosignin"] = False
+    profile = current.get("profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    profile["password_manager_enabled"] = False
+    profile["password_manager_leak_detection"] = False
+    current["profile"] = profile
+    path.write_text(json.dumps(current), encoding="utf-8")
+
+
+def _cookie_for_host(cookie_domain: str, host: str) -> bool:
+    """True when a cookie domain belongs to this employer host."""
+    domain = (cookie_domain or "").lstrip(".").lower()
+    host = (host or "").lower()
+    if not domain or not host:
+        return False
+    return domain == host or host.endswith("." + domain) or domain.endswith("." + host)
+
+
+def clear_employer_cookies(context: Any, url: str) -> int:
+    """Drop cookies for this employer host. Other hosts stay. Returns how many were dropped.
+
+    Does not click anything on the page. A missing context drops nothing.
+    """
+    from autofill.ats import site_domain
+
+    host = site_domain(url)
+    if not host or context is None:
+        return 0
+    try:
+        current = context.cookies()
+    except Exception:
+        return 0
+    if not isinstance(current, list):
+        return 0
+    drop: list[dict[str, Any]] = []
+    keep: list[dict[str, Any]] = []
+    for cookie in current:
+        if not isinstance(cookie, dict):
+            continue
+        if _cookie_for_host(str(cookie.get("domain") or ""), host):
+            drop.append(cookie)
+        else:
+            keep.append(cookie)
+    if not drop:
+        return 0
+    try:
+        context.clear_cookies()
+    except Exception:
+        return 0
+    if keep:
+        try:
+            context.add_cookies(keep)
+        except Exception:
+            return len(drop)
+    return len(drop)
+
+
 def launch_dedicated_chrome(
     *,
     user_data_dir: Path,
@@ -744,6 +823,7 @@ def launch_dedicated_chrome(
     require_feature()
     exe = find_chrome(executable)
     user_data_dir.mkdir(parents=True, exist_ok=True)
+    disarm_password_manager(user_data_dir)
     args = dedicated_launch_args(
         executable=exe,
         user_data_dir=user_data_dir,
@@ -1122,6 +1202,9 @@ def fill_visible_tab(
     on_observed: Any = None,
     on_nav_block: Any = None,
     nav_block: tuple | None = None,
+    credential_provider: Any = None,
+    verify_pending: bool = False,
+    protocol_version: str = "0.7.0",
 ) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
@@ -1150,10 +1233,12 @@ def fill_visible_tab(
         on_observed=on_observed,
         on_nav_block=on_nav_block,
         nav_block=nav_block,
+        protocol_version=protocol_version or "0.7.0",
+        verify_pending=bool(verify_pending),
         **_resume_options(resume),
     )
     try:
-        return autofill_application(application_url, profile, options=options)
+        return autofill_application(application_url, profile, credential_provider, options)
     finally:
         if resume is not None:
             if options.resume_uploaded:
@@ -1201,6 +1286,11 @@ class DedicatedApplySession:
         self._observe: Any = None
         self._nav_hook: Any = None
         self._nav_block: tuple | None = None
+        self._credential_provider: Any = None
+        self._verify_pending_flag = False
+        self._protocol_version = "0.7.0"
+        self._last_candidate_id = ""
+        self._last_employer_url = ""
 
     def ensure(self, application_url: str) -> VisibleTab:
         """Launch the dedicated profile if needed, then adopt the employer tab.
@@ -1327,6 +1417,9 @@ class DedicatedApplySession:
         on_observed: Any = None,
         on_nav_block: Any = None,
         nav_block: tuple | None = None,
+        credential_provider: Any = None,
+        verify_pending: bool = False,
+        protocol_version: str = "0.7.0",
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
@@ -1346,7 +1439,20 @@ class DedicatedApplySession:
         self._observe = on_observed
         self._nav_hook = on_nav_block
         self._nav_block = None if fresh else nav_block
+        if credential_provider is not None:
+            self._credential_provider = credential_provider
+        self._verify_pending_flag = bool(verify_pending)
+        self._protocol_version = protocol_version or "0.7.0"
+        previous = self._last_candidate_id
+        changed = bool(previous and candidate_id and previous != candidate_id)
         tab = self.ensure(application_url)
+        if changed and getattr(tab, "context", None) is not None:
+            clear_employer_cookies(tab.context, application_url)
+            if self._last_employer_url:
+                clear_employer_cookies(tab.context, self._last_employer_url)
+        if candidate_id:
+            self._last_candidate_id = candidate_id
+        self._last_employer_url = application_url
         if fresh:
             self._held.clear()
             self._page_mark = None
@@ -1366,6 +1472,9 @@ class DedicatedApplySession:
             session_id=session_id,
             candidate_id=candidate_id,
             job_id=job_id,
+            credential_provider=self._credential_provider,
+            verify_pending=self._verify_pending_flag,
+            protocol_version=self._protocol_version,
             **_resume_kwargs(resume),
         )
         submitted = _optional_submitted(tab.page)
@@ -1373,6 +1482,14 @@ class DedicatedApplySession:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
         self._remember_mark(tab.page)
         return result, submitted
+
+    def sign_out(self, url: str) -> int:
+        """Clear this employer's cookies. The stored secret is not touched and no button is clicked."""
+        tab = self.tab
+        context = getattr(tab, "context", None) if tab is not None else None
+        if context is None:
+            return 0
+        return clear_employer_cookies(context, url)
 
     def apply_answer(
         self,
@@ -1460,6 +1577,9 @@ class DedicatedApplySession:
             session_id=getattr(self, "_identity", {}).get("session_id", ""),
             candidate_id=getattr(self, "_identity", {}).get("candidate_id", ""),
             job_id=getattr(self, "_identity", {}).get("job_id", ""),
+            credential_provider=getattr(self, "_credential_provider", None),
+            verify_pending=bool(getattr(self, "_verify_pending_flag", False)),
+            protocol_version=getattr(self, "_protocol_version", "0.7.0") or "0.7.0",
         )
         if _optional_submitted(page) is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
@@ -1628,6 +1748,9 @@ class DedicatedApplySession:
             session_id=identity.get("session_id", ""),
             candidate_id=identity.get("candidate_id", ""),
             job_id=identity.get("job_id", ""),
+            credential_provider=getattr(self, "_credential_provider", None),
+            verify_pending=bool(getattr(self, "_verify_pending_flag", False)),
+            protocol_version=getattr(self, "_protocol_version", "0.7.0") or "0.7.0",
             **_resume_kwargs(resume),
         )
 
@@ -1953,8 +2076,27 @@ def _field_values(page: Any) -> dict[str, str]:
     return values
 
 
+_ACCOUNT_SECRET_KEYS = frozenset(
+    {"password", "confirmpassword", "confirm", "secret", "token", "username"}
+)
+
+
+def _public_account(account: dict[str, Any]) -> dict[str, Any]:
+    """Account view for status JSON. Drops any key that could hold a secret."""
+    cleaned: dict[str, Any] = {}
+    for key, value in account.items():
+        folded = str(key).casefold().replace("_", "")
+        if folded in _ACCOUNT_SECRET_KEYS:
+            continue
+        if isinstance(value, dict):
+            cleaned[key] = _public_account(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def _result_brief(result: ApplicationResult) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "status": result.status,
         "fields_detected": result.fields_detected,
         "fields_filled": result.fields_filled,
@@ -1962,6 +2104,10 @@ def _result_brief(result: ApplicationResult) -> dict[str, Any]:
         "stopped_before_submit": result.stopped_before_submit,
         "submit_controls": list(result.submit_controls),
     }
+    account = result.account if isinstance(result.account, dict) else None
+    if account:
+        body["account"] = _public_account(account)
+    return body
 
 
 def read_inspect_surface(page: Any) -> dict[str, Any]:

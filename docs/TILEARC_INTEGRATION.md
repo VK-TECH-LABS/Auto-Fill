@@ -17,7 +17,7 @@ Auto-Fill starts at that open page.
 `autofill_application(application_url, candidate_profile, credential_provider, options)`:
 
 1. Records the site and detects the ATS from `application_url`.
-2. If the page is a password login, asks `credential_provider` for that candidate and that domain, then signs in. Email-first sites (email, Continue, password, Sign in) are handled. A page that is already signed in skips login.
+2. If the page is a password login, asks `credential_provider` for that candidate and that employer (`credential_scope`, not the bare hostname when several employers share a host), then signs in. Email-first sites (email, Continue, password, Sign in) are handled. A page that is already signed in skips login. Create Account is typed only when the host posts `mode: "register"`.
 3. Fills profile fields and explicit application answers.
 4. Clicks Next, Continue, Save and Continue, or Proceed when that control is not a final submission.
 5. Stops at a resume file input with status `RESUME_UPLOAD_REQUIRED`. It does not choose a file. The person uploads the resume TileArc already downloaded.
@@ -89,14 +89,33 @@ Protocol 0.4.0 adds an HTTP resolver mode, documented in [HTTP_SERVICE.md](HTTP_
 
 Each call builds its own session from `candidate_id + job_id + application_url + session_id`. There is no process-wide "last profile". Two calls in parallel cannot read each other's profile or credentials.
 
-`MemoryCredentialProvider` keys records by `(candidate_id, domain)`. A lookup does not fall back to another candidate or another site. Hosts should apply the same scope in their own provider. Credential objects redact their values in `repr`. Logs record ids, ATS name, domain, state, and counts.
+`MemoryCredentialProvider` keys records by `(candidate_id, credential_scope)`. `credential_scope` is the Workday `tenantKey` (`host/site`) or `host/company` for Greenhouse, Lever, Ashby, and SmartRecruiters. A lookup does not fall back to another candidate, another employer, or the bare hostname. Hosts should apply the same scope in their own provider. Credential objects redact their values in `repr`. Logs record ids, ATS name, domain, state, and counts. A secret that misses the on-page password rules is refused with `password_policy` before Create Account is clicked.
+
+## Employer password vault (vinayaka)
+
+Auto-Fill does not generate or store the five-password pool. Vinayaka owns that pool: up to five generated passwords per candidate, one assigned to each employer, rotated when a site locks the account. The pool key is `candidateId` plus the `tenantKey` on the account view (`account.tenant.tenantKey`). The same string is `credential_scope(applicationUrl)`.
+
+Vinayaka posts one secret for the current session. It does not put the password in `chrome.storage`, status JSON, or the helper profile directory.
+
+Direct-browser helper, loopback only:
+
+| Call | Body | What Auto-Fill does |
+| --- | --- | --- |
+| `POST /v1/sessions/{sessionId}/credentials` | `candidateId`, `email` or `username`, `password`, optional `confirmPassword`, `mode` (`store`, `login`, `register`), optional `standardTerms`, optional `verified` | `store` keeps the secret in memory under `(candidateId, tenantKey)`. `register` refuses with `422` `password_policy` when the secret misses the rules on the open page, and does not type it. Otherwise it types and clicks Create Account or Sign In. The response has `stored`, `outcome`, `tenantKey`, and lengths in `fieldProof`. It never has the password. |
+| `POST /v1/sessions/{sessionId}/sign-out` | none | Clears that employer's cookies. Does not delete the secret and does not click a button. |
+| `POST /v1/sessions/{sessionId}/continue` | existing continue body, optional `verified: true` | The same continue #93 added. It reattaches and fills the open page. The in-memory secret is still passed in, so sign-in works after reconnect. `verified: true` is the person's confirmation that they opened the verification email. Continue does not create an account by itself. |
+
+There is no retrieve route that returns the password. The next fill or continue reads the memory store and signs in. OTP, CAPTCHA, MFA, and identity-provider SSO stay pauses. Final Submit stays human.
+
+The hosted service uses the same scope on `POST /v1/sessions/{sessionId}/credentials`. `site` may still be the hostname. The stored key is the tenant scope. `422` `password_policy` means the host should pick another pool password and post again.
 
 ## What stays human
 
 - Uploading the resume TileArc downloaded.
 - Clicking the final Submit, Submit Application, Finish, Complete, or Apply control.
 - Any CAPTCHA, puzzle, or anti-bot challenge. Detection only.
-- Creating an account, SSO through Google, Microsoft, Okta, Auth0, or Cisco, and the manual host `ibegin.tcsapps.com`.
+- Creating an account unless the host posted `mode: "register"` with a secret that meets the on-page rules.
+- SSO through Google, Microsoft, Okta, Auth0, or Cisco, inbox codes, MFA, and the manual host `ibegin.tcsapps.com`.
 - Legal attestations ("I agree", "I certify") and questions that are not on the profile.
 
 Login submission is allowed and is a different action from final application submit. The central guard raises `HumanSubmissionRequired` if any code path tries to activate a final submit control, including a login-purpose click.

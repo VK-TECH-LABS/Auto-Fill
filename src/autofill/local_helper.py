@@ -26,6 +26,15 @@ application can still continue. Cancel, replace, and a binding mismatch drop
 them.
 ``POST /v1/sessions/{id}/continue`` reattaches after a crash or a retryable
 failure and fills the page already showing. It does not reload the Apply URL.
+The same fill receives the in-memory credential provider, so a secret posted
+earlier is still used after continue. ``verified: true`` on that body is the
+person's confirmation that they opened the verification email.
+``POST /v1/sessions/{id}/credentials`` remembers one secret for this candidate
+and employer (``tenantKey``). ``mode`` ``store`` only remembers it. ``login``
+and ``register`` type it on the open page. The password is not written to the
+status JSON, the log, or the Chrome profile directory.
+``POST /v1/sessions/{id}/sign-out`` clears that employer's cookies and leaves
+the secret in memory so the next fill can sign in again.
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from autofill.answer_popup import new_nonce
+from autofill.credentials import Credentials, MemoryCredentialProvider, credential_scope
 from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item
 from autofill.engine import ApplicationResult, Status, is_browser_crash
 from autofill.local_attach import (
@@ -59,6 +69,7 @@ from autofill.local_attach import (
     LocalAttachError,
     LocalResume,
     LoopbackRequired,
+    _public_account,
     _result_brief,
     feature_enabled,
     is_default_user_data_dir,
@@ -359,6 +370,9 @@ class LocalJob:
         self.popup: dict[str, Any] | None = None
         self.progress: LocalProgress | None = None
         self.continue_attempts = 0
+        # Workday account registered here. Continue without verified does not sign in.
+        self.verify_pending = False
+        self._credential_candidate = ""
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -505,6 +519,8 @@ class LocalHelper:
         )
         self._jobs: dict[str, LocalJob] = {}
         self._staged: dict[str, StagedResume] = {}
+        # Candidate + tenantKey. Memory only. Wiped for a candidate when a different one applies.
+        self._credentials = MemoryCredentialProvider()
         # The worker's job (fill or answer). The newest live job is ``_current``.
         self._active: str | None = None
         self._current: str | None = None
@@ -579,8 +595,12 @@ class LocalHelper:
                 active = self._jobs.get(self._active) if self._active else None
                 if active is not None and not active.superseded and binding is None:
                     raise LocalAttachError("A fill is already running on this dedicated profile.")
+                incoming = (binding or {}).get("candidateId") or ""
                 for old in {job.session_id: job for job in (current, active) if job is not None}.values():
                     if not old.superseded:
+                        previous = (old.binding or {}).get("candidateId") or ""
+                        if incoming and previous and incoming != previous:
+                            self._credentials.drop_candidate(previous)
                         old.end("replaced")
                         logger.info("session=%s superseded reason=replaced", old.session_id)
                 self._generation += 1
@@ -849,6 +869,8 @@ class LocalHelper:
                 raise AnswerRejected(409, _failure(job, "continue_limit"))
             if job.profile is None:
                 raise AnswerRejected(409, _failure(job, "not_continuable"))
+            if payload.get("verified") is True:
+                job.verify_pending = False
             if self._active is not None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
             if job.state in {"queued", "running"}:
@@ -876,6 +898,92 @@ class LocalHelper:
         body = box.get("body")
         if not isinstance(body, dict):
             raise LocalAttachError("The continue did not finish.")
+        return body
+
+    def request_credentials(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Remember a secret, and type it when ``mode`` is ``login`` or ``register``.
+
+        ``store`` does not touch the page. The password is not returned.
+        """
+        job = self.get(session_id)
+        if job is None:
+            raise LocalAttachError("No such session.")
+        mode, email, username, password, confirm = _credential_fields(job, payload)
+        _require_credential_candidate(job, payload)
+        scope = credential_scope(job.application_url)
+        if mode == "store":
+            self._save_credential(job, email, username, password, scope)
+            body = job.public()
+            body["stored"] = True
+            body["outcome"] = "stored"
+            body["tenantKey"] = scope
+            logger.info("session=%s credentials_stored=true mode=store", job.session_id)
+            return body
+        with self._lock:
+            if job.superseded:
+                raise AnswerRejected(410, _failure(job, "replaced"))
+            if self._active is not None or job.state in {"queued", "running"}:
+                raise LocalAttachError("A fill is already running on this dedicated profile.")
+            self._active = job.session_id
+            job.state = "queued"
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        self._queue.put(
+            (
+                "credentials",
+                {
+                    "job": job,
+                    "mode": mode,
+                    "email": email,
+                    "username": username,
+                    "password": password,
+                    "confirm": confirm,
+                    "scope": scope,
+                    "standard_terms": payload.get("standardTerms") is True,
+                    "verified": payload.get("verified") is True,
+                    "done": done,
+                    "box": box,
+                },
+            )
+        )
+        if not done.wait(timeout=_ANSWER_WAIT_SECONDS):
+            with self._lock:
+                if self._active == job.session_id:
+                    self._active = None
+            raise LocalAttachError("The credentials action did not finish.")
+        error = box.get("error")
+        if isinstance(error, Exception):
+            raise error
+        report = box.get("body")
+        if not isinstance(report, dict):
+            raise LocalAttachError("The credentials action did not finish.")
+        return report
+
+    def request_sign_out(self, session_id: str) -> dict[str, Any]:
+        """Clear this employer's cookies. The remembered secret stays in memory."""
+        job = self.get(session_id)
+        if job is None:
+            raise LocalAttachError("No such session.")
+        with self._lock:
+            if job.superseded:
+                raise AnswerRejected(410, _failure(job, "replaced"))
+            if self._active is not None or job.state in {"queued", "running"}:
+                raise LocalAttachError("The fill is still running.")
+            self._active = job.session_id
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        self._queue.put(("signout", {"job": job, "done": done, "box": box}))
+        if not done.wait(timeout=30):
+            with self._lock:
+                if self._active == job.session_id:
+                    self._active = None
+            raise LocalAttachError("Sign out did not finish.")
+        error = box.get("error")
+        if isinstance(error, Exception):
+            raise error
+        body = box.get("body")
+        if not isinstance(body, dict):
+            raise LocalAttachError("Sign out did not finish.")
         return body
 
     def request_detach(self, session_id: str) -> LocalJob:
@@ -919,6 +1027,10 @@ class LocalHelper:
             kind, payload = item
             if kind == "fill":
                 self._run_fill(payload)
+            elif kind == "credentials":
+                self._run_credentials(payload)
+            elif kind == "signout":
+                self._run_sign_out(payload)
             elif kind == "answer":
                 self._run_answer(payload)
             elif kind == "resume":
@@ -1005,6 +1117,170 @@ class LocalHelper:
         except Exception:
             return
 
+    def _auth_kwargs(self, fill: Any, job: LocalJob) -> dict[str, Any]:
+        """Provider and protocol for the existing fill. Continue uses this same dict."""
+        kwargs: dict[str, Any] = {}
+        if _accepts(fill, "credential_provider"):
+            kwargs["credential_provider"] = self._credentials
+        if _accepts(fill, "verify_pending"):
+            kwargs["verify_pending"] = bool(job.verify_pending)
+        if _accepts(fill, "protocol_version"):
+            kwargs["protocol_version"] = "0.7.0"
+        return kwargs
+
+    def _save_credential(self, job: LocalJob, email: str, username: str, password: str, scope: str) -> None:
+        """Keep one secret in memory. Nothing is written to disk or the status body."""
+        from autofill.redact import redaction_filter
+
+        candidate_id = str(getattr(job, "_credential_candidate", "") or "")
+        if not candidate_id:
+            raise AnswerRejected(422, _failure(job, "candidate_required"))
+        self._credentials.put(
+            candidate_id,
+            scope,
+            Credentials(site=scope, email=email, username=username, password=password),
+        )
+        redaction_filter().add(password)
+
+    def _run_credentials(self, payload: dict[str, Any]) -> None:
+        job: LocalJob = payload["job"]
+        box: dict[str, Any] = payload["box"]
+        try:
+            box["body"] = self._credentials_on_worker(job, payload)
+            if job.state == "queued":
+                job.state = "done"
+        except AnswerRejected as exc:
+            if job.state == "queued":
+                job.state = "done" if job.result is not None else "error"
+            box["error"] = exc
+        except Exception as exc:
+            if job.state == "queued":
+                job.state = "error"
+            box["error"] = AnswerRejected(409, _failure(job, type(exc).__name__))
+        finally:
+            self._finish_active(job)
+            payload["done"].set()
+
+    def _credentials_on_worker(self, job: LocalJob, payload: dict[str, Any]) -> dict[str, Any]:
+        mode = str(payload.get("mode") or "")
+        email = str(payload.get("email") or "")
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        confirm = str(payload.get("confirm") or "")
+        scope = str(payload.get("scope") or "")
+        page = self._open_page(job.application_url)
+        if page is None:
+            raise AnswerRejected(409, _failure(job, "not_at_account_step"))
+        if mode == "register":
+            from autofill.extract import extract_page
+            from autofill.login import password_meets_policy, password_policy
+
+            reason = password_meets_policy(password, password_policy(extract_page(page)), email)
+            if reason:
+                raise AnswerRejected(422, _credential_failure(job, reason, scope))
+        if mode == "login" and job.verify_pending and not payload.get("verified"):
+            raise AnswerRejected(409, _credential_failure(job, "verification_pending", scope))
+        if payload.get("verified") is True:
+            job.verify_pending = False
+        self._save_credential(job, email, username, password, scope)
+        from autofill.account_flow import run_account_action
+        from autofill.ats import detect_ats
+
+        ats_info = detect_ats(job.application_url)
+        ats_name = ats_info.name if ats_info else None
+        report = run_account_action(
+            page,
+            mode=mode,
+            email=email,
+            username=username,
+            password=password,
+            confirm=confirm or password,
+            ats=ats_name,
+            standard_terms=bool(payload.get("standard_terms")),
+        )
+        if not isinstance(report, dict):
+            report = {"ok": False, "reason": "not_at_account_step"}
+        if report.get("reason") == "password_policy":
+            self._credentials.drop(str(getattr(job, "_credential_candidate", "") or ""), scope)
+            raise AnswerRejected(422, _credential_failure(job, "password_policy", scope))
+        if not report.get("ok"):
+            raise AnswerRejected(
+                422 if report.get("reason") in {"site_rejected", "account_exists"} else 409,
+                _credential_failure(job, str(report.get("reason") or "not_at_account_step"), scope, report),
+            )
+        outcome = str(report.get("outcome") or "")
+        verify_card = report.get("status") == Status.EMAIL_VERIFICATION_REQUIRED
+        if report.get("verifyBeforeSignIn") or outcome == "registered" or verify_card:
+            job.verify_pending = True
+        if job.profile is not None and outcome in {"signed_in", "registered", "verification_required"}:
+            fill = self._session.fill
+            kwargs = self._auth_kwargs(fill, job)
+            if _accepts(fill, "fresh"):
+                kwargs["fresh"] = False
+            if _accepts_cancel(fill):
+                kwargs["cancel"] = job.gate
+            identity = _fill_identity(job)
+            for key, value in identity.items():
+                if _accepts(fill, key):
+                    kwargs[key] = value
+            if job.resume is not None and _accepts(fill, "resume"):
+                kwargs["resume"] = job.resume
+            result, submitted = fill(job.application_url, job.profile, **kwargs)
+            job.submitted = submitted
+            self._remember_result(job, result)
+            self._capture_open_page(job)
+        body = job.public()
+        body["stored"] = True
+        body["outcome"] = outcome or "stored"
+        body["tenantKey"] = scope
+        proof = report.get("fieldProof")
+        if isinstance(proof, dict):
+            body["fieldProof"] = {
+                key: proof[key]
+                for key in (
+                    "emailFilled",
+                    "emailLength",
+                    "emailMatches",
+                    "passwordLength",
+                    "verifyLength",
+                    "passwordsMatch",
+                )
+                if key in proof
+            }
+        logger.info("session=%s credentials_stored=true mode=%s outcome=%s", job.session_id, mode, body["outcome"])
+        job.state = "done"
+        return body
+
+    def _open_page(self, url: str) -> Any:
+        ensure = getattr(self._session, "ensure", None)
+        if ensure is None:
+            tab = getattr(self._session, "tab", None)
+            return getattr(tab, "page", None) if tab is not None else None
+        try:
+            tab = ensure(url)
+        except Exception:
+            return None
+        return getattr(tab, "page", None)
+
+    def _run_sign_out(self, payload: dict[str, Any]) -> None:
+        job: LocalJob = payload["job"]
+        box: dict[str, Any] = payload["box"]
+        try:
+            cleared = 0
+            sign_out = getattr(self._session, "sign_out", None)
+            if sign_out is not None:
+                cleared = int(sign_out(job.application_url) or 0)
+            body = job.public()
+            body["signedOut"] = True
+            body["cleared"] = cleared
+            box["body"] = body
+            logger.info("session=%s signed_out=true cleared=%s", job.session_id, cleared)
+        except Exception as exc:
+            box["error"] = AnswerRejected(409, _failure(job, type(exc).__name__))
+        finally:
+            self._finish_active(job)
+            payload["done"].set()
+
     def _run_fill(self, payload: dict[str, Any]) -> None:
         job: LocalJob = payload["job"]
         profile: CandidateProfile = payload["profile"]
@@ -1051,6 +1327,7 @@ class LocalHelper:
             block = job.progress.nav_block if recover and job.progress is not None else None
             if block is not None and _accepts(fill, "nav_block"):
                 kwargs["nav_block"] = block
+            kwargs.update(self._auth_kwargs(fill, job))
             self._window_used = True
             result, submitted = fill(job.application_url, profile, **kwargs)
             job.submitted = submitted
@@ -1407,6 +1684,62 @@ class LocalHelper:
         return _public_status(job) in _DETACH_KEEP_STATUSES
 
 
+def _credential_fields(job: LocalJob, payload: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    """Mode and identity fields. The password is returned to the caller and not logged."""
+    mode = str(payload.get("mode") or "store").strip().lower()
+    if mode not in {"store", "login", "register"}:
+        raise AnswerRejected(422, _failure(job, "mode_invalid"))
+    email = str(payload.get("email") or "").strip()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    confirm = str(payload.get("confirmPassword") or payload.get("confirm") or "")
+    if not password or not (email or username):
+        raise AnswerRejected(422, _failure(job, "credentials_required"))
+    return mode, email, username, password, confirm
+
+
+def _require_credential_candidate(job: LocalJob, payload: dict[str, Any]) -> None:
+    candidate = str(payload.get("candidateId") or "").strip()
+    if not candidate:
+        raise AnswerRejected(422, _failure(job, "candidate_required"))
+    bound = (job.binding or {}).get("candidateId") or ""
+    if bound and candidate != bound:
+        raise AnswerRejected(409, _failure(job, "candidate_mismatch"))
+    job._credential_candidate = candidate
+
+
+def _credential_failure(
+    job: LocalJob,
+    reason: str,
+    scope: str,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A credentials refusal. The secret is not copied onto the body."""
+    body = _failure(job, reason)
+    body["tenantKey"] = scope
+    body["stored"] = False
+    if not isinstance(report, dict):
+        return body
+    proof = report.get("fieldProof")
+    if isinstance(proof, dict):
+        body["fieldProof"] = {
+            key: proof[key]
+            for key in (
+                "emailFilled",
+                "emailLength",
+                "emailMatches",
+                "passwordLength",
+                "verifyLength",
+                "passwordsMatch",
+            )
+            if key in proof
+        }
+    account = report.get("account")
+    if isinstance(account, dict):
+        body["account"] = _public_account(account)
+    return body
+
+
 def _fill_identity(job: LocalJob) -> dict[str, str]:
     """Binding ids for the engine. The helper session id is only a fallback."""
     binding = job.binding or {}
@@ -1468,6 +1801,14 @@ class _Handler(BaseHTTPRequestHandler):
         session_id = _action_id(path, "continue")
         if session_id is not None:
             self._continue(session_id)
+            return
+        session_id = _action_id(path, "credentials")
+        if session_id is not None:
+            self._credentials(session_id)
+            return
+        session_id = _action_id(path, "sign-out")
+        if session_id is not None:
+            self._sign_out(session_id)
             return
         session_id = _action_id(path, "cancel")
         if session_id is not None:
@@ -1611,6 +1952,37 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body)
 
+    def _credentials(self, session_id: str) -> None:
+        """``POST /v1/sessions/{id}/credentials``. The password is not echoed."""
+        try:
+            payload = _read_json(self)
+            body = self.server.helper.request_credentials(session_id, payload)
+        except AnswerRejected as exc:
+            self._send(exc.status, exc.body)
+            return
+        except LocalAttachError as exc:
+            missing = "No such" in str(exc)
+            busy = "already running" in str(exc) or "still running" in str(exc) or "did not finish" in str(exc)
+            code = 404 if missing else 409 if busy else 400
+            self._send(code, {"detail": str(exc), "stored": False, "stopped_before_submit": True})
+            return
+        self._send(200, body)
+
+    def _sign_out(self, session_id: str) -> None:
+        """``POST /v1/sessions/{id}/sign-out``. Clears employer cookies. Keeps the secret."""
+        try:
+            body = self.server.helper.request_sign_out(session_id)
+        except AnswerRejected as exc:
+            self._send(exc.status, exc.body)
+            return
+        except LocalAttachError as exc:
+            missing = "No such" in str(exc)
+            busy = "already running" in str(exc) or "still running" in str(exc) or "did not finish" in str(exc)
+            code = 404 if missing else 409 if busy else 400
+            self._send(code, {"detail": str(exc), "signedOut": False, "stopped_before_submit": True})
+            return
+        self._send(200, body)
+
     def _send(self, status: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -1626,7 +1998,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _session_id(path: str) -> str | None:
     prefix = "/v1/sessions/"
-    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel", "/resume", "/continue")):
+    if not path.startswith(prefix) or path.endswith(
+        ("/detach", "/answer", "/cancel", "/resume", "/continue", "/credentials", "/sign-out")
+    ):
         return None
     session_id = path[len(prefix) :]
     if not session_id or "/" in session_id:
