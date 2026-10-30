@@ -1519,7 +1519,11 @@ def test_resume_failure_reason_is_public_and_retry_continues(monkeypatch):
         sid = created["sessionId"]
         assert _wait(lambda: _request(port, "GET", f"/v1/sessions/{sid}")[1]["status"] == Status.RESUME_UPLOAD_REQUIRED)
         _code, status = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert status["resume"] == {"state": "failed", "reason": "ats_rejected", "siteErrors": ["File type not supported"]}
+        assert status["resume"] == {
+            "state": "failed",
+            "reason": "ats_rejected",
+            "siteErrors": ["File type not supported"],
+        }
         assert "Avery_Alpha_Resume" not in json.dumps(status)
         code, bad = _request(port, "POST", f"/v1/sessions/{sid}/resume", {"action": "upload_anything"})
         assert code == 422 and bad["reason"] == "action_required"
