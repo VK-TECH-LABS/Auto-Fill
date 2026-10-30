@@ -21,7 +21,11 @@ and returns ``verified``. Callers persist ``confirmedByEmployee`` only when
 Idle detach drops the CDP client. It does not close the browser object and
 it does not kill Chrome, including a browser this process did not launch.
 While a question is pending, idle detach waits so the answer lands on the
-open tab.
+open tab. The current job keeps its resume bytes across that detach when the
+application can still continue. Cancel, replace, and a binding mismatch drop
+them.
+``POST /v1/sessions/{id}/continue`` reattaches after a crash or a retryable
+failure and fills the page already showing. It does not reload the Apply URL.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from urllib.parse import urlparse
 
 from autofill.answer_popup import new_nonce
 from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item
-from autofill.engine import ApplicationResult, Status
+from autofill.engine import ApplicationResult, Status, is_browser_crash
 from autofill.local_attach import (
     ENV_FLAG,
     LOOPBACK,
@@ -59,6 +63,7 @@ from autofill.local_attach import (
     feature_enabled,
     is_default_user_data_dir,
     require_feature,
+    same_document,
     validate_application_url,
 )
 from autofill.mapping import option_stance
@@ -84,6 +89,15 @@ CANCELLED = "CANCELLED"
 _STAGED_RESUME_TTL_SECONDS = 120
 _MAX_STAGED_RESUMES = 2
 _RESUME_REF = re.compile(r"^[a-f0-9]{32}$")
+# Recoveries of one job. The next continue after this stops without typing.
+_CONTINUE_CAP = 2
+_DETACH_KEEP_STATUSES = frozenset(
+    {
+        Status.FAILED_RETRYABLE,
+        Status.MANUAL_ANSWER_REQUIRED,
+        Status.RESUME_UPLOAD_REQUIRED,
+    }
+)
 
 
 class StagedResume:
@@ -184,6 +198,39 @@ def _expires_epoch(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+def _same_live_job(job: LocalJob | None, url: str, binding: dict[str, str] | None) -> bool:
+    return bool(
+        job is not None
+        and binding is not None
+        and not job.superseded
+        and job.application_url == url
+        and same_binding(job.binding, binding)
+    )
+
+
+def _binding_matches(job: LocalJob, claimed: Any) -> bool:
+    """True when the caller sent no binding, or the session and candidate match."""
+    if claimed is None or not job.binding:
+        return True
+    if not isinstance(claimed, dict):
+        return False
+    return all(
+        str(claimed.get(key) or "").strip() == job.binding.get(key, "")
+        for key in ("tilearcSessionId", "candidateId")
+    )
+
+
+def _can_continue(job: LocalJob) -> bool:
+    """True after a crashed fill or a retryable employer failure. A reported submit is not."""
+    if job.superseded or job.submit_claimed():
+        return False
+    if job.state == "error":
+        return True
+    if job.state != "done" or job.result is None:
+        return False
+    return str(job.result.get("status") or "") == Status.FAILED_RETRYABLE
+
+
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
     if not left or not right:
         return False
@@ -243,6 +290,30 @@ def default_profile_dir() -> Path:
     return Path.home() / ".local" / "share" / "auto-fill" / "apply-profile"
 
 
+class LocalProgress:
+    """Where this job last looked. Selectors stay in memory and off the status."""
+
+    def __init__(
+        self,
+        binding: dict[str, str],
+        target_id: str,
+        url: str,
+        step: str,
+        selectors: frozenset[str],
+        nav_block: tuple | None = None,
+    ) -> None:
+        self.binding = dict(binding)
+        self.target_id = target_id
+        self.url = url
+        self.step = step
+        self.selectors = selectors
+        self.nav_block = nav_block
+
+    def view(self) -> dict[str, str]:
+        """Target, URL, and step. No selectors and no candidate values."""
+        return {"targetId": self.target_id, "url": self.url, "step": self.step}
+
+
 class LocalJob:
     """One fill request.
 
@@ -286,6 +357,8 @@ class LocalJob:
         self.question: dict[str, Any] | None = None
         # Employer-tab Save & Continue popup: nonce, questionId, state, values, answeredAt.
         self.popup: dict[str, Any] | None = None
+        self.progress: LocalProgress | None = None
+        self.continue_attempts = 0
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -322,6 +395,28 @@ class LocalJob:
             return "dropped"
         return "failed" if self.resume.failure else "held"
 
+    def note_progress(self, *, target_id: str, url: str, step: str, selectors: frozenset[str]) -> None:
+        """Record the page we are about to fill. The binding is copied with it."""
+        block = self.progress.nav_block if self.progress is not None else None
+        kept_target = target_id or (self.progress.target_id if self.progress is not None else "")
+        self.progress = LocalProgress(
+            binding=dict(self.binding or {}),
+            target_id=kept_target,
+            url=url,
+            step=step,
+            selectors=selectors,
+            nav_block=block,
+        )
+        if kept_target:
+            self.target_id = kept_target
+
+    def note_nav_block(self, block: tuple) -> None:
+        """The Next that already moved this page. A later continue will not press it again."""
+        if self.progress is None:
+            self.note_progress(target_id=self.target_id, url=self.application_url, step="", selectors=frozenset())
+        if self.progress is not None:
+            self.progress.nav_block = block
+
     def resume_view(self) -> dict[str, Any]:
         """``{state, reason, siteErrors}``. No file name and no bytes."""
         state = self.resume_state()
@@ -354,6 +449,8 @@ class LocalJob:
             # State and failure reason only. The file name and bytes are not part of the status.
             "resume": self.resume_view(),
         }
+        if self.progress is not None:
+            body["progress"] = self.progress.view()
         if self.binding:
             body["binding"] = {
                 key: self.binding[key]
@@ -436,52 +533,75 @@ class LocalHelper:
         fill starts.
 
         Same binding and URL as the live job: that job is returned (a double
-        click does not start a second fill). Different binding: the previous
-        job is cancelled at its next field or page, marked ``replaced``, and
-        its profile is dropped. An unbound create keeps the old rule and is
-        refused while a live fill runs.
+        click does not start a second fill). The same binding after ``error``
+        or ``FAILED_RETRYABLE`` continues on the open page and does not reload.
+        Different binding: the previous job is cancelled at its next field or
+        page, marked ``replaced``, and its profile is dropped. An unbound
+        create keeps the old rule and is refused while a live fill runs.
         """
         url = validate_application_url(application_url)
         if resume_ref is not None and binding is None:
             raise BindingError("A resume needs a TileArc binding.")
+        recover = False
         with self._lock:
             current = self._jobs.get(self._current) if self._current else None
-            if (
-                binding is not None
-                and current is not None
-                and not current.superseded
-                and current.application_url == url
-                and same_binding(current.binding, binding)
-                and current.state not in {"error"}
-            ):
+            same = _same_live_job(current, url, binding)
+            if same and current is not None and current.state in {"queued", "running"}:
+                if resume_ref is not None:
+                    self._staged.pop(resume_ref, None)
+                return current
+            if same and current is not None and _can_continue(current):
+                active = self._jobs.get(self._active) if self._active else None
+                if active is not None and not active.superseded and active.session_id != current.session_id:
+                    raise LocalAttachError("A fill is already running on this dedicated profile.")
+                if current.continue_attempts >= _CONTINUE_CAP:
+                    raise AnswerRejected(409, _failure(current, "continue_limit"))
+                if resume_ref is not None:
+                    claimed = self._claim_resume(resume_ref, binding)
+                    if current.resume is not None:
+                        current.resume.drop()
+                    current.resume = claimed
+                current.profile = profile
+                current.continue_attempts += 1
+                current.error = ""
+                current.state = "queued"
+                self._generation += 1
+                self._active = current.session_id
+                job = current
+                recover = True
+            elif same and current is not None:
                 if resume_ref is not None:
                     # A double click restaged the same file. The live job keeps its copy.
                     self._staged.pop(resume_ref, None)
                 return current
-            resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
-            active = self._jobs.get(self._active) if self._active else None
-            if active is not None and not active.superseded and binding is None:
-                raise LocalAttachError("A fill is already running on this dedicated profile.")
-            for old in {job.session_id: job for job in (current, active) if job is not None}.values():
-                if not old.superseded:
-                    old.end("replaced")
-                    logger.info("session=%s superseded reason=replaced", old.session_id)
-            self._generation += 1
-            job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
-            self._jobs[job.session_id] = job
-            self._current = job.session_id
-            self._active = job.session_id
-            self._prune()
-        logger.info(
-            "session=%s created bound=%s resume=%s",
-            job.session_id,
-            "1" if binding else "0",
-            job.resume_state(),
-        )
+            else:
+                resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
+                active = self._jobs.get(self._active) if self._active else None
+                if active is not None and not active.superseded and binding is None:
+                    raise LocalAttachError("A fill is already running on this dedicated profile.")
+                for old in {job.session_id: job for job in (current, active) if job is not None}.values():
+                    if not old.superseded:
+                        old.end("replaced")
+                        logger.info("session=%s superseded reason=replaced", old.session_id)
+                self._generation += 1
+                job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
+                self._jobs[job.session_id] = job
+                self._current = job.session_id
+                self._active = job.session_id
+                self._prune()
+        if recover:
+            logger.info("session=%s continue attempt=%s", job.session_id, job.continue_attempts)
+        else:
+            logger.info(
+                "session=%s created bound=%s resume=%s",
+                job.session_id,
+                "1" if binding else "0",
+                job.resume_state(),
+            )
         timer = self._timer
         if timer is not None:
             timer.cancel()
-        self._queue.put(("fill", {"job": job, "profile": profile}))
+        self._queue.put(("fill", {"job": job, "profile": profile, "recover": recover}))
         return job
 
     def stage_resume(self, data: bytes, filename: str, tilearc_session_id: str, candidate_id: str) -> StagedResume:
@@ -580,13 +700,9 @@ class LocalHelper:
                 if self._current == session_id:
                     self._current = None
                 raise AnswerRejected(410, _failure(job, "expired"))
-            claimed = payload.get("binding")
-            if claimed is not None and job.binding:
-                if not isinstance(claimed, dict) or any(
-                    str(claimed.get(key) or "").strip() != job.binding.get(key, "")
-                    for key in ("tilearcSessionId", "candidateId")
-                ):
-                    raise AnswerRejected(409, _failure(job, "binding_mismatch"))
+            if not _binding_matches(job, payload.get("binding")):
+                job.drop_resume()
+                raise AnswerRejected(409, _failure(job, "binding_mismatch"))
             if self._active is not None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
             if job.state in {"queued", "running"}:
@@ -628,13 +744,9 @@ class LocalHelper:
                 if self._current == session_id:
                     self._current = None
                 raise AnswerRejected(410, _failure(job, "expired"))
-            claimed = payload.get("binding")
-            if claimed is not None and job.binding:
-                if not isinstance(claimed, dict) or any(
-                    str(claimed.get(key) or "").strip() != job.binding.get(key, "")
-                    for key in ("tilearcSessionId", "candidateId")
-                ):
-                    raise AnswerRejected(409, _failure(job, "binding_mismatch"))
+            if not _binding_matches(job, payload.get("binding")):
+                job.drop_resume()
+                raise AnswerRejected(409, _failure(job, "binding_mismatch"))
             if self._active is not None:
                 raise LocalAttachError("A fill is already running on this dedicated profile.")
             if job.state in {"queued", "running"}:
@@ -715,6 +827,57 @@ class LocalHelper:
             body["reason"] = str(report.get("reason") or "not_confirmed")
         return body
 
+    def request_continue(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reattach and fill the page already showing. Does not reload the Apply URL."""
+        job = self.get(session_id)
+        if job is None:
+            raise LocalAttachError("No such session.")
+        with self._lock:
+            if job.superseded or (self._current is not None and self._current != session_id):
+                raise AnswerRejected(410, _failure(job, "replaced"))
+            if _binding_expired(job.binding):
+                job.end("cancelled")
+                if self._current == session_id:
+                    self._current = None
+                raise AnswerRejected(410, _failure(job, "expired"))
+            if not _binding_matches(job, payload.get("binding")):
+                job.drop_resume()
+                raise AnswerRejected(409, _failure(job, "binding_mismatch"))
+            if not _can_continue(job):
+                raise AnswerRejected(409, _failure(job, "not_continuable"))
+            if job.continue_attempts >= _CONTINUE_CAP:
+                raise AnswerRejected(409, _failure(job, "continue_limit"))
+            if job.profile is None:
+                raise AnswerRejected(409, _failure(job, "not_continuable"))
+            if self._active is not None:
+                raise LocalAttachError("A fill is already running on this dedicated profile.")
+            if job.state in {"queued", "running"}:
+                raise LocalAttachError("The fill is still running.")
+            job.continue_attempts += 1
+            job.error = ""
+            job.state = "queued"
+            self._generation += 1
+            self._active = job.session_id
+        timer = self._timer
+        if timer is not None:
+            timer.cancel()
+        box: dict[str, Any] = {}
+        done = threading.Event()
+        logger.info("session=%s continue attempt=%s", job.session_id, job.continue_attempts)
+        self._queue.put(("fill", {"job": job, "profile": job.profile, "recover": True, "done": done, "box": box}))
+        if not done.wait(timeout=_ANSWER_WAIT_SECONDS):
+            with self._lock:
+                if self._active == job.session_id:
+                    self._active = None
+            raise LocalAttachError("The continue did not finish.")
+        error = box.get("error")
+        if isinstance(error, Exception):
+            raise error
+        body = box.get("body")
+        if not isinstance(body, dict):
+            raise LocalAttachError("The continue did not finish.")
+        return body
+
     def request_detach(self, session_id: str) -> LocalJob:
         job = self.get(session_id)
         if job is None:
@@ -755,7 +918,7 @@ class LocalHelper:
                 return
             kind, payload = item
             if kind == "fill":
-                self._run_fill(payload["job"], payload["profile"])
+                self._run_fill(payload)
             elif kind == "answer":
                 self._run_answer(payload)
             elif kind == "resume":
@@ -778,22 +941,116 @@ class LocalHelper:
                 finally:
                     payload["done"].set()
 
-    def _run_fill(self, job: LocalJob, profile: CandidateProfile) -> None:
+    def _progress_allows(self, job: LocalJob) -> bool:
+        """Reattach, then refuse when the live tab is not the recorded page."""
+        progress = job.progress
+        if progress is None:
+            return True
+        ensure = getattr(self._session, "ensure", None)
+        if ensure is not None:
+            ensure(job.application_url)
+        live = getattr(self._session, "live_identity", None)
+        if live is None:
+            return True
+        target, url = live()
+        if progress.target_id and target != progress.target_id:
+            return False
+        if progress.url and (not url or not same_document(progress.url, url)):
+            return False
+        if progress.binding and job.binding and not same_binding(progress.binding, job.binding):
+            return False
+        return True
+
+    def _capture_progress(self, job: LocalJob, page: Any) -> None:
+        """Store binding, target, URL, and PageMark for the page about to be filled."""
+        url = ""
+        step = ""
+        selectors: frozenset[str] = frozenset()
+        try:
+            url = str(getattr(page, "url", "") or "")
+        except Exception as exc:
+            if is_browser_crash(exc):
+                raise
+        try:
+            from autofill.follow import read_page_mark
+
+            mark, _snapshot = read_page_mark(page)
+            url = mark.url or url
+            step = mark.step
+            selectors = mark.selectors
+        except Exception as exc:
+            if is_browser_crash(exc):
+                raise
+            step = str(getattr(page, "step", "") or "")
+            raw = getattr(page, "selectors", ()) or ()
+            try:
+                selectors = frozenset(str(item) for item in raw)
+            except TypeError:
+                selectors = frozenset()
+        target = ""
+        tab = getattr(self._session, "tab", None)
+        if tab is not None:
+            target = str(getattr(tab, "target_id", "") or "")
+        if not target:
+            target = str(getattr(page, "target_id", "") or "")
+        job.note_progress(target_id=target, url=url, step=step, selectors=selectors)
+
+    def _capture_open_page(self, job: LocalJob) -> None:
+        tab = getattr(self._session, "tab", None)
+        page = getattr(tab, "page", None) if tab is not None else None
+        if page is None:
+            return
+        try:
+            self._capture_progress(job, page)
+        except Exception:
+            return
+
+    def _run_fill(self, payload: dict[str, Any]) -> None:
+        job: LocalJob = payload["job"]
+        profile: CandidateProfile = payload["profile"]
+        recover = bool(payload.get("recover"))
+        box: dict[str, Any] | None = payload.get("box")
         if job.superseded:
             job.state = "replaced"
+            if box is not None:
+                box["error"] = AnswerRejected(410, _failure(job, "replaced"))
             self._finish_active(job)
+            done = payload.get("done")
+            if done is not None:
+                done.set()
             return
         job.state = "running"
         try:
+            if recover and not self._progress_allows(job):
+                job.error = "progress_mismatch"
+                job.state = "error"
+                logger.info("session=%s continue_stopped reason=progress_mismatch", job.session_id)
+                if box is not None:
+                    body = job.public()
+                    body["reason"] = "progress_mismatch"
+                    body["verified"] = False
+                    box["body"] = body
+                return
             fill = self._session.fill
             kwargs: dict[str, Any] = {}
             if _accepts_cancel(fill):
                 kwargs["cancel"] = job.gate
             if _accepts(fill, "fresh"):
-                # An earlier job wrote into this window. Start from a clean page.
-                kwargs["fresh"] = self._window_used
+                # A different candidate reloads. A continue keeps the open page.
+                kwargs["fresh"] = False if recover else self._window_used
             if job.resume is not None and _accepts(fill, "resume"):
                 kwargs["resume"] = job.resume
+            identity = _fill_identity(job)
+            for key, value in identity.items():
+                if _accepts(fill, key):
+                    kwargs[key] = value
+            if _accepts(fill, "on_observed"):
+                kwargs["on_observed"] = lambda page: self._capture_progress(job, page)
+            if _accepts(fill, "on_nav_block"):
+                kwargs["on_nav_block"] = job.note_nav_block
+            block = job.progress.nav_block if recover and job.progress is not None else None
+            if block is not None and _accepts(fill, "nav_block"):
+                kwargs["nav_block"] = block
             self._window_used = True
             result, submitted = fill(job.application_url, profile, **kwargs)
             job.submitted = submitted
@@ -802,20 +1059,39 @@ class LocalHelper:
             else:
                 self._remember_result(job, result)
                 job.state = "done"
+                self._capture_open_page(job)
                 self._present_popup(job)
-            job.target_id = self._session.tab.target_id if self._session.tab is not None else ""
+            job.target_id = self._session.tab.target_id if self._session.tab is not None else job.target_id
+            if box is not None:
+                body = job.public()
+                body["verified"] = not job.submit_claimed()
+                box["body"] = body
         except FillCancelled:
             job.state = "replaced"
             logger.info("session=%s fill_stopped reason=%s", job.session_id, job.ended or "cancelled")
+            if box is not None:
+                box["error"] = AnswerRejected(410, _failure(job, "replaced"))
         except Exception as exc:
             reported_submit = isinstance(exc, LocalAttachError) and "reported a submit" in str(exc)
             if reported_submit:
                 job.submitted = True
+            crashed = is_browser_crash(exc)
             job.error = type(exc).__name__
             job.state = "error"
-            logger.info("session=%s fill_failed error=%s detail=%s", job.session_id, type(exc).__name__, exc)
+            logger.info(
+                "session=%s fill_failed error=%s crash=%s detail=%s",
+                job.session_id,
+                type(exc).__name__,
+                "1" if crashed else "0",
+                exc,
+            )
+            if box is not None:
+                box["error"] = exc
         finally:
             self._finish_active(job)
+            done = payload.get("done")
+            if done is not None:
+                done.set()
 
     def _run_answer(self, payload: dict[str, Any]) -> None:
         job: LocalJob = payload["job"]
@@ -1115,9 +1391,30 @@ class LocalHelper:
             if job.state in {"queued", "running"}:
                 continue
             job.detached = True
-            job.drop_resume()
+            if not self._resume_survives_detach(job):
+                job.drop_resume()
             job.browser_running = running
             job.owns_browser = self._session.owns_chrome
+
+    def _resume_survives_detach(self, job: LocalJob) -> bool:
+        """Keep bytes for the current job when a later continue or retry still needs them."""
+        if job.session_id != self._current:
+            return False
+        if job.superseded or job.submit_claimed():
+            return False
+        if job.state == "error":
+            return True
+        return _public_status(job) in _DETACH_KEEP_STATUSES
+
+
+def _fill_identity(job: LocalJob) -> dict[str, str]:
+    """Binding ids for the engine. The helper session id is only a fallback."""
+    binding = job.binding or {}
+    return {
+        "session_id": binding.get("tilearcSessionId") or job.session_id,
+        "candidate_id": binding.get("candidateId") or "",
+        "job_id": binding.get("jobId") or "",
+    }
 
 
 class _HelperServer(ThreadingHTTPServer):
@@ -1168,6 +1465,10 @@ class _Handler(BaseHTTPRequestHandler):
         if session_id is not None:
             self._resume(session_id)
             return
+        session_id = _action_id(path, "continue")
+        if session_id is not None:
+            self._continue(session_id)
+            return
         session_id = _action_id(path, "cancel")
         if session_id is not None:
             try:
@@ -1203,6 +1504,9 @@ class _Handler(BaseHTTPRequestHandler):
                 job = self.server.helper.submit(url, profile, binding)
             else:
                 job = self.server.helper.submit(url, profile, binding, resume_ref)
+        except AnswerRejected as exc:
+            self._send(exc.status, exc.body)
+            return
         except LocalAttachError as exc:
             busy = "already running" in str(exc)
             self._send(409 if busy else 400, {"detail": str(exc), "stopped_before_submit": True})
@@ -1281,6 +1585,32 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body)
 
+    def _continue(self, session_id: str) -> None:
+        """``POST /v1/sessions/{id}/continue``. Reattach. Do not reload."""
+        try:
+            payload = _read_json(self)
+            body = self.server.helper.request_continue(session_id, payload)
+        except AnswerRejected as exc:
+            self._send(exc.status, exc.body)
+            return
+        except LocalAttachError as exc:
+            missing = "No such" in str(exc)
+            busy = "already running" in str(exc) or "still running" in str(exc) or "did not finish" in str(exc)
+            code = 404 if missing else 409 if busy else 400
+            self._send(code, {"detail": str(exc), "verified": False, "stopped_before_submit": True})
+            return
+        except Exception as exc:
+            self._send(
+                409,
+                {
+                    "detail": type(exc).__name__,
+                    "verified": False,
+                    "stopped_before_submit": True,
+                },
+            )
+            return
+        self._send(200, body)
+
     def _send(self, status: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -1296,7 +1626,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _session_id(path: str) -> str | None:
     prefix = "/v1/sessions/"
-    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel", "/resume")):
+    if not path.startswith(prefix) or path.endswith(("/detach", "/answer", "/cancel", "/resume", "/continue")):
         return None
     session_id = path[len(prefix) :]
     if not session_id or "/" in session_id:

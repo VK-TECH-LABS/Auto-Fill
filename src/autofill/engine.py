@@ -158,6 +158,11 @@ class AutofillOptions:
     on_paint: Any = None
     on_page: Any = None
     on_navigation: Any = None
+    on_observed: Any = None
+    on_nav_block: Any = None
+    # (selector, name, signature) of a Next that already ran on this page.
+    # The same control is not pressed again while that signature is current.
+    nav_block: tuple | None = None
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
@@ -1042,7 +1047,7 @@ def autofill_application(
         submit_controls: list[str] = []
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
-        nav_block: tuple | None = None
+        nav_block = _initial_nav_block(opts)
         for index in range(opts.max_pages):
             _cancel_point(opts)
             _maybe_reattach(page, opts)
@@ -1110,6 +1115,7 @@ def autofill_application(
             )
             if stopped is not None:
                 return stopped
+            _note_observed(page, opts)
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
             if visible in seen:
                 break
@@ -1292,6 +1298,7 @@ def autofill_application(
                     submit_controls=submit_controls,
                 )
             nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
+            _publish_nav_block(opts, nav_block)
 
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
@@ -1581,6 +1588,42 @@ def _adopt_page(opts: AutofillOptions, new_page):
         except Exception:
             pass
     return new_page
+
+
+def _initial_nav_block(opts: AutofillOptions) -> tuple | None:
+    """A Next this recovery already pressed. Anything else is ignored."""
+    block = opts.nav_block
+    if isinstance(block, tuple) and len(block) == 3:
+        return block
+    return None
+
+
+def _note_observed(page, opts: AutofillOptions) -> None:
+    """Tell the local helper which page is about to be filled.
+
+    A browser crash propagates so the helper can reconnect once. Any other
+    hook failure is ignored and the fill continues.
+    """
+    hook = opts.on_observed
+    if hook is None:
+        return
+    try:
+        hook(page)
+    except Exception as exc:
+        if is_browser_crash(exc):
+            raise
+        return
+
+
+def _publish_nav_block(opts: AutofillOptions, block: tuple) -> None:
+    """Remember the Next that just moved the page. The hook must not type."""
+    hook = opts.on_nav_block
+    if hook is None:
+        return
+    try:
+        hook(block)
+    except Exception:
+        return
 
 
 def _log_move(session_id: str, action: str, result: str) -> None:

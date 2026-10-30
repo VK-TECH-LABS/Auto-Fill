@@ -134,3 +134,90 @@ def test_apply_inside_an_iframe(browser, fixture_origin):
         assert result.stopped_before_submit is True
     finally:
         page.close()
+
+
+def test_recorded_next_is_not_pressed_again(browser, fixture_origin):
+    """A Next already recorded for this page is not clicked on the continue."""
+    from autofill.extract import extract_page
+    from autofill.pagewait import navigation_signature
+
+    page = browser.new_page()
+    url = f"{fixture_origin}/multistep_pages.html"
+    try:
+        page.goto(url)
+        snapshot = extract_page(page)
+        button = next(item for item in snapshot.buttons if (item.name or "").strip() == "Next")
+        block = (button.selector, button.name, navigation_signature(page, snapshot))
+        result = autofill_application(
+            url,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                nav_block=block,
+                session_id="sess-harness",
+                candidate_id="ref-a",
+                timings={},
+            ),
+        )
+        clicked = page.evaluate("() => window.__clicked")
+        assert clicked == []
+        assert "Submit application" not in clicked
+        assert "Send" not in clicked
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_dropped_second_page_continues_without_clicking_next_again(browser, fixture_origin):
+    """A crash on page 2 resumes there. Next, which already ran, is not clicked again."""
+    page = browser.new_page()
+    url = f"{fixture_origin}/multistep_pages.html"
+    seen = {"n": 0}
+    blocks: list[tuple] = []
+
+    def observe(_page) -> None:
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise RuntimeError("Target closed")
+
+    def remember(block: tuple) -> None:
+        blocks.append(block)
+
+    try:
+        page.goto(url)
+        with pytest.raises(RuntimeError, match="Target closed"):
+            autofill_application(
+                url,
+                _profile(),
+                None,
+                AutofillOptions(
+                    page=page,
+                    on_observed=observe,
+                    on_nav_block=remember,
+                    session_id="sess-harness",
+                    candidate_id="ref-a",
+                    timings={},
+                ),
+            )
+        assert page.evaluate("() => window.__clicked") == ["Next"]
+        assert blocks
+        result = autofill_application(
+            url,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                nav_block=blocks[-1],
+                session_id="sess-harness",
+                candidate_id="ref-a",
+                timings={},
+            ),
+        )
+        clicked = page.evaluate("() => window.__clicked")
+        assert clicked.count("Next") == 1
+        assert "Submit application" not in clicked
+        assert "Send" not in clicked
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()

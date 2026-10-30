@@ -19,11 +19,14 @@ import pytest
 from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import (
     ENV_FLAG,
+    DedicatedApplySession,
     DefaultProfileBlocked,
     FeatureDisabled,
     LocalAttachError,
     LoopbackRequired,
+    VisibleTab,
     _probe_note,
+    adopt_employer_tab,
     assert_loopback_listen,
     attempt_alternate_submits,
     dedicated_launch_args,
@@ -388,7 +391,7 @@ def _drive_session(monkeypatch, tmp_path, *, listeners: list[str]) -> tuple[list
         )
 
     def fake_fill(
-        page_obj: object, application_url: str, profile: CandidateProfile, *, cancel: object = None
+        page_obj: object, application_url: str, profile: CandidateProfile, *, cancel: object = None, **_kwargs: object
     ) -> ApplicationResult:
         events.append("fill")
         assert page_obj is page
@@ -874,6 +877,185 @@ def test_dedicated_profile_fills_the_same_tab(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
 @pytest.mark.skipif(not _chrome_ready(), reason="Google Chrome is not installed")
+def test_dead_page_reconnects_on_the_same_port_without_goto(monkeypatch, tmp_path):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    port = 9333
+    launches: list[dict] = []
+    gotos: list[str] = []
+
+    class _Page:
+        def __init__(self, url: str, *, dead: bool) -> None:
+            self.url = url
+            self.dead = dead
+
+        def evaluate(self, _script: str) -> int:
+            if self.dead:
+                raise RuntimeError("Target page, context or browser has been closed")
+            return 1
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            gotos.append(url)
+            self.url = url
+
+    class _Context:
+        def __init__(self, page: _Page) -> None:
+            self.pages = [page]
+
+    class _Driver:
+        def start(self) -> _Driver:
+            return self
+
+        def stop(self) -> None:
+            return None
+
+    live = _Page("https://boards.greenhouse.io/acme/jobs/1/step-2", dead=False)
+
+    def fake_attach(_playwright: object, endpoint: str, *, url_prefix: str = "") -> VisibleTab:
+        return VisibleTab(
+            browser=object(),
+            context=_Context(live),
+            page=live,
+            endpoint=endpoint,
+            target_id="target-1",
+            page_url=live.url,
+            context_count=1,
+            page_urls=[live.url],
+        )
+
+    monkeypatch.setattr(
+        "autofill.local_attach.launch_dedicated_chrome",
+        lambda **kwargs: launches.append(kwargs),
+    )
+    monkeypatch.setattr("autofill.local_attach.fetch_version", lambda _port, timeout=1.0: {"Browser": "Chrome"})
+    monkeypatch.setattr("autofill.local_attach.listening_hosts", lambda _port: ["127.0.0.1"])
+    monkeypatch.setattr("autofill.local_attach._target_id", lambda _context, _page: "target-1")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+    monkeypatch.setattr("autofill.local_attach.attach_visible_tab", fake_attach)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _Driver())
+
+    apply = "https://boards.greenhouse.io/acme/jobs/1"
+    dead = _Page(live.url, dead=True)
+    session = DedicatedApplySession(user_data_dir=tmp_path, debug_port=port, headless=True)
+    session.tab = VisibleTab(
+        browser=object(),
+        context=_Context(dead),
+        page=dead,
+        endpoint=f"http://127.0.0.1:{port}",
+        target_id="target-1",
+        page_url=dead.url,
+        context_count=1,
+        page_urls=[dead.url],
+    )
+    session._playwright = _Driver()
+    session.owns_chrome = True
+    tab = session.ensure(apply)
+    assert launches == []
+    assert gotos == []
+    assert tab.page is live
+    assert session.debug_port == port
+    assert session._cdp_reconnects == 1
+    session.tab.page = _Page(live.url, dead=True)
+    with pytest.raises(LocalAttachError, match="reconnect limit"):
+        session.ensure(apply)
+    assert launches == []
+    assert gotos == []
+
+
+def test_startup_pins_the_devtools_port_and_does_not_launch_a_second_chrome(monkeypatch, tmp_path):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    (tmp_path / "DevToolsActivePort").write_text("9444\n/devtools/browser/abc\n", encoding="utf-8")
+    launches: list[object] = []
+    page_url = "https://boards.greenhouse.io/acme/jobs/1/step-2"
+
+    class _Page:
+        url = page_url
+
+        def evaluate(self, _script: str) -> int:
+            return 1
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            raise AssertionError(f"goto {url}")
+
+    class _Context:
+        pages = [_Page()]
+
+    class _Driver:
+        def start(self) -> _Driver:
+            return self
+
+        def stop(self) -> None:
+            return None
+
+    def fake_attach(_playwright: object, endpoint: str, *, url_prefix: str = "") -> VisibleTab:
+        page = _Context.pages[0]
+        return VisibleTab(
+            browser=object(),
+            context=_Context(),
+            page=page,
+            endpoint=endpoint,
+            target_id="target-9",
+            page_url=page.url,
+            context_count=1,
+            page_urls=[page.url],
+        )
+
+    def fake_fetch(port: int, timeout: float = 1.0) -> dict | None:
+        return {"Browser": "Chrome"} if port == 9444 else None
+
+    monkeypatch.setattr("autofill.local_attach.fetch_version", fake_fetch)
+    monkeypatch.setattr("autofill.local_attach.launch_dedicated_chrome", lambda **_kwargs: launches.append(True))
+    monkeypatch.setattr("autofill.local_attach.listening_hosts", lambda _port: ["127.0.0.1"])
+    monkeypatch.setattr("autofill.local_attach._target_id", lambda _context, _page: "target-9")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+    monkeypatch.setattr("autofill.local_attach.attach_visible_tab", fake_attach)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _Driver())
+
+    session = DedicatedApplySession(user_data_dir=tmp_path, headless=True)
+    assert session.debug_port == 9444
+    tab = session.ensure("https://boards.greenhouse.io/acme/jobs/1")
+    assert launches == []
+    assert tab.page_url.endswith("/step-2")
+    assert session.owns_chrome is False
+
+
+def test_stale_devtools_file_does_not_pin_a_dead_port(monkeypatch, tmp_path):
+    monkeypatch.setenv(ENV_FLAG, "1")
+    (tmp_path / "DevToolsActivePort").write_text("9444\n/devtools/browser/abc\n", encoding="utf-8")
+    monkeypatch.setattr("autofill.local_attach.fetch_version", lambda _port, timeout=1.0: None)
+    session = DedicatedApplySession(user_data_dir=tmp_path, headless=True)
+    assert session.debug_port != 9444
+
+
+def test_adopt_keeps_a_later_path_and_gotos_for_a_posting_or_other_host(monkeypatch):
+    gotos: list[str] = []
+
+    class _Page:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            gotos.append(url)
+            self.url = url
+
+    apply = "https://boards.greenhouse.io/acme/jobs/1"
+    later = _Page(apply + "/step-2")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+    assert adopt_employer_tab(type("Ctx", (), {"pages": [later]})(), apply) is later
+    assert gotos == []
+
+    posting = _Page("https://boards.greenhouse.io/acme/jobs/9")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: True)
+    adopted = adopt_employer_tab(type("Ctx", (), {"pages": [posting]})(), apply)
+    assert adopted is posting
+    assert gotos == [apply]
+
+    other = _Page("https://jobs.lever.co/acme/1")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+    gotos.clear()
+    adopt_employer_tab(type("Ctx", (), {"pages": [other]})(), apply)
+    assert gotos == [apply]
+
+
 def test_branded_chrome_ignores_load_extension(monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
     result = probe_branded_load_extension(EXTENSION, timeout=3)
