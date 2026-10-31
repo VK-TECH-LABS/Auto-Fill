@@ -17,11 +17,10 @@ from autofill.dom_ui import focus_field, note_listbox_choice, type_char_delay
 from autofill.intents import match_option_exact
 from autofill.models import Option
 from autofill.safeguards import (
-    HUMAN_SUBMIT_ONLY,
-    ActionClass,
     HumanSubmissionRequired,
-    action_class,
+    clear_listbox_value,
     click_choice,
+    click_element,
     dismiss_combobox,
     open_combobox,
 )
@@ -683,41 +682,10 @@ _LISTBOX_OPTIONS_JS = r"""() => {
 }"""
 
 
-# A real pointer click opens the menu under the cursor. On a lower Workday
-# prompt the menu covers the button and that same click lands on Yes, the
-# first row. Dispatching the click on the element does not move the pointer.
-_SCRIPT_CLICK_JS = r"""(selector) => {
-  let el = null;
-  try { el = document.querySelector(selector); } catch (error) { return false; }
-  if (!el) return false;
-  try { el.scrollIntoView({block: "center", inline: "nearest"}); } catch (error) {}
-  // One click on the element. A real pointer click can release on the first
-  // option when the menu opens under the cursor. A second mouse event can
-  // also toggle the menu shut.
-  el.click();
-  return true;
-}"""
-
-
 _BUTTON_TEXT_JS = r"""(selector) => {
   const el = document.querySelector(selector);
   if (!el) return "";
   return String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-}"""
-
-
-_CLEAR_LISTBOX_JS = r"""(selector) => {
-  const el = document.querySelector(selector);
-  if (!el) return false;
-  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
-  if (!field || !field.querySelector) return false;
-  const charm = field.querySelector(
-    "[data-automation-id='DELETE_charm'], [data-automation-id='clearButton'], " +
-    "[aria-label='Remove'], [aria-label='Clear']"
-  );
-  if (!charm) return false;
-  charm.click();
-  return true;
 }"""
 
 
@@ -770,37 +738,18 @@ def _close_listbox(page) -> None:
         return
 
 
-def _script_click(page, selector: str) -> bool:
-    """Click ``selector`` without moving the pointer onto the menu that opens."""
-    evaluate = getattr(page, "evaluate", None)
-    if evaluate is None or not selector:
-        return False
-    try:
-        return bool(evaluate(_SCRIPT_CLICK_JS, selector))
-    except Exception:
-        return False
-
-
 def _open_listbox(page, selector: str) -> bool:
     """Open one choice button. A pointer click is not used.
 
     The menu is not in the page until the button is clicked. A trusted pointer
     click can release on the first option (Yes) when that row covers the button.
     """
-    if not HUMAN_SUBMIT_ONLY:
-        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
-    return _script_click(page, selector)
+    return click_element(page, selector)
 
 
 def _choose_listed(page, selector: str, name: str) -> bool:
     """Choose one menu row. A final Submit label is refused."""
-    if not HUMAN_SUBMIT_ONLY:
-        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
-    if action_class(name) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
-        raise HumanSubmissionRequired(
-            f"Refusing to choose {name!r}. That label is a final Submit or Apply."
-        )
-    if _script_click(page, selector):
+    if click_element(page, selector, name):
         return True
     try:
         click_choice(page, selector, name)
@@ -885,11 +834,10 @@ def _wait_for_answer(page, selector: str, intended: str) -> str:
 
 def _revert_listbox(page, selector: str) -> None:
     """Clear a committed choice that is not the approved answer."""
-    evaluate = getattr(page, "evaluate", None)
-    if evaluate is None:
-        return
     try:
-        evaluate(_CLEAR_LISTBOX_JS, selector)
+        clear_listbox_value(page, selector)
+    except HumanSubmissionRequired:
+        raise
     except Exception:
         return
 
