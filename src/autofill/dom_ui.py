@@ -616,7 +616,8 @@ _COMMITTED_JS = r"""(selector) => {
   function placeholder(text) {
     const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (!folded) return true;
-    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+    if (/^(?:select one|choose one|please select one)\.{0,3}$/.test(folded)) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|start typing\.{0,3}|[-–—]+)$/.test(folded);
   }
   function rootOf(node) {
     const root = node && typeof node.getRootNode === "function" ? node.getRootNode() : document;

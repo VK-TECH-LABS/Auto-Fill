@@ -2012,6 +2012,10 @@ def _apply_ask(
         return
     if ask.controls and ask.controls[0].kind == "buttons" and control_committed(page, ask.controls[0].selector):
         return
+    if ask.controls:
+        from autofill.combobox import attach_listbox_options
+
+        attach_listbox_options(page, ask.controls[0])
     if ask.field_key == "resume.file":
         _apply_resume(page, ask, response, outcome)
         return
@@ -2447,7 +2451,8 @@ _MATCH_VALUE_JS = r"""(hint) => {
   function placeholder(text) {
     const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (!folded) return true;
-    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+    if (/^(?:select one|choose one|please select one)\.{0,3}$/.test(folded)) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|start typing\.{0,3}|[-–—]+)$/.test(folded);
   }
   function read(el) {
     if (!el) return "";
@@ -3348,6 +3353,32 @@ def _apply_question(
                     confidence="high",
                 )
                 outcome.fields.append(apply_mapped(page, item, mapped))
+        return
+    if control.kind == "buttons" and control.role == "listbox":
+        from autofill.combobox import select_listbox_button
+
+        desired = answer.value or (answer.values[0] if answer.values else "")
+        picked = select_listbox_button(page, control.selector, desired)
+        if picked is None:
+            _manual(
+                outcome,
+                match,
+                blocking=True,
+                controls=ask.controls,
+                kind="OPTION_MISMATCH",
+            )
+            return
+        remember_confirmed(control, picked.label, field_key=match.intent or "")
+        outcome.fields.append(
+            FieldOutcome(
+                selector=control.selector,
+                label=control.label,
+                key=match.intent,
+                action="select",
+                detail=picked.label,
+                field_class="APPROVED_QUESTION",
+            )
+        )
         return
     if control.kind == "buttons":
         desired = answer.value or (answer.values[0] if answer.values else "")
@@ -4359,10 +4390,12 @@ _TYPEAHEAD_STATE_JS = r"""
   function clean(text) {
     return String(text || "").replace(/\s+/g, " ").trim();
   }
-  const placeholder = /^(select\.{0,3}|choose\.{0,3}|please select|start typing\.{0,3})$/i;
+  const placeholder = /^(select\.{0,3}|choose\.{0,3}|please select|please choose|start typing\.{0,3})$/i;
+  const selectOne = /^(?:select|choose|please select) one\.{0,3}$/i;
   function usable(text) {
     const value = clean(text);
-    if (!value || placeholder.test(value) || value.charAt(0) === "{" || value.charAt(0) === "[") return "";
+    const empty = !value || placeholder.test(value) || selectOne.test(value);
+    if (empty || value.charAt(0) === "{" || value.charAt(0) === "[") return "";
     return value;
   }
   const scope = (el.closest && el.closest(
@@ -4477,7 +4510,10 @@ def _cluster_committed(page, controls: list[Control]) -> bool:
         return _full_place(_visible_control_text(page, control))
     if control_committed(page, control.selector):
         return True
-    return bool(_visible_control_text(page, control))
+    shown = _visible_control_text(page, control)
+    if _PLACEHOLDER_OPTION.match(" ".join(shown.split())):
+        return False
+    return bool(shown)
 
 
 def _accept_standard_term(page, ask) -> bool:

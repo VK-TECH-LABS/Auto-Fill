@@ -1244,7 +1244,7 @@ EXTRACT_JS = r"""
         placeholder: "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: "",
-        required: ariaRequired,
+        required: controlMarkedRequired(el),
         hidden: false,
         disabled: !!el.disabled,
         readOnly: false,

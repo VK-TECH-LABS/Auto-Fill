@@ -284,6 +284,13 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
     try:
         target = _bound_target(page, getattr(control, "frame_url", "") or "")
         locator = target.locator(control.selector)
+        if mapped.action == "fill" and control.kind == "buttons" and control.role == "listbox":
+            return _outcome(
+                control,
+                mapped,
+                action="unanswered",
+                detail="A choice button is not a text field.",
+            )
         if mapped.action == "fill":
             current = _shown_value(locator)
             if not overwrite and current.strip() and not _value_matches(current, mapped.text or ""):
@@ -355,6 +362,15 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 from autofill.combobox import select_combobox
 
                 chosen = select_combobox(target, control.selector, mapped.option_label or mapped.text)
+                if chosen is None:
+                    return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
+                remember_confirmed(control, chosen.label, field_key=mapped.key or "")
+                refresh_preview(page)
+                return _outcome(control, mapped, detail=chosen.label)
+            if control.kind == "buttons" and control.role == "listbox":
+                from autofill.combobox import select_listbox_button
+
+                chosen = select_listbox_button(target, control.selector, mapped.option_label or mapped.text or "")
                 if chosen is None:
                     return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
                 remember_confirmed(control, chosen.label, field_key=mapped.key or "")
@@ -571,6 +587,9 @@ def fill_one_page(
                 not refill_cleared() or control_committed(page, control.selector)
             ):
                 continue
+            from autofill.combobox import attach_listbox_options
+
+            attach_listbox_options(page, control)
             if accept_recruitment_sms(page, control, profile):
                 fields.append(
                     _outcome(

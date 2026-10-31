@@ -491,3 +491,269 @@ def test_hear_about_options_are_the_source_prompt_not_the_phone_code(browser, so
         assert "phone-prompt" not in page.evaluate("() => window.__opens")
     finally:
         page.close()
+
+
+_SMS_ERROR = (
+    "Error-General Motors will need to contact you throughout the recruitment process, "
+    "this may include SMS/text messaging from GM and/or GM's third party partners "
+    "(message and data rates may apply.) Do you agree to communications via text message/SMS?"
+)
+
+_APP_QUESTIONS = (
+    ("eligible", "Are you currently eligible to work in the United States of America?"),
+    ("sponsor", "Will you require future sponsorship to work in the United States?"),
+    ("spouse", "Are you (or your spouse) a Current Government Employee?"),
+    ("former", "Are you a Current or Former Government Employee?"),
+    ("legal", "Are you aware of any legal restrictions on your ability to accept and perform this job, "
+     "such as an agreement with your current or former employer?"),
+)
+
+
+def _app_question_page(*, sms: bool = False, submit: bool = True) -> str:
+    """Workday Application Questions. Yes/No rows exist only after the button is clicked."""
+    questions = list(_APP_QUESTIONS)
+    if sms:
+        questions.append(
+            (
+                "sms",
+                "General Motors will need to contact you throughout the recruitment process, "
+                "this may include SMS/text messaging from GM and/or GM's third party partners "
+                "(message and data rates may apply.) Do you agree to communications via text message/SMS?",
+            )
+        )
+    fields = []
+    for element_id, question in questions:
+        fields.append(
+            f'<div data-automation-id="formField-{element_id}">'
+            f'<label id="{element_id}-q">{question}<abbr>*</abbr></label>'
+            f'<button id="{element_id}" type="button" aria-haspopup="listbox" '
+            f'aria-labelledby="{element_id}-q" aria-required="true">Select One</button>'
+            f"</div>"
+        )
+    body = "\n".join(fields)
+    return f"""
+    <h1>Application Questions</h1>
+    {body}
+    <button type="button" id="error-link">{_SMS_ERROR}</button>
+    <button type="button" id="save">Save and Continue</button>
+    {"<button type='submit' id='final'>Submit application</button>" if submit else ""}
+    <script>
+      window.__next = 0;
+      window.__submitted = 0;
+      window.__opens = 0;
+      function arm(id) {{
+        const button = document.getElementById(id);
+        button.addEventListener("click", () => {{
+          window.__opens += 1;
+          document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+          const list = document.createElement("ul");
+          list.setAttribute("role", "listbox");
+          list.setAttribute("data-autofill-menu", "1");
+          list.style.cssText = "display:block;min-height:48px";
+          for (const label of ["Select One", "Yes", "No"]) {{
+            const item = document.createElement("li");
+            item.setAttribute("role", "option");
+            item.style.height = "24px";
+            item.textContent = label;
+            item.addEventListener("click", (event) => {{
+              event.stopPropagation();
+              button.textContent = label;
+              list.remove();
+            }});
+            list.appendChild(item);
+          }}
+          document.body.appendChild(list);
+        }});
+      }}
+      for (const id of [{", ".join(repr(item[0]) for item in questions)}]) arm(id);
+      document.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape") {{
+          document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+        }}
+      }});
+      document.getElementById("save").addEventListener("click", () => {{ window.__next += 1; }});
+      const finalButton = document.getElementById("final");
+      if (finalButton) {{
+        finalButton.addEventListener("click", (event) => {{
+          event.preventDefault();
+          window.__submitted += 1;
+        }});
+      }}
+    </script>
+    """
+
+
+def test_closed_listbox_without_options_is_a_select_not_a_typed_value():
+    person = _person(
+        work_authorization={"legally_authorized_to_work": "Yes"},
+        applicationAnswers=[
+            {
+                "question": (
+                    "Will you now or in the future require sponsorship for employment visa status "
+                    "(e.g., H-1B visa status)?"
+                ),
+                "answer": "Yes",
+                "intent": "SPONSORSHIP_FUTURE",
+            }
+        ],
+    )
+    closed = _control(
+        "Will you require future sponsorship to work in the United States?",
+        kind="buttons",
+        role="listbox",
+        input_type="button",
+        selector="#sponsor",
+    )
+    mapped = map_field(closed, person)
+    assert mapped.action == "select"
+    assert mapped.option_label == "Yes"
+    spouse = _control(
+        "Are you (or your spouse) a Current Government Employee?",
+        kind="buttons",
+        role="listbox",
+        input_type="button",
+        selector="#spouse",
+        options=[Option("Yes", "Yes", "#y"), Option("No", "No", "#n")],
+    )
+    guessed = map_field(spouse, person)
+    assert guessed.action == "unanswered"
+    assert (guessed.option_label or guessed.text or "") not in {"Yes", "No"}
+    answered = _person(
+        applicationAnswers=[
+            {
+                "question": "Is your spouse or partner employed by a government agency?",
+                "answer": "No",
+                "key": "spouse_gov",
+            }
+        ]
+    )
+    chosen = map_field(spouse, answered)
+    assert chosen.action == "select"
+    assert chosen.option_label == "No"
+
+
+def test_validation_error_text_is_not_a_submit_control():
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY, classify_control, field_class_for_button
+
+    assert HUMAN_SUBMIT_ONLY is True
+    assert classify_control(_SMS_ERROR) == "other"
+    assert field_class_for_button(_SMS_ERROR) != "FINAL_SUBMIT"
+    assert classify_control("Apply") == "submit"
+    assert classify_control("Apply now") == "submit"
+    assert classify_control("Submit application") == "submit"
+    assert classify_control("Save and Continue") == "continue"
+
+
+def test_workday_app_questions_open_the_menu_and_do_not_guess(browser):
+    """Eligible and sponsorship are chosen. Government and legal stay blank."""
+    from autofill.engine import AutofillOptions, Status, autofill_application
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    person = _person(
+        work_authorization={"legally_authorized_to_work": "Yes"},
+        applicationAnswers=[
+            {
+                "question": (
+                    "Will you now or in the future require sponsorship for employment visa status "
+                    "(e.g., H-1B visa status)?"
+                ),
+                "answer": "Yes",
+                "intent": "SPONSORSHIP_FUTURE",
+            }
+        ],
+    )
+    person.candidate_id = "cand-appq"
+    page = browser.new_page()
+    try:
+        page.set_content(_app_question_page())
+        result = autofill_application(
+            "https://generalmotors.wd5.myworkdayjobs.com/en-US/Careers_GM/job/example/apply",
+            person,
+            None,
+            AutofillOptions(page=page, session_id="appq", candidate_id="cand-appq", max_pages=2),
+        )
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#sponsor").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "Select One"
+        assert page.locator("#former").inner_text().strip() == "Select One"
+        assert page.locator("#legal").inner_text().strip() == "Select One"
+        assert result.fields_filled >= 2
+        assert result.status == Status.MANUAL_ANSWER_REQUIRED
+        assert result.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert result.status != Status.NAVIGATION_STALLED
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "government employee" in prompts
+        assert "legal restrictions" in prompts
+        assert _SMS_ERROR not in result.submit_controls
+        assert "Submit application" in result.submit_controls
+        assert page.evaluate("() => window.__next") == 0
+        assert page.evaluate("() => window.__submitted") == 0
+        assert page.evaluate("() => window.__opens") > 0
+    finally:
+        page.close()
+
+
+def test_saved_app_question_answers_are_selected_including_sms(browser):
+    """Profile rows select eligible, sponsorship, both government facts, legal, and SMS."""
+    from autofill.engine import AutofillOptions, Status, autofill_application
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    person = _person(
+        work_authorization={"legally_authorized_to_work": "Yes", "require_sponsorship": "Yes"},
+        applicationAnswers=[
+            {
+                "question": (
+                    "Will you now or in the future require sponsorship for employment visa status "
+                    "(e.g., H-1B visa status)?"
+                ),
+                "answer": "Yes",
+                "intent": "SPONSORSHIP_FUTURE",
+            },
+            {
+                "question": "Have you ever been employed by a government agency?",
+                "answer": "No",
+                "key": "current_former_gov",
+            },
+            {
+                "question": "Is your spouse or partner employed by a government agency?",
+                "answer": "No",
+                "key": "spouse_gov",
+            },
+            {
+                "question": "Do you have any legal restrictions on employment?",
+                "answer": "No",
+                "key": "legal_restrictions",
+            },
+            {
+                "question": "Do you agree to communications via text message/SMS for the recruitment process?",
+                "answer": "Yes",
+                "intent": "RECRUITMENT_SMS_CONSENT",
+                "key": "recruitment_sms_consent",
+            },
+        ],
+    )
+    person.candidate_id = "2"
+    page = browser.new_page()
+    try:
+        page.set_content(_app_question_page(sms=True, submit=False))
+        result = autofill_application(
+            "https://generalmotors.wd5.myworkdayjobs.com/en-US/Careers_GM/job/example/apply",
+            person,
+            None,
+            AutofillOptions(page=page, session_id="appq-sms", candidate_id="2", max_pages=1),
+        )
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#sponsor").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#legal").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        categories = [row["category"] for row in result.auto_consents]
+        assert "RECRUITMENT_SMS_CONSENT" in categories
+        assert result.status != Status.READY_FOR_HUMAN_SUBMIT
+        assert _SMS_ERROR not in result.submit_controls
+        assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()

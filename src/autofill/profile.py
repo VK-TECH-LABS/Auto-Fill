@@ -481,7 +481,10 @@ def _answer_row(entry: dict) -> ApplicationAnswer:
 
     question = _text(entry, "question")
     intent = _stored_intent(_text(entry, "intent"))
-    key = canonical_sms_key(_text(entry, "key")) or canonical_sms_key(question)
+    host_key = _text(entry, "key").strip()
+    key = canonical_sms_key(host_key) or canonical_sms_key(question)
+    if not key and host_key and " " not in host_key:
+        key = host_key[:64]
     if intent == SMS_INTENT:
         key = key or SMS_KEY
     if key == SMS_KEY and not intent:
