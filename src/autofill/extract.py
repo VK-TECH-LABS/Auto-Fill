@@ -548,7 +548,9 @@ EXTRACT_JS = r"""
 
       let options = [];
       if (tag === "select") {
-        options = Array.from(el.options).map((option) => ({
+        options = Array.from(el.options).filter((option) => (
+          !option.disabled && option.getAttribute("aria-disabled") !== "true"
+        )).map((option) => ({
           value: option.value,
           label: (option.textContent || "").replace(/\s+/g, " ").trim(),
           selector: "",
@@ -557,7 +559,9 @@ EXTRACT_JS = r"""
         const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
         const list = listId ? byId(root, listId) : null;
         if (list && (list.getAttribute("role") || "") === "listbox") {
-          options = Array.from(list.querySelectorAll("[role='option']")).map((option) => ({
+          options = Array.from(list.querySelectorAll("[role='option']")).filter((option) => (
+            !option.disabled && option.getAttribute("aria-disabled") !== "true"
+          )).map((option) => ({
             value: option.getAttribute("data-value") || textOf(option),
             label: textOf(option),
             selector: selectorFor(option),

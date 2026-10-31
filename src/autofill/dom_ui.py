@@ -122,13 +122,16 @@ _CHOOSE_JS = ("""({ selector, expected, multi }) => {
   }
   if (root.tagName === "SELECT") {
     const match = Array.from(root.options).find((option) => {
+      if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
       const label = String(option.label || option.text || "").trim();
       return label === wanted[0] || String(option.value || "").trim() === wanted[0];
     });
     if (!match) return false;
-    root.value = match.value;
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+    if (desc && desc.set) desc.set.call(root, match.value);
+    else root.value = match.value;
     paint(root);
-    return true;
+    return String(root.value) === String(match.value);
   }
   const name = root.name || "";
   const kind = root.type === "checkbox" ? "checkbox" : "radio";
@@ -1120,6 +1123,141 @@ def _choice(answer_type: str) -> bool:
     return answer_type in {"single_select", "multi_select", "boolean"}
 
 
+def _is_native_select(page: Any, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    try:
+        return bool(
+            evaluate(
+                """(selector) => {
+                  const el = document.querySelector(selector);
+                  return !!el && el.tagName === "SELECT";
+                }""",
+                selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+_SELECT_NATIVE_JS = r"""
+({ selector, label, value }) => {
+  const el = document.querySelector(selector);
+  if (!el || el.tagName !== "SELECT") return false;
+  function fold(item) {
+    return String(item || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  const wanted = [label, value].map(fold).filter(Boolean);
+  if (!wanted.length) return false;
+  const match = Array.from(el.options).find((option) => {
+    if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
+    const text = String(option.label || option.text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const stored = String(option.value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return wanted.indexOf(text) !== -1 || wanted.indexOf(stored) !== -1;
+  });
+  if (!match) return false;
+  const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+  if (desc && desc.set) desc.set.call(el, match.value);
+  else el.value = match.value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return String(el.value) === String(match.value);
+}
+"""
+
+
+def _selected_option(page: Any, selector: str) -> dict[str, str] | None:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        raw = evaluate(
+            """(selector) => {
+              const el = document.querySelector(selector);
+              if (!el || el.tagName !== "SELECT") return null;
+              const option = el.options[el.selectedIndex];
+              if (!option) return null;
+              if (option.disabled || option.getAttribute("aria-disabled") === "true") return null;
+              return {
+                value: String(option.value || ""),
+                label: String(option.label || option.text || "").replace(/\\s+/g, " ").trim()
+              };
+            }""",
+            selector,
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {"value": str(raw.get("value") or ""), "label": str(raw.get("label") or "")}
+
+
+def _selection_matches(chosen: dict[str, str], label: str, value: str) -> bool:
+    wanted = {item.strip().casefold() for item in (label, value) if item.strip()}
+    if not wanted:
+        return False
+    have = {chosen.get("label", "").strip().casefold(), chosen.get("value", "").strip().casefold()}
+    have.discard("")
+    return bool(wanted & have)
+
+
+def choose_native_select(page: Any, selector: str, *, label: str = "", value: str = "") -> bool:
+    """Choose one enabled ``<select>`` option. The answer path and the fill path both use this.
+
+    Playwright's ``select_option`` runs first. A controlled select that ignores
+    that write is set through ``HTMLSelectElement``'s value setter. A disabled
+    option is not chosen.
+    """
+    expected_label = str(label or "").strip()
+    expected_value = str(value or "").strip()
+    if not selector or not (expected_label or expected_value):
+        return False
+    attempts: list[dict[str, str]] = []
+    if expected_value:
+        attempts.append({"value": expected_value})
+    if expected_label:
+        attempts.append({"label": expected_label})
+    if expected_label and expected_label != expected_value:
+        attempts.append({"value": expected_label})
+    if expected_value and expected_value != expected_label:
+        attempts.append({"label": expected_value})
+    seen: set[tuple[str, str]] = set()
+    locator_factory = getattr(page, "locator", None)
+    if locator_factory is not None:
+        target = page.locator(selector)
+        for attempt in attempts:
+            key = next(iter(attempt.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                target.select_option(**attempt)
+            except Exception:
+                continue
+            chosen = _selected_option(page, selector)
+            if chosen and _selection_matches(chosen, expected_label, expected_value):
+                return True
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        applied = bool(
+            evaluate(
+                _SELECT_NATIVE_JS,
+                {"selector": selector, "label": expected_label, "value": expected_value},
+            )
+        )
+    except Exception:
+        return False
+    if not applied:
+        return False
+    chosen = _selected_option(page, selector)
+    if chosen is None:
+        return True
+    return _selection_matches(chosen, expected_label, expected_value)
+
+
 _BUTTON_CHOICE_JS = r"""({ selector, expected }) => {
   const root = document.querySelector(selector);
   if (!root) return "";
@@ -1219,15 +1357,18 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         clear_highlight(page, selector)
         return {"filled": True}
     if _choice(answer_type):
-        evaluate = getattr(page, "evaluate", None)
-        if evaluate is None:
-            return {"filled": False, "reason": "not_committed"}
-        try:
-            multi = answer_type == "multi_select"
-            expected: str | list[str] = values if multi else values[0]
-            chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
-        except Exception:
-            chosen = False
+        if _is_native_select(page, selector):
+            chosen = choose_native_select(page, selector, label=values[0], value=values[0])
+        else:
+            evaluate = getattr(page, "evaluate", None)
+            if evaluate is None:
+                return {"filled": False, "reason": "not_committed"}
+            try:
+                multi = answer_type == "multi_select"
+                expected: str | list[str] = values if multi else values[0]
+                chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
+            except Exception:
+                chosen = False
         if not chosen:
             return {"filled": False, "reason": "not_committed"}
     else:
