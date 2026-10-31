@@ -71,10 +71,12 @@ from autofill.local_attach import (
     LoopbackRequired,
     _public_account,
     _result_brief,
+    _tab_is_posting,
     feature_enabled,
     is_default_user_data_dir,
     require_feature,
     same_document,
+    same_site,
     validate_application_url,
 )
 from autofill.mapping import option_stance
@@ -231,14 +233,21 @@ def _binding_matches(job: LocalJob, claimed: Any) -> bool:
 
 
 def _can_continue(job: LocalJob) -> bool:
-    """True after a crashed fill or a retryable employer failure. A reported submit is not."""
+    """True after a crash, a stall, or a retryable employer failure. A reported submit is not.
+
+    A second dead CDP pipe (``reconnect_limit``) is not continuable. The cap
+    stays at two for the cases that are.
+    """
     if job.superseded or job.submit_claimed():
+        return False
+    if job.error == "reconnect_limit":
         return False
     if job.state == "error":
         return True
     if job.state != "done" or job.result is None:
         return False
-    return str(job.result.get("status") or "") == Status.FAILED_RETRYABLE
+    status = str(job.result.get("status") or "")
+    return status in {Status.FAILED_RETRYABLE, Status.NAVIGATION_STALLED}
 
 
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
@@ -374,6 +383,10 @@ class LocalJob:
         self.notice = ""
         self.progress: LocalProgress | None = None
         self.continue_attempts = 0
+        self.entry_clicks = 0
+        self.next_clicks = 0
+        self.pages_advanced = 0
+        self.last_navigation: dict[str, str] | None = None
         # Workday account registered here. Continue without verified does not sign in.
         self.verify_pending = False
         self._credential_candidate = ""
@@ -469,6 +482,10 @@ class LocalJob:
             "detached": self.detached,
             "ownsBrowser": self.owns_browser,
             "browserRunning": self.browser_running,
+            "entryClicks": self.entry_clicks,
+            "nextClicks": self.next_clicks,
+            "pagesAdvanced": self.pages_advanced,
+            "lastNavigation": dict(self.last_navigation) if self.last_navigation else None,
             # State and failure reason only. The file name and bytes are not part of the status.
             "resume": self.resume_view(),
         }
@@ -1097,10 +1114,20 @@ class LocalHelper:
         if live is None:
             return True
         target, url = live()
-        if progress.target_id and target != progress.target_id:
+        allowed_targets = {progress.target_id} if progress.target_id else set()
+        bound_target = str(getattr(self._session, "bound_target_id", "") or "")
+        if bound_target:
+            allowed_targets.add(bound_target)
+        if progress.target_id and target and target not in allowed_targets:
             return False
         if progress.url and (not url or not same_document(progress.url, url)):
-            return False
+            page = None
+            tab = getattr(self._session, "tab", None)
+            if tab is not None:
+                page = getattr(tab, "page", None)
+            posting = bool(page is not None and _tab_is_posting(page))
+            if not url or posting or not same_site(progress.url, url):
+                return False
         if progress.binding and job.binding and not same_binding(progress.binding, job.binding):
             return False
         return True
@@ -1363,6 +1390,12 @@ class LocalHelper:
                 kwargs["nav_block"] = block
             kwargs.update(self._auth_kwargs(fill, job))
             self._window_used = True
+            closer = getattr(self._session, "close_question_popup", None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception:
+                    pass
             result, submitted = fill(job.application_url, profile, **kwargs)
             job.submitted = submitted
             if job.superseded:
@@ -1387,7 +1420,7 @@ class LocalHelper:
             if reported_submit:
                 job.submitted = True
             crashed = is_browser_crash(exc)
-            job.error = type(exc).__name__
+            job.error = "reconnect_limit" if "reconnect_limit" in str(exc) else type(exc).__name__
             job.state = "error"
             logger.info(
                 "session=%s fill_failed error=%s crash=%s detail=%s",
@@ -1672,6 +1705,12 @@ class LocalHelper:
         job.notice = ""
         job.result = _result_brief(result)
         job.result["stopped_before_submit"] = not job.submit_claimed()
+        job.entry_clicks += int(getattr(result, "entry_clicks", 0) or 0)
+        job.next_clicks += int(getattr(result, "next_clicks", 0) or 0)
+        job.pages_advanced += int(getattr(result, "pages_advanced", 0) or 0)
+        last = getattr(result, "last_navigation", None)
+        if isinstance(last, dict) and last.get("action") and last.get("result"):
+            job.last_navigation = {"action": str(last["action"]), "result": str(last["result"])}
         job.open_items = [dict(item) for item in result.open_items]
         job.blocking = dict(result.blocking) if isinstance(result.blocking, dict) else None
         job.question = pending_question(result.status, job.blocking, job.open_items)

@@ -56,6 +56,7 @@ from autofill.pagewait import (
     is_login_wall,
     is_review,
     is_site_error,
+    navigation_changed,
     navigation_signature,
     note_page_type,
     register_pane,
@@ -1067,6 +1068,8 @@ def autofill_application(
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
         nav_block = _initial_nav_block(opts)
+        turned = False
+        landed = False
         for index in range(opts.max_pages):
             _cancel_point(opts)
             _maybe_reattach(page, opts)
@@ -1137,6 +1140,21 @@ def autofill_application(
             _note_observed(page, opts)
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
             if visible in seen:
+                if turned:
+                    detected, filled, skipped = _counts(fields)
+                    session.mark(Status.NAVIGATION_STALLED)
+                    return _result(
+                        session,
+                        status=Status.NAVIGATION_STALLED,
+                        ats=ats_name,
+                        login_status=login_status,
+                        fields_detected=detected,
+                        fields_filled=filled,
+                        fields_skipped=skipped,
+                        manual_actions=manual,
+                        messages=["navigation_stalled"],
+                        submit_controls=submit_controls,
+                    )
                 break
             seen.add(visible)
             for button in snapshot.buttons:
@@ -1262,7 +1280,10 @@ def autofill_application(
                 )
 
             alert = validation_message(snapshot)
-            if alert:
+            # A banner that rode along onto a step we just opened, with no
+            # flagged field, is not a reason to stop. The page we were already
+            # on still stops before Next.
+            if alert and not (landed and not _aria_invalid(page)):
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 detected, filled, skipped = _counts(fields)
                 return _result(
@@ -1277,16 +1298,18 @@ def autofill_application(
                     messages=[alert],
                     submit_controls=submit_controls,
                 )
+            landed = False
             current_sig = navigation_signature(page, snapshot)
-            if nav_block is not None and nav_block[2] != current_sig:
+            if _release_block(nav_block, current_sig):
                 nav_block = None
-            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
-            if nxt is None:
+            nxt = _next_button(snapshot, nav_block)
+            if nxt is None or index + 1 >= opts.max_pages:
                 break
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
             except NavigationStalled:
+                _forward_block(opts, nxt, current_sig)
                 detected, filled, skipped = _counts(fields)
                 session.mark(Status.NAVIGATION_STALLED)
                 return _result(
@@ -1301,7 +1324,8 @@ def autofill_application(
                     messages=["navigation_stalled"],
                     submit_controls=submit_controls,
                 )
-            if validation_message(snapshot):
+            moved = navigation_changed(current_sig, page, snapshot)
+            if validation_message(snapshot) and not moved:
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 detected, filled, skipped = _counts(fields)
                 return _result(
@@ -1316,8 +1340,9 @@ def autofill_application(
                     messages=[validation_message(snapshot)],
                     submit_controls=submit_controls,
                 )
-            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
-            _publish_nav_block(opts, nav_block)
+            nav_block = _forward_block(opts, nxt, current_sig)
+            turned = True
+            landed = moved
 
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
@@ -1639,7 +1664,7 @@ def _note_observed(page, opts: AutofillOptions) -> None:
 
 
 def _publish_nav_block(opts: AutofillOptions, block: tuple) -> None:
-    """Remember the Next that just moved the page. The hook must not type."""
+    """Remember the Next that just ran on this signature. The hook must not type."""
     hook = opts.on_nav_block
     if hook is None:
         return
@@ -1647,6 +1672,30 @@ def _publish_nav_block(opts: AutofillOptions, block: tuple) -> None:
         hook(block)
     except Exception:
         return
+
+
+def _forward_block(opts: AutofillOptions, button, signature: tuple) -> tuple:
+    """Key the block to the page the click happened on, not the page it opened."""
+    block = (button.selector, button.name, signature)
+    _publish_nav_block(opts, block)
+    return block
+
+
+def _release_block(block: tuple | None, current_sig: tuple) -> bool:
+    """Drop the block when the route or the heading changed.
+
+    A click that only reveals fields keeps the same step. The same Next stays
+    ineligible so it is not pressed again. A new heading or route is the next
+    step, and a stable Save and Continue there is eligible.
+    """
+    if block is None:
+        return False
+    before = block[2]
+    if before == current_sig:
+        return False
+    if not isinstance(before, tuple) or len(before) < 3 or len(current_sig) < 3:
+        return True
+    return before[0] != current_sig[0] or before[2] != current_sig[2]
 
 
 def _log_move(session_id: str, action: str, result: str) -> None:
@@ -1680,8 +1729,10 @@ def _log_move(session_id: str, action: str, result: str) -> None:
 def _next_button(snapshot, block: tuple | None = None):
     """The forward control on this step. Submit, Send, and Complete stay unclicked.
 
-    ``block`` is ``(selector, name, signature)`` for a click that already moved
-    the page. The same control is not pressed again while that page is showing.
+    ``block`` is ``(selector, name, signature)`` for a click on that signature.
+    The same control is not pressed again while that page is still showing.
+    A later step with the same selector and name is eligible once the
+    signature changes.
     """
     for button in snapshot.buttons:
         if button.disabled or button.in_ad or button.in_header or not button.in_main:
@@ -1781,6 +1832,15 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
 _RESUME_NAMED = re.compile(r"\b(resume|résumé|cv|curriculum vitae)\b", re.IGNORECASE)
 
 
+def _aria_invalid(page) -> bool:
+    """True when a control is flagged. A role=alert banner alone is not a flag."""
+    try:
+        found = page.evaluate("() => !!document.querySelector('[aria-invalid=true]')")
+    except Exception:
+        return False
+    return bool(found)
+
+
 def _same_route(page, before: tuple) -> bool:
     """True when the URL route is the one recorded before the click."""
     from urllib.parse import urlparse
@@ -1808,6 +1868,12 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     if fresh is None:
         _log_move(session.session_id, "next", "stalled")
         raise NavigationStalled("next")
+    route_changed = not _same_route(page, before)
+    heading_changed = bool(fresh) and navigation_signature(page, fresh)[2] != before[2]
+    if advanced and (route_changed or heading_changed) and not _aria_invalid(page):
+        # A new step with a leftover banner and no flagged control is an advance.
+        _log_move(session.session_id, "next", "advanced")
+        return page, fresh
     if (
         advanced
         and not fresh.captcha_present
@@ -1966,7 +2032,10 @@ def _run_resolver_pages(
             questions=gaps,
         )
 
-    nav_block: tuple | None = None
+    nav_block = _initial_nav_block(opts)
+    turned = False
+    landed = False
+    leave_pages = False
     for index in range(opts.max_pages):
         _cancel_point(opts)
         _maybe_reattach(page, opts)
@@ -1987,6 +2056,9 @@ def _run_resolver_pages(
             return stopped
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
+            if turned:
+                session.mark(Status.NAVIGATION_STALLED)
+                return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
             break
         seen.add(visible)
         _remember_submit(snapshot, submit_controls)
@@ -2082,7 +2154,8 @@ def _run_resolver_pages(
             if held is not None:
                 return held
             alert = validation_message(snapshot)
-            if alert and not recheck:
+            suppress_landed_banner = bool(landed and alert and not _aria_invalid(page))
+            if alert and not recheck and not suppress_landed_banner:
                 updated = flags_for_alerts(validation_blob(snapshot), flags)
                 if updated != flags and attempt < REVEAL_ATTEMPTS - 1:
                     flags = updated
@@ -2090,17 +2163,20 @@ def _run_resolver_pages(
                     continue
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 return finish(Status.MANUAL_ANSWER_REQUIRED, [alert, *invalid_field_messages(page)])
+            landed = False
             recheck = False
             current_sig = navigation_signature(page, snapshot)
-            if nav_block is not None and nav_block[2] != current_sig:
+            if _release_block(nav_block, current_sig):
                 nav_block = None
-            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
-            if nxt is None:
+            nxt = _next_button(snapshot, nav_block)
+            if nxt is None or index + 1 >= opts.max_pages:
+                leave_pages = True
                 break
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
             except NavigationStalled:
+                _forward_block(opts, nxt, current_sig)
                 session.mark(Status.NAVIGATION_STALLED)
                 return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
             if snapshot.captcha_present:
@@ -2109,7 +2185,8 @@ def _run_resolver_pages(
                     Status.CAPTCHA_REQUIRED,
                     [challenge_message(snapshot)],
                 )
-            if validation_message(snapshot):
+            moved = navigation_changed(current_sig, page, snapshot)
+            if validation_message(snapshot) and not moved:
                 named = invalid_field_messages(page)
                 if not opts.resume_uploaded and any(_RESUME_NAMED.search(item) for item in named):
                     # The employer flagged the resume, which this step hid behind
@@ -2128,7 +2205,11 @@ def _run_resolver_pages(
                         [validation_message(snapshot), *invalid_field_messages(page)],
                     )
                 continue
-            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
+            nav_block = _forward_block(opts, nxt, current_sig)
+            turned = True
+            landed = moved
+            break
+        if leave_pages:
             break
 
     snapshot = _timed_extract(page, opts, run_started, inspect_state)

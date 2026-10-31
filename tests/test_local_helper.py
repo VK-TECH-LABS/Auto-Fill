@@ -1784,3 +1784,110 @@ def test_fill_visible_tab_passes_the_binding_ids(monkeypatch):
         job_id="11",
     )
     assert seen == {"session": "sess-a", "candidate": "101", "job": "11"}
+
+
+class _StallSession(_RecoverySession):
+    """First fill stalls after one Next. Later fills stay on that page."""
+
+    def __init__(self) -> None:
+        super().__init__(crashes=0)
+
+    def fill(self, url, profile, *, cancel=None, fresh=False, resume=None, on_observed=None,
+             on_nav_block=None, nav_block=None, **_kwargs):
+        self.fresh.append(bool(fresh))
+        self.fills += 1
+        self.nav_blocks.append(nav_block)
+        if on_observed is not None:
+            on_observed(self.page)
+        if self.fills == 1 and on_nav_block is not None:
+            on_nav_block(("#next", "Next", ("page-1",)))
+        return ApplicationResult(
+            status=Status.NAVIGATION_STALLED,
+            ats=None,
+            current_step=Status.NAVIGATION_STALLED,
+            login_status="NOT_REQUIRED",
+            messages=["navigation_stalled"],
+            next_clicks=1 if self.fills == 1 else 0,
+            last_navigation={"action": "next", "result": "stalled"},
+            stopped_before_submit=True,
+        ), False
+
+
+def test_stalled_fill_continues_in_place_until_the_cap(monkeypatch):
+    fake = _StallSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = created["sessionId"]
+        stalled = _wait_job(port, sid)
+        assert stalled["status"] == Status.NAVIGATION_STALLED
+        assert stalled["nextClicks"] == 1
+        assert stalled["lastNavigation"] == {"action": "next", "result": "stalled"}
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 200, body
+        assert fake.fresh == [False, False]
+        assert fake.nav_blocks[1] == ("#next", "Next", ("page-1",))
+        assert body["nextClicks"] == 1
+        code, _again = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 200
+        code, limited = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 409 and limited["reason"] == "continue_limit"
+        assert fake.fills == 3
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_continue_allows_a_later_path_on_the_same_host(monkeypatch):
+    fake = _RecoverySession(crashes=1)
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = created["sessionId"]
+        assert _wait_job(port, sid)["status"] == "FAILED"
+        fake.live_url = "https://boards.greenhouse.io/example/jobs/1/experience"
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 200, body
+        assert body.get("reason") != "progress_mismatch"
+        assert fake.fresh[-1] is False
+        assert fake.fills == 2
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_reconnect_limit_is_not_continuable(monkeypatch):
+    class _Drop(_RecoverySession):
+        def __init__(self) -> None:
+            super().__init__(crashes=0)
+
+        def fill(self, url, profile, **kwargs):
+            raise LocalAttachError("reconnect_limit")
+
+    fake = _Drop()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = created["sessionId"]
+        body = _wait_job(port, sid)
+        assert body["error"] == "reconnect_limit"
+        code, refused = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"binding": _binding("sess-a", "101")})
+        assert code == 409 and refused["reason"] == "not_continuable"
+    finally:
+        server.shutdown()
+        helper.close()

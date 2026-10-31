@@ -1093,8 +1093,18 @@ def invalid_field_messages(page) -> list[str]:
     return [str(item) for item in found or [] if str(item).strip()]
 
 
-def wait_for_navigation(page, before: tuple, *, timeout_s: float = 1.5):
-    """Poll until the page moves or the budget ends. Returns ``(advanced, snapshot)``."""
+# Same cap as ``wait_for_render``. A step that moves inside this window is one
+# advance. An unchanged page is one stall at the deadline, not at 1.5 seconds.
+_NAVIGATION_BUDGET_S = 12.0
+
+
+def wait_for_navigation(page, before: tuple, *, timeout_s: float = _NAVIGATION_BUDGET_S):
+    """Poll until the page moves or the budget ends. Returns ``(advanced, snapshot)``.
+
+    A signature change returns immediately. The page can sit still and then
+    change its heading inside the budget, so two identical extracts do not
+    end the wait early. The caller clicks once. This function does not click.
+    """
     deadline = time.monotonic() + timeout_s
     snapshot = None
     while True:
