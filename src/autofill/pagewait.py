@@ -17,7 +17,13 @@ from autofill.extract import extract_page
 from autofill.login import _CONFIRM_RE as _VERIFY_RE
 from autofill.login import _LOGIN_RE, _REGISTER_RE, create_account_form
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import classify_control, dismiss_cookie_banner, is_entry_control, semantic_action
+from autofill.safeguards import (
+    classify_control,
+    dismiss_cookie_banner,
+    is_entry_control,
+    is_forward_navigation,
+    semantic_action,
+)
 
 logger = logging.getLogger("autofill.pagewait")
 
@@ -324,6 +330,32 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     return "UNKNOWN"
 
 
+_APPLICATION_SUBMIT_RE = re.compile(
+    r"\b(submit\s+application|send(?:\s+my)?\s+application|complete\s+application)\b",
+    re.IGNORECASE,
+)
+
+
+def has_application_submit(snapshot: PageSnapshot) -> bool:
+    """A visible Submit application control. A posting Apply is not one."""
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if _APPLICATION_SUBMIT_RE.search(" ".join((button.name or "").split())):
+            return True
+    return False
+
+
+def _has_forward_control(snapshot: PageSnapshot) -> bool:
+    """True when this page still has a Next / Continue the fill may press."""
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if is_forward_navigation(button.name, control_type=button.control_type or ""):
+            return True
+    return False
+
+
 def has_final_submit(snapshot: PageSnapshot, remembered: list[str] | None = None) -> bool:
     """True when this page shows a control a person would use to send the application.
 
@@ -397,6 +429,17 @@ def terminal_kind(
         return "READY"
     if kind in {"APPLICATION_FORM", "REVIEW"}:
         return "FILLED"
+    # The step after Next can be only "Submit application", with a heading that
+    # does not say Review and with no fields left. That is the human submit
+    # stop. A page that still has Next stays on the forward path.
+    if (
+        not gaps
+        and (blocked or "") not in {"account", "login", "captcha", "resume"}
+        and has_application_submit(snapshot)
+        and not _has_forward_control(snapshot)
+    ):
+        note_page_type("REVIEW")
+        return "READY"
     return "NO_FORM"
 
 

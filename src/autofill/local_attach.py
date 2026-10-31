@@ -1539,6 +1539,22 @@ class DedicatedApplySession:
         if cancel is not None:
             cancel.check()
         page = self._page_for_answer(application_url)
+        from autofill.safeguards import hold_final_submit
+
+        with hold_final_submit(page):
+            return self._apply_answer(page, application_url, profile, target, cancel=cancel, resume=resume)
+
+    def _apply_answer(
+        self,
+        page: Any,
+        application_url: str,
+        profile: CandidateProfile,
+        target: dict[str, Any],
+        *,
+        cancel: CancelGate | None = None,
+        resume: LocalResume | None = None,
+    ) -> dict[str, Any]:
+        """Write one answer and follow the page. Final Submit stays refused."""
         # The Save & Continue popup leaves before the engine writes or navigates.
         from autofill.answer_popup import close_popup
 
