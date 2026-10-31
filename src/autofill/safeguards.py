@@ -624,6 +624,72 @@ def click_choice(page, selector: str, name: str) -> None:
     page.locator(selector).click()
 
 
+# A locator click moves the pointer. On a Workday listbox that menu opens
+# under the cursor, and the release lands on the first row. This click stays
+# on the element the caller named.
+_ELEMENT_CLICK_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  try { el.scrollIntoView({block: "center", inline: "nearest"}); } catch (error) {}
+  el.click();
+  return true;
+}"""
+
+
+def click_element(page, selector: str, name: str = "") -> bool:
+    """Click one node without moving the pointer. A final Submit label is refused.
+
+    The same guard as ``click_choice``. The click itself does not use the
+    pointer, so a list that opens under the cursor is not selected by the open.
+    """
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if not selector:
+        return False
+    if name and action_class(name) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        raise HumanSubmissionRequired(
+            f"Refusing to choose {name!r}. That label is a final Submit or Apply."
+        )
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate(_ELEMENT_CLICK_JS, selector) is True
+    except Exception:
+        return False
+
+
+_CLEAR_LISTBOX_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
+  if (!field || !field.querySelector) return false;
+  const charm = field.querySelector(
+    "[data-automation-id='DELETE_charm'], [data-automation-id='clearButton'], " +
+    "[aria-label='Remove'], [aria-label='Clear']"
+  );
+  if (!charm) return false;
+  charm.click();
+  return true;
+}"""
+
+
+def clear_listbox_value(page, selector: str) -> bool:
+    """Clear a prompt through its remove control. This is not a form submit."""
+    if not HUMAN_SUBMIT_ONLY:
+        raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate(_CLEAR_LISTBOX_JS, selector) is True
+    except Exception:
+        return False
+
+
 def dismiss_combobox(page) -> None:
     """Close an open list without choosing. Escape is not a submit."""
     page.keyboard.press("Escape")

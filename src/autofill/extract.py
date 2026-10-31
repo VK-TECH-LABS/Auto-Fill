@@ -1157,14 +1157,48 @@ EXTRACT_JS = r"""
       }
     }
   });
+  function isErrorText(text) {
+    const folded = cleanPrompt(text).toLowerCase();
+    if (!folded) return false;
+    if (/^error\b/.test(folded)) return true;
+    return folded.indexOf("must have a value") !== -1;
+  }
+
+  function isErrorNode(node) {
+    // A required-field banner is not the question and not a choice button.
+    if (!node || node.nodeType !== 1) return false;
+    const auto = ((node.getAttribute("data-automation-id") || "")).toLowerCase();
+    if (auto.indexOf("error") !== -1) return true;
+    if ((node.getAttribute("role") || "") === "alert") return true;
+    if (node.closest && node.closest(
+      "[data-automation-id='errorMessage'], [data-automation-id='errorWidget'], [role='alert']"
+    )) {
+      return true;
+    }
+    return isErrorText(textOf(node));
+  }
+
+  function questionText(node) {
+    if (!node) return "";
+    if (node.nodeType !== 1) return cleanPrompt(textOf(node));
+    if (isErrorNode(node)) return "";
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll(
+      "[data-automation-id='errorMessage'], [data-automation-id='errorWidget'], [role='alert']"
+    ).forEach((item) => item.remove());
+    const text = cleanPrompt(clone.textContent || "");
+    return isErrorText(text) ? "" : text;
+  }
+
   function pickerQuestion(el) {
     const labelled = el.getAttribute("aria-labelledby") || "";
     if (labelled) {
       const bits = [];
       for (const id of labelled.split(/\s+/)) {
         const node = document.getElementById(id);
-        if (!node || node === el || el.contains(node) || isSectionHeading(node, textOf(node))) continue;
-        const text = cleanPrompt(textOf(node));
+        if (!node || node === el || el.contains(node) || isErrorNode(node)) continue;
+        if (isSectionHeading(node, textOf(node))) continue;
+        const text = questionText(node);
         if (text) bits.push(text);
       }
       if (bits.length) return bits.join(" ");
@@ -1172,18 +1206,18 @@ EXTRACT_JS = r"""
     if (el.id) {
       const explicit = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
       if (explicit && !el.contains(explicit)) {
-        const text = cleanPrompt(textOf(explicit));
+        const text = questionText(explicit);
         if (text) return text;
       }
     }
     let node = el;
     for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
       const prev = node.previousElementSibling;
-      if (!prev || !prev.tagName) continue;
+      if (!prev || !prev.tagName || isErrorNode(prev)) continue;
       if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
       const tag = prev.tagName.toLowerCase();
       const cls = (prev.getAttribute("class") || "").toLowerCase();
-      const text = cleanPrompt(textOf(prev));
+      const text = questionText(prev);
       if (!text || text.length > 200 || isSectionHeading(prev, text)) continue;
       if (
         tag === "label" ||
@@ -1224,7 +1258,7 @@ EXTRACT_JS = r"""
   };
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll("button, [role='button']")) {
-      if (isHidden(el)) continue;
+      if (isHidden(el) || isErrorNode(el)) continue;
       const selector = selectorFor(el);
       if (!selector || consumed.has(selector)) continue;
       const popup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
@@ -1232,7 +1266,9 @@ EXTRACT_JS = r"""
       if (popup !== "listbox" && !ariaRequired) continue;
       if ((el.getAttribute("type") || "").toLowerCase() === "submit") continue;
       const own = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      if (!own || navNames[own.toLowerCase()]) continue;
+      // A closed listbox shows the chosen Yes or No. That word is the value,
+      // not a navigation button, so a later fill can replace a wrong choice.
+      if (!own || (popup !== "listbox" && navNames[own.toLowerCase()])) continue;
       const question = pickerQuestion(el);
       if (!question || question.toLowerCase() === own.toLowerCase()) continue;
       consumed.add(selector);

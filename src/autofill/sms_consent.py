@@ -366,6 +366,18 @@ def recruitment_sms_field(control: Control, profile: CandidateProfile | None) ->
         )
     option = _agree_option(control)
     if option is None:
+        # The menu is not on the page until the button is opened. Yes is still
+        # the approved answer; the click verifies the button text afterwards.
+        if control.kind == "buttons" and control.role == "listbox" and not control.options:
+            return MappedField(
+                key=SMS_INTENT,
+                action="select",
+                text="Yes",
+                option_label="Yes",
+                field_class="APPROVED_QUESTION",
+                confidence="high",
+                reason="Application Answers authorize recruitment SMS.",
+            )
         return None
     return MappedField(
         key=SMS_INTENT,
@@ -432,7 +444,11 @@ def apply_stored_sms_no(page, control: Control, profile: CandidateProfile | None
         return False
     option = _decline_option(control)
     if option is None:
-        return control.kind == "checkbox"
+        if control.kind == "checkbox":
+            return True
+        if not (control.kind == "buttons" and control.role == "listbox" and not control.options):
+            return False
+        option = Option(value="No", label="No", selector="")
     from autofill.fill import apply_mapped
 
     mapped = MappedField(

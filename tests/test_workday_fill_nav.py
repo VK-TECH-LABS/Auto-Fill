@@ -5,6 +5,7 @@ whose box says Search is still the question on its label. A former-employee
 Yes/No is filled only from an approved answer.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -755,5 +756,306 @@ def test_saved_app_question_answers_are_selected_including_sms(browser):
         assert result.status != Status.READY_FOR_HUMAN_SUBMIT
         assert _SMS_ERROR not in result.submit_controls
         assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+
+
+def _appq_person() -> CandidateProfile:
+    person = _person(
+        work_authorization={"legally_authorized_to_work": "Yes", "require_sponsorship": "Yes"},
+        applicationAnswers=[
+            {
+                "question": (
+                    "Will you now or in the future require sponsorship for employment visa status "
+                    "(e.g., H-1B visa status)?"
+                ),
+                "answer": "Yes",
+                "intent": "SPONSORSHIP_FUTURE",
+            },
+            {
+                "question": "Have you ever been employed by a government agency?",
+                "answer": "No",
+                "key": "current_former_gov",
+            },
+            {
+                "question": "Is your spouse or partner employed by a government agency?",
+                "answer": "No",
+                "key": "spouse_gov",
+            },
+            {
+                "question": "Do you have any legal restrictions on employment?",
+                "answer": "No",
+                "key": "legal_restrictions",
+            },
+            {
+                "question": "Do you agree to communications via text message/SMS for the recruitment process?",
+                "answer": "Yes",
+                "intent": "RECRUITMENT_SMS_CONSENT",
+                "key": "recruitment_sms_consent",
+            },
+        ],
+    )
+    person.candidate_id = "2"
+    return person
+
+
+def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: str = "Select One") -> str:
+    """GM Application Questions.
+
+    ``pointer`` makes a trusted click commit Yes without opening the menu.
+    ``flaky`` commits Yes on the first legal option click and the real label after that.
+    ``stuck`` always commits Yes for legal. A clear control puts Select One back.
+    ``errors`` paints Workday's required-field banners, including the SMS sentence.
+    """
+    questions = list(_APP_QUESTIONS) + [
+        (
+            "sms",
+            "General Motors will need to contact you throughout the recruitment process, "
+            "this may include SMS/text messaging from GM and/or GM's third party partners "
+            "(message and data rates may apply.) Do you agree to communications via text message/SMS?",
+        )
+    ]
+    fields = []
+    for element_id, question in questions:
+        initial = legal_value if element_id == "legal" else "Select One"
+        labelled = f"{element_id}-q"
+        if errors:
+            labelled = f"{element_id}-q page-error"
+        follow = ""
+        clear = ""
+        if element_id == "legal":
+            hidden = "" if initial == "Yes" else " hidden"
+            follow = (
+                f'<label id="legal-detail-q">Please describe the nature of the restrictions. '
+                f"Example - I have a non-compete agreement with my employer or previous employer.</label>"
+                f'<textarea id="legal-detail" aria-labelledby="legal-detail-q"{hidden}></textarea>'
+            )
+            clear = (
+                '<button id="legal-clear" type="button" data-automation-id="DELETE_charm" '
+                'aria-label="Remove">Remove</button>'
+            )
+        error = ""
+        if errors:
+            error = (
+                f'<div id="{element_id}-err" data-automation-id="errorMessage" role="alert">'
+                f'<button type="button" aria-required="true">Error: The field {question} '
+                f"is required and must have a value.</button></div>"
+            )
+        fields.append(
+            f'<div data-automation-id="formField-{element_id}">'
+            f'<label id="{element_id}-q">{question}<abbr>*</abbr></label>'
+            f'<button id="{element_id}" type="button" aria-haspopup="listbox" '
+            f'aria-labelledby="{labelled}" aria-required="true" aria-invalid="true">{initial}</button>'
+            f"{clear}{follow}{error}</div>"
+        )
+    page_error = ""
+    if errors:
+        page_error = (
+            '<div id="page-error" data-automation-id="errorMessage" role="alert">'
+            '<button type="button" aria-required="true">'
+            f"{_SMS_ERROR}"
+            "</button></div>"
+        )
+    body = "\n".join(fields)
+    ids = ", ".join(repr(item[0]) for item in questions)
+    detail_hidden = "false" if legal_value == "Yes" else "true"
+    return f"""
+    <h1>Application Questions</h1>
+    {page_error}
+    {body}
+    <button type="button" id="save">Save and Continue</button>
+    <button type="submit" id="final">Submit application</button>
+    <script>
+      window.__opens = 0;
+      window.__submitted = 0;
+      window.__clears = 0;
+      window.__legalClicks = 0;
+      const mode = {mode!r};
+      function syncDetail() {{
+        const button = document.getElementById("legal");
+        const detail = document.getElementById("legal-detail");
+        const yes = (button.textContent || "").trim() === "Yes";
+        detail.hidden = !yes;
+        if (yes) detail.setAttribute("required", "true");
+        else detail.removeAttribute("required");
+      }}
+      function arm(id) {{
+        const button = document.getElementById(id);
+        button.addEventListener("click", (event) => {{
+          if (mode === "pointer" && event.isTrusted) {{
+            button.textContent = "Yes";
+            if (id === "legal") syncDetail();
+            return;
+          }}
+          window.__opens += 1;
+          document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+          const list = document.createElement("ul");
+          list.setAttribute("role", "listbox");
+          list.setAttribute("data-autofill-menu", "1");
+          list.style.cssText = "display:block;min-height:48px";
+          for (const label of ["Yes", "No"]) {{
+            const item = document.createElement("li");
+            item.setAttribute("role", "option");
+            item.style.height = "24px";
+            item.textContent = label;
+            item.addEventListener("click", (optionEvent) => {{
+              optionEvent.stopPropagation();
+              let shown = label;
+              if (id === "legal") {{
+                window.__legalClicks += 1;
+                if (mode === "stuck" || (mode === "flaky" && window.__legalClicks === 1)) shown = "Yes";
+              }}
+              button.textContent = shown;
+              list.remove();
+              if (id === "legal") syncDetail();
+            }});
+            list.appendChild(item);
+          }}
+          document.body.appendChild(list);
+        }});
+      }}
+      for (const id of [{ids}]) arm(id);
+      document.getElementById("legal-clear").addEventListener("click", () => {{
+        window.__clears += 1;
+        document.getElementById("legal").textContent = "Select One";
+        syncDetail();
+      }});
+      document.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape") {{
+          document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+        }}
+      }});
+      document.getElementById("save").addEventListener("click", () => {{ window.__next = (window.__next || 0) + 1; }});
+      document.getElementById("final").addEventListener("click", (event) => {{
+        event.preventDefault();
+        window.__submitted += 1;
+      }});
+      document.getElementById("legal-detail").hidden = {detail_hidden};
+      if ({detail_hidden}) document.getElementById("legal-detail").removeAttribute("required");
+      else document.getElementById("legal-detail").setAttribute("required", "true");
+    </script>
+    """
+
+
+def _fill_appq(page, session_id: str):
+    from autofill.engine import AutofillOptions, autofill_application
+
+    return autofill_application(
+        "https://generalmotors.wd5.myworkdayjobs.com/en-US/Careers_GM/job/example/apply",
+        _appq_person(),
+        None,
+        AutofillOptions(page=page, session_id=session_id, candidate_id="2", max_pages=1),
+    )
+
+
+def _legal_choice(result) -> dict:
+    rows = [item for item in result.listbox_choices if "legal restriction" in item.get("label", "").casefold()]
+    assert rows, result.listbox_choices
+    return rows[-1]
+
+
+def test_legal_listbox_verifies_no_when_a_pointer_click_would_hit_yes(browser, caplog):
+    """A trusted click commits Yes. The fill must still leave the approved No."""
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    caplog.set_level(logging.INFO, logger="autofill.combobox")
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="pointer"))
+        result = _fill_appq(page, "appq-pointer")
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#sponsor").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#legal").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "describe the nature" not in prompts
+        choice = _legal_choice(result)
+        assert choice["intended"] == "No"
+        assert choice["clicked"] == "No"
+        assert choice["shown"] == "No"
+        assert any(
+            "intended=No" in record.message and "clicked=No" in record.message and "shown=No" in record.message
+            for record in caplog.records
+        )
+        assert page.evaluate("() => window.__clears") == 0
+        assert page.evaluate("() => window.__opens") > 0
+        assert page.evaluate("() => window.__submitted") == 0
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_legal_listbox_corrects_a_first_click_that_commits_yes(browser):
+    """The first legal click lands on Yes. The button is read again and set to No."""
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="flaky"))
+        result = _fill_appq(page, "appq-flaky")
+        assert page.locator("#legal").inner_text().strip() == "No"
+        assert page.locator("#legal-detail").is_hidden()
+        assert page.evaluate("() => window.__legalClicks") >= 2
+        choice = _legal_choice(result)
+        assert choice["intended"] == "No"
+        assert choice["shown"] == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+
+
+def test_wrong_legal_yes_is_overwritten_and_a_stuck_yes_is_cleared(browser):
+    """A rerun replaces a committed Yes. A click that cannot leave No is cleared."""
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(legal_value="Yes"))
+        result = _fill_appq(page, "appq-overwrite")
+        assert page.locator("#legal").inner_text().strip() == "No"
+        assert page.locator("#legal-detail").is_hidden()
+        assert _legal_choice(result)["intended"] == "No"
+        assert page.evaluate("() => window.__clears") == 0
+        assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="stuck"))
+        result = _fill_appq(page, "appq-stuck")
+        assert page.locator("#legal").inner_text().strip() != "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "describe the nature" not in prompts
+        assert "legal restriction" in prompts
+        choice = _legal_choice(result)
+        assert choice["intended"] == "No"
+        assert choice["shown"] != "Yes"
+        assert page.evaluate("() => window.__clears") >= 1
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+
+
+def test_required_errors_do_not_blank_app_questions_or_skip_sms(browser):
+    """Red required errors stay on the page. Approved Yes/No values are still chosen."""
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(errors=True))
+        result = _fill_appq(page, "appq-errors")
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#sponsor").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#legal").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        manual = " ".join(result.manual_actions).casefold()
+        assert "this statement stays manual" not in manual
+        assert _legal_choice(result)["intended"] == "No"
+        assert page.evaluate("() => window.__submitted") == 0
+        assert result.stopped_before_submit is True
     finally:
         page.close()

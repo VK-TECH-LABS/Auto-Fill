@@ -9,13 +9,23 @@ that form field, or from the open ``promptOption`` menu.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 
-from autofill.dom_ui import focus_field, type_char_delay
+from autofill.dom_ui import focus_field, note_listbox_choice, type_char_delay
 from autofill.intents import match_option_exact
 from autofill.models import Option
-from autofill.safeguards import click_choice, dismiss_combobox, open_combobox
+from autofill.safeguards import (
+    HumanSubmissionRequired,
+    clear_listbox_value,
+    click_choice,
+    click_element,
+    dismiss_combobox,
+    open_combobox,
+)
+
+logger = logging.getLogger("autofill.combobox")
 
 # A menu may show any of these for one country. Longer names are typed first.
 # Calling codes let a phone-country row such as "United States +1" match too.
@@ -672,12 +682,10 @@ _LISTBOX_OPTIONS_JS = r"""() => {
 }"""
 
 
-_BUTTON_SHOWS_JS = r"""({ selector, label }) => {
+_BUTTON_TEXT_JS = r"""(selector) => {
   const el = document.querySelector(selector);
-  if (!el) return false;
-  const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-  const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
-  return !!wanted && shown === wanted;
+  if (!el) return "";
+  return String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
 }"""
 
 
@@ -730,6 +738,28 @@ def _close_listbox(page) -> None:
         return
 
 
+def _open_listbox(page, selector: str) -> bool:
+    """Open one choice button. A pointer click is not used.
+
+    The menu is not in the page until the button is clicked. A trusted pointer
+    click can release on the first option (Yes) when that row covers the button.
+    """
+    return click_element(page, selector)
+
+
+def _choose_listed(page, selector: str, name: str) -> bool:
+    """Choose one menu row. A final Submit label is refused."""
+    if click_element(page, selector, name):
+        return True
+    try:
+        click_choice(page, selector, name)
+    except HumanSubmissionRequired:
+        raise
+    except Exception:
+        return False
+    return True
+
+
 def read_listbox_button_options(page, selector: str) -> list[Option]:
     """Open one Workday listbox button, read the rows that appear, and close it.
 
@@ -739,8 +769,12 @@ def read_listbox_button_options(page, selector: str) -> list[Option]:
     if not selector:
         return []
     try:
-        open_combobox(page, selector)
+        opened = _open_listbox(page, selector)
+    except HumanSubmissionRequired:
+        raise
     except Exception:
+        return []
+    if not opened:
         return []
     found = _await_open_listbox(page, 400)
     _close_listbox(page)
@@ -760,42 +794,137 @@ def attach_listbox_options(page, control) -> None:
         control.options = found
 
 
-def _button_shows(page, selector: str, label: str) -> bool:
+def _button_text(page, selector: str) -> str:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
-        return False
+        return ""
     try:
-        return bool(evaluate(_BUTTON_SHOWS_JS, {"selector": selector, "label": label}))
+        return str(evaluate(_BUTTON_TEXT_JS, selector) or "")
     except Exception:
-        return False
+        return ""
 
 
-def select_listbox_button(page, selector: str, desired: str) -> Option | None:
+def _answer_matches(shown: str, intended: str) -> bool:
+    """True when the button text is the approved answer. Yes is not No."""
+    from autofill.mapping import normalize, yes_no
+
+    wanted = yes_no(intended)
+    if wanted:
+        if yes_no(shown) == wanted:
+            return True
+        first = normalize(shown).split(" ")[:1]
+        return first == [wanted]
+    folded = normalize(shown)
+    target = normalize(intended)
+    return bool(target) and folded == target
+
+
+def _wait_for_answer(page, selector: str, intended: str) -> str:
+    """Poll until the button shows ``intended`` or the short wait ends."""
+    shown = _button_text(page, selector)
+    if _answer_matches(shown, intended) or getattr(page, "wait_for_timeout", None) is None:
+        return shown
+    for _ in range(8):
+        _pause(page, 40)
+        shown = _button_text(page, selector)
+        if _answer_matches(shown, intended):
+            return shown
+    return shown
+
+
+def _revert_listbox(page, selector: str) -> None:
+    """Clear a committed choice that is not the approved answer."""
+    try:
+        clear_listbox_value(page, selector)
+    except HumanSubmissionRequired:
+        raise
+    except Exception:
+        return
+
+
+def _note_listbox(selector: str, question: str, intended: str, clicked: str, shown: str) -> None:
+    label = " ".join((question or selector or "").split())[:160]
+    logger.info(
+        "listbox label=%s intended=%s clicked=%s shown=%s",
+        label,
+        intended,
+        clicked,
+        shown,
+    )
+    note_listbox_choice(
+        {
+            "selector": selector,
+            "label": label,
+            "intended": intended,
+            "clicked": clicked,
+            "shown": shown,
+        }
+    )
+
+
+def select_listbox_button(page, selector: str, desired: str, question: str = "") -> Option | None:
     """Open a Workday choice button and choose ``desired``. Does not type into the button.
 
-    The button text must equal the option label afterwards. A click that leaves
-    ``Select One`` in place is not a commit.
+    The button text afterwards must be the approved answer, not merely the row
+    that was clicked and not the first visible row. A mismatch is clicked again.
+    If it still disagrees, the wrong value is cleared and this returns None.
+    A button that already shows the approved answer is left as it is.
     """
-    if not selector or not str(desired or "").strip():
+    intended = str(desired or "").strip()
+    if not selector or not intended:
         return None
     from autofill.intents import pick_option
 
-    try:
-        open_combobox(page, selector)
-    except Exception:
-        return None
-    found = _await_open_listbox(page, 400)
-    status, match = pick_option(desired, found)
-    if status != "match" or match is None or not match.selector:
+    clicked = ""
+    for _attempt in range(2):
+        shown = _button_text(page, selector)
+        if _answer_matches(shown, intended):
+            _note_listbox(selector, question, intended, clicked or shown, shown)
+            return Option(value=intended, label=shown, selector=selector)
+        try:
+            opened = _open_listbox(page, selector)
+        except HumanSubmissionRequired:
+            raise
+        except Exception:
+            opened = False
+        if not opened:
+            break
+        found = _await_open_listbox(page, 400)
+        if not found:
+            _close_listbox(page)
+            shown = _button_text(page, selector)
+            if _answer_matches(shown, intended):
+                _note_listbox(selector, question, intended, clicked or shown, shown)
+                return Option(value=intended, label=shown, selector=selector)
+            continue
+        status, match = pick_option(intended, found)
+        if status != "match" or match is None or not match.selector:
+            _close_listbox(page)
+            break
+        clicked = match.label or intended
+        try:
+            chose = _choose_listed(page, match.selector, clicked)
+        except HumanSubmissionRequired:
+            raise
+        except Exception:
+            chose = False
+        if not chose:
+            _close_listbox(page)
+            continue
+        shown = _wait_for_answer(page, selector, intended)
+        if _read_open_listbox(page):
+            _close_listbox(page)
+            shown = _wait_for_answer(page, selector, intended)
+        if _answer_matches(shown, intended):
+            _note_listbox(selector, question, intended, clicked, shown)
+            return Option(value=intended, label=shown or clicked, selector=match.selector)
         _close_listbox(page)
-        return None
-    try:
-        click_choice(page, match.selector, match.label or desired)
-    except Exception:
-        _close_listbox(page)
-        return None
-    _pause(page, 40)
-    if _button_shows(page, selector, match.label or desired):
-        return match
-    _close_listbox(page)
+    shown = _button_text(page, selector)
+    if shown and not _answer_matches(shown, intended):
+        _revert_listbox(page, selector)
+        _pause(page, 40)
+        shown = _button_text(page, selector)
+    _note_listbox(selector, question, intended, clicked, shown)
+    if _answer_matches(shown, intended):
+        return Option(value=intended, label=shown, selector=selector)
     return None

@@ -273,6 +273,7 @@ class RunState:
         self.token: contextvars.Token | None = None
         self.preview: Callable[[Any], None] | None = None
         self.preview_at = 0.0
+        self.listbox_choices: list[dict[str, str]] = []
 
 
 _RUN: contextvars.ContextVar[RunState | None] = contextvars.ContextVar("af_run", default=None)
@@ -364,6 +365,33 @@ def install(page: Any) -> None:
 
 def current_run() -> RunState | None:
     return _RUN.get()
+
+
+def note_listbox_choice(record: dict[str, str]) -> None:
+    """Remember one listbox commit for this fill. The values are Yes or No."""
+    state = _RUN.get()
+    if state is None or not isinstance(record, dict):
+        return
+    state.listbox_choices.append(
+        {
+            "selector": str(record.get("selector") or ""),
+            "label": str(record.get("label") or ""),
+            "intended": str(record.get("intended") or ""),
+            "clicked": str(record.get("clicked") or ""),
+            "shown": str(record.get("shown") or ""),
+        }
+    )
+
+
+def listbox_choice_for(selector: str) -> dict[str, str] | None:
+    """The latest listbox record for ``selector`` during this fill."""
+    state = _RUN.get()
+    if state is None or not selector:
+        return None
+    for record in reversed(state.listbox_choices):
+        if record.get("selector") == selector:
+            return record
+    return None
 
 
 def begin_run(
