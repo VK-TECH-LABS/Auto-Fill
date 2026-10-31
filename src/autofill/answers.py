@@ -197,6 +197,10 @@ def _saved_intent(item: ApplicationAnswer, *, us_on_page: bool = False) -> str |
     if carried not in PROTOCOL_INTENTS:
         carried = ""
     if classified and carried and classified != carried:
+        # A now-or-future sentence the host stored as future answers a future
+        # sponsorship question. A future sentence tagged as "needed now" does not.
+        if classified == "SPONSORSHIP_NOW_OR_FUTURE" and carried == "SPONSORSHIP_FUTURE":
+            return carried
         return None
     return classified or carried or None
 

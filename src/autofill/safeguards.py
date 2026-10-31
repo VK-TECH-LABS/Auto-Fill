@@ -74,15 +74,30 @@ class HumanSubmissionRequired(SubmitBlockedError):
     """
 
 
+# Workday paints a required-field error as a button whose sentence includes
+# "rates may apply". That is not the Apply control.
+_VALIDATION_LABEL_RE = re.compile(
+    r"(^error\b|errors found|must have a value|rates may apply)",
+    re.IGNORECASE,
+)
+
+
 def classify_control(name: str, *, control_type: str = "") -> str:
     """Classify a button as ``submit``, ``auth``, ``continue``, or ``other``.
 
     Submit and auth controls are never clicked. Continue controls are the
     only ones the fill routine may activate, and only to open the next page
     of the same application. A type=submit control whose label is not a
-    continue label is treated as a final submit.
+    continue label is treated as a final submit. A validation sentence is
+    not a submit control, even when it contains the word "apply".
     """
     label = " ".join(name.split())
+    if _VALIDATION_LABEL_RE.search(label):
+        if _CONTINUE_RE.search(label):
+            return "continue"
+        if _AUTH_RE.search(label):
+            return "auth"
+        return "other"
     if _SUBMIT_RE.search(label) or _FORBIDDEN_RE.search(label):
         return "submit"
     if _AUTH_RE.search(label):

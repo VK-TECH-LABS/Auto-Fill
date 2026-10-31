@@ -619,3 +619,183 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return match
     dismiss_combobox(page)
     return None
+
+
+_LISTBOX_OPTIONS_JS = r"""() => {
+  function textOf(node) {
+    return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+  function shown(node) {
+    if (!node || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function junk(text) {
+    const folded = String(text || "").toLowerCase().replace(/[.…]+$/g, "").trim();
+    return (
+      folded === "select" ||
+      folded === "select one" ||
+      folded === "please select" ||
+      folded === "please select one" ||
+      folded === "choose" ||
+      folded === "choose one"
+    );
+  }
+  function selectedPill(node) {
+    if (!node || !node.closest) return false;
+    return !!node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id='selectedItem'], " +
+      "[data-automation-id='selectedItemText']"
+    );
+  }
+  const found = [];
+  const seen = new Set();
+  for (const option of document.querySelectorAll("[role='option'], [data-automation-id='promptOption']")) {
+    if (!shown(option) || selectedPill(option)) continue;
+    if (option.getAttribute("aria-disabled") === "true" || option.disabled) continue;
+    const label = textOf(option);
+    if (!label || junk(label) || seen.has(label)) continue;
+    seen.add(label);
+    if (!option.id) option.setAttribute("data-autofill-option", String(found.length));
+    const selector = option.id
+      ? "#" + CSS.escape(option.id)
+      : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
+    found.push({
+      label: label,
+      value: option.getAttribute("data-value") || label,
+      selector: selector,
+    });
+  }
+  return found;
+}"""
+
+
+_BUTTON_SHOWS_JS = r"""({ selector, label }) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+  return !!wanted && shown === wanted;
+}"""
+
+
+def _options_from_raw(raw) -> list[Option]:
+    found: list[Option] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        found.append(
+            Option(
+                value=str(item.get("value") or label),
+                label=label,
+                selector=str(item.get("selector") or ""),
+            )
+        )
+    return found
+
+
+def _read_open_listbox(page) -> list[Option]:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return []
+    try:
+        raw = evaluate(_LISTBOX_OPTIONS_JS) or []
+    except Exception:
+        return []
+    return _options_from_raw(raw)
+
+
+def _await_open_listbox(page, timeout_ms: int) -> list[Option]:
+    found = _read_open_listbox(page)
+    if found or timeout_ms <= 0 or getattr(page, "wait_for_timeout", None) is None:
+        return found
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        _pause(page, 40)
+        found = _read_open_listbox(page)
+        if found:
+            return found
+    return found
+
+
+def _close_listbox(page) -> None:
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        return
+
+
+def read_listbox_button_options(page, selector: str) -> list[Option]:
+    """Open one Workday listbox button, read the rows that appear, and close it.
+
+    The menu is not in the page until the button is clicked. ``Select One`` is
+    not an option. A selected pill on another prompt is not this menu.
+    """
+    if not selector:
+        return []
+    try:
+        open_combobox(page, selector)
+    except Exception:
+        return []
+    found = _await_open_listbox(page, 400)
+    _close_listbox(page)
+    return found
+
+
+def attach_listbox_options(page, control) -> None:
+    """Fill ``control.options`` from the menu. A control that already has rows is left alone."""
+    if control is None:
+        return
+    if getattr(control, "kind", "") != "buttons" or getattr(control, "role", "") != "listbox":
+        return
+    if getattr(control, "options", None) or not getattr(control, "selector", ""):
+        return
+    found = read_listbox_button_options(page, control.selector)
+    if found:
+        control.options = found
+
+
+def _button_shows(page, selector: str, label: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_BUTTON_SHOWS_JS, {"selector": selector, "label": label}))
+    except Exception:
+        return False
+
+
+def select_listbox_button(page, selector: str, desired: str) -> Option | None:
+    """Open a Workday choice button and choose ``desired``. Does not type into the button.
+
+    The button text must equal the option label afterwards. A click that leaves
+    ``Select One`` in place is not a commit.
+    """
+    if not selector or not str(desired or "").strip():
+        return None
+    from autofill.intents import pick_option
+
+    try:
+        open_combobox(page, selector)
+    except Exception:
+        return None
+    found = _await_open_listbox(page, 400)
+    status, match = pick_option(desired, found)
+    if status != "match" or match is None or not match.selector:
+        _close_listbox(page)
+        return None
+    try:
+        click_choice(page, match.selector, match.label or desired)
+    except Exception:
+        _close_listbox(page)
+        return None
+    _pause(page, 40)
+    if _button_shows(page, selector, match.label or desired):
+        return match
+    _close_listbox(page)
+    return None

@@ -392,3 +392,135 @@ def page_snapshot(page):
     from autofill.extract import extract_page
 
     return extract_page(page)
+
+
+_GM_SMS = (
+    "General Motors will need to contact you throughout the recruitment process, "
+    "this may include SMS/text messaging from GM and/or GM's third party partners "
+    "(message and data rates may apply.) Do you agree to communications via text message/SMS?"
+)
+
+
+def _gm_sms_page() -> str:
+    """The GM consent control is a closed listbox. Yes and No appear after the click."""
+    return f"""
+    <h1>Application Questions</h1>
+    <div data-automation-id="formField-sms">
+      <label id="sms-q">{_GM_SMS}<abbr>*</abbr></label>
+      <button id="sms" type="button" aria-haspopup="listbox" aria-labelledby="sms-q"
+        aria-required="true">Select One</button>
+    </div>
+    <label><input id="arb" type="checkbox" required> I agree to binding arbitration</label>
+    <script>
+      const button = document.getElementById("sms");
+      button.addEventListener("click", () => {{
+        document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+        const list = document.createElement("ul");
+        list.setAttribute("role", "listbox");
+        list.setAttribute("data-autofill-menu", "1");
+        list.style.cssText = "display:block;min-height:48px";
+        for (const label of ["Select One", "Yes", "No"]) {{
+          const item = document.createElement("li");
+          item.setAttribute("role", "option");
+          item.style.height = "24px";
+          item.textContent = label;
+          item.addEventListener("click", (event) => {{
+            event.stopPropagation();
+            button.textContent = label;
+            list.remove();
+          }});
+          list.appendChild(item);
+        }}
+        document.body.appendChild(list);
+      }});
+      document.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape") {{
+          document.querySelectorAll("[data-autofill-menu]").forEach((node) => node.remove());
+        }}
+      }});
+    </script>
+    """
+
+
+def test_authorized_sms_dropdown_selects_yes_and_records_autoconsent(browser):
+    from autofill.fill import fill_one_page
+    from autofill.stepfill import inspect_required
+
+    profile = _profile(answers=[{"key": "recruitment_sms_consent", "answer": "Yes"}])
+    bind_sms_scope(profile, "cand-a")
+    bind_standard_terms(False)
+    page = browser.new_page()
+    try:
+        page.set_content(_gm_sms_page())
+        fill_one_page(
+            page,
+            profile,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#arb").is_checked() is False
+        categories = [row["category"] for row in consume_auto_consents()]
+        assert categories == ["RECRUITMENT_SMS_CONSENT"]
+        gaps, _total, _done = inspect_required(page, page_snapshot(page), profile)
+        assert not any(gap.get("intent") == SMS_INTENT for gap in gaps)
+    finally:
+        page.close()
+        consume_auto_consents()
+
+
+def test_missing_sms_dropdown_is_one_consent_stop(browser):
+    from autofill.fill import fill_one_page
+    from autofill.stepfill import inspect_required
+
+    profile = _profile()
+    bind_sms_scope(profile, "cand-a")
+    bind_standard_terms(False)
+    page = browser.new_page()
+    try:
+        page.set_content(_gm_sms_page())
+        fill_one_page(
+            page,
+            profile,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#sms").inner_text().strip() == "Select One"
+        assert page.locator("#arb").is_checked() is False
+        assert consume_auto_consents() == []
+        gaps, _total, _done = inspect_required(page, page_snapshot(page), profile)
+        sms_gaps = [gap for gap in gaps if gap.get("intent") == SMS_INTENT or gap.get("fieldKey") == SMS_KEY]
+        assert len(sms_gaps) == 1
+        assert sms_gaps[0]["kind"] in {"CONSENT", "CONSENT_CHOICE"}
+        assert sms_gaps[0]["fieldKey"] == SMS_KEY
+    finally:
+        page.close()
+        consume_auto_consents()
+
+
+def test_another_candidates_sms_yes_does_not_select_the_dropdown(browser):
+    from autofill.fill import fill_one_page
+
+    profile = _profile(answers=[{"key": "recruitment_sms_consent", "answer": "Yes"}])
+    bind_sms_scope(profile, "cand-b")
+    bind_standard_terms(False)
+    page = browser.new_page()
+    try:
+        page.set_content(_gm_sms_page())
+        fill_one_page(
+            page,
+            profile,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#sms").inner_text().strip() == "Select One"
+        assert consume_auto_consents() == []
+    finally:
+        page.close()
+        consume_auto_consents()

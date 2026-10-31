@@ -1271,6 +1271,16 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason or "Source is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
+    # A Workday Application Questions dropdown is a button whose menu exists
+    # only after it is opened. Do not type the answer into the button.
+    if control.kind == "buttons" and control.role == "listbox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Choice is taken from the menu.",
+        )
     if control.kind in {"select", "radio"} or (control.kind in {"combobox", "buttons"} and control.options):
         from autofill.intents import pick_option
 
@@ -1626,15 +1636,41 @@ def _map_work_authorization(
         if approved is not None:
             return approved
         return _ask_person(key, "The Application Profile does not answer this exact work-authorization question.")
+    # An empty work-authorization fact is not an answer. The saved Application
+    # Answer is used instead, including by the caller when this returns None.
     if not value:
-        if approved is not None:
-            return approved
-        return _ask_person(key, "Profile has no value for this field.")
+        return approved
     if approved is not None and not _same_answer(value, approved.text):
         return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
     mapped = _from_text(control, key, value)
     mapped.field_class = "PROFILE_FIELD" if mapped.action != "unanswered" else "MANUAL_REVIEW_FIELD"
     return mapped
+
+
+def _fact_key(question: str) -> str:
+    """Catalogue key for a government-employment or legal-restriction question.
+
+    Empty when the question is not one of those facts. A missing row is not a No.
+    """
+    folded = normalize(question)
+    if "legal restriction" in folded:
+        return "legal_restrictions"
+    if "government" in folded and ("spouse" in folded or "partner" in folded):
+        return "spouse_gov"
+    if "government" in folded and any(word in folded for word in ("employee", "employed", "agency")):
+        return "current_former_gov"
+    return ""
+
+
+def _keyed_fact_answer(question: str, answers: list) -> str | None:
+    """The saved answer for this fact, only when the profile has that one row."""
+    key = _fact_key(question)
+    if not key:
+        return None
+    rows = [item for item in answers if getattr(item, "key", "") == key and str(item.answer or "").strip()]
+    if len(rows) != 1:
+        return None
+    return rows[0].answer
 
 
 def _explicit_answer(
@@ -1664,6 +1700,8 @@ def _explicit_answer(
             field_class="MANUAL_REVIEW_FIELD",
             reason="Saved answers disagree for this question.",
         )
+    if text is None:
+        text = _keyed_fact_answer(texts[0], profile.application_answers)
     if text is None:
         return None
     mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")
