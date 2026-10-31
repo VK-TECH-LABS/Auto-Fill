@@ -196,6 +196,11 @@ class ApplicationAnswer:
     # TileArc's canonical intent for this saved answer (e.g. SPONSORSHIP_FUTURE),
     # when known. It is checked against the question text before it is used.
     intent: str = ""
+    # Employer this answer belongs to. Empty means the host did not name one.
+    # Previously-employed answers are not reused for a different employer.
+    employer: str = ""
+    # True when this fill verified the value. A host-supplied row stays False.
+    from_session: bool = False
 
 
 @dataclass
@@ -467,6 +472,7 @@ def _answer_list(raw: object) -> list[ApplicationAnswer]:
             question=_text(entry, "question"),
             answer=_text(entry, "answer"),
             intent=_text(entry, "intent")[:64],
+            employer=_text(entry, "employer")[:200],
         )
         for entry in _objects(raw, "applicationAnswers")
     ]

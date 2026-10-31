@@ -883,13 +883,25 @@ def autofill_application(
     owns_browser = page is None
     playwright = None
     browser = None
+    from autofill.answers import bind_catalogue, employer_keys, reset_catalogue
     from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
+    from autofill.mapping import bind_us_page, reset_us_page
 
     confirmed_token = None
     session_token = None
+    catalogue_token = None
+    us_token = None
     try:
+        us_token = bind_us_page()
         confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
         session_token = bind_session_id(opts.session_id)
+        catalogue_token = bind_catalogue(
+            candidate_profile,
+            employer_keys(
+                company=opts.job.company if opts.job is not None else "",
+                url=application_url,
+            ),
+        )
         if page is None:
             from playwright.sync_api import sync_playwright
 
@@ -1386,6 +1398,10 @@ def autofill_application(
             reset_confirmed(confirmed_token)
         if session_token is not None:
             reset_session_id(session_token)
+        if catalogue_token is not None:
+            reset_catalogue(catalogue_token)
+        if us_token is not None:
+            reset_us_page(us_token)
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:

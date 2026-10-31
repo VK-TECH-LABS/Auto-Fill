@@ -25,8 +25,8 @@ PROFILE = ROOT / "examples" / "profile.example.json"
 YES_NO = [Option("Yes", "Yes"), Option("No", "No")]
 
 
-def _match(question: str, answers: list[ApplicationAnswer]) -> str | None:
-    return match_answer(question, answers, normalize=normalize)
+def _match(question: str, answers: list[ApplicationAnswer], **kwargs) -> str | None:
+    return match_answer(question, answers, normalize=normalize, **kwargs)
 
 
 def _profile(authorized: str, sponsorship: str, answers: list[dict] | None = None) -> CandidateProfile:
@@ -52,7 +52,7 @@ def test_jurisdiction_sets_match():
 
 def test_sponsorship_now_future_and_combined_are_not_interchangeable():
     saved = [ApplicationAnswer("Will you now or in the future require visa sponsorship?", "Yes")]
-    assert _match("Will you now or in the future require sponsorship?", saved) == "Yes"
+    assert _match("Will you now or in the future require sponsorship?", saved, us_on_page=True) == "Yes"
     assert _match("Do you currently require sponsorship?", saved) is None
     assert _match("Will you require sponsorship in the future?", saved) is None
     assert _match("Are you authorized to work in the US without sponsorship?", saved) is None
@@ -87,7 +87,7 @@ def test_canada_question_has_no_us_intent():
     ],
 )
 def test_equivalent_wording_is_reused(asked: str, saved_question: str, answer: str):
-    assert _match(asked, [ApplicationAnswer(saved_question, answer)]) == answer
+    assert _match(asked, [ApplicationAnswer(saved_question, answer)], us_on_page=True) == answer
 
 
 def test_tilearc_intent_is_used_when_the_saved_text_has_no_intent_of_its_own():
@@ -160,7 +160,9 @@ def test_profile_payload_carries_the_intent():
     ],
 )
 def test_work_authorization_answers_the_question_that_is_asked(authorized, sponsorship, label, expected):
-    mapped = map_field(_radio(label), _profile(authorized, sponsorship))
+    person = _profile(authorized, sponsorship)
+    person.personal.country = "United States"
+    mapped = map_field(_radio(label), person)
     if expected is None:
         assert mapped.action == "unanswered"
         assert mapped.field_class == "MANUAL_REVIEW_FIELD"
@@ -182,6 +184,7 @@ def test_profile_and_approved_work_answer_disagree_asks_the_employee():
         "No",
         [{"question": "Will you now or in the future require sponsorship?", "answer": "Yes"}],
     )
+    person.personal.country = "United States"
     mapped = map_field(_radio("Will you now or in the future require visa sponsorship?"), person)
     assert mapped.action == "unanswered"
     assert "disagree" in mapped.reason
@@ -312,6 +315,7 @@ _VALUES_JS = """() => {
 
 def _candidate(name: str) -> dict:
     data = json.loads(PROFILE.read_text())
+    data["personal"]["country"] = "United States"
     if name == "authorized":
         data["screening"]["previously_employed_here"] = ""
         data["applicationAnswers"] = [

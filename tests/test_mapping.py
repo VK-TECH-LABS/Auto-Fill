@@ -120,6 +120,7 @@ def test_autocomplete_beats_a_vague_label():
 
 def test_work_auth_select_and_sponsorship_radio():
     filled = profile()
+    filled.personal.country = "United States"
     authorized = map_field(
         control(
             "Are you legally authorized to work?",

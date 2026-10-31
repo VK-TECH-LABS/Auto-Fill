@@ -25,7 +25,7 @@ from autofill.dom_ui import (
 )
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
-from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
+from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, Option, PageSnapshot
 from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
 from autofill.safeguards import _bound_target, activate, classify_control, is_add_row
@@ -95,23 +95,49 @@ def current_session_id() -> str:
 
 
 def remember_confirmed(control: Control, value: str, *, field_key: str = "", choice: str = "") -> None:
-    """Keep a value the engine wrote and then read back on the control."""
-    hook = _CONFIRMED.get()
-    text = str(value or "")
-    if hook is None or not text.strip():
+    """Keep a value the engine wrote and then read back on the control.
+
+    The confirmed-value store puts the same control back after a rewrite.
+    ``choice`` marks a checkbox or radio for that restore. A separate catalogue
+    on the profile reuses a question answer on a later page. Profile fields
+    and consent are not copied into that catalogue.
+    """
+    text = str(value or "").strip()
+    if not text:
         return
-    record = {
-        "value": text,
-        "label": control.label or "",
-        "name": control.name or "",
-        "elementId": control.element_id or "",
-        "automationId": control.automation_id or "",
-        "fieldKey": field_key or "",
-        "selector": control.selector or "",
-    }
-    if choice:
-        record["choice"] = choice
-    hook(record)
+    hook = _CONFIRMED.get()
+    if hook is not None:
+        record = {
+            "value": text,
+            "label": control.label or "",
+            "name": control.name or "",
+            "elementId": control.element_id or "",
+            "automationId": control.automation_id or "",
+            "fieldKey": field_key or "",
+            "selector": control.selector or "",
+        }
+        if choice:
+            record["choice"] = choice
+        hook(record)
+    from autofill.answers import current_catalogue, note_session_answer
+    from autofill.mapping import question_stem, wrote_us_country
+
+    if wrote_us_country(field_key, text):
+        from autofill.mapping import mark_us_committed
+
+        mark_us_committed()
+    bound = current_catalogue()
+    if bound is None:
+        return
+    profile, employers = bound
+    note_session_answer(
+        profile,
+        stem=question_stem(control),
+        value=text,
+        field_key=field_key,
+        employers=employers,
+        control=control,
+    )
 
 
 _SET_NATIVE = """
@@ -417,6 +443,84 @@ def _note_manual(control: Control, mapped: MappedField, manual: list[str]) -> No
         manual.append(f"{label}: {mapped.reason}")
 
 
+def _fill_checkbox_group(
+    page,
+    controls: list[Control],
+    profile: CandidateProfile,
+    *,
+    job: JobContext | None,
+    cursor: MapCursor | None,
+    manual: list[str],
+) -> list[FieldOutcome]:
+    """One checkbox group is one question. A partial option list checks nothing.
+
+    Grouping is the step filler's ``_clusters`` helper. This does not build a
+    second radio grouper. Custom checkboxes stay unclicked.
+    """
+    from autofill.intents import match_all_options
+    from autofill.mapping import map_field, question_stem
+    from autofill.stepfill import _checkbox_label
+
+    visible = [
+        control
+        for control in controls
+        if not (
+            selector_held(control.selector)
+            and (not refill_cleared() or control_committed(page, control.selector))
+        )
+    ]
+    if not visible:
+        return []
+    stem = question_stem(visible[0])
+    synthetic = Control(
+        kind="textarea",
+        label=stem,
+        prompt=visible[0].prompt,
+        group=visible[0].group,
+        name=visible[0].name,
+    )
+    mapped = map_field(synthetic, profile, job=job, cursor=cursor)
+    options = [
+        Option(value=item.selector, label=_checkbox_label(item), selector=item.selector) for item in visible
+    ]
+    values: list[str] = []
+    if mapped.action == "fill" and mapped.text.strip():
+        raw = mapped.text.strip()
+        values = [part.strip() for part in raw.split(",") if part.strip()] if "," in raw else [raw]
+    chosen = match_all_options(values, options) if values else None
+    if chosen is None or any(not _native_checkbox(item) for item in visible):
+        reason = mapped.reason or "No option matched this group."
+        if values and chosen is None and "disagree" not in reason and "Several options" not in reason:
+            reason = f"No option matched profile value {mapped.text!r}."
+        if any(not _native_checkbox(item) for item in visible):
+            reason = "Custom checkbox left for a person."
+        blank = MappedField(
+            key=mapped.key,
+            action="unanswered",
+            field_class=mapped.field_class or "UNKNOWN_FIELD",
+            reason=reason,
+        )
+        outcomes: list[FieldOutcome] = []
+        for control in visible:
+            _note_manual(control, blank, manual)
+            outcomes.append(_outcome(control, blank))
+        return outcomes
+    chosen_selectors = {item.selector for item in chosen}
+    outcomes = []
+    for control in visible:
+        if control.selector not in chosen_selectors:
+            continue
+        check = MappedField(
+            key=mapped.key or "application_answer",
+            action="check",
+            text=_checkbox_label(control),
+            field_class="APPROVED_QUESTION",
+            confidence="high",
+        )
+        outcomes.append(_apply_mapped(page, control, check))
+    return outcomes
+
+
 def fill_one_page(
     page,
     profile: CandidateProfile,
@@ -434,16 +538,33 @@ def fill_one_page(
     fields: list[FieldOutcome] = []
     manual: list[str] = []
     resume_blocked = False
-    snapshot = extract_page(page)
+    from autofill.mapping import note_page_country
+
     for _ in range(4):
         fields = []
         manual = []
         resume_blocked = False
         snapshot = extract_page(page)
+        note_page_country(page, snapshot)
         cursor = MapCursor(page_heading=snapshot.heading)
-        for control in snapshot.controls:
+        from autofill.stepfill import _clusters
+
+        for kind, group in _clusters(snapshot):
             if not checkpoint():
                 break
+            if kind == "multi":
+                fields.extend(
+                    _fill_checkbox_group(
+                        page,
+                        group,
+                        profile,
+                        job=job,
+                        cursor=cursor,
+                        manual=manual,
+                    )
+                )
+                continue
+            control = group[0]
             if selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
@@ -701,10 +822,46 @@ def fill_application(
             "This is an identity-provider login. Auto-Fill does not sign in through SSO.",
         )
 
+    from autofill.mapping import bind_us_page, reset_us_page
+
     ats = detect_ats(target)
     resume = _path_text(resume_path)
     cover = _path_text(cover_letter_path)
+    us_token = bind_us_page()
+    try:
+        return _open_and_fill(
+            profile,
+            url=url,
+            page=page,
+            resume=resume,
+            cover=cover,
+            cover_letter_text=cover_letter_text,
+            job=job,
+            advance_pages=advance_pages,
+            max_pages=max_pages,
+            headless=headless,
+            resume_uploaded=resume_uploaded,
+            ats_name=ats.name if ats else None,
+        )
+    finally:
+        reset_us_page(us_token)
 
+
+def _open_and_fill(
+    profile: CandidateProfile,
+    *,
+    url: str | None,
+    page,
+    resume: str | None,
+    cover: str | None,
+    cover_letter_text: str | None,
+    job: JobContext | None,
+    advance_pages: bool,
+    max_pages: int,
+    headless: bool,
+    resume_uploaded: bool,
+    ats_name: str | None,
+) -> FillResult:
     if page is not None:
         current = getattr(page, "url", "") or ""
         if url and current in _BLANK_URLS:
@@ -718,7 +875,7 @@ def fill_application(
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
-            ats_name=ats.name if ats else None,
+            ats_name=ats_name,
             resume_uploaded=resume_uploaded,
         )
 
@@ -740,7 +897,7 @@ def fill_application(
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
-            ats_name=ats.name if ats else None,
+            ats_name=ats_name,
             resume_uploaded=resume_uploaded,
         )
     finally:

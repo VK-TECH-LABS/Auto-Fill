@@ -19,7 +19,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from autofill.answers import match_answer
 from autofill.dates import format_for_control
 from autofill.models import Control, JobContext, MappedField, Option
 from autofill.profile import CandidateProfile
@@ -247,6 +246,110 @@ _SKILL_RE = re.compile(
     r"(?:experience with|proficient in|knowledge of|familiar with|worked with|do you know)\s+(.+)$"
 )
 _SPECIFIC_EXPERIENCE_RE = re.compile(r"\b(with|using)\b")
+# True once this fill has committed a United States address country.
+_US_COMMITTED: contextvars.ContextVar[bool] = contextvars.ContextVar("autofill_us_committed", default=False)
+
+
+def bind_us_page() -> contextvars.Token[bool]:
+    """Start a fill with no committed address country. Reset the token when it ends."""
+    return _US_COMMITTED.set(False)
+
+
+def reset_us_page(token: contextvars.Token[bool]) -> None:
+    _US_COMMITTED.reset(token)
+
+
+def mark_us_committed() -> None:
+    """The page's address country is the United States for the rest of this fill."""
+    _US_COMMITTED.set(True)
+
+
+def wrote_us_country(field_key: str, value: str) -> bool:
+    """True when this write is an address country and the value is the United States."""
+    from autofill.intents import country_is_us
+
+    key = field_key.casefold()
+    if "phone" in key:
+        return False
+    if key != "country" and not key.endswith(".country"):
+        return False
+    return country_is_us(value)
+
+
+def note_page_country(page: object, snapshot: object) -> None:
+    """If a country control already shows the United States, remember that."""
+    from autofill.intents import country_is_us
+    from autofill.stepfill import live_field_value
+
+    if _US_COMMITTED.get() or page is None:
+        return
+    controls = getattr(snapshot, "controls", None) or []
+    for control in controls:
+        if getattr(control, "hidden", False) or match_field_key(control) != "country":
+            continue
+        shown = live_field_value(page, control) or ""
+        if country_is_us(str(shown)):
+            mark_us_committed()
+            return
+
+
+def us_context(profile: CandidateProfile | None = None) -> bool:
+    """True when this application already has a United States address country.
+
+    The profile country counts when it is the address we fill. A country
+    control that already shows the United States counts too. A question that
+    names no country is not assumed to be American without one of those.
+    """
+    from autofill.intents import country_is_us
+
+    if _US_COMMITTED.get():
+        return True
+    person = profile
+    if person is None:
+        from autofill.stepfill import current_location_profile
+
+        person = current_location_profile()
+    if person is None:
+        return False
+    return country_is_us(person.personal.country)
+
+
+def question_stem(control: Control) -> str:
+    """The question a person would read. Not the haystack and not a placeholder.
+
+    Order is group, prompt, label, then the accessible name. A section title
+    in all capitals is skipped. When one of those is the question (it contains
+    ``?``) it wins over a shorter option label such as ``Yes``.
+    """
+    options = {normalize(option.label) for option in control.options}
+    options.update(normalize(option.value) for option in control.options if option.value)
+    candidates: list[str] = []
+    for raw in (control.group, control.prompt, control.label, control.aria_label):
+        cleaned = (raw or "").strip()
+        if not cleaned:
+            continue
+        letters = [char for char in cleaned if char.isalpha()]
+        if "?" not in cleaned and len(letters) >= 3 and all(char.isupper() for char in letters):
+            continue
+        if len(options) > 1 and normalize(cleaned) in options:
+            continue
+        if cleaned not in candidates:
+            candidates.append(cleaned)
+    for text in candidates:
+        if "?" in text:
+            return text
+    return candidates[0] if candidates else ""
+
+
+def employer_keys_for(job: JobContext | None, url: str = "") -> tuple[str, ...]:
+    """This session's company and tenant scope, for employer-scoped answers."""
+    from autofill.answers import employer_keys
+
+    company = job.company if job is not None else ""
+    target = url or (job.url if job is not None else "")
+    return employer_keys(company=company, url=target)
+
+
 _SCREENING_KEYS = frozenset(
     {
         "age_18_or_older",
@@ -738,12 +841,18 @@ def _salary_decision(
     )
 
 
-def _explicit_salary(control: Control, profile: CandidateProfile, shape: str) -> MappedField | None:
+def _explicit_salary(
+    control: Control,
+    profile: CandidateProfile,
+    shape: str,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
     """An explicit answer for this question, when that answer covers the shape.
 
     A saved minimum does not satisfy a range question through this path.
     """
-    approved = _explicit_answer(control, profile)
+    approved = _explicit_answer(control, profile, job=job)
     if approved is None or approved.action == "unanswered":
         return None
     if not salary_value_covers(approved.text, shape):
@@ -771,7 +880,7 @@ def _map_salary(
         mapped.confidence = "high"
         mapped.related_fields = decision.related_fields
         return mapped
-    explicit = _explicit_salary(control, profile, shape)
+    explicit = _explicit_salary(control, profile, shape, job=job)
     if explicit is not None:
         return explicit
     if decision.status == "confirm":
@@ -1160,7 +1269,18 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             field_class="PROFILE_FIELD",
         )
     if control.kind in {"select", "radio"} or (control.kind in {"combobox", "buttons"} and control.options):
-        option = match_option(text, control.options)
+        from autofill.intents import pick_option
+
+        status, option = pick_option(text, control.options)
+        if status == "ambiguous":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Several options match this value.",
+            )
+        if option is None:
+            # Country and state aliases stay on the closed alias list.
+            option = match_option(text, control.options)
         if option is None:
             return MappedField(
                 key=key,
@@ -1177,6 +1297,12 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason,
         )
     if control.kind == "checkbox":
+        if control.input_type in {"aria-checkbox", "switch"} or control.role == "switch":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Custom checkbox left for a person.",
+            )
         answer = yes_no(text)
         if answer == "yes":
             return MappedField(key=key, action="check", text=text, reason=reason)
@@ -1312,7 +1438,7 @@ def map_field(
     if key is not None and control.kind == "file" and key not in {"resume", "cover_letter"}:
         return MappedField(key=key, action="unanswered", reason="File input did not match a resume or cover letter.")
     if key is None:
-        answered = _explicit_answer(control, profile)
+        answered = _explicit_answer(control, profile, job=job)
         if answered is not None:
             return answered
         skill = _skill_answer(control, profile)
@@ -1354,7 +1480,7 @@ def map_field(
     if key in {"salary", "salary_range"}:
         return _map_salary(control, profile, job, key)
     if key in {"legally_authorized_to_work", "require_sponsorship"}:
-        semantic = _map_work_authorization(control, profile, key)
+        semantic = _map_work_authorization(control, profile, key, job=job)
         if semantic is not None:
             return semantic
     try:
@@ -1364,14 +1490,14 @@ def map_field(
     # Screening questions: the Application Profile first, then an approved answer
     # for the same question. When both exist and disagree, the employee decides.
     if key in _SCREENING_KEYS:
-        approved = _explicit_answer(control, profile)
+        approved = _explicit_answer(control, profile, job=job)
         if approved is not None and approved.action != "unanswered":
             if text and not _same_answer(text, approved.text):
                 return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
             if not text:
                 return approved
     if not text:
-        answered = _explicit_answer(control, profile)
+        answered = _explicit_answer(control, profile, job=job)
         if answered is not None and answered.action != "unanswered":
             return answered
     if key == "cover_letter" and cover_letter_text is not None:
@@ -1396,13 +1522,9 @@ def _retarget_date(key: str, cursor: MapCursor | None) -> str:
 
 
 def _question_texts(control: Control) -> list[str]:
-    """The control's question wording, most specific first."""
-    texts: list[str] = []
-    for part in (control.label, control.prompt, control.aria_label, control.group, control.placeholder):
-        cleaned = (part or "").strip()
-        if cleaned and cleaned not in texts:
-            texts.append(cleaned)
-    return texts
+    """The question stem only. Placeholders and nearby text are not the question."""
+    stem = question_stem(control)
+    return [stem] if stem else []
 
 
 def _same_answer(left: str, right: str) -> bool:
@@ -1455,24 +1577,38 @@ def _work_value(intent: str, text: str, authorized: str, sponsorship: str) -> st
     return ""
 
 
-def _map_work_authorization(control: Control, profile: CandidateProfile, key: str) -> MappedField | None:
+def _map_work_authorization(
+    control: Control,
+    profile: CandidateProfile,
+    key: str,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
     """Answer the work-authorization question that is actually asked.
 
     Returns None when the question has no known intent; the caller then maps the
-    profile field as before.
+    profile field as before. A question that names no country does not use the
+    U.S. profile facts unless this page's address country is the United States.
     """
-    from autofill.answers import _JURISDICTION_INTENTS, jurisdiction, question_intent
+    from autofill.answers import _JURISDICTION_INTENTS, question_intent
+    from autofill.intents import countries_named
 
     texts = _question_texts(control)
-    approved = _explicit_answer(control, profile)
+    on_page = us_context(profile)
+    approved = _explicit_answer(control, profile, job=job)
     if approved is not None and approved.action == "unanswered":
         approved = None
-    if texts and jurisdiction(texts[0]) != frozenset({"US"}):
+    named = countries_named(texts[0]) if texts else frozenset()
+    if named and named != frozenset({"US"}):
         # The profile's work facts are for the United States only.
         if approved is not None:
             return approved
         return _ask_person(key, "This question asks about a country other than the United States.")
-    intent, text = question_intent(texts)
+    if texts and not named and not on_page:
+        if approved is not None:
+            return approved
+        return _ask_person(key, "This question does not name the United States.")
+    intent, text = question_intent(texts, us_on_page=on_page)
     if intent not in _JURISDICTION_INTENTS:
         return None
     authorized = profile.work_authorization.legally_authorized_to_work.strip()
@@ -1493,11 +1629,33 @@ def _map_work_authorization(control: Control, profile: CandidateProfile, key: st
     return mapped
 
 
-def _explicit_answer(control: Control, profile: CandidateProfile) -> MappedField | None:
+def _explicit_answer(
+    control: Control,
+    profile: CandidateProfile,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
     if not profile.application_answers:
         return None
-    texts = [*_question_texts(control), haystack(control)]
-    text = match_answer(texts, profile.application_answers, normalize=normalize)
+    from autofill.answers import catalogue_match
+
+    texts = _question_texts(control)
+    if not texts:
+        return None
+    text, status = catalogue_match(
+        texts,
+        profile.application_answers,
+        normalize=normalize,
+        us_on_page=us_context(profile),
+        employers=employer_keys_for(job),
+    )
+    if status == "conflict":
+        return MappedField(
+            key="application_answer",
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Saved answers disagree for this question.",
+        )
     if text is None:
         return None
     mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")
