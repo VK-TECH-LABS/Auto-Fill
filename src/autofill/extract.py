@@ -564,9 +564,27 @@ EXTRACT_JS = r"""
     return "[data-autofill-target='" + el.getAttribute("data-autofill-target") + "']";
   }
 
+  function inTilearcPopup(el) {
+    let node = el;
+    while (node) {
+      if (node.nodeType === 1) {
+        if (node.id === "tilearc-answer-popup") return true;
+        if (node.getAttribute && node.getAttribute("data-tilearc-popup")) return true;
+      }
+      const root = node.getRootNode ? node.getRootNode() : null;
+      if (root && root.host && root.host !== node) {
+        node = root.host;
+        continue;
+      }
+      node = node.parentElement || null;
+    }
+    return false;
+  }
+
   function eachRoot(root, visit) {
     visit(root);
     for (const el of root.querySelectorAll("*")) {
+      if (el.id === "tilearc-answer-popup" || (el.getAttribute && el.getAttribute("data-tilearc-popup"))) continue;
       if (el.shadowRoot) eachRoot(el.shadowRoot, visit);
     }
   }
@@ -604,6 +622,7 @@ EXTRACT_JS = r"""
   eachRoot(document, (root) => {
     const rootKey = root.host ? (root.host.id || "shadow") : "document";
     for (const el of root.querySelectorAll("input, select, textarea")) {
+      if (inTilearcPopup(el)) continue;
       const tag = el.tagName.toLowerCase();
       const inputType = tag === "textarea"
         ? "textarea"
@@ -706,7 +725,7 @@ EXTRACT_JS = r"""
     }
 
     for (const el of root.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")) {
-      if (isHidden(el)) continue;
+      if (inTilearcPopup(el) || isHidden(el)) continue;
       const href = el.getAttribute("href") || "";
       let name = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
       if (!name && /apply/i.test(href)) name = "Apply";
@@ -1687,6 +1706,7 @@ _FINGERPRINT_JS = r"""() => {
       bits.push([el.id || "", el.getAttribute("data-automation-id") || "", type, value].join(":"));
     }
     for (const el of node.querySelectorAll("*")) {
+      if (el.id === "tilearc-answer-popup" || (el.getAttribute && el.getAttribute("data-tilearc-popup"))) continue;
       if (el.shadowRoot) walk(el.shadowRoot);
     }
   }

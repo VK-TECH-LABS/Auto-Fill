@@ -25,6 +25,7 @@ from autofill.dom_ui import (
     empty_progress,
     fit_choice_values,
     match_open_item,
+    page_question_views,
     progress_percent,
     public_blocking,
     workflow_percent,
@@ -74,6 +75,7 @@ from autofill.service.schemas import (
     ManualQuestionOut,
     ProgressOut,
     RunStatusOut,
+    StopQuestionOut,
     SuggestIn,
     SuggestOptionOut,
     SuggestOut,
@@ -569,6 +571,21 @@ URL, a browser page, or client-side JavaScript.
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _stop_questions(session: ServiceSession) -> list[StopQuestionOut]:
+    """The page set already collected. Empty unless this stop is waiting on a question."""
+    if _public_status(session) != Status.MANUAL_ANSWER_REQUIRED:
+        return []
+    return [StopQuestionOut.model_validate(row) for row in page_question_views(session.open_items)]
+
+
+def _same_page_set(prior_sig: tuple | None, prior_ids: list[str], outcome: ApplicationResult) -> bool:
+    """True when the follow-up is the rest of the set already shown for this page."""
+    if outcome.status != Status.MANUAL_ANSWER_REQUIRED or prior_sig is None or outcome.page_signature != prior_sig:
+        return False
+    remaining = [row["id"] for row in page_question_views(outcome.open_items)]
+    return bool(remaining) and set(remaining) <= set(prior_ids)
+
+
 def _questions_out(session: ServiceSession) -> list[ManualQuestionOut]:
     source = session.result.manual_questions if session.result is not None else session.manual_questions
     return [ManualQuestionOut(intent=item.get("intent"), text=item.get("text") or "") for item in source]
@@ -606,6 +623,7 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
         paused=session.paused,
+        questions=_stop_questions(session),
         pageType=session.page_type or "UNKNOWN",
         entryClicks=session.entry_clicks,
         nextClicks=session.next_clicks,
@@ -727,6 +745,13 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     if isinstance(result.blocking, dict):
         result.blocking = _canonicalize_blocker(result.blocking)
     session.open_items = [_canonicalize_blocker(item) for item in result.open_items]
+    if result.status == Status.MANUAL_ANSWER_REQUIRED:
+        session.page_set_ids = [row["id"] for row in page_question_views(session.open_items)]
+        if result.page_signature is not None:
+            session.page_signature = result.page_signature
+    else:
+        session.page_set_ids = []
+        session.page_signature = None
     session.paused = session.pause_gate.paused
     if result.timings:
         for key, value in result.timings.items():
@@ -1742,7 +1767,25 @@ def create_app(
             if not recorded:
                 store.release_answer(session.session_id)
 
-    def _answer_once(session: ServiceSession, body: AnswerIn) -> AnswerOut:
+    def _answer_once(session: ServiceSession, body: AnswerIn, *, finish: bool = True) -> AnswerOut:
+        if finish and body.answers:
+            last: AnswerOut | None = None
+            rows = list(body.answers)
+            for index, row in enumerate(rows):
+                one = AnswerIn(
+                    questionId=row.question_id,
+                    questionHash=row.question_hash,
+                    fieldKey=row.field_key,
+                    value=row.value,
+                    values=list(row.values),
+                    confirm=row.confirm,
+                )
+                last = _answer_once(session, one, finish=index == len(rows) - 1)
+                if not last.filled:
+                    return last
+            if last is None:
+                raise HTTPException(status_code=422, detail={"reason": "needs_option"})
+            return last
         if session.status in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED}:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
@@ -1853,6 +1896,12 @@ def create_app(
             session.held_selectors.add(selector)
         session.pause_gate.resume()
         session.paused = False
+        if not finish:
+            return _answer_filled(session, item, body, started)
+        prior_next = session.next_clicks
+        prior_pages = session.pages_advanced
+        prior_sig = session.page_signature
+        prior_ids = list(session.page_set_ids)
         advance = getattr(active_runner, "advance_after_answer", None)
         if advance is not None:
             try:
@@ -1869,7 +1918,15 @@ def create_app(
                 _mark_browser_crash(session)
                 raise HTTPException(status_code=exc.status_code, detail={"reason": "element_not_found"}) from None
             if outcome is not None:
+                same = _same_page_set(prior_sig, prior_ids, outcome)
+                if not same:
+                    session.nav_base_entry = session.entry_clicks
+                    session.nav_base_next = prior_next
+                    session.nav_base_pages = prior_pages
                 _accept_result(session, outcome)
+                if same:
+                    session.next_clicks = prior_next
+                    session.pages_advanced = prior_pages
                 _keep_place_options(session, item, filled)
                 return _answer_filled(session, item, body, started)
         if session.status in {Status.MANUAL_ANSWER_REQUIRED, Status.RESUME_UPLOAD_REQUIRED}:

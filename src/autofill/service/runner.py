@@ -772,6 +772,20 @@ def _bind_page(slot):
     return bind
 
 
+def _stamp_page(page: Any, result: ApplicationResult) -> ApplicationResult:
+    """Remember the page signature for a question stop. Other statuses are unchanged."""
+    if page is None or result.status != Status.MANUAL_ANSWER_REQUIRED:
+        return result
+    try:
+        from autofill.extract import extract_page
+        from autofill.pagewait import navigation_signature
+
+        result.page_signature = navigation_signature(page, extract_page(page))
+    except Exception:
+        return result
+    return result
+
+
 class PlaywrightRunner:
     """Default runner. Manual-ATS and SSO decisions do not launch a browser."""
 
@@ -965,7 +979,7 @@ class PlaywrightRunner:
                 result = self._run_engine(request, slot.page, slot)
                 slot.last_ats = result.ats
                 self._remember_mark(slot)
-                return result
+                return _stamp_page(slot.page, result)
             except Exception as exc:
                 if is_ats_timeout(exc):
                     return self._retryable(request, category="ats_timeout")
@@ -1284,14 +1298,14 @@ class PlaywrightRunner:
                     cover_letter_text=request.cover_letter_text,
                     previous_stage=str((request.progress or {}).get("stage") or ""),
                 )
-                if follow.changed:
+                if follow.changed or (follow.status == Status.FILLED and not follow.open_items):
                     result = self._run_engine(request, slot.page, slot)
                     slot.last_ats = result.ats
                     self._remember_mark(slot)
-                    return result
+                    return _stamp_page(slot.page, result)
                 if follow.mark is not None:
                     slot.mark = follow.mark
-                return self._result_from_follow(request, follow, slot.last_ats)
+                return _stamp_page(slot.page, self._result_from_follow(request, follow, slot.last_ats))
             except Exception as exc:
                 if not is_browser_crash(exc):
                     raise

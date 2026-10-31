@@ -69,6 +69,9 @@ class ServiceSession:
     pause_gate: PauseGate = field(default_factory=PauseGate)
     progress: dict = field(default_factory=empty_progress)
     open_items: list[dict] = field(default_factory=list)
+    # navigation_signature of the page set, and the question ids collected with it.
+    page_signature: tuple | None = None
+    page_set_ids: list[str] = field(default_factory=list)
     held_selectors: set[str] = field(default_factory=set)
     held_answers: list[str] = field(default_factory=list)
     state_version: int = 0

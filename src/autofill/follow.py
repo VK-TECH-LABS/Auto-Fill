@@ -22,10 +22,18 @@ from autofill.dom_ui import (
     stage_for,
     workflow_percent,
 )
-from autofill.engine import Status
+from autofill.engine import REVEAL_ATTEMPTS, Status
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped
-from autofill.mapping import MapCursor, is_honeypot, map_field
+from autofill.mapping import (
+    MapCursor,
+    acknowledgement_kind,
+    attestation_manual,
+    is_consent_choice,
+    is_demographic_control,
+    is_honeypot,
+    map_field,
+)
 from autofill.models import Control, JobContext, PageSnapshot
 from autofill.pagewait import classify_page, current_page_type, site_error_messages, terminal_kind
 from autofill.profile import CandidateProfile
@@ -70,6 +78,52 @@ def read_page_mark(page) -> tuple[PageMark, PageSnapshot]:
 
 
 def follow_answer(
+    page,
+    *,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    held: set[str],
+    prior: list[dict],
+    previous: PageMark | None,
+    cover_letter_text: str | None = None,
+    cover_letter_path: str | None = None,
+    previous_stage: str = "",
+) -> FollowUp:
+    """Scan this page, then at most a few reveals, and return one gap set."""
+    outcome = _follow_once(
+        page,
+        profile=profile,
+        job=job,
+        held=held,
+        prior=prior,
+        previous=previous,
+        cover_letter_text=cover_letter_text,
+        cover_letter_path=cover_letter_path,
+        previous_stage=previous_stage,
+    )
+    attempt = 1
+    while (
+        attempt < REVEAL_ATTEMPTS
+        and outcome.typed
+        and not outcome.changed
+        and outcome.mark is not None
+    ):
+        outcome = _follow_once(
+            page,
+            profile=profile,
+            job=job,
+            held=held,
+            prior=prior,
+            previous=outcome.mark,
+            cover_letter_text=cover_letter_text,
+            cover_letter_path=cover_letter_path,
+            previous_stage=previous_stage,
+        )
+        attempt += 1
+    return outcome
+
+
+def _follow_once(
     page,
     *,
     profile: CandidateProfile,
@@ -313,12 +367,21 @@ def _fill_new(
             job=job,
             cursor=cursor,
         )
-        if mapped.action not in _WRITE:
+        if _leave_for_person(control, mapped) or mapped.action not in _WRITE:
             continue
         outcome = apply_mapped(page, control, mapped)
         if outcome.action in _WRITE and outcome.detail != "already set":
             typed.append(control.selector)
     return typed
+
+
+def _leave_for_person(control: Control, mapped) -> bool:
+    """A reveal must not auto-answer a row a normal scan would pause on."""
+    if getattr(mapped, "challenge", "") == "confirm":
+        return True
+    if is_demographic_control(control) or is_consent_choice(control) or attestation_manual(control):
+        return True
+    return acknowledgement_kind(control) in {"consent", "marketing"}
 
 
 def _should_fill(page, control: Control, fresh: frozenset[str], held: set[str]) -> bool:

@@ -901,6 +901,44 @@ def canonical_blocker_kind(kind: object) -> str:
     return name
 
 
+_NOT_A_QUESTION = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
+
+
+def page_question_views(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """One public row per gap, in page order. Login and resume stops are not rows."""
+    views: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if canonical_blocker_kind(item.get("kind")) in _NOT_A_QUESTION:
+            continue
+        qid = str(
+            item.get("questionId") or item.get("questionHash") or item.get("fieldKey") or item.get("id") or ""
+        ).strip()
+        prompt = str(item.get("text") or item.get("prompt") or "").strip()
+        if not qid or not prompt or qid in seen:
+            continue
+        seen.add(qid)
+        options: list[str] = []
+        for option in item.get("options") or []:
+            if isinstance(option, dict):
+                label = str(option.get("label") or option.get("value") or "").strip()
+            else:
+                label = str(option).strip()
+            if label and label not in options:
+                options.append(label)
+        views.append(
+            {
+                "id": qid,
+                "prompt": prompt,
+                "type": str(item.get("answerType") or item.get("type") or "text"),
+                "options": options,
+            }
+        )
+    return views
+
+
 def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if item is None:
         return None
