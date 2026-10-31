@@ -9,13 +9,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from autofill.dom_ui import public_blocking
 from autofill.engine import ApplicationResult, Status
 from autofill.local_attach import ENV_FLAG, DedicatedApplySession, find_chrome, start_fixture_server
 from autofill.local_helper import serve
 from test_local_helper import (
     _COLOR,
+    _VISA,
     _AnswerSession,
     _binding,
+    _manual_result,
     _profile,
     _request,
     _serve,
@@ -36,18 +39,42 @@ class _PopupSession(_AnswerSession):
         self.messages: list[tuple[str, bool, bool]] = []
         self.closed = 0
 
-    def show_question_popup(self, question, *, nonce, selector="", candidate="", message="", error=False, force=False):
-        self.popup = {"nonce": nonce, "questionId": question["id"], "state": "ask", "values": []}
-        self.shown.append({"question": dict(question), "nonce": nonce, "selector": selector,
-                           "candidate": candidate, "message": message, "error": error})
+    def show_question_popup(
+        self, question, *, nonce, selector="", candidate="", message="", error=False, force=False,
+        questions=None, locked=False, restored=None,
+    ):
+        self.popup = {
+            "nonce": nonce,
+            "questionId": question["id"],
+            "questionIds": [row["id"] for row in questions] if questions else [question["id"]],
+            "state": "ask",
+            "values": [],
+        }
+        self.shown.append({
+            "question": dict(question),
+            "questions": [dict(row) for row in questions] if questions else None,
+            "nonce": nonce,
+            "selector": selector,
+            "candidate": candidate,
+            "message": message,
+            "error": error,
+            "locked": locked,
+            "restored": restored,
+            "force": force,
+        })
         return True
 
     def read_question_popup(self, nonce):
         popup = self.popup
         if popup is None or popup["nonce"] != nonce:
             return {"present": False}
-        return {"present": True, "state": popup["state"], "questionId": popup["questionId"],
-                "values": list(popup["values"])}
+        return {
+            "present": True,
+            "state": popup["state"],
+            "questionId": popup["questionId"],
+            "questionIds": list(popup.get("questionIds") or []),
+            "values": list(popup["values"]) if popup["values"] else None,
+        }
 
     def question_popup_message(self, nonce, message, *, error=False, reopen=False):
         self.messages.append((message, error, reopen))
@@ -68,6 +95,23 @@ class _PopupSession(_AnswerSession):
         if question_id is not None:
             self.popup["questionId"] = question_id
 
+    def click_rows(self, rows):
+        """One click that records every row of the page set."""
+        assert self.popup is not None
+        self.popup["state"] = "answered"
+        self.popup["values"] = [dict(row) for row in rows]
+
+
+class _PairPopup(_PopupSession):
+    """Both questions are already on the page when the fill stops."""
+
+    def fill(self, url: str, profile: object) -> tuple:
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        result = _manual_result(_COLOR)
+        result.open_items = [dict(_COLOR), dict(_VISA)]
+        return result, False
+
 
 def _start(port: int, session: str = "sess-a", candidate: str = "101") -> dict:
     code, created = _request(port, "POST", "/v1/sessions", {
@@ -80,7 +124,7 @@ def _start(port: int, session: str = "sess-a", candidate: str = "101") -> dict:
 
 
 def test_popup_payload_answer_and_continue(monkeypatch):
-    fake = _PopupSession()
+    fake = _PairPopup()
     helper, server, port = _serve(monkeypatch, fake)
     try:
         created = _start(port)
@@ -94,6 +138,8 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         assert shown["question"]["options"] == ["Red", "Blue"]
         assert shown["selector"] == "#color"
         assert shown["candidate"] == "Avery Alpha"
+        assert [row["id"] for row in shown["questions"]] == ["q-color", "q-visa"]
+        assert [row["id"] for row in body["questions"]] == ["q-color", "q-visa"]
         nonce = shown["nonce"]
 
         # A value outside the employer's choices reopens the popup with an error.
@@ -108,32 +154,37 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["question"]["popup"]["state"] == "shown"
 
-        # The real click: canonical option, nonce exposed for the panel.
+        # One click records both rows. Nothing is typed until /answer.
         fake.popup["questionId"] = "q-color"
-        fake.click(["red"])
+        fake.click_rows([
+            {"questionId": "q-color", "values": ["red"]},
+            {"questionId": "q-visa", "values": ["Sponsorship no"]},
+        ])
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["question"]["popup"] == {
-            "state": "answered", "source": "employer_tab", "nonce": nonce, "values": ["Red"],
+            "state": "answered",
+            "source": "employer_tab",
+            "nonce": nonce,
+            "values": [
+                {"questionId": "q-color", "values": ["Red"]},
+                {"questionId": "q-visa", "values": ["Sponsorship no"]},
+            ],
         }
-        assert fake.applied == []  # Nothing reaches the page until TileArc posts /answer.
+        assert fake.applied == []
+        shows = len(fake.shown)
 
-        # TileArc saved and verified; the panel posts the answer.
         code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
             "id": "q-color", "value": "Red", "binding": _binding("sess-a", "101"),
         })
         assert code == 200, answered
         assert answered["verified"] is True
         assert fake.applied[0]["value"] == "Red"
-        # The next question gets a fresh popup with a new nonce.
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["question"]["id"] == "q-visa"
-        assert body["question"]["popup"]["state"] == "shown"
-        assert fake.shown[-1]["nonce"] != nonce
-        # The verified answer is offered to later pages of this same fill.
+        assert len(fake.shown) == shows  # The sibling was already on the card.
         job = helper.get(sid)
         assert any(row.question == _COLOR["text"] and row.answer == "Red" for row in job.profile.application_answers)
 
-        fake.click(["Sponsorship no"])
         code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
             "id": "q-visa", "value": "Sponsorship no", "binding": _binding("sess-a", "101"),
         })
@@ -141,7 +192,130 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
         assert "question" not in body
+        assert len(fake.shown) == shows
         assert fake.popup is None  # Closed once nothing is left to ask.
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_revealed_question_gets_one_extra_card_and_not_a_third(monkeypatch):
+    """A question that was not on the first card gets one more card. A further one does not."""
+    third = dict(
+        _VISA,
+        questionId="q-extra",
+        questionHash="q-extra",
+        text="Name a tool you have used.",
+        selector="#tool",
+    )
+
+    class _Reveal(_PopupSession):
+        def apply_answer(self, url: str, profile: object, target: dict) -> dict:
+            self.applied.append({
+                "selector": target.get("selector"),
+                "value": target.get("value"),
+                "check": bool(target.get("check")),
+            })
+            self._step += 1
+            if self._step == 1:
+                return {
+                    "verified": True,
+                    "filled": True,
+                    "status": Status.MANUAL_ANSWER_REQUIRED,
+                    "open_items": [dict(_VISA)],
+                    "blocking": public_blocking(_VISA),
+                }
+            if self._step == 2:
+                return {
+                    "verified": True,
+                    "filled": True,
+                    "status": Status.MANUAL_ANSWER_REQUIRED,
+                    "open_items": [third],
+                    "blocking": public_blocking(third),
+                }
+            return {
+                "verified": True,
+                "filled": True,
+                "status": Status.READY_FOR_HUMAN_SUBMIT,
+                "open_items": [],
+                "blocking": None,
+            }
+
+    fake = _Reveal()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start(port)
+        sid = created["sessionId"]
+        fake.release.set()
+        body = _wait_status(port, sid, lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
+        first_nonce = fake.shown[-1]["nonce"]
+        fake.click(["Red"])
+        code, _answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
+            "id": "q-color", "value": "Red", "binding": _binding("sess-a", "101"),
+        })
+        assert code == 200
+        body = _wait_status(port, sid, lambda b: b.get("question", {}).get("id") == "q-visa")
+        assert len(fake.shown) == 2
+        assert fake.shown[-1]["nonce"] != first_nonce
+        assert [row["id"] for row in fake.shown[-1]["questions"]] == ["q-visa"]
+        fake.click(["Sponsorship no"])
+        code, _answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
+            "id": "q-visa", "value": "Sponsorship no", "binding": _binding("sess-a", "101"),
+        })
+        assert code == 200, body
+        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert body["question"]["id"] == "q-extra"
+        assert len(fake.shown) == 2  # No third card.
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_lost_card_keeps_the_same_nonce(monkeypatch):
+    fake = _PopupSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start(port)
+        sid = created["sessionId"]
+        fake.release.set()
+        _wait_status(port, sid, lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "shown")
+        nonce = fake.shown[-1]["nonce"]
+        fake.popup = None  # The page dropped the host.
+        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert body["question"]["popup"]["state"] == "shown"
+        assert fake.shown[-1]["nonce"] == nonce
+        assert len(fake.shown) == 2
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_validation_banner_is_one_locked_card(monkeypatch):
+    class _Banner(_PopupSession):
+        def fill(self, url: str, profile: object) -> tuple:
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            result = ApplicationResult(
+                status=Status.MANUAL_ANSWER_REQUIRED,
+                ats=None,
+                current_step="questions",
+                login_status="NOT_REQUIRED",
+                fields_detected=1,
+                fields_filled=0,
+                stopped_before_submit=True,
+                messages=["This field is required"],
+            )
+            return result, False
+
+    fake = _Banner()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start(port)
+        fake.release.set()
+        _wait_status(port, created["sessionId"], lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
+        assert len(fake.shown) == 1
+        assert fake.shown[0]["locked"] is True
+        assert fake.shown[0]["question"]["prompt"] == "This field is required"
     finally:
         helper.close()
         server.shutdown()
@@ -290,7 +464,8 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         sid = created["sessionId"]
         body = wait(lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "shown", sid)
         question = body["question"]
-        assert question["prompt"] == "Are you willing to work rotating night shifts?", body
+        # #97's stem keeps the legend's required mark. The question is the same sentence.
+        assert question["prompt"].replace("*", "").strip() == "Are you willing to work rotating night shifts?", body
         assert question["options"] == ["Yes", "No"]
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
@@ -313,7 +488,7 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         body = wait(lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
                     and b["question"].get("popup", {}).get("state") == "shown", sid)
         second = body["question"]
-        assert second["prompt"] == "Which forklift brand have you operated most?", body
+        assert second["prompt"].replace("*", "").strip() == "Which forklift brand have you operated most?", body
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
             page = [p for c in browser.contexts for p in c.pages if "t172-local-tab" in p.url][0]

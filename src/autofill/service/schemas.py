@@ -326,8 +326,8 @@ class BlockingOut(BaseModel):
         return data
 
 
-class AnswerIn(BaseModel):
-    """One saved value for the current blocker or another open item. Memory only."""
+class AnswerRowIn(BaseModel):
+    """One row of an optional page-set body. The single-question fields still work alone."""
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
@@ -337,6 +337,24 @@ class AnswerIn(BaseModel):
     value: str = Field(default="", max_length=8000)
     values: list[str] = Field(default_factory=list, max_length=20)
     confirm: bool = False
+
+
+class AnswerIn(BaseModel):
+    """One saved value for the current blocker or another open item. Memory only.
+
+    ``answers`` is an optional batch of the same shape. When it is set, each row
+    is written and Next runs only after the last row.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    question_id: str = Field(default="", alias="questionId", max_length=128)
+    question_hash: str = Field(default="", alias="questionHash", max_length=128)
+    field_key: str = Field(default="", alias="fieldKey", max_length=128)
+    value: str = Field(default="", max_length=8000)
+    values: list[str] = Field(default_factory=list, max_length=20)
+    confirm: bool = False
+    answers: list[AnswerRowIn] = Field(default_factory=list, max_length=20)
 
     @field_validator("values")
     @classmethod
@@ -351,6 +369,8 @@ class AnswerIn(BaseModel):
 
     @model_validator(mode="after")
     def _target(self) -> AnswerIn:
+        if self.answers:
+            return self
         if not (self.question_id.strip() or self.question_hash.strip() or self.field_key.strip()):
             raise ValueError("questionId, questionHash, or fieldKey is required")
         return self
@@ -413,6 +433,17 @@ class AnswerOut(BaseModel):
     ms: int | None = None
 
 
+class StopQuestionOut(BaseModel):
+    """One question in the current page set. The answer value is not included."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    prompt: str = ""
+    type: str = "text"
+    options: list[str] = Field(default_factory=list)
+
+
 class ManualQuestionOut(BaseModel):
     """A question left blank. The answer value is not included."""
 
@@ -467,6 +498,7 @@ class RunStatusOut(BaseModel):
     progress: ProgressOut = Field(default_factory=ProgressOut)
     paused: bool = False
     blocking: BlockingOut | None = None
+    questions: list[StopQuestionOut] = Field(default_factory=list)
     state_version: int | None = Field(default=None, alias="stateVersion")
     account: dict[str, Any] | None = None
     resume: dict[str, Any] | None = None
@@ -490,6 +522,8 @@ class RunStatusOut(BaseModel):
                 data.pop(key, None)
         if not data.get("autoConsents"):
             data.pop("autoConsents", None)
+        if not data.get("questions"):
+            data.pop("questions", None)
         return data
 
 

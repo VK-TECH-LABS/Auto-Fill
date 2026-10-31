@@ -56,7 +56,7 @@ from urllib.parse import urlparse
 
 from autofill.answer_popup import new_nonce
 from autofill.credentials import Credentials, MemoryCredentialProvider, credential_scope
-from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item
+from autofill.dom_ui import canonical_blocker_kind, fit_choice_values, match_open_item, page_question_views
 from autofill.engine import ApplicationResult, Status, is_browser_crash
 from autofill.local_attach import (
     ENV_FLAG,
@@ -90,7 +90,6 @@ _ANSWER_WAIT_SECONDS = 60
 # A popup answer TileArc has not confirmed by then reopens the popup with an error.
 _POPUP_SAVE_TIMEOUT_SECONDS = 45
 _POPUP_SYNC_WAIT_SECONDS = 1.5
-_NON_QUESTION_KINDS = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
 # Finished and replaced jobs kept so a late status/answer gets 410, not a fill.
 _MAX_JOBS = 8
 _BINDING_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -366,8 +365,13 @@ class LocalJob:
         self.open_items: list[dict[str, Any]] = []
         self.blocking: dict[str, Any] | None = None
         self.question: dict[str, Any] | None = None
-        # Employer-tab Save & Continue popup: nonce, questionId, state, values, answeredAt.
+        # Employer-tab Save & Continue card: nonce, question ids, state, values, answeredAt.
+        # One nonce covers the page set. ``card_ids`` is that set. ``extra_shown`` is the
+        # one card allowed for fields that appear only after a write.
         self.popup: dict[str, Any] | None = None
+        self.card_ids: list[str] = []
+        self.extra_shown = False
+        self.notice = ""
         self.progress: LocalProgress | None = None
         self.continue_attempts = 0
         # Workday account registered here. Continue without verified does not sign in.
@@ -393,6 +397,9 @@ class LocalJob:
         self.drop_resume()
         self.question = None
         self.popup = None
+        self.card_ids = []
+        self.extra_shown = False
+        self.notice = ""
         self.blocking = None
         self.open_items = []
 
@@ -488,6 +495,10 @@ class LocalJob:
             popup = _popup_view(self)
             if popup is not None:
                 body["question"]["popup"] = popup
+        if status == Status.MANUAL_ANSWER_REQUIRED:
+            listed = _status_questions(self)
+            if listed:
+                body["questions"] = listed
         if self.error:
             body["error"] = self.error
         return body
@@ -696,6 +707,7 @@ class LocalHelper:
                 logger.info("session=%s superseded reason=cancelled", job.session_id)
             if self._current == session_id:
                 self._current = None
+        self._queue.put(("close_popup", {}))
         return job
 
     def _prune(self) -> None:
@@ -1057,6 +1069,13 @@ class LocalHelper:
                     with self._lock:
                         self._peeking = False
                     payload["done"].set()
+            elif kind == "close_popup":
+                close = getattr(self._session, "close_question_popup", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
             elif kind == "detach":
                 self._detach(payload.get("session_id"), payload.get("generation"))
                 payload["done"].set()
@@ -1443,7 +1462,6 @@ class LocalHelper:
             raise AnswerRejected(409, _failure(job, "submit_reported"))
         if not report.get("verified"):
             code = 422 if report.get("reason") == "needs_option" else 200
-            job.popup = None
             self._present_popup(
                 job,
                 message="The employer page did not accept that answer. Check it and click Save & Continue again.",
@@ -1454,8 +1472,16 @@ class LocalHelper:
                 raise AnswerRejected(code, body)
             return body
         _remember_answer(job, item, target)
+        card_before = list(job.card_ids)
         self._adopt_follow(job, report, target)
-        job.popup = None
+        follow_ids = [row["id"] for row in _open_question_rows(job)]
+        if card_before and follow_ids and set(follow_ids) <= set(card_before) and job.card_ids:
+            if job.popup is not None:
+                job.popup["state"] = "saving"
+                job.popup["questionIds"] = list(card_before)
+            return _answer_body(job, report, started)
+        if card_before and follow_ids and job.extra_shown and set(follow_ids) - set(card_before):
+            return _answer_body(job, report, started)
         self._present_popup(job)
         return _answer_body(job, report, started)
 
@@ -1477,7 +1503,7 @@ class LocalHelper:
                 or self._active is not None
                 or self._peeking
                 or job.state != "done"
-                or job.question is None
+                or (job.question is None and not job.notice)
             ):
                 return
             self._peeking = True
@@ -1492,36 +1518,88 @@ class LocalHelper:
         message: str = "",
         error: bool = False,
     ) -> None:
-        """Worker thread. Show the popup for ``job.question`` or remove it."""
+        """Worker thread. Show one card for the page set, or remove it."""
         show = getattr(self._session, "show_question_popup", None)
         close = getattr(self._session, "close_question_popup", None)
-        question = job.question if _public_status(job) == Status.MANUAL_ANSWER_REQUIRED else None
-        if question is None or job.superseded or job.profile is None:
+
+        def _close() -> None:
             job.popup = None
-            if close is not None:
-                try:
-                    close()
-                except Exception:
-                    pass
+            if close is None:
+                return
+            try:
+                close()
+            except Exception:
+                return
+
+        waiting = (
+            _public_status(job) == Status.MANUAL_ANSWER_REQUIRED and not job.superseded and job.profile is not None
+        )
+        rows = _open_question_rows(job) if waiting else []
+        if not rows and waiting and job.notice:
+            rows = [{"id": "validation", "prompt": job.notice, "type": "text", "options": [], "selector": ""}]
+            locked = True
+        else:
+            locked = False
+        if not rows or not waiting:
+            job.card_ids = []
+            _close()
             return
         if show is None:
             # No employer tab to draw on: the TileArc panel's own Save & Fill stays the path.
             job.popup = None
             return
-        popup = job.popup
-        if popup is None or popup.get("questionId") != question["id"] or popup.get("state") == "unavailable":
-            popup = {"nonce": new_nonce(), "questionId": question["id"], "state": "shown"}
-        item = _match_item(job, {"id": question["id"]}) or {}
+        ids = [row["id"] for row in rows]
+        known = list(job.card_ids)
+        new_ids = [qid for qid in ids if qid not in known]
+        popup = job.popup if isinstance(job.popup, dict) else None
+        if known and not new_ids and popup is not None and popup.get("state") == "saving" and not error:
+            return
+        if known and new_ids:
+            if job.extra_shown:
+                return
+            job.extra_shown = True
+            rows = [row for row in rows if row["id"] in new_ids]
+            ids = [row["id"] for row in rows]
+            popup = None
+        elif known and not new_ids and popup is not None and popup.get("state") != "unavailable":
+            ids = list(popup.get("questionIds") or known)
+            rows = _rows_for_ids(job, ids) or rows
+        else:
+            job.extra_shown = False
+            popup = None
+        if popup is None:
+            popup = {"nonce": new_nonce(), "questionId": ids[0], "questionIds": list(ids), "state": "shown"}
+        else:
+            popup["questionId"] = ids[0]
+            popup["questionIds"] = list(ids)
+        job.card_ids = list(ids)
+        restored = _restored_map(popup) if error or popup.get("values") else None
         try:
             shown = show(
-                question,
+                rows[0],
                 nonce=popup["nonce"],
-                selector=str(item.get("selector") or ""),
+                questions=rows,
+                selector=str(rows[0].get("selector") or ""),
                 candidate=_candidate_label(job),
                 message=message,
                 error=error,
                 force=True,
+                locked=locked,
+                restored=restored,
             )
+        except TypeError:
+            try:
+                shown = show(
+                    rows[0],
+                    nonce=popup["nonce"],
+                    selector=str(rows[0].get("selector") or ""),
+                    candidate=_candidate_label(job),
+                    message=message,
+                    error=error,
+                    force=True,
+                )
+            except Exception:
+                shown = False
         except Exception:
             shown = False
         popup["state"] = "shown" if shown else "unavailable"
@@ -1530,15 +1608,25 @@ class LocalHelper:
         job.popup = popup
 
     def _sync_popup(self, job: LocalJob) -> None:
-        """Worker thread. Pick up a Save & Continue click, re-show a lost popup, time out a stale save."""
-        if job.superseded or job.question is None or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
+        """Worker thread. Pick up a Save & Continue click, re-show a lost card, time out a stale save."""
+        if job.superseded or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
+            return
+        if job.question is None and not job.notice:
             return
         popup = job.popup
-        if popup is None or popup.get("state") == "unavailable" or popup.get("questionId") != job.question["id"]:
+        covered = set(popup.get("questionIds") or []) if isinstance(popup, dict) else set()
+        current = job.question["id"] if job.question is not None else "validation"
+        if (
+            popup is None
+            or popup.get("state") == "unavailable"
+            or (current not in covered and popup.get("questionId") != current)
+        ):
             self._present_popup(job)
             return
-        if popup.get("state") == "answered":
-            if time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS:
+        if popup.get("state") in {"answered", "saving"}:
+            if popup.get("state") == "answered" and (
+                time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS
+            ):
                 self._present_popup(
                     job,
                     message=(
@@ -1552,17 +1640,14 @@ class LocalHelper:
         if read.get("detached"):
             return
         if not read.get("present"):
-            # The page re-rendered or navigated. Same question, same nonce: show it again.
+            # The page re-rendered. Same nonce, same rows.
             self._present_popup(job)
             return
         if read.get("state") != "answered":
             return
         values = list(read.get("values") or [])
-        item = _match_item(job, {"id": job.question["id"]})
-        reason, canonical = ("needs_option", list[str]())
-        if item is not None and values and read.get("questionId") == job.question["id"]:
-            reason, canonical = fit_choice_values(item, values)
-        if reason != "ok" or not canonical:
+        reason, stored = _canonical_popup_values(job, read, values)
+        if reason != "ok" or not stored:
             message = getattr(self._session, "question_popup_message", None)
             if message is not None:
                 message(
@@ -1573,19 +1658,25 @@ class LocalHelper:
                 )
             return
         popup["state"] = "answered"
-        popup["values"] = [str(value) for value in canonical]
+        popup["values"] = stored
         popup["answeredAt"] = time.monotonic()
-        logger.info("session=%s popup_answered values=%s", job.session_id, len(canonical))
+        counted = len(stored) if isinstance(stored, list) else 1
+        logger.info("session=%s popup_answered values=%s", job.session_id, counted)
         timer = threading.Timer(_POPUP_SAVE_TIMEOUT_SECONDS + 1, self.refresh_popup, args=(job.session_id,))
         timer.daemon = True
         timer.start()
 
     def _remember_result(self, job: LocalJob, result: ApplicationResult) -> None:
+        job.card_ids = []
+        job.extra_shown = False
+        job.notice = ""
         job.result = _result_brief(result)
         job.result["stopped_before_submit"] = not job.submit_claimed()
         job.open_items = [dict(item) for item in result.open_items]
         job.blocking = dict(result.blocking) if isinstance(result.blocking, dict) else None
         job.question = pending_question(result.status, job.blocking, job.open_items)
+        if job.question is None and result.status == Status.MANUAL_ANSWER_REQUIRED and result.messages:
+            job.notice = str(result.messages[0]).strip()
 
     def _adopt_follow(self, job: LocalJob, report: dict[str, Any], target: dict[str, Any]) -> None:
         result = report.get("result")
@@ -2051,31 +2142,93 @@ def _detach_id(path: str) -> str | None:
 
 def question_view(item: dict[str, Any] | None) -> dict[str, Any] | None:
     """Public question. ``id`` is the question id, else the hash, else the field key."""
-    if not isinstance(item, dict):
-        return None
-    kind = canonical_blocker_kind(item.get("kind"))
-    if kind in _NON_QUESTION_KINDS:
-        return None
-    qid = str(
-        item.get("questionId") or item.get("questionHash") or item.get("fieldKey") or item.get("id") or ""
-    ).strip()
-    prompt = str(item.get("text") or item.get("prompt") or "").strip()
-    if not qid or not prompt:
-        return None
-    options: list[str] = []
-    for option in item.get("options") or []:
-        if isinstance(option, dict):
-            label = str(option.get("label") or option.get("value") or "").strip()
-        else:
-            label = str(option).strip()
-        if label and label not in options:
-            options.append(label)
-    return {
-        "id": qid,
-        "prompt": prompt,
-        "type": str(item.get("answerType") or item.get("type") or "text"),
-        "options": options,
-    }
+    rows = page_question_views([item] if isinstance(item, dict) else [])
+    return dict(rows[0]) if rows else None
+
+
+def _open_question_rows(job: LocalJob) -> list[dict[str, Any]]:
+    """Page-set rows plus the control selector. The selector is not part of the status."""
+    rows: list[dict[str, Any]] = []
+    for item in job.open_items:
+        view = question_view(item)
+        if view is None:
+            continue
+        row = dict(view)
+        row["selector"] = str(item.get("selector") or "")
+        rows.append(row)
+    return rows
+
+
+def _rows_for_ids(job: LocalJob, ids: list[str]) -> list[dict[str, Any]]:
+    by_id = {row["id"]: row for row in _open_question_rows(job)}
+    return [by_id[qid] for qid in ids if qid in by_id]
+
+
+def _status_questions(job: LocalJob) -> list[dict[str, Any]]:
+    return [
+        {"id": row["id"], "prompt": row["prompt"], "type": row["type"], "options": list(row["options"])}
+        for row in _open_question_rows(job)
+    ]
+
+
+def _restored_map(popup: dict[str, Any]) -> dict[str, list[str]]:
+    values = popup.get("values")
+    if not isinstance(values, list) or not values:
+        return {}
+    if isinstance(values[0], str):
+        qid = str(popup.get("questionId") or "")
+        return {qid: [str(value) for value in values]} if qid else {}
+    restored: dict[str, list[str]] = {}
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("questionId") or "")
+        picked = [str(value) for value in item.get("values") or [] if str(value).strip()]
+        if qid and picked:
+            restored[qid] = picked
+    return restored
+
+
+def _canonical_popup_values(
+    job: LocalJob,
+    read: dict[str, Any],
+    values: list[Any],
+) -> tuple[str, list[Any]]:
+    """Canonical clicks for this nonce. A string list is the current question."""
+    if not values:
+        return "needs_option", []
+    if isinstance(values[0], str):
+        if read.get("questionId") != (job.question or {}).get("id"):
+            return "needs_option", []
+        item = _match_item(job, {"id": str(read.get("questionId") or "")})
+        if item is None:
+            return "needs_option", []
+        reason, canonical = fit_choice_values(item, [str(value) for value in values])
+        if reason != "ok" or not canonical:
+            return "needs_option", []
+        return "ok", [str(value) for value in canonical]
+    rows: list[dict[str, Any]] = []
+    expected = set(job.card_ids) or {str((job.question or {}).get("id") or "")}
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, dict):
+            return "needs_option", []
+        qid = str(item.get("questionId") or "")
+        if qid not in expected or qid in seen:
+            return "needs_option", []
+        seen.add(qid)
+        target = _match_item(job, {"id": qid})
+        if target is None:
+            return "needs_option", []
+        reason, canonical = fit_choice_values(target, [str(value) for value in item.get("values") or []])
+        if reason != "ok" or not canonical:
+            return "needs_option", []
+        rows.append({"questionId": qid, "values": [str(value) for value in canonical]})
+    if seen != expected:
+        return "needs_option", []
+    if len(rows) == 1:
+        return "ok", list(rows[0]["values"])
+    return "ok", rows
 
 
 def pending_question(
@@ -2106,11 +2259,14 @@ def pending_question(
 def _popup_view(job: LocalJob) -> dict[str, Any] | None:
     """Public popup state. ``values`` only after the employee clicked Save & Continue."""
     popup = job.popup
-    if not popup or job.question is None or popup.get("questionId") != job.question["id"]:
+    if not popup or job.question is None:
+        return None
+    covered = set(popup.get("questionIds") or [])
+    if popup.get("questionId") != job.question["id"] and job.question["id"] not in covered:
         return None
     state = str(popup.get("state") or "")
     view: dict[str, Any] = {"state": state, "source": "employer_tab"}
-    if state == "answered" and popup.get("values"):
+    if state in {"answered", "saving"} and popup.get("values"):
         view["nonce"] = str(popup.get("nonce") or "")
         view["values"] = list(popup["values"])
     return view

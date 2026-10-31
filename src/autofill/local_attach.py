@@ -1250,6 +1250,18 @@ def fill_visible_tab(
                 resume.failure = dict(options.resume_failure)
 
 
+def _close_answer_popup(page: Any) -> None:
+    """Remove the TileArc card before a fill looks for Next or Save and Continue."""
+    if page is None:
+        return
+    try:
+        from autofill.answer_popup import close_popup
+
+        close_popup(page)
+    except Exception:
+        return
+
+
 class DedicatedApplySession:
     """One dedicated profile. Call it from a single thread.
 
@@ -1466,6 +1478,7 @@ class DedicatedApplySession:
             tab.page_url = str(tab.page.url or "")
             if cancel is not None:
                 cancel.check()
+        _close_answer_popup(tab.page)
         result = fill_visible_tab(
             tab.page,
             application_url,
@@ -1686,13 +1699,16 @@ class DedicatedApplySession:
         question: dict[str, Any],
         *,
         nonce: str,
+        questions: list[dict[str, Any]] | None = None,
         selector: str = "",
         candidate: str = "",
         message: str = "",
         error: bool = False,
         force: bool = False,
+        locked: bool = False,
+        restored: dict[str, list[str]] | None = None,
     ) -> bool:
-        """Save & Continue popup on the employer tab. Not shown after a detach."""
+        """Save & Continue card on the employer tab. Not shown after a detach."""
         page = self._popup_page()
         if page is None:
             return False
@@ -1702,11 +1718,14 @@ class DedicatedApplySession:
             page,
             question,
             nonce=nonce,
+            questions=questions,
             selector=selector,
             candidate=candidate,
             message=message,
             error=error,
             force=force,
+            locked=locked,
+            restored=restored,
         )
 
     def read_question_popup(self, nonce: str) -> dict[str, Any]:
@@ -1744,6 +1763,7 @@ class DedicatedApplySession:
     ) -> ApplicationResult:
         """Fill the open page with this session's binding ids and recovery block."""
         identity = getattr(self, "_identity", {})
+        _close_answer_popup(page)
         return fill_visible_tab(
             page,
             application_url,

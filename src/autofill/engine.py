@@ -122,6 +122,11 @@ class Status:
     NAVIGATION_STALLED = "NAVIGATION_STALLED"
 
 
+# A write can reveal the next controls. The step is filled again at most this
+# many times, then whatever is still empty is one human stop.
+REVEAL_ATTEMPTS = 3
+
+
 @dataclass
 class AutofillOptions:
     """Per-call options. ``page`` is an existing Playwright page when the host has one."""
@@ -209,6 +214,8 @@ class ApplicationResult:
     next_clicks: int = 0
     pages_advanced: int = 0
     last_navigation: dict[str, str] | None = None
+    # Route, visible fields, and heading when this stop was collected.
+    page_signature: tuple | None = None
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -1988,7 +1995,7 @@ def _run_resolver_pages(
         on_review = step_name == "review" or "review" in snapshot.heading.casefold()
         flags = FillFlags()
         recheck = False
-        for attempt in range(3):
+        for attempt in range(REVEAL_ATTEMPTS):
             fill_started = time.perf_counter()
             outcome = fill_resolved_page(
                 page,
@@ -2009,7 +2016,7 @@ def _run_resolver_pages(
                 _remember_submit(snapshot, submit_controls)
             blocking = [item for item in outcome.manual_questions if _blocks(item)]
             optional = [item for item in outcome.manual_questions if not _blocks(item)]
-            if attempt < 2 and _revealed_fields(
+            if attempt < REVEAL_ATTEMPTS - 1 and _revealed_fields(
                 page,
                 outcome.snapshot or snapshot,
                 settle_ms=_reveal_settle_ms(outcome.fields),
@@ -2077,7 +2084,7 @@ def _run_resolver_pages(
             alert = validation_message(snapshot)
             if alert and not recheck:
                 updated = flags_for_alerts(validation_blob(snapshot), flags)
-                if updated != flags and attempt < 2:
+                if updated != flags and attempt < REVEAL_ATTEMPTS - 1:
                     flags = updated
                     recheck = True
                     continue
@@ -2114,7 +2121,7 @@ def _run_resolver_pages(
                         Status.RESUME_UPLOAD_REQUIRED,
                         ["Upload the resume that was already downloaded, then continue with resumeUploaded.", *named],
                     )
-                if attempt == 2:
+                if attempt == REVEAL_ATTEMPTS - 1:
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)
                     return finish(
                         Status.MANUAL_ANSWER_REQUIRED,
