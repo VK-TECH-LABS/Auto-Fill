@@ -419,7 +419,7 @@ def _drive_session(monkeypatch, tmp_path, *, listeners: list[str]) -> tuple[list
         lambda port: events.append("loopback_checked") or list(listeners),
     )
     monkeypatch.setattr("autofill.local_attach.attach_visible_tab", fake_attach)
-    monkeypatch.setattr("autofill.local_attach.adopt_employer_tab", lambda context, url: page)
+    monkeypatch.setattr("autofill.local_attach.adopt_employer_tab", lambda context, url, bound=None: page)
     monkeypatch.setattr("autofill.local_attach._target_id", lambda context, page_obj: "target-1")
     monkeypatch.setattr("autofill.local_attach.fill_visible_tab", fake_fill)
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _Driver())
@@ -955,7 +955,7 @@ def test_dead_page_reconnects_on_the_same_port_without_goto(monkeypatch, tmp_pat
     assert session.debug_port == port
     assert session._cdp_reconnects == 1
     session.tab.page = _Page(live.url, dead=True)
-    with pytest.raises(LocalAttachError, match="reconnect limit"):
+    with pytest.raises(LocalAttachError, match="reconnect_limit"):
         session.ensure(apply)
     assert launches == []
     assert gotos == []
@@ -1024,6 +1024,26 @@ def test_stale_devtools_file_does_not_pin_a_dead_port(monkeypatch, tmp_path):
     monkeypatch.setattr("autofill.local_attach.fetch_version", lambda _port, timeout=1.0: None)
     session = DedicatedApplySession(user_data_dir=tmp_path, headless=True)
     assert session.debug_port != 9444
+
+
+def test_adopt_prefers_the_bound_application_tab(monkeypatch):
+    gotos: list[str] = []
+
+    class _Page:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            gotos.append(url)
+            self.url = url
+
+    apply = "https://boards.greenhouse.io/acme/jobs/1"
+    posting = _Page(apply)
+    opened = _Page(apply + "/apply")
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: _page is posting)
+    adopted = adopt_employer_tab(type("Ctx", (), {"pages": [posting, opened]})(), apply, bound=opened)
+    assert adopted is opened
+    assert gotos == []
 
 
 def test_adopt_keeps_a_later_path_and_gotos_for_a_posting_or_other_host(monkeypatch):

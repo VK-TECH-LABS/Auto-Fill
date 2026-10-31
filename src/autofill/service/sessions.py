@@ -104,6 +104,8 @@ class ServiceSession:
     next_clicks: int = 0
     pages_advanced: int = 0
     last_navigation: dict | None = None
+    # (selector, name, signature) of a Next already pressed on that signature.
+    nav_block: tuple | None = None
     nav_base_entry: int = 0
     nav_base_next: int = 0
     nav_base_pages: int = 0

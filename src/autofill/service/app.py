@@ -1084,6 +1084,37 @@ def _note_navigation(session: ServiceSession):
     return note
 
 
+def _note_nav_block(session: ServiceSession):
+    """Keep the Next that already ran on its signature. The tuple has no answer text."""
+
+    def note(block: tuple) -> None:
+        if isinstance(block, tuple) and len(block) == 3:
+            session.nav_block = block
+
+    return note
+
+
+def _page_alive(runner, session_id: str) -> bool:
+    """True when the runner still has a page. A runner without the probe is treated as closed."""
+    probe = getattr(runner, "page_alive", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe(session_id))
+    except Exception:
+        return False
+
+
+def _drop_stalled_page(session: ServiceSession, runner) -> None:
+    """Close a dead stalled page and forget its Next block. A live page stays."""
+    if _page_alive(runner, session.session_id):
+        return
+    runner.discard(session.session_id)
+    session.nav_block = None
+    session.preview_jpeg = None
+    session.preview_host = ""
+
+
 def _paint_frame(session: ServiceSession):
     """Store a JPEG as soon as the page can be captured. A crash propagates."""
 
@@ -1144,6 +1175,8 @@ def _request_for(
         on_paint=_paint_frame(session),
         on_phase=_set_phase(session),
         on_navigation=_note_navigation(session),
+        on_nav_block=_note_nav_block(session),
+        nav_block=session.nav_block,
         on_confirmed=session.remember_confirmed_value,
         confirmed_values=session.confirmed_values,
         standard_terms_authorized=session.standard_terms_authorized,
@@ -1560,6 +1593,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
+        if session.status == Status.NAVIGATION_STALLED:
+            _drop_stalled_page(session, active_runner)
         return _start_in_background(session, store, active_runner, limits)
 
     @router.post("/sessions/{session_id}/retry", response_model=RunStatusOut, tags=["sessions"])
@@ -1574,9 +1609,12 @@ def create_app(
         messages = session.result.messages if session.result is not None else []
         if session.status == Status.FAILED_RETRYABLE and ("browser_crash" in messages or "browser_crashed" in messages):
             _allow_browser_restart(session)
-        active_runner.discard(session.session_id)
-        session.preview_jpeg = None
-        session.preview_host = ""
+        if session.status == Status.NAVIGATION_STALLED:
+            _drop_stalled_page(session, active_runner)
+        else:
+            active_runner.discard(session.session_id)
+            session.preview_jpeg = None
+            session.preview_host = ""
         return _run(
             session,
             store,
@@ -1612,6 +1650,9 @@ def create_app(
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
+                return _continue_run(session, body)
+            if session.status == Status.NAVIGATION_STALLED:
+                _drop_stalled_page(session, active_runner)
                 return _continue_run(session, body)
             if _is_070(session) and session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
                 found = _probe_challenge(session, active_runner)

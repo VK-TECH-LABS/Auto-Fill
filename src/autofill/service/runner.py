@@ -463,6 +463,8 @@ class FillRequest:
     on_paint: Any = None
     on_phase: Any = None
     on_navigation: Any = None
+    on_nav_block: Any = None
+    nav_block: tuple | None = None
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
@@ -901,6 +903,8 @@ class PlaywrightRunner:
             on_paint=request.on_paint,
             on_page=_bind_page(slot),
             on_navigation=request.on_navigation,
+            on_nav_block=request.on_nav_block,
+            nav_block=request.nav_block,
             on_confirmed=request.on_confirmed,
             confirmed_values=request.confirmed_values,
             standard_terms_authorized=request.standard_terms_authorized,
@@ -1299,6 +1303,8 @@ class PlaywrightRunner:
                     previous_stage=str((request.progress or {}).get("stage") or ""),
                 )
                 if follow.changed or (follow.status == Status.FILLED and not follow.open_items):
+                    # A new signature, or this step is filled: the engine presses
+                    # Next once. Review stays READY and does not enter here.
                     result = self._run_engine(request, slot.page, slot)
                     slot.last_ats = result.ats
                     self._remember_mark(slot)
@@ -1401,6 +1407,29 @@ class PlaywrightRunner:
             return [str(option) for option in item.get("options") or []]
 
         return worker.submit(read)
+
+    def page_alive(self, session_id: str) -> bool:
+        """True when this session's page still answers. A dead page is not reused."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return False
+
+        def check() -> bool:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return False
+            try:
+                slot.page.evaluate("() => 1")
+            except Exception as exc:
+                if is_browser_crash(exc):
+                    return False
+                return True
+            return True
+
+        try:
+            return bool(worker.submit(check))
+        except Exception:
+            return False
 
     def discard(self, session_id: str) -> None:
         """Close this session's page and context, and the browser when it is idle.

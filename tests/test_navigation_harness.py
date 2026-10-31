@@ -170,14 +170,20 @@ def test_recorded_next_is_not_pressed_again(browser, fixture_origin):
 
 
 def test_dropped_second_page_continues_without_clicking_next_again(browser, fixture_origin):
-    """A crash on page 2 resumes there. Next, which already ran, is not clicked again."""
+    """A crash on page 2 resumes there. The recorded block is the page Next left."""
+    from autofill.extract import extract_page
+    from autofill.pagewait import navigation_signature
+
     page = browser.new_page()
     url = f"{fixture_origin}/multistep_pages.html"
     seen = {"n": 0}
     blocks: list[tuple] = []
+    first_signature: list[tuple] = []
 
-    def observe(_page) -> None:
+    def observe(current) -> None:
         seen["n"] += 1
+        if seen["n"] == 1:
+            first_signature.append(navigation_signature(current, extract_page(current)))
         if seen["n"] == 2:
             raise RuntimeError("Target closed")
 
@@ -202,6 +208,7 @@ def test_dropped_second_page_continues_without_clicking_next_again(browser, fixt
             )
         assert page.evaluate("() => window.__clicked") == ["Next"]
         assert blocks
+        assert blocks[-1][2] == first_signature[0]
         result = autofill_application(
             url,
             _profile(),
@@ -216,8 +223,114 @@ def test_dropped_second_page_continues_without_clicking_next_again(browser, fixt
         )
         clicked = page.evaluate("() => window.__clicked")
         assert clicked.count("Next") == 1
+        assert clicked.count("Save & Continue") == 1
         assert "Submit application" not in clicked
         assert "Send" not in clicked
         assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_stable_save_and_continue_advances_both_steps(browser, fixture_origin):
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/stable_next_button.html")
+        result = _run(page, f"{fixture_origin}/stable_next_button.html")
+        clicked = page.evaluate("() => window.__clicked")
+        assert clicked == ["Save and Continue", "Save and Continue"]
+        assert "Submit application" not in clicked
+        assert result.next_clicks == 2
+        assert result.pages_advanced == 2
+        assert result.status != Status.NAVIGATION_STALLED
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_delayed_heading_is_one_advance(browser, fixture_origin):
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/delayed_heading.html")
+        result = _run(page, f"{fixture_origin}/delayed_heading.html")
+        assert page.evaluate("() => window.__clicked") == ["Next"]
+        assert result.next_clicks == 1
+        assert result.pages_advanced == 1
+        assert result.status != Status.NAVIGATION_STALLED
+        assert "Submit application" not in page.evaluate("() => window.__clicked")
+    finally:
+        page.close()
+
+
+def test_repeated_selectors_after_next_are_a_stall(browser, fixture_origin):
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/same_selector_steps.html")
+        result = _run(page, f"{fixture_origin}/same_selector_steps.html")
+        assert page.evaluate("() => window.__clicked") == ["Next"]
+        assert result.status == Status.NAVIGATION_STALLED
+        assert result.messages == ["navigation_stalled"]
+        assert result.next_clicks == 1
+    finally:
+        page.close()
+
+
+def test_heading_change_without_a_flagged_field_is_not_manual(browser, fixture_origin):
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/heading_without_invalid.html")
+        result = _run(page, f"{fixture_origin}/heading_without_invalid.html")
+        assert page.evaluate("() => window.__clicked") == ["Next"]
+        assert result.pages_advanced == 1
+        assert result.status != Status.MANUAL_ANSWER_REQUIRED
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_page_cap_fills_eight_steps_and_does_not_open_the_ninth(browser, fixture_origin):
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/nine_step_pages.html")
+        result = _run(page, f"{fixture_origin}/nine_step_pages.html")
+        assert page.evaluate("() => window.__step") == 8
+        assert page.evaluate("() => window.__clicked") == ["Next"] * 7
+        assert result.next_clicks == 7
+        assert "Submit application" not in page.evaluate("() => window.__clicked")
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_filled_step_presses_next_once(browser, fixture_origin):
+    from autofill.follow import follow_answer, read_page_mark
+
+    page = browser.new_page()
+    url = f"{fixture_origin}/two_questions_next.html"
+    try:
+        page.goto(url)
+        previous, _snapshot = read_page_mark(page)
+        page.fill("#color", "Blue")
+        page.fill("#visa", "No")
+        follow = follow_answer(
+            page,
+            profile=_profile(),
+            job=None,
+            held=set(),
+            prior=[],
+            previous=previous,
+        )
+        assert follow.changed is False
+        assert follow.status == Status.FILLED
+        assert follow.open_items == []
+        result = autofill_application(
+            url,
+            _profile(),
+            None,
+            AutofillOptions(page=page, session_id="sess-harness", candidate_id="ref-a", timings={}),
+        )
+        clicked = page.evaluate("() => window.__clicked")
+        assert clicked == ["Next"]
+        assert result.stopped_before_submit is True
+        assert result.status != Status.NAVIGATION_STALLED
     finally:
         page.close()

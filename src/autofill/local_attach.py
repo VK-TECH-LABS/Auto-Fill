@@ -1000,14 +1000,15 @@ def _tab_is_posting(page: Any) -> bool:
     return kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}
 
 
-def adopt_employer_tab(context: Any, application_url: str) -> Any:
+def adopt_employer_tab(context: Any, application_url: str, *, bound: Any = None) -> Any:
     """Use the open application tab. Do not rewind a later step of the same site.
 
-    A tab already on the Apply URL is used as-is. A later path on the same
-    host is kept when it is no longer a job posting. ``goto`` runs only when
-    the host differs or the tab is still a posting. This does not create a
-    browser context, does not set a viewport, and does not install request
-    blocking.
+    A tab the engine already adopted (``bound``) wins, including over the
+    posting that matches the Apply URL. Otherwise a tab already on the Apply
+    URL is used as-is. A later path on the same host is kept when it is no
+    longer a job posting. ``goto`` runs only when the host differs or the tab
+    is still a posting. This does not create a browser context, does not set
+    a viewport, and does not install request blocking.
     """
     validate_application_url(application_url)
     pages = list(getattr(context, "pages", []) or [])
@@ -1018,6 +1019,10 @@ def adopt_employer_tab(context: Any, application_url: str) -> Any:
         except Exception:
             continue
         readable.append((page, current))
+    if bound is not None:
+        for page, _current in readable:
+            if page is bound:
+                return page
     for page, current in readable:
         if same_document(current, application_url):
             return page
@@ -1202,6 +1207,7 @@ def fill_visible_tab(
     on_observed: Any = None,
     on_nav_block: Any = None,
     nav_block: tuple | None = None,
+    on_page: Any = None,
     credential_provider: Any = None,
     verify_pending: bool = False,
     protocol_version: str = "0.7.0",
@@ -1234,6 +1240,7 @@ def fill_visible_tab(
         on_observed=on_observed,
         on_nav_block=on_nav_block,
         nav_block=nav_block,
+        on_page=on_page,
         protocol_version=protocol_version or "0.7.0",
         verify_pending=bool(verify_pending),
         standard_terms_authorized=bool(standard_terms_authorized),
@@ -1300,6 +1307,8 @@ class DedicatedApplySession:
         self._observe: Any = None
         self._nav_hook: Any = None
         self._nav_block: tuple | None = None
+        self._bound_page: Any = None
+        self.bound_target_id = ""
         self._credential_provider: Any = None
         self._verify_pending_flag = False
         self._standard_terms_authorized = False
@@ -1353,7 +1362,7 @@ class DedicatedApplySession:
 
             self._playwright = sync_playwright().start()
             tab = attach_visible_tab(self._playwright, self.endpoint, url_prefix=application_url)
-            page = adopt_employer_tab(tab.context, application_url)
+            page = adopt_employer_tab(tab.context, application_url, bound=self._bound_page)
             tab.page = page
             tab.page_url = str(page.url or "")
             tab.target_id = _target_id(tab.context, page)
@@ -1369,7 +1378,7 @@ class DedicatedApplySession:
         tab = self.tab
         if tab is None:
             raise LocalAttachError("No Chrome tab is attached.")
-        page = adopt_employer_tab(tab.context, application_url)
+        page = adopt_employer_tab(tab.context, application_url, bound=self._bound_page)
         tab.page = page
         tab.page_url = str(page.url or "")
         tab.target_id = _target_id(tab.context, page)
@@ -1389,7 +1398,7 @@ class DedicatedApplySession:
     def _reconnect_cdp(self) -> None:
         """Drop the dead pipe and allow one ``connect_over_cdp`` on the same port."""
         if self._cdp_reconnects >= 1:
-            raise LocalAttachError("CDP reconnect limit reached.")
+            raise LocalAttachError("reconnect_limit")
         self._cdp_reconnects += 1
         self._drop_client()
 
@@ -1487,6 +1496,7 @@ class DedicatedApplySession:
             on_observed=self._observe,
             on_nav_block=self._bridge_nav_block,
             nav_block=self._nav_block,
+            on_page=self._bind_open_page,
             session_id=session_id,
             candidate_id=candidate_id,
             job_id=job_id,
@@ -1593,6 +1603,9 @@ class DedicatedApplySession:
             profile,
             cancel=cancel,
             resume=resume,
+            on_nav_block=self._bridge_nav_block,
+            nav_block=getattr(self, "_nav_block", None),
+            on_page=self._bind_open_page,
             session_id=getattr(self, "_identity", {}).get("session_id", ""),
             candidate_id=getattr(self, "_identity", {}).get("candidate_id", ""),
             job_id=getattr(self, "_identity", {}).get("job_id", ""),
@@ -1772,6 +1785,7 @@ class DedicatedApplySession:
             on_observed=getattr(self, "_observe", None),
             on_nav_block=self._bridge_nav_block,
             nav_block=getattr(self, "_nav_block", None),
+            on_page=self._bind_open_page,
             session_id=identity.get("session_id", ""),
             candidate_id=identity.get("candidate_id", ""),
             job_id=identity.get("job_id", ""),
@@ -1781,6 +1795,23 @@ class DedicatedApplySession:
             standard_terms_authorized=bool(getattr(self, "_standard_terms_authorized", False)),
             **_resume_kwargs(resume),
         )
+
+    def _bind_open_page(self, new_page: Any) -> None:
+        """Point this session at the tab an entry click opened."""
+        tab = self.tab
+        if tab is None or new_page is None:
+            return
+        tab.page = new_page
+        try:
+            tab.page_url = str(getattr(new_page, "url", "") or "")
+        except Exception:
+            tab.page_url = ""
+        try:
+            tab.target_id = _target_id(getattr(tab, "context", None), new_page)
+        except Exception:
+            tab.target_id = str(getattr(tab, "target_id", "") or "")
+        self._bound_page = new_page
+        self.bound_target_id = str(getattr(tab, "target_id", "") or "")
 
     def _bridge_nav_block(self, block: tuple) -> None:
         """Keep the latest Next on this session and tell the helper."""

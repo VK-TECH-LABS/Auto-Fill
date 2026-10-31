@@ -35,7 +35,14 @@ from autofill.mapping import (
     map_field,
 )
 from autofill.models import Control, JobContext, PageSnapshot
-from autofill.pagewait import classify_page, current_page_type, site_error_messages, terminal_kind
+from autofill.pagewait import (
+    classify_page,
+    current_page_type,
+    navigation_changed,
+    navigation_signature,
+    site_error_messages,
+    terminal_kind,
+)
 from autofill.profile import CandidateProfile
 from autofill.stepfill import inspect_required
 
@@ -49,6 +56,7 @@ class PageMark:
     url: str
     step: str
     selectors: frozenset[str]
+    signature: tuple = ()
 
 
 @dataclass
@@ -74,7 +82,7 @@ def read_page_mark(page) -> tuple[PageMark, PageSnapshot]:
     info = detect_ats(url)
     step = page_step(info.name if info else None, snapshot.heading, url)
     selectors = frozenset(control.selector for control in snapshot.controls if control.selector and not control.hidden)
-    return PageMark(url, step, selectors), snapshot
+    return PageMark(url, step, selectors, navigation_signature(page, snapshot)), snapshot
 
 
 def follow_answer(
@@ -153,7 +161,7 @@ def _follow_once(
                 previous_stage=previous_stage,
             ),
         )
-    if _page_changed(previous, mark):
+    if _follow_page_changed(previous, page, snapshot, mark):
         return FollowUp(changed=True, status="", mark=mark)
     typed: list[str] = []
     fresh = mark.selectors - previous.selectors if previous is not None else frozenset()
@@ -268,6 +276,27 @@ def _page_url(page) -> str:
         return str(getattr(page, "url", "") or "")
     except Exception:
         return ""
+
+
+def _follow_page_changed(previous: PageMark | None, page, snapshot: PageSnapshot, mark: PageMark) -> bool:
+    """A new route, heading, or replaced field set. A revealed control is not one.
+
+    ``PageMark`` stays the progress record. New controls are filled by
+    ``_fill_new`` so a committed field is not typed again.
+    """
+    if previous is None:
+        return False
+    before = previous.signature
+    if before:
+        after = navigation_signature(page, snapshot)
+        if len(before) < 3 or len(after) < 3:
+            return navigation_changed(before, page, snapshot)
+        if before[0] != after[0] or before[2] != after[2]:
+            return True
+        old_fields = set(before[1])
+        new_fields = set(after[1])
+        return bool(old_fields) and len(old_fields & new_fields) * 2 < len(old_fields)
+    return _page_changed(previous, mark)
 
 
 def _page_changed(previous: PageMark | None, mark: PageMark) -> bool:

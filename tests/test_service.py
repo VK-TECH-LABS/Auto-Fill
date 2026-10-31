@@ -676,6 +676,48 @@ def test_library_imports_without_a_host_checkout():
     assert "postgres://" not in refused.stderr
 
 
+def test_live_stalled_page_retries_without_discard_or_goto(client: TestClient, runner: RecordingRunner):
+    runner.gotos = []
+    runner.page_alive = lambda _session_id: True  # type: ignore[method-assign]
+    runner.mode = "stalled"
+    created = _create(client)
+    session_id = created["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    assert started.status_code == 200
+    assert started.json()["status"] == Status.NAVIGATION_STALLED
+    store = client.app.state.store
+    session = store.get(session_id)
+    assert session is not None
+    session.nav_block = ("#next", "Next", ("page-1",))
+    session.browser_restarts = 0
+    runner.mode = "resume"
+    retried = client.post(f"/v1/sessions/{session_id}/retry", headers=AUTH)
+    assert retried.status_code == 200, retried.text
+    assert session_id not in runner.discarded
+    assert runner.gotos == []
+    assert session.nav_block == ("#next", "Next", ("page-1",))
+    assert session.browser_restarts == 0
+
+
+def test_navigation_stalled_continue_with_human_resolved(client: TestClient, runner: RecordingRunner):
+    runner.page_alive = lambda _session_id: True  # type: ignore[method-assign]
+    runner.mode = "stalled"
+    created = _create(client)
+    session_id = created["sessionId"]
+    client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    runner.mode = "resume"
+    runner.discarded.clear()
+    continued = client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"humanResolved": True},
+    )
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+    assert session_id not in runner.discarded
+    assert client.app.state.store.get(session_id).browser_restarts == 0
+
+
 def test_navigation_stalled_is_retryable_without_a_crash_budget(client: TestClient, runner: RecordingRunner):
     runner.mode = "stalled"
     created = _create(client)
