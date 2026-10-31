@@ -28,7 +28,7 @@ from autofill.mapping import MapCursor, map_field
 from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, Option, PageSnapshot
 from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
-from autofill.safeguards import _bound_target, activate, classify_control, is_add_row
+from autofill.safeguards import HumanSubmissionRequired, _bound_target, activate, classify_control, is_add_row
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -717,7 +717,10 @@ def _fill_pages(
         if nxt is None:
             break
         before = navigation_signature(page, snapshot)
-        activate(page, nxt.selector, nxt.name, control_type=nxt.control_type, frame_url=nxt.frame_url)
+        try:
+            activate(page, nxt.selector, nxt.name, control_type=nxt.control_type, frame_url=nxt.frame_url)
+        except HumanSubmissionRequired:
+            break
         clicked.add(nxt.selector)
         advanced, _moved = wait_for_navigation(page, before)
         if not advanced:

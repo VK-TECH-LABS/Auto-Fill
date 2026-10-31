@@ -50,6 +50,7 @@ from autofill.pagewait import (
     classify_page,
     current_page_type,
     find_entry_control,
+    has_application_submit,
     icims_login_gate,
     invalid_field_messages,
     is_job_closed,
@@ -79,8 +80,10 @@ from autofill.safeguards import (
     activate_entry,
     dismiss_cookie_banner,
     field_class_for_button,
+    install_final_submit_guard,
     is_add_row,
     is_forward_navigation,
+    release_final_submit_guard,
 )
 from autofill.session import SessionStore
 from autofill.stepfill import (
@@ -484,8 +487,14 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ],
             **extra,
         )
+    # A page with no fields is not a form, except the last step whose only
+    # control is Submit application. That stop is READY, decided below.
     if kind == "CONFIRMATION" or (
-        not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot) and kind not in {
+        not opts.human_resolved
+        and not visible_fields(snapshot)
+        and not is_review(snapshot)
+        and not has_application_submit(snapshot)
+        and kind not in {
             "APPLICATION_FORM",
             "REVIEW",
         }
@@ -899,6 +908,7 @@ def autofill_application(
     session_token = None
     catalogue_token = None
     us_token = None
+    guard_page = None
     try:
         us_token = bind_us_page()
         confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
@@ -919,6 +929,8 @@ def autofill_application(
             attach_page(page)
             page.goto(application_url)
 
+        install_final_submit_guard(page)
+        guard_page = page
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if is_site_error(snapshot):
             note_page_type("SITE_ERROR")
@@ -1308,6 +1320,8 @@ def autofill_application(
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except HumanSubmissionRequired:
+                break
             except NavigationStalled:
                 _forward_block(opts, nxt, current_sig)
                 detected, filled, skipped = _counts(fields)
@@ -1425,6 +1439,8 @@ def autofill_application(
             timings=_timings(opts),
         )
     finally:
+        if guard_page is not None:
+            release_final_submit_guard(guard_page)
         reset_location_profile(_profile_token)
         if confirmed_token is not None:
             reset_confirmed(confirmed_token)
@@ -2175,6 +2191,9 @@ def _run_resolver_pages(
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except HumanSubmissionRequired:
+                leave_pages = True
+                break
             except NavigationStalled:
                 _forward_block(opts, nxt, current_sig)
                 session.mark(Status.NAVIGATION_STALLED)

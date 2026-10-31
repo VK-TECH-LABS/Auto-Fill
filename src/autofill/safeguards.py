@@ -12,8 +12,10 @@ continue, Proceed, Review, Add another) go through :func:`activate`.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
+from contextlib import contextmanager
 
 logger = logging.getLogger("autofill.safeguards")
 
@@ -686,6 +688,163 @@ def _click(page, selector: str, frame_url: str, at_point: bool) -> None:
     page.mouse.click(x, y)
 
 
+_LIVE_CONTROL_JS = """(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return null; }
+  if (!el) return null;
+  const name = (el.innerText || el.value || el.getAttribute("aria-label") || "")
+    .replace(/\\s+/g, " ")
+    .trim();
+  return {name, controlType: (el.getAttribute("type") || "").toLowerCase()};
+}"""
+
+
+def _live_control(page, selector: str, frame_url: str) -> tuple[str, str]:
+    """The label and type on the element ``selector`` points at now.
+
+    A snapshot name can be stale, or the selector can point at a different
+    control than the one the caller named. An unreadable target does not
+    invent a label.
+    """
+    if not selector:
+        return "", ""
+    target = _bound_target(page, frame_url)
+    evaluate = getattr(target, "evaluate", None)
+    if evaluate is None:
+        return "", ""
+    try:
+        raw = evaluate(_LIVE_CONTROL_JS, selector)
+    except Exception:
+        return "", ""
+    if not isinstance(raw, dict):
+        return "", ""
+    return str(raw.get("name") or ""), str(raw.get("controlType") or "")
+
+
+def _refuse_live_submit(page, selector: str, name: str, *, control_type: str, frame_url: str) -> None:
+    """Refuse when the element that would be clicked is a final submit."""
+    live_name, live_type = _live_control(page, selector, frame_url)
+    if not live_name and not live_type:
+        return
+    shown = live_name or name
+    if action_class(shown, control_type=live_type or control_type) == ActionClass.FINAL_APPLICATION_SUBMIT_FORBIDDEN:
+        raise HumanSubmissionRequired(
+            f"Refusing to activate {shown!r}. A person must click the final Submit or Apply control."
+        )
+
+
+_GUARD_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("autofill_submit_guard_depth", default=0)
+
+# Active only while a fill or an answer is running, then removed so the person
+# can click Submit. Continue labels and Apply entry stay clickable. A click or
+# an Enter that would activate Submit application is cancelled before the
+# button's own handler or the form's onsubmit can record a submit.
+_INSTALL_SUBMIT_GUARD_JS = r"""() => {
+  if (window.__autofillSubmitGuard) return;
+  function labelOf(node) {
+    return String(node.innerText || node.value || node.getAttribute("aria-label") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function isFinal(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const tag = String(node.tagName || "").toLowerCase();
+    const type = String(node.getAttribute("type") || "").toLowerCase();
+    const role = String(node.getAttribute("role") || "").toLowerCase();
+    if (tag !== "button" && tag !== "input" && role !== "button") return false;
+    const name = labelOf(node);
+    if (/\b(next|continue|save\s*(and|&)\s*continue|proceed|review)\b/i.test(name)) return false;
+    if (/\b(submit(\s+application)?|send(\s+my)?\s+application|send)\b/i.test(name)) return true;
+    if (/\b(finish(\s+application)?|complete\s+application)\b/i.test(name)) return true;
+    return type === "submit" && !name;
+  }
+  function stop(event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  function onClick(event) {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    for (const node of path) {
+      if (isFinal(node)) {
+        stop(event);
+        return;
+      }
+    }
+  }
+  function onSubmit(event) {
+    const submitter = event.submitter || null;
+    if (submitter && isFinal(submitter)) {
+      stop(event);
+      return;
+    }
+    const form = event.target;
+    if (submitter || !form || !form.querySelectorAll) return;
+    for (const button of form.querySelectorAll("button, input")) {
+      const type = String(button.getAttribute("type") || (button.tagName === "BUTTON" ? "submit" : "")).toLowerCase();
+      if (type === "submit" && isFinal(button)) {
+        stop(event);
+        return;
+      }
+    }
+  }
+  document.addEventListener("click", onClick, true);
+  document.addEventListener("submit", onSubmit, true);
+  window.__autofillSubmitGuard = true;
+  window.__autofillSubmitGuardOff = () => {
+    document.removeEventListener("click", onClick, true);
+    document.removeEventListener("submit", onSubmit, true);
+    window.__autofillSubmitGuard = false;
+  };
+}"""
+
+_REMOVE_SUBMIT_GUARD_JS = """() => {
+  if (window.__autofillSubmitGuardOff) window.__autofillSubmitGuardOff();
+}"""
+
+
+def install_final_submit_guard(page) -> None:
+    """Hold Submit application clicks and implicit submits for one nested scope."""
+    depth = _GUARD_DEPTH.get()
+    _GUARD_DEPTH.set(depth + 1)
+    if depth != 0 or page is None:
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(_INSTALL_SUBMIT_GUARD_JS)
+    except Exception:
+        return
+
+
+def release_final_submit_guard(page) -> None:
+    """Drop one scope. The listener comes off when the outermost fill finishes."""
+    depth = _GUARD_DEPTH.get()
+    if depth <= 0:
+        return
+    depth -= 1
+    _GUARD_DEPTH.set(depth)
+    if depth != 0 or page is None:
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(_REMOVE_SUBMIT_GUARD_JS)
+    except Exception:
+        return
+
+
+@contextmanager
+def hold_final_submit(page):
+    """Cancel final-submit activation until this fill or answer returns."""
+    install_final_submit_guard(page)
+    try:
+        yield
+    finally:
+        release_final_submit_guard(page)
+
+
 def perform_click(
     page,
     selector: str,
@@ -701,6 +860,8 @@ def perform_click(
     If the control is a final application submission, this raises
     :class:`HumanSubmissionRequired` before any click. That is true for every
     purpose, so an adapter cannot reach Submit by asking for a login click.
+    The live label is checked as well: a caller that says Next must not
+    activate an element that now reads Submit application.
     """
     if not HUMAN_SUBMIT_ONLY:
         raise HumanSubmissionRequired("HUMAN_SUBMIT_ONLY was disabled. That is not a supported configuration.")
@@ -709,6 +870,7 @@ def perform_click(
         raise HumanSubmissionRequired(
             f"Refusing to activate {name!r}. A person must click the final Submit or Apply control."
         )
+    _refuse_live_submit(page, selector, name, control_type=control_type, frame_url=frame_url)
     if purpose == "login":
         if klass != ActionClass.LOGIN_SUBMIT_ALLOWED:
             raise SubmitBlockedError(
