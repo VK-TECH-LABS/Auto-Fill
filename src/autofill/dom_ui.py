@@ -641,6 +641,17 @@ _COMMITTED_JS = r"""(selector) => {
     }
     return false;
   }
+  if (role === "radio" || role === "checkbox" || role === "switch") {
+    if (el.getAttribute("aria-checked") === "true" || el.checked === true) return true;
+    const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]");
+    if (role === "radio" && group) {
+      const peers = group.querySelectorAll("[role='radio']");
+      for (const peer of peers) {
+        if (peer.getAttribute("aria-checked") === "true") return true;
+      }
+    }
+    return false;
+  }
   if (tag === "SELECT") {
     const value = String(el.value || "").trim();
     if (!value) return false;
@@ -1360,15 +1371,23 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         if _is_native_select(page, selector):
             chosen = choose_native_select(page, selector, label=values[0], value=values[0])
         else:
-            evaluate = getattr(page, "evaluate", None)
-            if evaluate is None:
-                return {"filled": False, "reason": "not_committed"}
-            try:
-                multi = answer_type == "multi_select"
-                expected: str | list[str] = values if multi else values[0]
-                chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
-            except Exception:
-                chosen = False
+            native = _commit_native_choices(
+                page, selector, values, multi=answer_type == "multi_select"
+            )
+            if native is not None:
+                chosen = native
+            elif _commit_aria_radio(page, selector, values[0]):
+                chosen = True
+            else:
+                evaluate = getattr(page, "evaluate", None)
+                if evaluate is None:
+                    return {"filled": False, "reason": "not_committed"}
+                try:
+                    multi = answer_type == "multi_select"
+                    expected: str | list[str] = values if multi else values[0]
+                    chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
+                except Exception:
+                    chosen = False
         if not chosen:
             return {"filled": False, "reason": "not_committed"}
     else:
@@ -1388,14 +1407,112 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     return {"filled": True}
 
 
-def _check_box(page: Any, selector: str) -> dict[str, Any]:
-    """Check one checkbox through the locator. This does not click a button."""
-    locator = getattr(page, "locator", None)
-    if locator is None:
-        return {"filled": False, "reason": "not_committed"}
+_NATIVE_CHOICE_SELECTORS_JS = r"""({ selector, labels, multi }) => {
+  let root = null;
+  try {
+    root = document.querySelector(selector);
+  } catch (error) {
+    return null;
+  }
+  if (!root || root.tagName !== "INPUT") return null;
+  const type = String(root.type || root.getAttribute("type") || "").toLowerCase();
+  if (type !== "checkbox" && type !== "radio") return null;
+  function labelOf(node) {
+    const wrap = node.closest("label");
+    const raw = wrap ? wrap.innerText : (node.getAttribute("aria-label") || node.value || "");
+    return String(raw || "").replace(/\s+/g, " ").trim();
+  }
+  function css(node) {
+    if (node.id) return "#" + CSS.escape(node.id);
+    const name = node.getAttribute("name") || "";
+    if (!name) return selector;
+    return "input[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(node.value || "") + "']";
+  }
+  const name = root.getAttribute("name") || "";
+  const group = name
+    ? Array.from(document.querySelectorAll("input")).filter((node) => (
+        node.type === type && node.getAttribute("name") === name
+      ))
+    : [root];
+  const wanted = (labels || []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (type === "checkbox" && !multi) {
+    const word = wanted[0] || "";
+    const off = /^(no|false|unchecked)$/i.test(word);
+    return [{ selector: css(root), on: !off }];
+  }
+  const found = [];
+  for (const word of wanted) {
+    const match = group.find((node) => labelOf(node) === word || String(node.value || "").trim() === word);
+    if (!match) return [];
+    found.push({ selector: css(match), on: true });
+  }
+  return found;
+}"""
+
+
+def _commit_native_choices(page: Any, selector: str, values: list[str], *, multi: bool) -> bool | None:
+    """Commit native checkbox or radio options. None when this control is not one."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
     try:
-        page.locator(selector).check()
+        found = evaluate(_NATIVE_CHOICE_SELECTORS_JS, {"selector": selector, "labels": values, "multi": multi})
     except Exception:
+        return None
+    if found is None:
+        return None
+    if not isinstance(found, list) or not found:
+        return False
+    from autofill.safeguards import commit_native_choice
+
+    for item in found:
+        if not isinstance(item, dict):
+            return False
+        target = str(item.get("selector") or "")
+        if not target or not commit_native_choice(page, target, on=bool(item.get("on", True))):
+            return False
+    return True
+
+
+def _commit_aria_radio(page: Any, selector: str, value: str) -> bool:
+    """Select one factual ``role=radio`` option. False when this is not that widget."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not value.strip():
+        return False
+    script = r"""({ selector, label }) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return ""; }
+      if (!el) return "";
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      if (!group) return "";
+      const radios = Array.from(group.querySelectorAll("[role='radio']"));
+      if (role !== "radio" && !radios.length) return "";
+      const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const match = radios.find((node) => {
+        const text = String(node.innerText || node.getAttribute("aria-label") || "");
+        return text.replace(/\s+/g, " ").trim().toLowerCase() === wanted;
+      });
+      if (!match) return "";
+      if (match.id) return "#" + CSS.escape(match.id);
+      return selector;
+    }"""
+    try:
+        target = str(evaluate(script, {"selector": selector, "label": value}) or "")
+    except Exception:
+        return False
+    if not target:
+        return False
+    from autofill.safeguards import press_aria_radio
+
+    return press_aria_radio(page, target)
+
+
+def _check_box(page: Any, selector: str) -> dict[str, Any]:
+    """Check one native checkbox and reread it. This does not click a button."""
+    from autofill.safeguards import commit_native_choice
+
+    if not commit_native_choice(page, selector, on=True):
         return {"filled": False, "reason": "not_committed"}
     if not control_committed(page, selector):
         return {"filled": False, "reason": "not_committed"}

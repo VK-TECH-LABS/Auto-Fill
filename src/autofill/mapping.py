@@ -38,6 +38,14 @@ _CONSENT_STRONG_RE = re.compile(
 _MARKETING_RE = re.compile(
     r"\b(newsletter|promotional|marketing|product updates|special offers|opt in|receive emails|receive updates)\b"
 )
+# Statements that stay manual even when they are not a fixed terms sentence.
+# Demographic words are classified separately so they stay DEMOGRAPHIC.
+_ATTESTATION_RE = re.compile(
+    r"\b(background check|e-?sign|electronic signature|arbitration|certify|attest|attestation"
+    r"|recording|text messages?|sms)\b"
+)
+_DEMOGRAPHIC_TEXT_RE = re.compile(r"\b(gender|race|ethnicity|veteran|disability)\b")
+_TERMS_KINDS = frozenset({"checkbox", "radio", "select", "combobox", "buttons"})
 _ALIAS_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"united states", "united states of america", "usa", "us"}),
     frozenset({"canada", "ca"}),
@@ -314,8 +322,8 @@ def option_stance(label: str) -> str:
 
 
 def is_consent_choice(control: Control) -> bool:
-    """A radio or select that offers both a consent option and a decline option."""
-    if control.kind not in {"radio", "select", "combobox"}:
+    """A choice control that offers both a consent option and a decline option."""
+    if control.kind not in {"radio", "select", "combobox", "buttons"}:
         return False
     stances = {option_stance(option.label or option.value) for option in control.options}
     return "agree" in stances and "decline" in stances
@@ -500,7 +508,7 @@ def terms_category(control: Control) -> str:
     ``STANDARD_TERMS``. Fixed data-submission wording, with no free-word gap,
     is ``STANDARD_SUBMISSION_CONSENT``. Anything else stays ``CONSENT``.
     """
-    if control.kind != "checkbox":
+    if control.kind not in _TERMS_KINDS:
         return "CONSENT"
     option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
     blob = normalize(f"{haystack(control)} {control.prompt} {control.group} {option_text}")
@@ -542,7 +550,7 @@ def acknowledgement_kind(control: Control) -> str:
     Marketing is checked first so "I agree to receive marketing emails" is an
     opt-in. Terms, privacy, attestation, and e-signature stay consent.
     """
-    if control.kind not in {"checkbox", "radio", "select"}:
+    if control.kind not in _TERMS_KINDS:
         return "factual"
     option_text = " ".join(
         part for option in control.options for part in (option.label, option.value) if part
@@ -555,6 +563,20 @@ def acknowledgement_kind(control: Control) -> str:
     if _CONSENT_RE.search(blob) or _LEGAL_RE.search(blob):
         return "consent"
     return "factual"
+
+
+def is_demographic_control(control: Control) -> bool:
+    """Gender, race, veteran, and disability questions stay demographic."""
+    return bool(_DEMOGRAPHIC_TEXT_RE.search(haystack(control)))
+
+
+def attestation_manual(control: Control) -> bool:
+    """Background-check, e-sign, arbitration, certification, SMS, and recording stay manual."""
+    if control.kind not in _TERMS_KINDS:
+        return False
+    option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
+    blob = normalize(f"{haystack(control)} {option_text}")
+    return bool(_ATTESTATION_RE.search(blob))
 
 
 def mark_required_acknowledgements(controls: list[Control]) -> None:
@@ -1220,6 +1242,30 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    if is_demographic_control(control):
+        key = _match_rule(
+            Control(
+                kind=control.kind,
+                label=control.label,
+                name=control.name,
+                aria_label=control.aria_label,
+                prompt=control.prompt,
+                group=control.group,
+            )
+        )
+        return MappedField(
+            key=key if key in {"gender", "race_ethnicity", "veteran_status", "disability_status"} else None,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Demographic questions are left blank.",
+        )
+    if attestation_manual(control) and acknowledgement_kind(control) == "factual":
+        return MappedField(
+            key=None,
+            action="skip",
+            field_class="LEGAL_FIELD",
+            reason="This statement stays manual.",
+        )
     if is_consent_choice(control):
         return MappedField(
             key=None,
@@ -1227,9 +1273,9 @@ def map_field(
             field_class="LEGAL_FIELD",
             reason="Consent choice left for a person.",
         )
-    if control.kind == "checkbox" and acknowledgement_kind(control) == "marketing":
+    if control.kind in _TERMS_KINDS and acknowledgement_kind(control) == "marketing":
         return MappedField(key=None, action="skip", reason="Marketing opt-in left unchecked.")
-    if control.kind in {"checkbox", "radio", "select"} and (
+    if control.kind in _TERMS_KINDS and (
         acknowledgement_kind(control) == "consent" or _LEGAL_RE.search(haystack(control))
     ):
         return MappedField(

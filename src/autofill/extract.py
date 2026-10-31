@@ -268,6 +268,133 @@ EXTRACT_JS = r"""
     return "";
   }
 
+  function formFieldQuestion(el) {
+    const field = el.closest("[data-automation-id^='formField'], [data-field-path]");
+    if (!field) return "";
+    const option = optionText(el) || cleanPrompt(textOf(el));
+    const labelled = field.getAttribute("aria-labelledby") || "";
+    if (labelled) {
+      const node = document.getElementById(labelled.split(/\s+/)[0]);
+      if (node && !node.contains(el)) {
+        const text = cleanPrompt(textOf(node));
+        if (text && text !== option && !isSectionHeading(node, text)) return text;
+      }
+    }
+    const labels = field.querySelectorAll("label, legend");
+    for (const label of labels) {
+      if (!label || label.contains(el)) continue;
+      const text = cleanPrompt(textOf(label));
+      if (!text || text === option || text.length > 200 || isSectionHeading(label, text)) continue;
+      return text;
+    }
+    return "";
+  }
+
+  function radioContainer(el) {
+    return el.closest("[role='radiogroup'], fieldset, [data-field-path]") || null;
+  }
+
+  function containerKey(box, el) {
+    if (box) {
+      if (box.id) return "id:" + box.id;
+      const path = box.getAttribute("data-field-path") || box.getAttribute("data-automation-id") || "";
+      if (path) return "path:" + path;
+      if (!box.getAttribute("data-autofill-radio-group")) {
+        box.setAttribute("data-autofill-radio-group", Math.random().toString(36).slice(2));
+      }
+      return "mark:" + box.getAttribute("data-autofill-radio-group");
+    }
+    const parent = el.parentElement;
+    if (parent) {
+      const peers = Array.from(parent.querySelectorAll("input[type='radio']")).filter((radio) => {
+        if (radio.getAttribute("name")) return false;
+        const label = radio.closest("label");
+        return radio.parentElement === parent || (label && label.parentElement === parent);
+      });
+      if (peers.length > 1) {
+        if (!parent.getAttribute("data-autofill-radio-group")) {
+          parent.setAttribute("data-autofill-radio-group", Math.random().toString(36).slice(2));
+        }
+        return "parent:" + parent.getAttribute("data-autofill-radio-group");
+      }
+    }
+    return "solo:" + (el.id || selectorFor(el));
+  }
+
+  function nativeRadioGroup(root, el) {
+    const name = el.getAttribute("name") || "";
+    if (name) {
+      return Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
+    }
+    const box = radioContainer(el);
+    const scope = box || el.parentElement || el;
+    return Array.from(scope.querySelectorAll("input[type='radio']")).filter((radio) => {
+      if (radio.getAttribute("name")) return false;
+      if (box) return radioContainer(radio) === box;
+      const parent = el.parentElement;
+      const label = radio.closest("label");
+      return radio.parentElement === parent || (label && label.parentElement === parent);
+    });
+  }
+
+  function radioOptionLabel(radio) {
+    const wrapping = radio.closest("label");
+    if (wrapping) return cleanPrompt(textOf(wrapping));
+    if (radio.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(radio.id) + "']");
+      if (explicit) return cleanPrompt(textOf(explicit));
+    }
+    const next = radio.nextElementSibling;
+    if (next && next.tagName && next.tagName.toLowerCase() === "label") {
+      if (!next.querySelector("input, select, textarea")) return cleanPrompt(textOf(next));
+    }
+    const role = (radio.getAttribute("role") || "").toLowerCase();
+    if (role === "radio") return cleanPrompt(radio.getAttribute("aria-label") || textOf(radio));
+    return radio.value || "";
+  }
+
+  function pushRadioControl(group) {
+    const visible = group.filter((radio) => radio);
+    if (!visible.length) return;
+    const first = visible[0];
+    const fieldset = first.closest("fieldset");
+    const legend = fieldset ? fieldset.querySelector("legend") : null;
+    const question = groupQuestion(first) || formFieldQuestion(first);
+    const options = visible.map((radio) => ({
+      value: radio.value || radioOptionLabel(radio),
+      label: radioOptionLabel(radio),
+      selector: selectorFor(radio),
+    })).filter((option) => option.selector && option.label);
+    if (!options.length) return;
+    const native = (first.tagName || "").toLowerCase() === "input";
+    controls.push({
+      kind: "radio",
+      name: first.getAttribute("name") || "",
+      elementId: first.id || "",
+      label: question || radioOptionLabel(first),
+      placeholder: "",
+      ariaLabel: first.getAttribute("aria-label") || "",
+      autocomplete: "",
+      required: visible.some((radio) => (
+        radio.required ||
+        radio.getAttribute("aria-required") === "true" ||
+        controlMarkedRequired(radio) ||
+        controlMarkedRequired(radioContainer(radio))
+      )),
+      hidden: visible.every((radio) => isHidden(radio)),
+      disabled: visible.every((radio) => radio.disabled || radio.getAttribute("aria-disabled") === "true"),
+      readOnly: false,
+      options,
+      selector: options[0].selector,
+      inputMode: "",
+      inputType: native ? "radio" : "aria-radio",
+      role: "radio",
+      nearby: "",
+      group: textOf(legend) || question,
+      prompt: question,
+    });
+  }
+
   function stripStar(text) {
     return cleanPrompt(text).replace(/[\s*✱＊]+$/g, "").trim();
   }
@@ -411,7 +538,10 @@ EXTRACT_JS = r"""
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute("type") || "").toLowerCase();
     if (name && (type === "radio" || type === "checkbox")) {
-      return tag + "[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value || "") + "']";
+      const attr = el.getAttribute("value");
+      const base = tag + "[type='" + type + "'][name='" + CSS.escape(name) + "']";
+      if (attr === null) return base;
+      return base + "[value='" + CSS.escape(attr) + "']";
     }
     if (name) return tag + "[name='" + CSS.escape(name) + "']";
     const fieldPath = el.closest && el.closest("[data-field-path]");
@@ -484,44 +614,11 @@ EXTRACT_JS = r"""
 
       if (inputType === "radio") {
         const name = el.getAttribute("name") || "";
-        const groupKey = rootKey + "::" + name;
-        if (!name || seenRadios.has(groupKey)) continue;
+        const box = radioContainer(el);
+        const groupKey = name ? rootKey + "::name::" + name : rootKey + "::" + containerKey(box, el);
+        if (seenRadios.has(groupKey)) continue;
         seenRadios.add(groupKey);
-        const group = Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
-        const fieldset = el.closest("fieldset");
-        const legend = fieldset ? fieldset.querySelector("legend") : null;
-        const question = groupQuestion(el);
-        const options = group.map((radio) => ({
-          value: radio.value || "",
-          label: textOf(radio.closest("label")) || radio.value || "",
-          selector: selectorFor(radio),
-        })).filter((option) => option.selector);
-        if (!options.length) continue;
-        controls.push({
-          kind: "radio",
-          name,
-          elementId: el.id || "",
-          label: question,
-          placeholder: "",
-          ariaLabel: el.getAttribute("aria-label") || "",
-          autocomplete: "",
-          required: group.some((radio) => (
-            radio.required ||
-            radio.getAttribute("aria-required") === "true" ||
-            controlMarkedRequired(radio)
-          )),
-          hidden: group.every((radio) => isHidden(radio)),
-          disabled: group.every((radio) => radio.disabled),
-          readOnly: false,
-          options,
-          selector: options[0].selector,
-          inputMode: "",
-          inputType: "radio",
-          role: "radio",
-          nearby: "",
-          group: textOf(legend) || question,
-          prompt: question,
-        });
+        pushRadioControl(nativeRadioGroup(root, el));
         continue;
       }
 
@@ -599,7 +696,7 @@ EXTRACT_JS = r"""
         inputType,
         role,
         nearby: textOf(headingNode).slice(0, 160),
-        group: legendText(el),
+        group: legendText(el) || (inputType === "checkbox" ? formFieldQuestion(el) : ""),
         prompt: inputType === "checkbox" ? groupQuestion(el) : "",
         automationId: el.getAttribute("data-automation-id") || "",
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
@@ -629,6 +726,70 @@ EXTRACT_JS = r"""
         inAd: place.inAd,
         inMain: place.inMain,
         disabled: isDisabled(el),
+      });
+    }
+  });
+
+  // Custom checkbox, switch, and radio widgets. A native input inside the
+  // widget is already recorded. These are reported and not clicked here.
+  eachRoot(document, (root) => {
+    const rootKey = root.host ? (root.host.id || "shadow") : "document";
+    const seenAriaRadios = new Set();
+    for (const el of root.querySelectorAll("[role='radio']")) {
+      if (isHidden(el)) continue;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      const type = (el.getAttribute("type") || "").toLowerCase();
+      if (tag === "input" || tag === "button" || tag === "a" || type === "submit" || type === "button") continue;
+      if ((el.getAttribute("role") || "").toLowerCase() === "button") continue;
+      if (el.querySelector("input[type='radio']")) continue;
+      const box = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      const key = rootKey + "::aria::" + containerKey(box, el);
+      if (seenAriaRadios.has(key)) continue;
+      seenAriaRadios.add(key);
+      const scope = box || el;
+      const group = Array.from(scope.querySelectorAll("[role='radio']")).filter((radio) => {
+        if (isHidden(radio)) return false;
+        const radioTag = radio.tagName ? radio.tagName.toLowerCase() : "";
+        if (radioTag === "input" || radioTag === "button" || radioTag === "a") return false;
+        if (radio.querySelector("input[type='radio']")) return false;
+        return radio.closest("[role='radiogroup'], fieldset, [data-field-path]") === box
+          || radio.parentElement === box;
+      });
+      pushRadioControl(group.length ? group : [el]);
+    }
+    for (const el of root.querySelectorAll("[role='checkbox'], [role='switch']")) {
+      if (isHidden(el)) continue;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (tag === "input" || tag === "button" || tag === "a") continue;
+      if (el.querySelector("input[type='checkbox'], input[type='radio']")) continue;
+      const yesno = el.closest("[class*='yesno'], .ashby-application-form-input-yesno");
+      if (yesno && yesno.querySelector("button, [role='button']")) continue;
+      const roleName = (el.getAttribute("role") || "").toLowerCase();
+      const selector = selectorFor(el);
+      if (!selector || controls.some((control) => control.selector === selector)) continue;
+      const question = groupQuestion(el) || formFieldQuestion(el);
+      const own = cleanPrompt(el.getAttribute("aria-label") || textOf(el));
+      controls.push({
+        kind: "checkbox",
+        name: el.getAttribute("name") || "",
+        elementId: el.id || "",
+        label: own || question,
+        placeholder: "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        autocomplete: "",
+        required: el.getAttribute("aria-required") === "true" || controlMarkedRequired(el),
+        hidden: false,
+        disabled: el.getAttribute("aria-disabled") === "true",
+        readOnly: false,
+        options: [],
+        selector,
+        inputMode: "",
+        inputType: roleName === "switch" ? "switch" : "aria-checkbox",
+        role: roleName,
+        nearby: "",
+        group: question && question !== own ? question : formFieldQuestion(el),
+        prompt: question && question !== own ? question : "",
+        automationId: el.getAttribute("data-automation-id") || "",
       });
     }
   });

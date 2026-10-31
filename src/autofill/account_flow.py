@@ -37,11 +37,9 @@ from autofill.mapping import (
     terms_category,
 )
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch, press_choice_label
+from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch, commit_native_choice
 
 _logger = logging.getLogger("autofill.account")
-_EEO_RE = re.compile(r"\b(eeo|equal employment|self-identif|voluntary|work authorization)\b", re.IGNORECASE)
-_TERMS_RE = re.compile(r"\b(terms|privacy)\b", re.IGNORECASE)
 _WAIT_SECONDS = 15.0
 # After Create Account the form disappears while the site works. A page without
 # a password box must stay that way this long before it counts as registered.
@@ -173,15 +171,27 @@ def _perform_account_action(
         policy_reason = password_meets_policy(password, password_policy(snapshot), email)
         if policy_reason:
             return {"ok": False, "reason": policy_reason}
-    terms = None
-    if not standard_terms:
-        terms, terms_error = _terms_checkbox(snapshot)
-        if terms_error:
-            return _rejected(snapshot, page.url or "", ats, mode, scored.alternate, [terms_error], secrets)
     identity = _email_control(snapshot)
     primary, confirm_box = _password_targets(snapshot, mode)
     if primary is None:
         return {"ok": False, "reason": "not_at_account_step"}
+    rows: list[dict] = []
+    if mode == "register" and not standard_terms:
+        # The flag is off, so nothing will be checked. Stop before the password
+        # is typed when a required box is still empty.
+        rows, pending = _accept_account_terms(page, snapshot, accept=False)
+        if pending:
+            rejected = _rejected(
+                snapshot,
+                page.url or "",
+                ats,
+                mode,
+                scored.alternate,
+                [f"{_CONSENT_PREFIX}{statement}" for statement in pending],
+                secrets,
+            )
+            rejected["reason"] = "site_rejected"
+            return _attach_proof(rejected, {}, rows, standard_terms=False)
     try:
         if identity is not None and not identity.read_only:
             _type_secret(page, identity.selector, username if _username_field(identity) and username else email)
@@ -193,13 +203,9 @@ def _perform_account_action(
     proof = _field_proof(page, identity, primary, confirm_box, password, confirm, email, username)
     if mode == "register" and not proof["passwordsMatch"]:
         return {"ok": False, "reason": "password_mismatch", "fieldProof": proof}
-    rows: list[dict] = []
-    if standard_terms:
-        rows, pending = _accept_account_terms(page, snapshot)
+    if mode == "register" and standard_terms:
+        rows, pending = _accept_account_terms(page, snapshot, accept=True)
         if pending:
-            # Never press Create Account over a required box that is still
-            # unchecked: the site only answers "Please check the box" and the
-            # attempt is spent. The person sees the exact statement instead.
             rejected = _rejected(
                 snapshot,
                 page.url or "",
@@ -210,18 +216,7 @@ def _perform_account_action(
                 secrets,
             )
             rejected["reason"] = "site_rejected"
-            return _attach_proof(rejected, proof, rows, standard_terms=standard_terms)
-    elif terms is not None:
-        if not check_registered(page, terms.selector):
-            return _rejected(
-                snapshot,
-                page.url or "",
-                ats,
-                mode,
-                scored.alternate,
-                ["The terms checkbox did not stay checked on the employer page."],
-                secrets,
-            )
+            return _attach_proof(rejected, proof, rows, standard_terms=True)
     button = _primary_button(snapshot, mode)
     if button is None:
         return {"ok": False, "reason": "not_at_account_step"}
@@ -299,23 +294,23 @@ def _required_box(control: Control) -> bool:
     return bool(control.required or control.automation_id == "createAccountCheckbox")
 
 
-def _accept_account_terms(page, snapshot: PageSnapshot) -> tuple[list[dict], list[str]]:
-    """Check required plain terms. Every other checkbox stays unchecked.
+def _accept_account_terms(page, snapshot: PageSnapshot, *, accept: bool) -> tuple[list[dict], list[str]]:
+    """Check required plain terms when ``accept`` is true. Every other box stays unchecked.
 
     Returns the audit rows and the statements of required boxes that are still
-    unchecked (not standard wording, or the site refused the check). The caller
-    must not press the account button while that list is non-empty.
+    unchecked. The caller must not press the account button while that list is
+    non-empty. ``accept`` false never calls the press.
     """
     rows: list[dict] = []
     pending: list[str] = []
     for control in snapshot.controls:
         if control.hidden or control.kind != "checkbox" or not control.selector:
             continue
-        category = terms_category(control)
+        category = terms_category(control) if accept else "CONSENT"
         checked = False
         required = _required_box(control)
         already = required and _is_checked(page, control.selector) is True
-        if category in AUTO_CONSENT_CATEGORIES and required:
+        if accept and category in AUTO_CONSENT_CATEGORIES and required and control.input_type in {"", "checkbox"}:
             if check_registered(page, control.selector):
                 record_auto_consent(control, category)
                 checked = True
@@ -361,37 +356,13 @@ def _is_checked(page, selector: str) -> bool | None:
 
 
 def check_registered(page, selector: str) -> bool:
-    """Check one box with a real pointer click and confirm the page kept it.
+    """Check one native box and confirm the page kept it.
 
-    A script that sets ``input.checked`` paints the box but a React form such as
-    Workday never sees it, and the site still says "Please check the box to
-    continue". Playwright's ``check()`` clicks like a person. A box covered by a
-    styled wrapper falls back to its label. At most three attempts, each verified.
+    Pointer check, then a forced check, then the label. A script that sets
+    ``input.checked`` paints the box but a React form such as Workday never
+    sees it. An unreadable state is not proof.
     """
-    attempts = (
-        # A covered box fails the pointer check until the timeout; keep it short
-        # so the forced check and the label press follow quickly.
-        lambda: page.locator(selector).check(timeout=1500),
-        lambda: page.locator(selector).check(force=True, timeout=3000),
-        lambda: press_choice_label(page, selector),
-    )
-    for attempt in attempts:
-        if _is_checked(page, selector) is True:
-            return True
-        try:
-            attempt()
-        except TypeError:
-            # Test doubles accept ``check()`` without keyword arguments.
-            try:
-                page.locator(selector).check()
-            except Exception:
-                continue
-        except Exception:
-            continue
-        # An unreadable state is not proof: try the next way, then give up.
-        if _is_checked(page, selector) is True:
-            return True
-    return _is_checked(page, selector) is True
+    return commit_native_choice(page, selector, on=True)
 
 
 def _covered_pane_button(snapshot: PageSnapshot, button: ButtonControl) -> bool:
@@ -527,34 +498,6 @@ def _switch_target(snapshot: PageSnapshot) -> tuple[str, str] | None:
             if button.selector and button.name:
                 return button.selector, button.name
     return None
-
-
-def _terms_checkbox(snapshot: PageSnapshot) -> tuple[Control | None, str | None]:
-    matches: list[Control] = []
-    unsure = False
-    for control in snapshot.controls:
-        if control.hidden or control.kind != "checkbox":
-            continue
-        blob = " ".join(
-            part
-            for part in (control.label, control.nearby, control.prompt, control.group, control.aria_label)
-            if part
-        )
-        if _EEO_RE.search(blob):
-            if control.required:
-                unsure = True
-            continue
-        if _TERMS_RE.search(blob):
-            matches.append(control)
-            continue
-        if control.required:
-            unsure = True
-    required = [control for control in matches if control.required]
-    if len(required) == 1 and not unsure:
-        return required[0], None
-    if required or unsure:
-        return None, "Terms consent needs a person"
-    return None, None
 
 
 def _errors(snapshot: PageSnapshot, secrets: list[str]) -> list[str]:

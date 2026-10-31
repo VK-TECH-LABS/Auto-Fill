@@ -679,7 +679,9 @@ def test_local_fixtures_drive_account_verification_and_resume(caplog, fixture_or
     app = create_app(token=TOKEN, runner=runner, run_browser=True)
     strong = "Correct-Horse-1!"
     with TestClient(app) as client:
-        register = _start(client, resolver_origin, f"{fixture_origin}/account_register.html")
+        register = _start(
+            client, resolver_origin, f"{fixture_origin}/account_register.html", standard_terms=True
+        )
         assert register["status"] == Status.ACCOUNT_CREATION_REQUIRED
         assert register["account"]["mode"] == "register"
         assert register["progress"]["stage"] == "ACCOUNT"
@@ -900,8 +902,10 @@ def test_workday_create_account_waits_until_the_pane_settles():
     assert page.calls >= 3
 
 
-def _start(client: TestClient, resolver_origin: str, url: str) -> dict:
+def _start(client: TestClient, resolver_origin: str, url: str, *, standard_terms: bool = False) -> dict:
     payload = _body("0.7.0", url)
+    if standard_terms:
+        payload["standardTermsAuthorized"] = True
     payload["resolver"]["url"] = f"{resolver_origin}/resolve"
     created = client.post("/v1/sessions", headers=AUTH, json=payload)
     assert created.status_code == 201, created.text

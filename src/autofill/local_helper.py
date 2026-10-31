@@ -373,6 +373,8 @@ class LocalJob:
         # Workday account registered here. Continue without verified does not sign in.
         self.verify_pending = False
         self._credential_candidate = ""
+        # Candidate preference from session create. False checks no terms box.
+        self.standard_terms_authorized = False
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -540,6 +542,7 @@ class LocalHelper:
         profile: CandidateProfile,
         binding: dict[str, str] | None = None,
         resume_ref: str | None = None,
+        standard_terms_authorized: bool = False,
     ) -> LocalJob:
         """Queue one fill. A bound create replaces the previous job.
 
@@ -565,6 +568,8 @@ class LocalHelper:
             if same and current is not None and current.state in {"queued", "running"}:
                 if resume_ref is not None:
                     self._staged.pop(resume_ref, None)
+                if standard_terms_authorized:
+                    current.standard_terms_authorized = True
                 return current
             if same and current is not None and _can_continue(current):
                 active = self._jobs.get(self._active) if self._active else None
@@ -578,6 +583,8 @@ class LocalHelper:
                         current.resume.drop()
                     current.resume = claimed
                 current.profile = profile
+                if standard_terms_authorized:
+                    current.standard_terms_authorized = True
                 current.continue_attempts += 1
                 current.error = ""
                 current.state = "queued"
@@ -589,6 +596,8 @@ class LocalHelper:
                 if resume_ref is not None:
                     # A double click restaged the same file. The live job keeps its copy.
                     self._staged.pop(resume_ref, None)
+                if standard_terms_authorized:
+                    current.standard_terms_authorized = True
                 return current
             else:
                 resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
@@ -605,6 +614,7 @@ class LocalHelper:
                         logger.info("session=%s superseded reason=replaced", old.session_id)
                 self._generation += 1
                 job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
+                job.standard_terms_authorized = bool(standard_terms_authorized)
                 self._jobs[job.session_id] = job
                 self._current = job.session_id
                 self._active = job.session_id
@@ -909,6 +919,8 @@ class LocalHelper:
         if job is None:
             raise LocalAttachError("No such session.")
         mode, email, username, password, confirm = _credential_fields(job, payload)
+        if payload.get("standardTerms") is True:
+            job.standard_terms_authorized = True
         _require_credential_candidate(job, payload)
         scope = credential_scope(job.application_url)
         if mode == "store":
@@ -939,7 +951,8 @@ class LocalHelper:
                     "password": password,
                     "confirm": confirm,
                     "scope": scope,
-                    "standard_terms": payload.get("standardTerms") is True,
+                    "standard_terms": payload.get("standardTerms") is True
+                    or bool(getattr(job, "standard_terms_authorized", False)),
                     "verified": payload.get("verified") is True,
                     "done": done,
                     "box": box,
@@ -1126,6 +1139,8 @@ class LocalHelper:
             kwargs["verify_pending"] = bool(job.verify_pending)
         if _accepts(fill, "protocol_version"):
             kwargs["protocol_version"] = "0.7.0"
+        if _accepts(fill, "standard_terms_authorized"):
+            kwargs["standard_terms_authorized"] = bool(getattr(job, "standard_terms_authorized", False))
         return kwargs
 
     def _save_credential(self, job: LocalJob, email: str, username: str, password: str, scope: str) -> None:
@@ -1842,9 +1857,20 @@ class _Handler(BaseHTTPRequestHandler):
             resume_ref = parse_resume_claim(payload.get("resume"))
             profile = CandidateProfile.from_dict(profile_raw)
             if resume_ref is None:
-                job = self.server.helper.submit(url, profile, binding)
+                job = self.server.helper.submit(
+                url,
+                profile,
+                binding,
+                standard_terms_authorized=payload.get("standardTermsAuthorized") is True,
+            )
             else:
-                job = self.server.helper.submit(url, profile, binding, resume_ref)
+                job = self.server.helper.submit(
+                    url,
+                    profile,
+                    binding,
+                    resume_ref,
+                    standard_terms_authorized=payload.get("standardTermsAuthorized") is True,
+                )
         except AnswerRejected as exc:
             self._send(exc.status, exc.body)
             return

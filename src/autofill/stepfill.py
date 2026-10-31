@@ -51,8 +51,10 @@ from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
     _wants_national_digits,
     acknowledgement_kind,
+    attestation_manual,
     haystack,
     is_consent_choice,
+    is_demographic_control,
     is_honeypot,
     map_field,
     match_field_key,
@@ -373,23 +375,29 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
     control = controls[0]
-    if control.kind == "buttons":
-        text = _question_text(controls)
-        options = _option_labels(controls)
-        match = classify_question(text, options, hook=hook)
-        return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "password" or control.input_type == "password":
         return None
     if is_honeypot(control):
         return None
     blob = haystack(control)
     role = acknowledgement_kind(control)
-    if is_consent_choice(control):
-        return _Ask(controls=controls, consent=True, consent_choice=True)
-    if role == "marketing":
-        return None
-    if control.kind == "checkbox" and (role == "consent" or _LEGAL_RE.search(blob)):
-        return _Ask(controls=controls, consent=True)
+    if not is_demographic_control(control):
+        if is_consent_choice(control):
+            return _Ask(controls=controls, consent=True, consent_choice=True)
+        if role == "marketing" and not control.required:
+            return None
+        manual_statement = role in {"consent", "marketing"} or _LEGAL_RE.search(blob) or attestation_manual(control)
+        if manual_statement:
+            # An optional attestation that the employer did not mark required stays
+            # unchecked and does not become a blocker. Required ones pause.
+            if attestation_manual(control) and role == "factual" and not control.required:
+                return None
+            return _Ask(controls=controls, consent=True)
+    if control.kind == "buttons":
+        text = _question_text(controls)
+        options = _option_labels(controls)
+        match = classify_question(text, options, hook=hook)
+        return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if _is_application_resume(control):
             return _Ask(controls=controls, field_key="resume.file")
@@ -1990,17 +1998,18 @@ def _apply_ask(
         _apply_resume(page, ask, response, outcome)
         return
     if ask.consent:
-        if not any(control.required for control in ask.controls):
-            return
+        required = any(control.required for control in ask.controls)
         if _cluster_committed(page, ask.controls):
             return
-        if _accept_standard_term(page, ask):
+        if required and _accept_standard_term(page, ask):
+            return
+        if not required and ask.consent_choice:
             return
         statement = _consent_statement(ask.controls[0])
         _manual(
             outcome,
             IntentMatch(None, "unknown", "none", statement),
-            blocking=True,
+            blocking=required,
             controls=ask.controls,
             kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
         )
@@ -2519,6 +2528,8 @@ def _confirmed_hint(record: dict) -> dict[str, str]:
         "name": str(record.get("name") or ""),
         "elementId": str(record.get("elementId") or ""),
         "automationId": str(record.get("automationId") or ""),
+        "selector": str(record.get("selector") or ""),
+        "choice": str(record.get("choice") or ""),
     }
 
 
@@ -2786,8 +2797,138 @@ def _harvest_name_records(page, records: list[dict]) -> None:
         )
 
 
+def _choice_record_is_consent(record: dict) -> bool:
+    """Consent and attestations are not written back. The next pass pauses them."""
+    label = str(record.get("label") or "")
+    value = str(record.get("value") or "")
+    control = Control(
+        kind="checkbox" if str(record.get("choice") or "") == "checkbox" else "radio",
+        label=label,
+        prompt=label,
+        options=[Option(value, value)] if value else [],
+    )
+    if acknowledgement_kind(control) in {"consent", "marketing"}:
+        return True
+    return attestation_manual(control) or is_demographic_control(control)
+
+
+_FIND_CHOICE_JS = r"""(hint) => {
+  function visible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function labelOf(el) {
+    const wrap = el.closest ? el.closest("label") : null;
+    const raw = wrap ? wrap.innerText : (el.getAttribute("aria-label") || el.innerText || el.value || "");
+    return String(raw || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  function selected(el) {
+    const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") return !!el.checked;
+    return el.getAttribute("aria-checked") === "true";
+  }
+  function cssOf(el) {
+    if (el.id) return "#" + CSS.escape(el.id);
+    return "";
+  }
+  const choice = String(hint.choice || "");
+  const want = String(hint.value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const nodes = Array.from(document.querySelectorAll(
+    "input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio'], [role='switch']"
+  )).filter(visible);
+  let el = null;
+  let via = "none";
+  if (hint.selector) {
+    try {
+      const found = document.querySelector(hint.selector);
+      if (found && visible(found)) {
+        el = found;
+        via = "selector";
+      }
+    } catch (error) {
+      el = null;
+    }
+  }
+  if (!el && hint.elementId) {
+    el = nodes.find((node) => node.id === hint.elementId) || null;
+    if (el) via = "id";
+  }
+  if (!el && hint.name) {
+    const group = nodes.filter((node) => (node.getAttribute("name") || "") === hint.name);
+    el = group.find((node) => {
+      const value = String(node.value || "").trim().toLowerCase();
+      return labelOf(node) === want || value === want;
+    }) || null;
+    if (!el && choice === "checkbox" && group.length === 1) el = group[0];
+    if (el) via = "name";
+  }
+  if (!el && hint.label) {
+    const folded = String(hint.label || "").replace(/\s+/g, " ").trim().toLowerCase();
+    el = nodes.find((node) => labelOf(node) === folded) || null;
+    if (el) via = "label";
+  }
+  if (!el) return {selector: "", via: "none", selected: false, role: ""};
+  const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  const native = el.tagName === "INPUT" && (type === "checkbox" || type === "radio");
+  return {
+    selector: cssOf(el) || String(hint.selector || ""),
+    via: via,
+    selected: selected(el),
+    role: role || type,
+    native: native,
+  };
+}"""
+
+
+def _restore_choice(page, record: dict) -> dict | None:
+    """Put a factual checkbox or radio back. Consent is left empty so it pauses."""
+    if _choice_record_is_consent(record):
+        return {"via": "consent", "result": "skipped"}
+    hint = _confirmed_hint(record)
+    from autofill.safeguards import commit_native_choice, press_aria_radio
+
+    missed: dict | None = None
+    for target in _frame_targets(page):
+        evaluate = getattr(target, "evaluate", None)
+        if evaluate is None:
+            continue
+        try:
+            found = evaluate(_FIND_CHOICE_JS, hint)
+        except Exception:
+            continue
+        if not isinstance(found, dict):
+            continue
+        selector = str(found.get("selector") or "")
+        via = str(found.get("via") or "none")
+        if not selector:
+            missed = {"via": via, "result": "miss"}
+            continue
+        role = str(found.get("role") or "")
+        want = str(hint.get("value") or "")
+        turn_on = hint.get("choice") == "radio" or want.casefold() not in {"no", "false", "unchecked"}
+        if bool(found.get("selected")) is turn_on:
+            return {"via": via, "result": "kept"}
+        if found.get("native"):
+            ok = commit_native_choice(target, selector, on=turn_on)
+        elif role == "radio":
+            ok = press_aria_radio(target, selector)
+        else:
+            ok = False
+        if ok:
+            return {"via": via, "result": "restored"}
+        missed = {"via": via, "result": "miss"}
+    return missed
+
+
 def _restore_one(page, record: dict) -> dict | None:
     """Match one confirmed value. A miss on the top document tries the frames."""
+    if str(record.get("choice") or "") in {"checkbox", "radio"}:
+        return _restore_choice(page, record)
     hint = _confirmed_hint(record)
     missed: dict | None = None
     for target in _frame_targets(page):
@@ -2845,7 +2986,7 @@ def post_upload_refill(
         if isinstance(outcome, dict):
             via = str(outcome.get("via") or "none")
             result = str(outcome.get("result") or "miss")
-            if result not in {"miss", "kept", "restored"}:
+            if result not in {"miss", "kept", "restored", "skipped"}:
                 result = "miss"
         if result == "restored":
             restored += 1
@@ -4201,7 +4342,7 @@ def _accept_standard_term(page, ask) -> bool:
     if len(ask.controls) != 1:
         return False
     control = ask.controls[0]
-    if control.kind != "checkbox" or not control.required:
+    if control.kind != "checkbox" or control.input_type in {"aria-checkbox", "switch"} or not control.required:
         return False
     category = terms_category(control)
     if category not in AUTO_CONSENT_CATEGORIES:
@@ -4227,9 +4368,11 @@ def _consent_statement(control: Control) -> str:
 
 def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     text = _question_text(controls) or controls[0].label
+    if is_demographic_control(controls[0]):
+        return "DEMOGRAPHIC"
     if is_consent_choice(controls[0]):
         return "CONSENT_CHOICE"
-    if controls[0].kind == "checkbox" and acknowledgement_kind(controls[0]) == "consent":
+    if acknowledgement_kind(controls[0]) == "consent" or attestation_manual(controls[0]):
         return "CONSENT"
     if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
         return "DEMOGRAPHIC"
