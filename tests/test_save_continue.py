@@ -464,7 +464,8 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         sid = created["sessionId"]
         body = wait(lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "shown", sid)
         question = body["question"]
-        assert question["prompt"] == "Are you willing to work rotating night shifts?", body
+        # #97's stem keeps the legend's required mark. The question is the same sentence.
+        assert question["prompt"].replace("*", "").strip() == "Are you willing to work rotating night shifts?", body
         assert question["options"] == ["Yes", "No"]
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
@@ -487,7 +488,7 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         body = wait(lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
                     and b["question"].get("popup", {}).get("state") == "shown", sid)
         second = body["question"]
-        assert second["prompt"] == "Which forklift brand have you operated most?", body
+        assert second["prompt"].replace("*", "").strip() == "Which forklift brand have you operated most?", body
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
             page = [p for c in browser.contexts for p in c.pages if "t172-local-tab" in p.url][0]
