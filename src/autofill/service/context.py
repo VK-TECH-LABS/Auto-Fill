@@ -43,12 +43,21 @@ def validate_application_url(url: str) -> str:
     return cleaned
 
 
+def _answer_merge_key(item: ApplicationAnswer) -> str:
+    """Recruitment SMS rows share one key. Other rows merge on question text."""
+    from autofill.sms_consent import SMS_KEY, is_sms_answer_row
+
+    if is_sms_answer_row(item):
+        return SMS_KEY
+    return item.question.casefold().strip()
+
+
 def apply_approved_answers(profile: CandidateProfile, answers: list[ApprovedAnswerIn]) -> None:
     """Approved answers override the same question. Other profile answers stay."""
     merged: dict[str, ApplicationAnswer] = {}
     order: list[str] = []
     for existing in profile.application_answers:
-        key = existing.question.casefold().strip()
+        key = _answer_merge_key(existing)
         if not key:
             continue
         if key not in merged:
@@ -58,17 +67,23 @@ def apply_approved_answers(profile: CandidateProfile, answers: list[ApprovedAnsw
             answer=existing.answer,
             intent=existing.intent,
             employer=existing.employer,
+            key=existing.key,
+            from_session=existing.from_session,
         )
     for approved in answers:
-        key = approved.question.casefold().strip()
-        if key not in merged:
-            order.append(key)
-        merged[key] = ApplicationAnswer(
+        row = ApplicationAnswer(
             question=approved.question.strip(),
             answer=approved.answer.strip(),
             intent=approved.intent,
             employer=approved.employer,
+            key=approved.key,
         )
+        key = _answer_merge_key(row)
+        if not key:
+            continue
+        if key not in merged:
+            order.append(key)
+        merged[key] = row
     profile.application_answers = [merged[key] for key in order]
 
 

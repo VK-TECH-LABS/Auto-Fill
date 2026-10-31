@@ -39,6 +39,7 @@ PROTOCOL_INTENTS: tuple[str, ...] = (
     "VETERAN_STATUS",
     "DISABILITY_STATUS",
     "REFERRAL",
+    "RECRUITMENT_SMS_CONSENT",
 )
 
 # Demographic questions are never written by the engine.
@@ -160,6 +161,17 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("PREVIOUSLY_EMPLOYED", "worked here before"),
     ("PREVIOUSLY_EMPLOYED", "former employee"),
     ("PREVIOUSLY_EMPLOYED", "worked for this company"),
+    ("RECRUITMENT_SMS_CONSENT", "would you like to receive text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "would you like to receive text message"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text message updates"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text message"),
+    ("RECRUITMENT_SMS_CONSENT", "sms text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "sms text message"),
+    ("RECRUITMENT_SMS_CONSENT", "text message consent"),
+    ("RECRUITMENT_SMS_CONSENT", "sms consent"),
+    ("RECRUITMENT_SMS_CONSENT", "consent to receive sms"),
+    ("RECRUITMENT_SMS_CONSENT", "consent to receive text"),
     ("REFERRAL", "who referred you"),
     ("REFERRAL", "employee referral"),
     ("REFERRAL", "referred you"),

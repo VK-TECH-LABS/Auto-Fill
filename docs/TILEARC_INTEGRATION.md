@@ -109,6 +109,38 @@ There is no retrieve route that returns the password. The next fill or continue 
 
 The hosted service uses the same scope on `POST /v1/sessions/{sessionId}/credentials`. `site` may still be the hostname. The stored key is the tenant scope. `422` `password_policy` means the host should pick another pool password and post again.
 
+## Recruitment SMS consent
+
+Recruitment text-message consent is an Application Answer, not a Terms of Service checkbox. `standardTermsAuthorized` does not check it. Marketing email, promotional SMS, AI or recording consent, arbitration, e-sign, background-check authorization, demographic attestations, and other certifications stay manual.
+
+Hosts store one row on that candidate's `applicationAnswers`. The catalogue key is `recruitment_sms_consent`. The intent is `RECRUITMENT_SMS_CONSENT`. The answer is `Yes` or `No`.
+
+```json
+{
+  "key": "recruitment_sms_consent",
+  "intent": "RECRUITMENT_SMS_CONSENT",
+  "answer": "Yes"
+}
+```
+
+`SMS_CONSENT` is accepted as an alias for the intent or the key and is stored as `RECRUITMENT_SMS_CONSENT` / `recruitment_sms_consent`. A `Yes` authorizes auto-fill. A `No` does not, and it is not asked again.
+
+When a form asks the question (any ATS; Workday's "Would you like to receive text messages…" is one wording), Auto-Fill selects **Yes / I agree / opt-in** only if this candidate's row is `Yes`. A different `candidateId` is refused. The acceptance is listed on `autoConsents` with `category: "RECRUITMENT_SMS_CONSENT"`. A stored `No` selects the decline option when the control is a choice, and leaves a checkbox unchecked. It is not an auto-accept, so it is not added to `autoConsents`.
+
+If the row is missing, Auto-Fill does not check the box. It stops once with `MANUAL_ANSWER_REQUIRED` and kind `CONSENT` or `CONSENT_CHOICE`. The blocker `fieldKey` is `recruitment_sms_consent`. The same SMS consent is not asked again for every field in that session. A human answer is written onto the profile as `Yes` or `No` and returned as `learnedApplicationAnswers`:
+
+```json
+{
+  "key": "recruitment_sms_consent",
+  "intent": "RECRUITMENT_SMS_CONSENT",
+  "question": "Would you like to receive text messages about your application?",
+  "answer": "Yes",
+  "candidateId": "candidate-id"
+}
+```
+
+Vinayaka / Fillo should upsert that row on the candidate's Local Apply profile under `recruitment_sms_consent`. Final Submit stays human.
+
 ## What stays human
 
 - Uploading the resume TileArc downloaded.

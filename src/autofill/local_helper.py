@@ -518,6 +518,9 @@ class LocalJob:
                 body["questions"] = listed
         if self.error:
             body["error"] = self.error
+        learned = _learned_sms(self)
+        if learned:
+            body["learnedApplicationAnswers"] = learned
         return body
 
 
@@ -1258,6 +1261,7 @@ class LocalHelper:
             confirm=confirm or password,
             ats=ats_name,
             standard_terms=bool(payload.get("standard_terms")),
+            recruitment_sms_authorized=_job_sms_authorized(job),
         )
         if not isinstance(report, dict):
             report = {"ok": False, "reason": "not_at_account_step"}
@@ -2324,22 +2328,59 @@ def _candidate_label(job: LocalJob) -> str:
 _NO_SESSION_REUSE_KINDS = frozenset({"CONSENT", "CONSENT_CHOICE", "DEMOGRAPHIC", "MISSING_PROFILE_VALUE"})
 
 
+def _job_candidate(job: LocalJob) -> str:
+    binding = job.binding or {}
+    bound = str(binding.get("candidateId") or "").strip()
+    if bound:
+        return bound
+    profile = job.profile
+    return (profile.candidate_id or "").strip() if profile is not None else ""
+
+
+def _job_sms_authorized(job: LocalJob) -> bool:
+    from autofill.sms_consent import sms_authorized
+
+    if job.profile is None:
+        return False
+    return sms_authorized(job.profile, _job_candidate(job))
+
+
+def _learned_sms(job: LocalJob) -> list[dict]:
+    from autofill.sms_consent import learned_application_answers
+
+    return learned_application_answers(job.profile, _job_candidate(job))
+
+
 def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]) -> None:
     """A verified answer is offered to later pages of this same fill.
 
     Same candidate only (it lives on this job's profile, which is dropped on
     replace or cancel). Reuse still goes through the Req2 matcher, which
     refuses demographic intents and anything it cannot match with confidence.
-    Consent and missing-profile values are not reused.
+    Consent and missing-profile values are not reused. A recruitment-SMS Yes
+    is the exception: it is stored on this candidate as
+    ``RECRUITMENT_SMS_CONSENT`` so a later apply can auto-accept it.
     """
     profile = job.profile
     if profile is None:
         return
     kind = canonical_blocker_kind(item.get("kind"))
-    if kind in _NO_SESSION_REUSE_KINDS:
-        return
     question = str(item.get("text") or "").strip()
     values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+    if question and len(values) == 1:
+        from autofill.sms_consent import remember_human_sms
+
+        if remember_human_sms(
+            profile,
+            question=question,
+            value=values[0],
+            intent=str(item.get("intent") or ""),
+            kind=kind,
+            candidate_id=_job_candidate(job),
+        ):
+            return
+    if kind in _NO_SESSION_REUSE_KINDS:
+        return
     if not question or len(values) != 1:
         return
     from autofill.answers import employer_keys, note_session_answer

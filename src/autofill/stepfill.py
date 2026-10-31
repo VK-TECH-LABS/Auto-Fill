@@ -1951,6 +1951,9 @@ def _apply(
     # A missing resume is recorded after the other controls. It must not skip them.
     ordered = [ask for ask in requests if ask.field_key != "resume.file"]
     ordered.extend(ask for ask in requests if ask.field_key == "resume.file")
+    from autofill.sms_consent import begin_sms_pass
+
+    begin_sms_pass()
     shared = (by_intent, unnamed, by_key, unclassified, rows, employment_index)
     for ask in ordered:
         if not checkpoint():
@@ -2016,17 +2019,69 @@ def _apply_ask(
         required = any(control.required for control in ask.controls)
         if _cluster_committed(page, ask.controls):
             return
+        from autofill.answers import current_catalogue
+        from autofill.sms_consent import (
+            SMS_INTENT,
+            SMS_KEY,
+            accept_recruitment_sms,
+            apply_stored_sms_no,
+            is_recruitment_sms_control,
+            note_sms_block,
+            skip_resolved_sms,
+            sms_blocked_this_pass,
+        )
+
+        bound = current_catalogue()
+        profile = bound[0] if bound is not None else None
+        control = ask.controls[0]
+        if accept_recruitment_sms(page, control, profile):
+            outcome.fields.append(
+                FieldOutcome(
+                    selector=control.selector,
+                    label=control.label,
+                    key=SMS_INTENT,
+                    action="check" if control.kind == "checkbox" else "select",
+                    detail="recruitment SMS",
+                    field_class="APPROVED_QUESTION",
+                )
+            )
+            return
+        if apply_stored_sms_no(page, control, profile):
+            outcome.fields.append(
+                FieldOutcome(
+                    selector=control.selector,
+                    label=control.label,
+                    key=SMS_KEY,
+                    action="select",
+                    detail="recruitment SMS declined",
+                    field_class="APPROVED_QUESTION",
+                )
+            )
+            return
+        if skip_resolved_sms(control, profile):
+            return
+        if is_recruitment_sms_control(control) and (sms_blocked_this_pass() or not required):
+            return
         if required and _accept_standard_term(page, ask):
             return
         if not required and ask.consent_choice:
             return
-        statement = _consent_statement(ask.controls[0])
+        statement = _consent_statement(control)
+        sms = is_recruitment_sms_control(control)
+        if sms:
+            note_sms_block()
         _manual(
             outcome,
-            IntentMatch(None, "unknown", "none", statement),
+            IntentMatch(
+                SMS_INTENT if sms else None,
+                "HIGH" if sms else "unknown",
+                "level1" if sms else "none",
+                statement,
+            ),
             blocking=required,
             controls=ask.controls,
             kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
+            field_key=SMS_KEY if sms else None,
         )
         return
     if ask.compose_location:
@@ -4568,11 +4623,16 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
     intent = match.intent if named else None
     if kind != "DEMOGRAPHIC" and intent in DEMOGRAPHIC_INTENTS:
         intent = None
+    from autofill.sms_consent import SMS_INTENT, SMS_KEY, gap_intent
+
+    intent = gap_intent(primary, intent)
     names = {label.casefold() for label in options}
     if primary.kind == "buttons" and "yes" in names and "no" in names:
         field_key = None
         if kind == "MISSING_PROFILE_VALUE":
             kind = "QUESTION"
+    if intent == SMS_INTENT:
+        field_key = SMS_KEY
     digest = _question_digest(text, primary) or None
     multi = len(controls) > 1 and any(item.kind == "checkbox" for item in controls)
     result = {
@@ -4659,6 +4719,9 @@ def inspect_required(
     Choice items that are still missing a list are read afterwards. A full
     fill leaves the cap unset.
     """
+    from autofill.sms_consent import begin_sms_pass, collapse_sms_gaps, sms_stored_choice
+
+    begin_sms_pass()
     snapshot = _live_snapshot(page, snapshot)
     clusters = _gap_clusters(snapshot)
     committed: set[str] = set()
@@ -4681,6 +4744,7 @@ def inspect_required(
     sync_required_progress(committed, open_keys)
     if prior:
         gaps = _merge_gap_items(gaps, prior)
+    gaps = collapse_sms_gaps(gaps, skip_all=profile is not None and sms_stored_choice(profile) == "no")
     if page is not None:
         ensure_blocker_options(page, gaps)
     return gaps, len(clusters), committed_clusters
