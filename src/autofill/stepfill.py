@@ -44,6 +44,7 @@ from autofill.intents import (
     match_option_exact,
     may_fill,
     normalize_question,
+    pick_option,
     question_hash,
     sanitize_question,
 )
@@ -3276,9 +3277,15 @@ def _apply_question(
         return
     if control.kind == "buttons":
         desired = answer.value or (answer.values[0] if answer.values else "")
-        option = match_option_exact(desired, control.options)
-        if option is None or not option.selector:
-            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
+        status, option = pick_option(desired, control.options)
+        if status != "match" or option is None or not option.selector:
+            _manual(
+                outcome,
+                match,
+                blocking=True,
+                controls=ask.controls,
+                kind="AMBIGUOUS_OPTION" if status == "ambiguous" else "OPTION_MISMATCH",
+            )
             return
         click_choice(page, option.selector, option.label)
         if _button_requires_selected_state(page, option.selector) and not control_committed(
@@ -3321,9 +3328,15 @@ def _apply_question(
         return
     if control.kind in {"radio", "select"}:
         desired = answer.value or (answer.values[0] if answer.values else "")
-        option = match_option_exact(desired, control.options)
-        if option is None:
-            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
+        status, option = pick_option(desired, control.options)
+        if status != "match" or option is None:
+            _manual(
+                outcome,
+                match,
+                blocking=True,
+                controls=ask.controls,
+                kind="AMBIGUOUS_OPTION" if status == "ambiguous" else "OPTION_MISMATCH",
+            )
             return
         mapped = MappedField(
             key=match.intent,
@@ -4443,7 +4456,12 @@ def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     match = classify_question(text, _option_labels(controls), us_on_page=_us_on_page())
     if match.intent in DEMOGRAPHIC_INTENTS or _eeo(text) or _eeo(controls[0].label):
         return "DEMOGRAPHIC"
-    if mapped is not None and "No option matched" in (mapped.reason or ""):
+    reason = (mapped.reason or "") if mapped is not None else ""
+    if "Saved answers disagree" in reason:
+        return "ANSWER_CONFLICT"
+    if "Several options match" in reason:
+        return "AMBIGUOUS_OPTION"
+    if "No option matched" in reason:
         return "OPTION_MISMATCH"
     if (mapped is not None and mapped.key) or match_field_key(controls[0]):
         return "MISSING_PROFILE_VALUE"

@@ -222,13 +222,17 @@ def _contains(asked: str, known: str) -> bool:
     return len(short_words & long_words) / len(long_words) >= _CONTAIN_COVERAGE
 
 
+class _AnswerConflict(Exception):
+    """Two saved rows name one question and do not say the same thing."""
+
+
 def _one_value(items: list[ApplicationAnswer], normalize: Callable[[str], str]) -> str | None:
     """The answer when every candidate says the same thing. Disagreement is not a guess."""
     if not items:
         return None
     values = {normalize(item.answer) for item in items}
     if len(values) != 1:
-        return None
+        raise _AnswerConflict
     return items[0].answer
 
 
@@ -288,7 +292,56 @@ def _employer_ok(
     return saved in keys
 
 
+def catalogue_match(
+    question: str | Sequence[str],
+    answers: list[ApplicationAnswer],
+    *,
+    normalize: Callable[[str], str],
+    us_on_page: bool = False,
+    employers: Sequence[str] = (),
+) -> tuple[str | None, str]:
+    """The saved answer, and ``ok``, ``conflict``, or ``none``."""
+    try:
+        value = _match_answer_impl(
+            question,
+            answers,
+            normalize=normalize,
+            us_on_page=us_on_page,
+            employers=employers,
+        )
+    except _AnswerConflict:
+        return None, "conflict"
+    if value is None:
+        return None, "none"
+    return value, "ok"
+
+
 def match_answer(
+    question: str | Sequence[str],
+    answers: list[ApplicationAnswer],
+    *,
+    normalize: Callable[[str], str],
+    us_on_page: bool = False,
+    employers: Sequence[str] = (),
+) -> str | None:
+    """Return the approved answer for ``question``, or None.
+
+    Two disagreeing saved values return None. ``catalogue_match`` reports that
+    disagreement separately.
+    """
+    try:
+        return _match_answer_impl(
+            question,
+            answers,
+            normalize=normalize,
+            us_on_page=us_on_page,
+            employers=employers,
+        )
+    except _AnswerConflict:
+        return None
+
+
+def _match_answer_impl(
     question: str | Sequence[str],
     answers: list[ApplicationAnswer],
     *,

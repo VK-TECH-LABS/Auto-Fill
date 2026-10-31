@@ -264,3 +264,139 @@ def test_map_field_uses_the_job_company_for_previously_employed():
     )
     assert acme.action == "select"
     assert acme.option_label == "No"
+
+
+def test_education_equivalent_selects_one_label_and_pauses_on_two():
+    from autofill.mapping import map_field
+
+    person = _profile()
+    person.experience.education_level = "Bachelor of Science"
+    one = map_field(
+        Control(
+            kind="select",
+            label="Highest education",
+            options=[Option("Bachelor's", "Bachelor's"), Option("Master's", "Master's")],
+        ),
+        person,
+    )
+    assert one.action == "select"
+    assert one.option_label == "Bachelor's"
+    both = map_field(
+        Control(
+            kind="select",
+            label="Highest education",
+            options=[Option("BS", "BS"), Option("Bachelor's", "Bachelor's")],
+        ),
+        person,
+    )
+    assert both.action == "unanswered"
+    assert "Several options" in both.reason
+
+
+def test_full_time_and_permanent_together_are_ambiguous():
+    from autofill.mapping import map_field
+
+    person = _profile()
+    person.availability.available_for_full_time = "Yes"
+    # The employment-type intent is not this profile flag. Use a saved answer.
+    person.application_answers = [ApplicationAnswer("Employment type", "fulltime")]
+    mapped = map_field(
+        Control(
+            kind="select",
+            label="Employment type",
+            options=[Option("Full Time", "Full Time"), Option("Permanent", "Permanent")],
+        ),
+        person,
+    )
+    assert mapped.action == "unanswered"
+    assert "Several options" in mapped.reason
+
+
+def test_disagreeing_saved_answers_are_a_conflict():
+    from autofill.mapping import map_field
+    from autofill.stepfill import _gap_kind
+
+    person = _profile()
+    person.application_answers = [
+        ApplicationAnswer("Which programming paradigm do you enjoy most?", "Functional"),
+        ApplicationAnswer("Which programming paradigm do you enjoy most?", "Object oriented"),
+    ]
+    control = Control(kind="text", label="Which programming paradigm do you enjoy most?")
+    mapped = map_field(control, person)
+    assert mapped.action == "unanswered"
+    assert _gap_kind([control], mapped) == "ANSWER_CONFLICT"
+
+
+def test_custom_checkbox_is_not_checked_from_a_saved_yes():
+    from autofill.mapping import map_field
+
+    person = _profile()
+    person.application_answers = [ApplicationAnswer("Send me the handbook?", "Yes")]
+    control = Control(
+        kind="checkbox",
+        label="Send me the handbook?",
+        input_type="aria-checkbox",
+        selector="#hand",
+    )
+    mapped = map_field(control, person)
+    assert mapped.action == "unanswered"
+    assert "Custom checkbox" in mapped.reason
+
+
+def test_checkbox_group_checks_only_a_full_match():
+    from autofill.fill import _fill_checkbox_group
+
+    class _Locator:
+        def __init__(self) -> None:
+            self.checked = False
+
+        def is_checked(self) -> bool:
+            return self.checked
+
+        def check(self, **_kwargs) -> None:
+            self.checked = True
+
+        def uncheck(self, **_kwargs) -> None:
+            self.checked = False
+
+    class _Page:
+        def __init__(self) -> None:
+            self.boxes = {"#py": _Locator(), "#sql": _Locator()}
+
+        def locator(self, selector: str) -> _Locator:
+            return self.boxes[selector]
+
+        def evaluate(self, _script: str, _selector: str = ""):
+            return "checkbox"
+
+    person = _profile()
+    person.application_answers = [ApplicationAnswer("Which languages do you know?", "Python")]
+    controls = [
+        Control(
+            kind="checkbox",
+            label="Python",
+            group="Which languages do you know?",
+            selector="#py",
+            name="lang",
+        ),
+        Control(
+            kind="checkbox",
+            label="SQL",
+            group="Which languages do you know?",
+            selector="#sql",
+            name="lang",
+        ),
+    ]
+    page = _Page()
+    outcomes = _fill_checkbox_group(page, controls, person, job=None, cursor=None, manual=[])
+    assert [item.action for item in outcomes] == ["check"]
+    assert page.boxes["#py"].checked is True
+    assert page.boxes["#sql"].checked is False
+
+    person.application_answers = [ApplicationAnswer("Which languages do you know?", "Cobol")]
+    page = _Page()
+    missed = _fill_checkbox_group(page, controls, person, job=None, cursor=None, manual=[])
+    assert missed
+    assert all(item.action == "unanswered" for item in missed)
+    assert page.boxes["#py"].checked is False
+    assert page.boxes["#sql"].checked is False

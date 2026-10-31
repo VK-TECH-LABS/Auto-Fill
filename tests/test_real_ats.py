@@ -24,7 +24,14 @@ PDF = b"%PDF-1.1\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 def _profile() -> CandidateProfile:
     return CandidateProfile.from_dict(
-        {"candidateId": "ref-a", "personal": {"full_name": "River Example", "email": EMAIL}}
+        {
+            "candidateId": "ref-a",
+            "personal": {
+                "full_name": "River Example",
+                "email": EMAIL,
+                "country": "United States",
+            },
+        }
     )
 
 

@@ -885,11 +885,14 @@ def autofill_application(
     browser = None
     from autofill.answers import bind_catalogue, employer_keys, reset_catalogue
     from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
+    from autofill.mapping import bind_us_page, reset_us_page
 
     confirmed_token = None
     session_token = None
     catalogue_token = None
+    us_token = None
     try:
+        us_token = bind_us_page()
         confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
         session_token = bind_session_id(opts.session_id)
         catalogue_token = bind_catalogue(
@@ -1397,6 +1400,8 @@ def autofill_application(
             reset_session_id(session_token)
         if catalogue_token is not None:
             reset_catalogue(catalogue_token)
+        if us_token is not None:
+            reset_us_page(us_token)
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:

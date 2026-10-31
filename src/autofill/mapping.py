@@ -19,7 +19,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from autofill.answers import match_answer
 from autofill.dates import format_for_control
 from autofill.models import Control, JobContext, MappedField, Option
 from autofill.profile import CandidateProfile
@@ -251,9 +250,30 @@ _SPECIFIC_EXPERIENCE_RE = re.compile(r"\b(with|using)\b")
 _US_COMMITTED: contextvars.ContextVar[bool] = contextvars.ContextVar("autofill_us_committed", default=False)
 
 
+def bind_us_page() -> contextvars.Token[bool]:
+    """Start a fill with no committed address country. Reset the token when it ends."""
+    return _US_COMMITTED.set(False)
+
+
+def reset_us_page(token: contextvars.Token[bool]) -> None:
+    _US_COMMITTED.reset(token)
+
+
 def mark_us_committed() -> None:
     """The page's address country is the United States for the rest of this fill."""
     _US_COMMITTED.set(True)
+
+
+def wrote_us_country(field_key: str, value: str) -> bool:
+    """True when this write is an address country and the value is the United States."""
+    from autofill.intents import country_is_us
+
+    key = field_key.casefold()
+    if "phone" in key:
+        return False
+    if key != "country" and not key.endswith(".country"):
+        return False
+    return country_is_us(value)
 
 
 def note_page_country(page: object, snapshot: object) -> None:
@@ -1249,7 +1269,18 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             field_class="PROFILE_FIELD",
         )
     if control.kind in {"select", "radio"} or (control.kind in {"combobox", "buttons"} and control.options):
-        option = match_option(text, control.options)
+        from autofill.intents import pick_option
+
+        status, option = pick_option(text, control.options)
+        if status == "ambiguous":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Several options match this value.",
+            )
+        if option is None:
+            # Country and state aliases stay on the closed alias list.
+            option = match_option(text, control.options)
         if option is None:
             return MappedField(
                 key=key,
@@ -1266,6 +1297,12 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason,
         )
     if control.kind == "checkbox":
+        if control.input_type in {"aria-checkbox", "switch"} or control.role == "switch":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Custom checkbox left for a person.",
+            )
         answer = yes_no(text)
         if answer == "yes":
             return MappedField(key=key, action="check", text=text, reason=reason)
@@ -1600,16 +1637,25 @@ def _explicit_answer(
 ) -> MappedField | None:
     if not profile.application_answers:
         return None
+    from autofill.answers import catalogue_match
+
     texts = _question_texts(control)
     if not texts:
         return None
-    text = match_answer(
+    text, status = catalogue_match(
         texts,
         profile.application_answers,
         normalize=normalize,
         us_on_page=us_context(profile),
         employers=employer_keys_for(job),
     )
+    if status == "conflict":
+        return MappedField(
+            key="application_answer",
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Saved answers disagree for this question.",
+        )
     if text is None:
         return None
     mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")

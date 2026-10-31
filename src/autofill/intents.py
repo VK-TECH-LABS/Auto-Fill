@@ -710,6 +710,25 @@ def _plain_number(value: str) -> str | None:
     return found.group(1).replace(",", "") if found else None
 
 
+# Closed labels that are the same fact. Two options in one group are a pause.
+_LISTED_EQUIVALENTS: tuple[frozenset[str], ...] = (
+    frozenset({"bachelors", "bachelor", "bachelor s", "bs", "b s", "bachelor of science"}),
+    frozenset({"bachelor of arts", "ba", "b a"}),
+    frozenset({"masters", "master", "master s", "ms", "m s", "master of science"}),
+    frozenset({"master of arts", "ma", "m a"}),
+    frozenset({"doctorate", "doctoral", "phd", "ph d", "doctor of philosophy"}),
+    frozenset({"full time", "fulltime", "permanent"}),
+    frozenset({"part time", "parttime"}),
+)
+
+
+def _same_listed_equivalent(left: str, right: str) -> bool:
+    for group in _LISTED_EQUIVALENTS:
+        if left in group and right in group:
+            return True
+    return False
+
+
 def options_equivalent(desired: str, option: str) -> bool:
     """True only for an exact label or a listed equivalent. No approximation."""
     left = normalize_question(desired)
@@ -724,6 +743,8 @@ def options_equivalent(desired: str, option: str) -> bool:
         return True
     left_number = _plain_number(desired)
     if left_number is not None and left_number == _plain_number(option):
+        return True
+    if _same_listed_equivalent(left, right):
         return True
     if left in _NO or right in _NO:
         return left in _NO and right in _NO
@@ -788,11 +809,27 @@ def pick_option(desired: str, options: list[Option]) -> tuple[str, Option | None
     """
     if not desired.strip() or not options:
         return "none", None
+    exact: list[Option] = []
+    equivalent: list[Option] = []
+    wanted_exact = normalize_question(desired)
     for option in options:
+        label = normalize_question(option.label)
+        value = normalize_question(option.value) if option.value else ""
+        if wanted_exact and (wanted_exact == label or wanted_exact == value):
+            exact.append(option)
+            continue
         if options_equivalent(desired, option.label) or (
             option.value and options_equivalent(desired, option.value)
         ):
-            return "match", option
+            equivalent.append(option)
+    if len(exact) == 1:
+        return "match", exact[0]
+    if len(exact) > 1:
+        return "ambiguous", None
+    if len(equivalent) == 1:
+        return "match", equivalent[0]
+    if len(equivalent) > 1:
+        return "ambiguous", None
     wanted = option_words(desired)
     if not wanted:
         return "none", None
