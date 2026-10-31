@@ -662,17 +662,33 @@ _COMMITTED_JS = r"""(selector) => {
   if (type === "file") return !!(el.files && el.files.length);
   if (tag === "BUTTON" || role === "button" || role === "listbox" || role === "combobox") {
     const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
-    if (popup === "listbox" || role === "listbox") {
+    if ((popup === "listbox" || role === "listbox") && tag !== "INPUT" && tag !== "TEXTAREA") {
       const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
       return shown.length > 0 && !placeholder(shown);
     }
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
       const typed = String(el.value || "").trim();
       if (typed && !placeholder(typed)) return true;
-      const root = el.closest(".select__control") || el.parentElement;
-      const choice = root ? root.querySelector(".select__single-value, .select__multi-value") : null;
-      const shown = choice ? String(choice.textContent || "").replace(/\s+/g, " ").trim() : "";
-      return shown.length > 0 && !placeholder(shown);
+      const root = el.closest(
+        "[data-automation-id='multiSelectContainer'], " +
+        "[data-automation-id='multiselectInputContainer'], .select__control"
+      ) || el.parentElement;
+      const choice = root
+        ? root.querySelector(
+            ".select__single-value, .select__multi-value, " +
+            "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+          )
+        : null;
+      if (choice && !choice.hidden) {
+        const item = choice.closest("[data-automation-id='selectedItem']");
+        const style = window.getComputedStyle(choice);
+        const hiddenItem = item && item.hidden;
+        if (!hiddenItem && style.display !== "none" && style.visibility !== "hidden") {
+          const shown = String(choice.innerText || choice.textContent || "").replace(/\s+/g, " ").trim();
+          if (shown.length > 0 && !placeholder(shown)) return true;
+        }
+      }
+      return false;
     }
     function selected(node) {
       if (!node) return false;
@@ -693,6 +709,22 @@ _COMMITTED_JS = r"""(selector) => {
       return false;
     }
     return selected(el);
+  }
+  const promptHost = el.closest && el.closest(
+    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  );
+  if (promptHost) {
+    const pill = promptHost.querySelector(
+      "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+    );
+    if (pill && !pill.hidden) {
+      const item = pill.closest("[data-automation-id='selectedItem']");
+      const style = window.getComputedStyle(pill);
+      if (!(item && item.hidden) && style.display !== "none" && style.visibility !== "hidden") {
+        const pillText = String(pill.innerText || pill.textContent || "").replace(/\s+/g, " ").trim();
+        if (pillText && !placeholder(pillText)) return true;
+      }
+    }
   }
   const value = "value" in el ? el.value : el.textContent;
   return String(value || "").trim().length > 0;

@@ -1,8 +1,10 @@
 """Open one combobox and read only the listbox that belongs to it.
 
 A phone-country list that is already on the page is not an option list for a
-different question. Options that appear after the control is opened are read
-from ``aria-controls`` / ``aria-owns``, or from the list inside that control.
+different question. A Workday ``selectedItemList`` is the value already chosen
+on that prompt, not the prompt menu. Options that appear after the control is
+opened are read from ``aria-controls`` / ``aria-owns``, from the list inside
+that form field, or from the open ``promptOption`` menu.
 """
 
 from __future__ import annotations
@@ -109,6 +111,29 @@ _SCOPED_OPTIONS_JS = r"""
     const tag = node.tagName.toLowerCase();
     return tag === "body" || tag === "html" || tag === "form";
   }
+  function isSelectedItemNode(node) {
+    // The Country Phone Code pill ("India (+91)") lives in selectedItemList.
+    // That list is not How Did You Hear About Us's promptOption menu.
+    if (!node || !node.closest) return false;
+    const auto = ((node.getAttribute && node.getAttribute("data-automation-id")) || "").toLowerCase();
+    if (
+      auto === "selecteditem" ||
+      auto === "selecteditemlist" ||
+      auto === "selecteditemtext" ||
+      auto === "promptselectionlabel"
+    ) {
+      return true;
+    }
+    return !!node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id='selectedItem'], " +
+      "[data-automation-id='selectedItemText']"
+    );
+  }
+  function owningField(node) {
+    if (!node || !node.closest) return null;
+    return node.closest("[data-automation-id^='formField']")
+      || node.closest("[data-field-path], fieldset");
+  }
   let list = null;
   const owned = (el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "").trim();
   if (owned) {
@@ -129,17 +154,22 @@ _SCOPED_OPTIONS_JS = r"""
     "[data-automation-id='multiSelectContainer']",
     "[data-automation-id='multiselectInputContainer']",
   ].join(", ");
+  const owner = owningField(el);
   let container = el.closest(widget) || el.parentElement;
   for (let depth = 0; container && depth < 4 && !list; depth += 1) {
     if (pageRoot(container)) break;
+    // Do not climb out of this form field into a sibling prompt's selected list.
+    if (owner && container !== owner && !owner.contains(container)) break;
     for (const candidate of container.querySelectorAll("[role='listbox']")) {
-      if (!claimedByOther(candidate)) {
-        list = candidate;
-        break;
-      }
+      if (isSelectedItemNode(candidate) || claimedByOther(candidate)) continue;
+      const candidateOwner = owningField(candidate);
+      if (owner && candidateOwner && candidateOwner !== owner) continue;
+      list = candidate;
+      break;
     }
     const parent = container.parentElement;
     if (!parent || pageRoot(parent)) break;
+    if (owner && parent !== owner && !owner.contains(parent)) break;
     container = parent;
   }
   function shown(node) {
@@ -163,24 +193,42 @@ _SCOPED_OPTIONS_JS = r"""
   ].join(", ");
   if (list) {
     for (const option of list.querySelectorAll(optionSelector)) {
-      if (optionEnabled(option) && optionShown(option)) optionNodes.push(option);
+      if (optionEnabled(option) && optionShown(option) && !isSelectedItemNode(option)) optionNodes.push(option);
     }
   }
   const promptRoot = el.closest(
     "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
   );
+  function promptOpen(node) {
+    if (!node) return false;
+    if (node.getAttribute("aria-expanded") === "true") return true;
+    const root = node.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    return !!(root && root.querySelector("[aria-expanded='true']"));
+  }
   if (!optionNodes.length && promptRoot) {
-    // Workday draws the prompt menu on document.body. Only that widget may use it.
-    const portalSelector = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode']";
-    for (const option of document.querySelectorAll(portalSelector)) {
-      if (optionEnabled(option) && shown(option)) optionNodes.push(option);
+    // Workday draws the prompt menu on document.body. A selected pill on
+    // another field is not that menu. Skip the portal when a different prompt
+    // is the one that is open.
+    const anotherOpen = Array.from(document.querySelectorAll(
+      "[data-automation-id='multiSelectContainer'] [aria-expanded='true'], " +
+      "[data-automation-id='multiselectInputContainer'] [aria-expanded='true']"
+    )).some((node) => !promptRoot.contains(node));
+    if (promptOpen(el) || !anotherOpen) {
+      const portalSelector = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode']";
+      for (const option of document.querySelectorAll(portalSelector)) {
+        if (isSelectedItemNode(option)) continue;
+        if (optionEnabled(option) && shown(option)) optionNodes.push(option);
+      }
     }
   }
   if (!optionNodes.length && allowSingle) {
     // One unclaimed visible list. Two menus means we will not guess which one.
+    // A selected-item list is a value, not a menu.
     const boxes = [];
     for (const candidate of document.querySelectorAll("[role='listbox']")) {
-      if (claimedByOther(candidate) || !shown(candidate)) continue;
+      if (claimedByOther(candidate) || !shown(candidate) || isSelectedItemNode(candidate)) continue;
       boxes.push(candidate);
     }
     if (boxes.length === 1) {
@@ -194,6 +242,10 @@ _SCOPED_OPTIONS_JS = r"""
   for (const option of optionNodes) {
     const label = textOf(option);
     if (!label) continue;
+    const nested = option.querySelector(
+      "[role='option'], [data-automation-id='promptOption'], [data-automation-id='promptLeafNode']"
+    );
+    if (nested && nested !== option && textOf(nested) === label) continue;
     if (!option.id) option.setAttribute("data-autofill-option", String(options.length));
     const itemSelector = option.id
       ? "#" + CSS.escape(option.id)
@@ -450,19 +502,23 @@ def _type_filter(page, selector: str, text: str) -> None:
 
 
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
-    """Open the menu once, read option text, and close it."""
+    """Open the menu once, read option text, and close it.
+
+    The prompt icon is clicked when the input click does not reveal options.
+    Workday search prompts open from that icon, and the menu is ``promptOption``
+    rows, not another field's selected pills.
+    """
     if not selector:
         return []
     focus_field(page, selector)
     try:
-        open_combobox(page, selector)
-        found = _await_menu(page, selector, 480)
+        found = _open_for_options(page, selector)
     except Exception:
         found = []
     labels: list[str] = []
     for option in found:
         label = (option.label or option.value).strip()
-        if not label:
+        if not label or label in labels:
             continue
         labels.append(label[:200])
         if len(labels) >= limit:
