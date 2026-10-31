@@ -1056,10 +1056,20 @@ def test_adopt_keeps_a_later_path_and_gotos_for_a_posting_or_other_host(monkeypa
     assert gotos == [apply]
 
 
+def test_load_extension_refusal_survives_a_long_log_prefix():
+    from autofill.local_attach import load_extension_refused
+
+    phrase = "--load-extension is not allowed in Google Chrome, ignoring."
+    text = phrase + "\n" + ("dbus: noise\n" * 3000)
+    assert phrase not in text[-8000:]
+    assert load_extension_refused(text) is True
+    assert load_extension_refused("extension loaded") is False
+
+
 def test_branded_chrome_ignores_load_extension(monkeypatch):
     monkeypatch.setenv(ENV_FLAG, "1")
-    result = probe_branded_load_extension(EXTENSION, timeout=3)
-    assert result["load_extension_ignored"] is True
+    result = probe_branded_load_extension(EXTENSION, timeout=8)
+    assert result["load_extension_ignored"] is True, result.get("stderr_excerpt")
 
 
 @pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")

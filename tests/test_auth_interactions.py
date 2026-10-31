@@ -24,7 +24,7 @@ from playwright.sync_api import sync_playwright
 
 from autofill import AutofillOptions, Status, autofill_application
 from autofill.account_flow import check_registered, run_account_action
-from autofill.credentials import Credentials, MemoryCredentialProvider
+from autofill.credentials import Credentials, MemoryCredentialProvider, credential_scope
 from autofill.dom_ui import _CHOOSE_JS
 from autofill.extract import extract_page
 from autofill.login import email_sign_in_button
@@ -263,7 +263,7 @@ def test_sso_chooser_without_credentials_opens_email_form_and_types_nothing(work
 def test_sso_chooser_with_saved_credentials_signs_in_and_continues(workday):
     page = workday("workday_sso_sign_in.html")
     provider = MemoryCredentialProvider()
-    provider.put("ref-a", HOST, Credentials(site=HOST, email=EMAIL, password=SECRET))
+    provider.put("ref-a", credential_scope(URL), Credentials(site=credential_scope(URL), email=EMAIL, password=SECRET))
     result = _run(page, provider)
     assert page.evaluate("window.__sso") == 0
     assert page.evaluate("window.__signedIn") == 1

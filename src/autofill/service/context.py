@@ -5,6 +5,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from autofill.ats import site_domain
+from autofill.credentials import credential_scope
 from autofill.models import JobContext
 from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
 from autofill.resolver import ResolverBinding, ResolverCallError, assert_token_not_in_url
@@ -91,17 +92,22 @@ def build_profile(body: CreateSessionIn) -> tuple[CandidateProfile, JobContext, 
 
 
 def credential_domain(application_url: str, site: str) -> str:
-    """Domain for this session. A different site is rejected."""
+    """Tenant scope for this session. A different site is rejected.
+
+    Callers may send the hostname. The stored key is ``credential_scope``
+    (candidate + employer), not the bare host when several employers share it.
+    """
     expected = site_domain(application_url)
     if not expected:
         raise ContextError("This session has no site domain to scope credentials to.")
+    scope = credential_scope(application_url)
     raw = site.strip()
     if not raw:
-        return expected
+        return scope
     presented = site_domain(raw) or raw.lower()
-    if presented != expected:
+    if presented not in {expected, scope}:
         raise ContextError("Credentials must be for this session's application site.", status_code=409)
-    return expected
+    return scope
 
 
 def placeholder_profile(candidate_ref: str) -> CandidateProfile:

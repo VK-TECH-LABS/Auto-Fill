@@ -665,6 +665,35 @@ def password_policy(snapshot: PageSnapshot) -> dict | None:
     return policy
 
 
+def password_meets_policy(password: str, policy: dict | None, email: str = "") -> str | None:
+    """``password_policy`` when ``password`` misses the on-page rules, else None.
+
+    The return value is a reason token. It never contains the secret.
+    ``policy`` None means the page published no rules, so the secret is not refused here.
+    """
+    if not policy:
+        return None
+    secret = password or ""
+    minimum = int(policy.get("minLength") or 0)
+    maximum = int(policy.get("maxLength") or 0)
+    if minimum and len(secret) < minimum:
+        return "password_policy"
+    if maximum and len(secret) > maximum:
+        return "password_policy"
+    if policy.get("requireUpper") and not any(char.isupper() for char in secret):
+        return "password_policy"
+    if policy.get("requireLower") and not any(char.islower() for char in secret):
+        return "password_policy"
+    if policy.get("requireDigit") and not any(char.isdigit() for char in secret):
+        return "password_policy"
+    if policy.get("requireSymbol") and not any(not char.isalnum() for char in secret):
+        return "password_policy"
+    folded_email = (email or "").strip().casefold()
+    if policy.get("disallowEmail") and folded_email and folded_email in secret.casefold():
+        return "password_policy"
+    return None
+
+
 def redact_site_error(text: str, secrets: list[str] | None = None) -> str:
     """Short site text with emails, digit runs, and submitted values removed."""
     cleaned = " ".join((text or "").split())

@@ -461,6 +461,11 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             if proof.get("field_proof"):
                 detail["fieldProof"] = proof["field_proof"]
             raise HTTPException(status_code=409, detail=detail)
+        if reason == "password_policy":
+            # The secret was stored before the click. Drop it. The reason token
+            # is the only thing the caller sees.
+            session.credentials.clear()
+            raise HTTPException(status_code=422, detail={"reason": "password_policy"})
         raise HTTPException(status_code=409, detail="No page is open for this session.")
     if report.get("account"):
         session.account = report["account"]

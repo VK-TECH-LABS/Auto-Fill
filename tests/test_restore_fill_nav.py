@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 
 from autofill import AutofillOptions, Credentials, MemoryCredentialProvider, Status, autofill_application
+from autofill.credentials import credential_scope
 from autofill.extract import extract_page
 from autofill.login import verification_present
 from autofill.models import Control, PageSnapshot
@@ -112,8 +113,8 @@ def test_saved_sign_in_waits_for_the_application_and_fills_it(browser):
     provider = MemoryCredentialProvider()
     provider.put(
         "ref-a",
-        "boards.greenhouse.io",
-        Credentials(site="boards.greenhouse.io", email="casey.example@example.com", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="casey.example@example.com", password=PASSWORD),
     )
     page = browser.new_page()
     try:
@@ -148,8 +149,8 @@ def test_continue_on_a_sign_in_form_uses_saved_credentials_and_fills(browser):
     provider = MemoryCredentialProvider()
     provider.put(
         "ref-a",
-        "boards.greenhouse.io",
-        Credentials(site="boards.greenhouse.io", email="casey.example@example.com", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="casey.example@example.com", password=PASSWORD),
     )
     page = browser.new_page()
     try:
@@ -177,8 +178,8 @@ def test_create_account_is_not_auto_registered(browser):
     provider = MemoryCredentialProvider()
     provider.put(
         "ref-a",
-        "boards.greenhouse.io",
-        Credentials(site="boards.greenhouse.io", email="casey.example@example.com", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="casey.example@example.com", password=PASSWORD),
     )
     page = browser.new_page()
     try:

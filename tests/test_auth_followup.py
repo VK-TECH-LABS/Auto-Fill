@@ -26,7 +26,7 @@ from playwright.sync_api import sync_playwright
 
 from autofill import AutofillOptions, Status, autofill_application
 from autofill.account_flow import run_account_action
-from autofill.credentials import Credentials, MemoryCredentialProvider
+from autofill.credentials import Credentials, MemoryCredentialProvider, credential_scope
 from autofill.engine import ApplicationResult
 from autofill.login import LOGIN_FAILED_MESSAGES, account_exists_text, login_failure_reason
 from autofill.models import PageSnapshot
@@ -207,7 +207,7 @@ def test_saved_login_on_create_account_opens_sign_in_instead_of_registering(work
 def test_visible_sign_in_with_saved_credentials_signs_in_without_continue(workday):
     page = workday(start="signin")
     provider = MemoryCredentialProvider()
-    provider.put("ref-a", HOST, Credentials(site=HOST, email=EMAIL, password=SECRET))
+    provider.put("ref-a", credential_scope(URL), Credentials(site=credential_scope(URL), email=EMAIL, password=SECRET))
     result = autofill_application(
         URL,
         _profile(),
@@ -224,7 +224,7 @@ def test_visible_sign_in_with_saved_credentials_signs_in_without_continue(workda
 def test_locked_sign_in_reports_the_site_banner_and_a_clear_message(workday):
     page = workday(start="signin", locked=True)
     provider = MemoryCredentialProvider()
-    provider.put("ref-a", HOST, Credentials(site=HOST, email=EMAIL, password=SECRET))
+    provider.put("ref-a", credential_scope(URL), Credentials(site=credential_scope(URL), email=EMAIL, password=SECRET))
     result = autofill_application(
         URL,
         _profile(),

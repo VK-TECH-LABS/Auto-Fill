@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 
 from autofill.account_flow import _VERIFY_FIRST_MESSAGE, run_account_action
-from autofill.credentials import Credentials, MemoryCredentialProvider
+from autofill.credentials import Credentials, MemoryCredentialProvider, credential_scope
 from autofill.engine import AutofillOptions, Status, _verify_first, autofill_application
 from autofill.login import LOGIN_FAILED_MESSAGES
 from autofill.profile import CandidateProfile
@@ -96,7 +96,7 @@ def _profile() -> CandidateProfile:
 
 def _provider() -> MemoryCredentialProvider:
     provider = MemoryCredentialProvider()
-    provider.put("ref-a", HOST, Credentials(site=HOST, email=EMAIL, password=SECRET))
+    provider.put("ref-a", credential_scope(URL), Credentials(site=credential_scope(URL), email=EMAIL, password=SECRET))
     return provider
 
 

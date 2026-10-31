@@ -21,6 +21,8 @@ from autofill.login import (
     application_form_visible,
     clear_cookie_banner,
     login_failure_reason,
+    password_meets_policy,
+    password_policy,
     redact_site_error,
     score_account,
     sign_in_switch_target,
@@ -165,6 +167,12 @@ def _perform_account_action(
             return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "register"}
     if scored.mode != mode:
         return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "login"}
+    if mode == "register":
+        # Refuse before any keystroke. A secret that misses the rules on this
+        # pane is not typed and Create Account is not clicked.
+        policy_reason = password_meets_policy(password, password_policy(snapshot), email)
+        if policy_reason:
+            return {"ok": False, "reason": policy_reason}
     terms = None
     if not standard_terms:
         terms, terms_error = _terms_checkbox(snapshot)
