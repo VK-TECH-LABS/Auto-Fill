@@ -391,7 +391,7 @@ def test_generate_validate_create_save_sign_out_retrieve_sign_in(workday, caplog
         password=secret,
         confirm=secret,
         ats="workday",
-        standard_terms=False,
+        standard_terms=True,
     )
     assert created.get("ok") is True, created
     assert page.evaluate("window.__created") == 1

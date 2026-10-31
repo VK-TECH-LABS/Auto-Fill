@@ -1205,6 +1205,7 @@ def fill_visible_tab(
     credential_provider: Any = None,
     verify_pending: bool = False,
     protocol_version: str = "0.7.0",
+    standard_terms_authorized: bool = False,
 ) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
@@ -1235,6 +1236,7 @@ def fill_visible_tab(
         nav_block=nav_block,
         protocol_version=protocol_version or "0.7.0",
         verify_pending=bool(verify_pending),
+        standard_terms_authorized=bool(standard_terms_authorized),
         **_resume_options(resume),
     )
     try:
@@ -1288,6 +1290,7 @@ class DedicatedApplySession:
         self._nav_block: tuple | None = None
         self._credential_provider: Any = None
         self._verify_pending_flag = False
+        self._standard_terms_authorized = False
         self._protocol_version = "0.7.0"
         self._last_candidate_id = ""
         self._last_employer_url = ""
@@ -1420,6 +1423,7 @@ class DedicatedApplySession:
         credential_provider: Any = None,
         verify_pending: bool = False,
         protocol_version: str = "0.7.0",
+        standard_terms_authorized: bool = False,
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
@@ -1442,6 +1446,7 @@ class DedicatedApplySession:
         if credential_provider is not None:
             self._credential_provider = credential_provider
         self._verify_pending_flag = bool(verify_pending)
+        self._standard_terms_authorized = bool(standard_terms_authorized)
         self._protocol_version = protocol_version or "0.7.0"
         previous = self._last_candidate_id
         changed = bool(previous and candidate_id and previous != candidate_id)
@@ -1475,6 +1480,7 @@ class DedicatedApplySession:
             credential_provider=self._credential_provider,
             verify_pending=self._verify_pending_flag,
             protocol_version=self._protocol_version,
+            standard_terms_authorized=self._standard_terms_authorized,
             **_resume_kwargs(resume),
         )
         submitted = _optional_submitted(tab.page)
@@ -1580,6 +1586,7 @@ class DedicatedApplySession:
             credential_provider=getattr(self, "_credential_provider", None),
             verify_pending=bool(getattr(self, "_verify_pending_flag", False)),
             protocol_version=getattr(self, "_protocol_version", "0.7.0") or "0.7.0",
+            standard_terms_authorized=bool(getattr(self, "_standard_terms_authorized", False)),
         )
         if _optional_submitted(page) is True:
             raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
@@ -1751,6 +1758,7 @@ class DedicatedApplySession:
             credential_provider=getattr(self, "_credential_provider", None),
             verify_pending=bool(getattr(self, "_verify_pending_flag", False)),
             protocol_version=getattr(self, "_protocol_version", "0.7.0") or "0.7.0",
+            standard_terms_authorized=bool(getattr(self, "_standard_terms_authorized", False)),
             **_resume_kwargs(resume),
         )
 

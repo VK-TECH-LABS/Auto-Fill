@@ -754,18 +754,216 @@ PRESS_CHOICE_JS = """(node, on) => {
 
 
 def press_choice_label(page, selector: str) -> None:
-    """Click the ``<label for=id>`` of one checkbox or radio input.
+    """Click the label of one checkbox or radio input.
 
-    Used when a styled wrapper covers the box itself. Refuses a selector that is
-    not a plain ``#id`` and a label that sits inside a button or link.
+    Used when a styled wrapper covers the box itself. The label may be
+    ``label[for]``, a wrapping label, or a sibling label. A button, link, or
+    submit is never clicked. An unreadable target is refused.
     """
-    if not re.fullmatch(r"#[A-Za-z][\w:.-]*", selector or ""):
-        raise SubmitBlockedError("label press needs an #id selector")
-    label = page.locator(f"label[for='{selector[1:]}']").first
-    inside_action = label.evaluate(
-        "(el) => !!el.closest('button, a[href], [role=button], [role=link]')"
-    )
-    kind = page.locator(selector).first.evaluate("(el) => el.tagName === 'INPUT' ? el.type : ''")
-    if inside_action or kind not in {"checkbox", "radio"}:
+    if not selector:
+        raise SubmitBlockedError("label press needs a selector")
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
         raise SubmitBlockedError("label press refused")
-    label.click(timeout=3000)
+    try:
+        result = evaluate(_LABEL_PRESS_JS, selector)
+    except Exception as exc:
+        raise SubmitBlockedError("label press refused") from exc
+    if result != "clicked":
+        raise SubmitBlockedError("label press refused")
+
+
+_LABEL_PRESS_JS = r"""(selector) => {
+  let el = null;
+  try {
+    el = document.querySelector(selector);
+  } catch (error) {
+    return "refused";
+  }
+  if (!el || el.tagName !== "INPUT" || (el.type !== "checkbox" && el.type !== "radio")) return "refused";
+  if (el.disabled) return "refused";
+  const action = "button, a[href], [role='button'], [role='link'], input[type='submit'], input[type='button']";
+  if (el.closest(action)) return "refused";
+  let label = el.closest("label");
+  if (!label && el.id) {
+    label = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+  }
+  if (!label && el.parentElement) {
+    for (const child of el.parentElement.children) {
+      if (!child || child.tagName !== "LABEL" || child.contains(el)) continue;
+      if (child.querySelector("input, select, textarea, button")) continue;
+      label = child;
+      break;
+    }
+  }
+  if (!label) return "missing";
+  if (label.closest(action) || label.querySelector(action)) return "refused";
+  label.click();
+  return "clicked";
+}"""
+
+
+_CHOICE_KIND_JS = r"""(selector) => {
+  let el = null;
+  try {
+    el = document.querySelector(selector);
+  } catch (error) {
+    return "";
+  }
+  if (!el || el.tagName !== "INPUT") return "";
+  const type = String(el.type || el.getAttribute("type") || "").toLowerCase();
+  if (type === "checkbox" || type === "radio") return type;
+  return "";
+}"""
+
+
+_CHOICE_STATE_JS = r"""(selector) => {
+  let el = null;
+  try {
+    el = document.querySelector(selector);
+  } catch (error) {
+    return null;
+  }
+  if (!el) return null;
+  const type = String(el.type || el.getAttribute("type") || "").toLowerCase();
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  if (el.tagName === "INPUT" && (type === "checkbox" || type === "radio")) return !!el.checked;
+  if (role === "checkbox" || role === "radio" || role === "switch") {
+    const state = el.getAttribute("aria-checked");
+    if (state === "true") return true;
+    if (state === "false" || state === "mixed") return false;
+  }
+  return null;
+}"""
+
+
+def _choice_state(page, selector: str) -> bool | None:
+    """The page's checked or aria-checked state, or None when it cannot be read."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is not None:
+        try:
+            state = evaluate(_CHOICE_STATE_JS, selector)
+        except Exception:
+            state = None
+        if isinstance(state, bool) or state is None:
+            return state if isinstance(state, bool) else None
+    reader = getattr(page.locator(selector), "is_checked", None)
+    if reader is None:
+        return None
+    try:
+        return bool(reader())
+    except Exception:
+        return None
+
+
+def commit_native_choice(page, selector: str, *, on: bool = True) -> bool:
+    """Check or uncheck one native checkbox or radio, then reread the page.
+
+    Order is a pointer check, a forced check, then the label. True only when
+    ``checked`` or ``aria-checked`` still matches. A button, link, or submit
+    is not clicked. An unreadable state is not success.
+    """
+    if not selector:
+        return False
+    state = _choice_state(page, selector)
+    if on and state is True:
+        return True
+    if not on and state is False:
+        return True
+    evaluate = getattr(page, "evaluate", None)
+    kind = ""
+    if evaluate is not None:
+        try:
+            raw_kind = evaluate(_CHOICE_KIND_JS, selector)
+        except Exception:
+            raw_kind = ""
+        # A unit-test page returns its snapshot for every evaluate. Only a
+        # real string result can say this node is not a checkbox or radio.
+        if isinstance(raw_kind, str):
+            kind = raw_kind
+            if kind not in {"checkbox", "radio"}:
+                return False
+            if kind == "radio" and not on:
+                return False
+
+    def pointer() -> None:
+        locator = page.locator(selector)
+        if on:
+            locator.check(timeout=1500)
+        else:
+            locator.uncheck(timeout=1500)
+
+    def forced() -> None:
+        locator = page.locator(selector)
+        if on:
+            locator.check(force=True, timeout=3000)
+        else:
+            locator.uncheck(force=True, timeout=3000)
+
+    def label() -> None:
+        press_choice_label(page, selector)
+
+    for attempt in (pointer, forced, label):
+        state = _choice_state(page, selector)
+        if on and state is True:
+            return True
+        if not on and state is False:
+            return True
+        try:
+            attempt()
+        except TypeError:
+            try:
+                if on:
+                    page.locator(selector).check()
+                else:
+                    page.locator(selector).uncheck()
+            except Exception:
+                continue
+        except Exception:
+            continue
+        state = _choice_state(page, selector)
+        if on and state is True:
+            return True
+        if not on and state is False:
+            return True
+    state = _choice_state(page, selector)
+    if on:
+        return state is True
+    return state is False
+
+
+_ARIA_RADIO_JS = r"""(selector) => {
+  let el = null;
+  try {
+    el = document.querySelector(selector);
+  } catch (error) {
+    return false;
+  }
+  if (!el) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  const type = String(el.getAttribute("type") || "").toLowerCase();
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  if (tag === "button" || tag === "a" || type === "submit" || type === "button") return false;
+  if (role === "button" || role === "link") return false;
+  if (el.closest("button, a[href], [role='button'], [role='link'], input[type='submit']")) return false;
+  if (role !== "radio") return false;
+  if (el.getAttribute("aria-checked") === "true") return true;
+  el.click();
+  return el.getAttribute("aria-checked") === "true";
+}"""
+
+
+def press_aria_radio(page, selector: str) -> bool:
+    """Click one ``role=radio`` node that is not a button, link, or submit.
+
+    Success is ``aria-checked=true`` after the click.
+    """
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate(_ARIA_RADIO_JS, selector) is True
+    except Exception:
+        return False

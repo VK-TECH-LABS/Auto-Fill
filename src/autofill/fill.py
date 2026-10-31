@@ -94,23 +94,24 @@ def current_session_id() -> str:
     return _SESSION_ID.get() or ""
 
 
-def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> None:
+def remember_confirmed(control: Control, value: str, *, field_key: str = "", choice: str = "") -> None:
     """Keep a value the engine wrote and then read back on the control."""
     hook = _CONFIRMED.get()
     text = str(value or "")
     if hook is None or not text.strip():
         return
-    hook(
-        {
-            "value": text,
-            "label": control.label or "",
-            "name": control.name or "",
-            "elementId": control.element_id or "",
-            "automationId": control.automation_id or "",
-            "fieldKey": field_key or "",
-            "selector": control.selector or "",
-        }
-    )
+    record = {
+        "value": text,
+        "label": control.label or "",
+        "name": control.name or "",
+        "elementId": control.element_id or "",
+        "automationId": control.automation_id or "",
+        "fieldKey": field_key or "",
+        "selector": control.selector or "",
+    }
+    if choice:
+        record["choice"] = choice
+    hook(record)
 
 
 _SET_NATIVE = """
@@ -209,6 +210,23 @@ _CHOICE_STATE_JS = r"""(el) => {
 }"""
 
 
+def _native_checkbox(control: Control) -> bool:
+    """A real checkbox input. Custom ``role=checkbox`` and switches are reported only."""
+    if control.kind != "checkbox":
+        return False
+    if control.input_type in {"aria-checkbox", "switch", "aria-radio"}:
+        return False
+    if control.role == "switch":
+        return False
+    return True
+
+
+def _yes_no_labels(control: Control) -> bool:
+    names = {(option.label or option.value or "").strip().casefold() for option in control.options}
+    names.discard("")
+    return names == {"yes", "no"}
+
+
 def _choice_selected(target, selector: str) -> bool:
     """True when the clicked Yes/No button itself reads as chosen.
 
@@ -263,12 +281,48 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             return _verified_or_blank(control, mapped, locator, mapped.text or "")
         if mapped.action == "select":
             if control.kind == "radio":
-                option = target.locator(mapped.option_selector or control.selector)
-                focus_field(target, mapped.option_selector or control.selector)
-                option.check()
-                if not option.is_checked():
-                    return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
-                remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
+                selector = mapped.option_selector or control.selector
+                if control.input_type == "aria-radio":
+                    if not _yes_no_labels(control):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Custom radio left for a person.",
+                        )
+                    from autofill.safeguards import press_aria_radio
+
+                    if not press_aria_radio(target, selector):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Value did not stay on the page.",
+                        )
+                else:
+                    from autofill.safeguards import commit_native_choice
+
+                    if not commit_native_choice(target, selector, on=True):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Value did not stay on the page.",
+                        )
+                picked = Control(
+                    kind=control.kind,
+                    name=control.name,
+                    label=control.label,
+                    selector=selector,
+                    automation_id=control.automation_id,
+                    input_type=control.input_type,
+                )
+                remember_confirmed(
+                    picked,
+                    mapped.option_label or mapped.text or "",
+                    field_key=mapped.key or "",
+                    choice="radio",
+                )
                 refresh_preview(page)
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
             if control.kind == "combobox":
@@ -309,15 +363,23 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             refresh_preview(page)
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
-            locator.check()
-            if hasattr(locator, "is_checked") and not locator.is_checked():
+            if not _native_checkbox(control):
+                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
+            from autofill.safeguards import commit_native_choice
+
+            if not commit_native_choice(target, control.selector, on=True):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            remember_confirmed(control, "yes", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
             return _outcome(control, mapped, detail="checked")
         if mapped.action == "uncheck":
-            locator.uncheck()
-            if hasattr(locator, "is_checked") and locator.is_checked():
+            if not _native_checkbox(control):
+                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
+            from autofill.safeguards import commit_native_choice
+
+            if not commit_native_choice(target, control.selector, on=False):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            remember_confirmed(control, "no", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
             return _outcome(control, mapped, detail="unchecked")
         if mapped.action == "upload":
@@ -328,6 +390,25 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
     except Exception as exc:
         return _outcome(control, mapped, action="error", detail=str(exc))
     return _outcome(control, mapped, action="unanswered", detail=f"Unsupported action {mapped.action}.")
+
+
+def _accept_standard_checkbox(page, control: Control) -> bool:
+    """Check one required standard-terms box when the session flag is on."""
+    from autofill.mapping import AUTO_CONSENT_CATEGORIES, record_auto_consent, standard_terms_enabled, terms_category
+    from autofill.safeguards import commit_native_choice
+
+    if not standard_terms_enabled() or not _native_checkbox(control):
+        return False
+    if not control.required or not control.selector:
+        return False
+    category = terms_category(control)
+    if category not in AUTO_CONSENT_CATEGORIES:
+        return False
+    if not commit_native_choice(page, control.selector, on=True):
+        return False
+    record_auto_consent(control, category)
+    remember_confirmed(control, "yes", field_key=category, choice="checkbox")
+    return True
 
 
 def _note_manual(control: Control, mapped: MappedField, manual: list[str]) -> None:
@@ -366,6 +447,15 @@ def fill_one_page(
             if selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
+                continue
+            if _accept_standard_checkbox(page, control):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(key="STANDARD_TERMS", action="check", field_class="LEGAL_FIELD"),
+                        detail="checked",
+                    )
+                )
                 continue
             mapped = map_field(
                 control,

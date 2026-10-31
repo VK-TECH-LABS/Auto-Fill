@@ -180,13 +180,22 @@ def test_authorized_register_checks_tenant_terms_and_creates_account(workday):
 # --- Hendrick: nameless click_filter over the aria-hidden Create Account ----
 
 
-@pytest.mark.parametrize("standard_terms", [False, True])
-def test_nameless_click_filter_create_account_is_clicked(workday, standard_terms):
+def test_nameless_click_filter_create_account_is_clicked(workday):
     page = workday("workday_create_account_wrapped.html")
-    result = _register(page, standard_terms=standard_terms)
+    result = _register(page, standard_terms=True)
     assert result["ok"] is True, result
     assert result["outcome"] in {"registered", "verification_required"}
     assert page.evaluate("window.__created") == 1
+    assert result["consentRows"][0]["checked"] is True
+
+
+def test_flag_off_does_not_check_terms_or_press_create_account(workday):
+    page = workday("workday_create_account_wrapped.html")
+    result = _register(page, standard_terms=False)
+    assert result["ok"] is False, result
+    assert result["reason"] == "site_rejected"
+    assert page.evaluate("window.__created") == 0
+    assert page.locator("#input-7").is_checked() is False
 
 
 def test_covered_click_refuses_a_foreign_overlay(browser):

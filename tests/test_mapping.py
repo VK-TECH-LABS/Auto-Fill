@@ -148,7 +148,8 @@ def test_work_auth_select_and_sponsorship_radio():
 def test_checkbox_yes_and_no():
     filled = profile()
     background = map_field(control("Willing to undergo a background check", kind="checkbox"), filled)
-    assert background.action == "check"
+    assert background.action == "skip"
+    assert background.field_class == "LEGAL_FIELD"
     felony = map_field(control("Have you been convicted of a felony?", kind="checkbox"), filled)
     assert felony.action == "uncheck"
 
