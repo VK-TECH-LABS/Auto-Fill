@@ -610,6 +610,18 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
     )
 
 
+def _learned_sms(session: ServiceSession) -> list[dict]:
+    from autofill.sms_consent import learned_application_answers
+
+    return learned_application_answers(session.profile, session.candidate_id)
+
+
+def _sms_authorized(session: ServiceSession) -> bool:
+    from autofill.sms_consent import sms_authorized
+
+    return sms_authorized(session.profile, session.candidate_id)
+
+
 def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut:
     result = session.result
     body = RunStatusOut(
@@ -635,6 +647,7 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         ),
         startedAt=session.started_at,
         autoConsents=list(session.auto_consents) or None,
+        learnedApplicationAnswers=_learned_sms(session) or None,
     )
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
@@ -1926,6 +1939,16 @@ def create_app(
                 reason=str(filled.get("reason") or "not_committed"),
                 ms=elapsed_ms(started),
             )
+        from autofill.sms_consent import remember_human_sms
+
+        remember_human_sms(
+            session.profile,
+            question=str(item.get("text") or ""),
+            value=str(canonical[0] if canonical else ""),
+            intent=str(item.get("intent") or ""),
+            kind=kind_name,
+            candidate_id=session.candidate_id,
+        )
         remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
         if remembered and remembered not in session.completed_keys:
             session.completed_keys.append(remembered)
@@ -2023,6 +2046,7 @@ def create_app(
                     "password": body.password,
                     "confirm": body.confirm_password or body.password,
                     "standardTerms": session.standard_terms_authorized,
+                    "recruitmentSmsAuthorized": _sms_authorized(session),
                 },
             )
         except PageUnavailable as exc:

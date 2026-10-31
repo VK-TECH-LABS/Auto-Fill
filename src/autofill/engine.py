@@ -920,6 +920,9 @@ def autofill_application(
                 url=application_url,
             ),
         )
+        from autofill.sms_consent import bind_sms_scope
+
+        bind_sms_scope(candidate_profile, opts.candidate_id or candidate_profile.candidate_id)
         if page is None:
             from playwright.sync_api import sync_playwright
 

@@ -1108,6 +1108,7 @@ class PlaywrightRunner:
                     confirm=str(payload.get("confirm") or ""),
                     ats=slot.last_ats,
                     standard_terms=bool(payload.get("standardTerms")),
+                    recruitment_sms_authorized=payload.get("recruitmentSmsAuthorized") is True,
                 )
             except Exception as exc:
                 if _page_navigating(exc):

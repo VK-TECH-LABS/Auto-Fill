@@ -46,6 +46,8 @@ class ApprovedAnswerIn(BaseModel):
     answer: str = Field(min_length=1, max_length=2000)
     intent: str = Field(default="", max_length=64)
     employer: str = Field(default="", max_length=200)
+    # Catalogue key. ``recruitment_sms_consent`` is the recruitment-SMS row.
+    key: str = Field(default="", max_length=64)
 
     @field_validator("question", "answer")
     @classmethod
@@ -59,16 +61,37 @@ class ApprovedAnswerIn(BaseModel):
     @classmethod
     def _known_intent(cls, value: str) -> str:
         from autofill.intents import PROTOCOL_INTENTS
+        from autofill.sms_consent import canonical_sms_intent
 
-        cleaned = value.strip().upper()
-        if cleaned and cleaned not in PROTOCOL_INTENTS:
+        upper = canonical_sms_intent(value.strip()).upper()
+        if upper and upper not in PROTOCOL_INTENTS:
             raise ValueError("intent is not a known question intent")
-        return cleaned
+        return upper
 
     @field_validator("employer")
     @classmethod
     def _employer(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("key")
+    @classmethod
+    def _catalogue_key(cls, value: str) -> str:
+        from autofill.sms_consent import canonical_sms_key
+
+        cleaned = value.strip()
+        return canonical_sms_key(cleaned) or cleaned
+
+    @model_validator(mode="after")
+    def _sms_pair(self) -> ApprovedAnswerIn:
+        from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer
+
+        if self.key == SMS_KEY and not self.intent:
+            self.intent = SMS_INTENT
+        if self.intent == SMS_INTENT and not self.key:
+            self.key = SMS_KEY
+        if self.key == SMS_KEY or self.intent == SMS_INTENT:
+            self.answer = canonical_sms_answer(self.answer) or self.answer
+        return self
 
 
 class ResolverIn(BaseModel):
@@ -512,6 +535,11 @@ class RunStatusOut(BaseModel):
     phase: Literal["launching", "navigating", "loaded"] = "launching"
     started_at: str | None = Field(default=None, alias="startedAt")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
+    # Affirmative recruitment-SMS answers captured this session. Hosts store
+    # them on the candidate as applicationAnswers with this intent.
+    learned_application_answers: list[dict[str, Any]] | None = Field(
+        default=None, alias="learnedApplicationAnswers"
+    )
     features: list[str] = Field(default_factory=lambda: list(ADVERTISED_FEATURES))
 
     @model_serializer(mode="wrap")
@@ -522,6 +550,8 @@ class RunStatusOut(BaseModel):
                 data.pop(key, None)
         if not data.get("autoConsents"):
             data.pop("autoConsents", None)
+        if not data.get("learnedApplicationAnswers"):
+            data.pop("learnedApplicationAnswers", None)
         if not data.get("questions"):
             data.pop("questions", None)
         return data

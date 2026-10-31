@@ -201,6 +201,8 @@ class ApplicationAnswer:
     employer: str = ""
     # True when this fill verified the value. A host-supplied row stays False.
     from_session: bool = False
+    # Catalogue key. Recruitment SMS is ``recruitment_sms_consent``.
+    key: str = ""
 
 
 @dataclass
@@ -466,13 +468,37 @@ def _project_list(raw: object) -> list[Project]:
     ]
 
 
+def _stored_intent(value: str) -> str:
+    """Keep a host intent. ``SMS_CONSENT`` is the recruitment-SMS alias."""
+    from autofill.sms_consent import canonical_sms_intent
+
+    return canonical_sms_intent(value)[:64]
+
+
+def _answer_row(entry: dict) -> ApplicationAnswer:
+    """One application answer. Recruitment SMS is normalized to the host key."""
+    from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer, canonical_sms_key
+
+    question = _text(entry, "question")
+    intent = _stored_intent(_text(entry, "intent"))
+    key = canonical_sms_key(_text(entry, "key")) or canonical_sms_key(question)
+    if intent == SMS_INTENT:
+        key = key or SMS_KEY
+    if key == SMS_KEY and not intent:
+        intent = SMS_INTENT
+    if not question and key:
+        question = key
+    answer = _text(entry, "answer")
+    if key == SMS_KEY or intent == SMS_INTENT:
+        answer = canonical_sms_answer(answer)
+    return ApplicationAnswer(
+        question=question,
+        answer=answer,
+        intent=intent,
+        employer=_text(entry, "employer")[:200],
+        key=key,
+    )
+
+
 def _answer_list(raw: object) -> list[ApplicationAnswer]:
-    return [
-        ApplicationAnswer(
-            question=_text(entry, "question"),
-            answer=_text(entry, "answer"),
-            intent=_text(entry, "intent")[:64],
-            employer=_text(entry, "employer")[:200],
-        )
-        for entry in _objects(raw, "applicationAnswers")
-    ]
+    return [_answer_row(entry) for entry in _objects(raw, "applicationAnswers")]

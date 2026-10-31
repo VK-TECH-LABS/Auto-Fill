@@ -539,6 +539,7 @@ def fill_one_page(
     manual: list[str] = []
     resume_blocked = False
     from autofill.mapping import note_page_country
+    from autofill.sms_consent import SMS_INTENT, accept_recruitment_sms, apply_stored_sms_no, begin_sms_pass
 
     for _ in range(4):
         fields = []
@@ -549,6 +550,7 @@ def fill_one_page(
         cursor = MapCursor(page_heading=snapshot.heading)
         from autofill.stepfill import _clusters
 
+        begin_sms_pass()
         for kind, group in _clusters(snapshot):
             if not checkpoint():
                 break
@@ -568,6 +570,28 @@ def fill_one_page(
             if selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
+                continue
+            if accept_recruitment_sms(page, control, profile):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(
+                            key=SMS_INTENT,
+                            action="check" if control.kind == "checkbox" else "select",
+                            field_class="APPROVED_QUESTION",
+                        ),
+                        detail="recruitment SMS",
+                    )
+                )
+                continue
+            if apply_stored_sms_no(page, control, profile):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(key=SMS_INTENT, action="select", text="No", field_class="APPROVED_QUESTION"),
+                        detail="recruitment SMS declined",
+                    )
+                )
                 continue
             if _accept_standard_checkbox(page, control):
                 fields.append(

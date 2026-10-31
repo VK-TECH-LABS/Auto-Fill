@@ -91,9 +91,13 @@ def run_account_action(
     confirm: str,
     ats: str | None,
     standard_terms: bool = False,
+    recruitment_sms_authorized: bool = False,
 ) -> dict:
     """Fill the current account form and classify what the site did next."""
+    from autofill.sms_consent import bind_account_sms, clear_account_sms
+
     bind_standard_terms(bool(standard_terms))
+    bind_account_sms(bool(recruitment_sms_authorized))
     try:
         return _perform_account_action(
             page,
@@ -106,6 +110,7 @@ def run_account_action(
             standard_terms=standard_terms,
         )
     finally:
+        clear_account_sms()
         if standard_terms_enabled():
             consume_auto_consents()
 
@@ -306,6 +311,11 @@ def _accept_account_terms(page, snapshot: PageSnapshot, *, accept: bool) -> tupl
     for control in snapshot.controls:
         if control.hidden or control.kind != "checkbox" or not control.selector:
             continue
+        from autofill.sms_consent import SMS_CATEGORY, accept_recruitment_sms, is_recruitment_sms_control
+
+        if is_recruitment_sms_control(control) and accept_recruitment_sms(page, control, None):
+            rows.append({"textExcerpt": _statement(control), "category": SMS_CATEGORY, "checked": True})
+            continue
         category = terms_category(control) if accept else "CONSENT"
         checked = False
         required = _required_box(control)
@@ -375,9 +385,12 @@ def _covered_pane_button(snapshot: PageSnapshot, button: ButtonControl) -> bool:
 def _attach_proof(result: dict, proof: dict, rows: list[dict], *, standard_terms: bool) -> dict:
     body = dict(result)
     body["fieldProof"] = proof
+    consents = consume_auto_consents()
     if standard_terms:
-        body["autoConsents"] = consume_auto_consents()
+        body["autoConsents"] = consents
         body["consentRows"] = rows
+    elif consents:
+        body["autoConsents"] = consents
     if body.get("status") == "READY_FOR_HUMAN_SUBMIT":
         body["status"] = "ACCOUNT_CREATION_REQUIRED"
     return body

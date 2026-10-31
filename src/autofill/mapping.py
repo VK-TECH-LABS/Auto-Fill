@@ -553,7 +553,10 @@ _SUBMISSION_CONSENT = re.compile(
     r"my (?:personal )?(?:information|data)"
     r"(?: for this (?:job )?application| for the purposes of this (?:application|recruitment process))?"
 )
-AUTO_CONSENT_CATEGORIES = frozenset({"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT"})
+# Recruitment SMS is a separate Application Answer, not a standard-terms checkbox.
+AUTO_CONSENT_CATEGORIES = frozenset(
+    {"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT", "RECRUITMENT_SMS_CONSENT"}
+)
 _logger = logging.getLogger("autofill.mapping")
 
 
@@ -1368,6 +1371,11 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    from autofill.sms_consent import recruitment_sms_field
+
+    sms = recruitment_sms_field(control, profile)
+    if sms is not None:
+        return sms
     if is_demographic_control(control):
         key = _match_rule(
             Control(
