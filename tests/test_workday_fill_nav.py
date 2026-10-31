@@ -340,3 +340,154 @@ def test_missing_source_and_former_employee_stay_manual(browser, monkeypatch):
         assert "yes" not in {str(item.detail or "").casefold() for item in chosen}
     finally:
         page.close()
+
+
+_HEAR_ABOUT = (
+    "GM Careers Website",
+    "Internet Job Board / Job Search",
+    "Referred by GM Employee",
+)
+
+
+def _my_information_page(*, source_id: str) -> str:
+    """Country Phone Code already shows India. Hear About options are a separate prompt.
+
+    The phone pill is a visible ``selectedItemList``. The source menu is
+    ``promptOption`` rows that appear only after the source prompt icon is
+    clicked. Clicking the search box does not open it. There is no ``<form>``,
+    so a list walk can otherwise climb into the phone field.
+    """
+    source_id_attr = f' id="{source_id}"' if source_id else ""
+    options = "".join(
+        f'<div id="opt-{index}" data-automation-id="promptOption" style="height:24px">{label}</div>'
+        for index, label in enumerate(_HEAR_ABOUT)
+    )
+    return f"""
+    <div id="wrap">
+      <h1>My Information</h1>
+      <div data-automation-id="formField-countryPhoneCode">
+        <label>Country Phone Code<abbr>*</abbr></label>
+        <div data-automation-id="multiSelectContainer">
+          <ul id="phone-selected" data-automation-id="selectedItemList" role="listbox">
+            <li id="india" data-automation-id="selectedItem" role="option" style="height:24px">India (+91)</li>
+          </ul>
+          <input data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+            aria-label="Search" placeholder="Search" aria-required="true">
+          <button type="button" id="phone-prompt" data-automation-id="promptIcon" aria-label="Search"
+            style="width:24px;height:24px"></button>
+        </div>
+      </div>
+      <div data-automation-id="formField-phoneNumber">
+        <label for="national">Phone Number</label>
+        <input id="national" type="tel" data-automation-id="phoneNumber" value="9876543210">
+      </div>
+      <div data-automation-id="formField-source">
+        <label>How Did You Hear About Us?<abbr>*</abbr></label>
+        <div data-automation-id="multiSelectContainer">
+          <input{source_id_attr} data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+            aria-label="Search" placeholder="Search" aria-required="true">
+          <button type="button" id="source-prompt" data-automation-id="promptIcon" aria-label="Search"
+            style="width:24px;height:24px"></button>
+          <span id="source-picked" data-automation-id="selectedItem" hidden></span>
+        </div>
+      </div>
+      <button type="submit" id="submit">Submit</button>
+    </div>
+    <script>
+      window.__submitted = false;
+      window.__opens = [];
+      document.getElementById("submit").addEventListener("click", (event) => {{
+        event.preventDefault();
+        window.__submitted = true;
+      }});
+      const phoneInput = document.querySelector(
+        "[data-automation-id='formField-countryPhoneCode'] [data-automation-id='searchBox']"
+      );
+      const sourceInput = document.querySelector(
+        "[data-automation-id='formField-source'] [data-automation-id='searchBox']"
+      );
+      phoneInput.addEventListener("click", () => window.__opens.push("phone-input"));
+      document.getElementById("phone-prompt").addEventListener("click", () => {{
+        window.__opens.push("phone-prompt");
+      }});
+      sourceInput.addEventListener("click", () => window.__opens.push("source-input"));
+      document.getElementById("source-prompt").addEventListener("click", () => {{
+        window.__opens.push("source-prompt");
+        sourceInput.setAttribute("aria-expanded", "true");
+        setTimeout(() => {{
+          if (document.getElementById("source-menu")) return;
+          const menu = document.createElement("div");
+          menu.id = "source-menu";
+          menu.innerHTML = {options!r};
+          for (const item of menu.children) {{
+            item.addEventListener("click", () => {{
+              const picked = document.getElementById("source-picked");
+              picked.hidden = false;
+              picked.textContent = item.textContent;
+              sourceInput.value = "";
+              sourceInput.setAttribute("aria-expanded", "false");
+              menu.remove();
+            }});
+          }}
+          document.body.appendChild(menu);
+        }}, 300);
+      }});
+    </script>
+    """
+
+
+def _hear_about_gap(page):
+    from autofill.extract import extract_page
+    from autofill.stepfill import required_gaps
+
+    gaps = required_gaps(page, extract_page(page), None)
+    heard = [item for item in gaps if "how did you hear" in str(item.get("text") or "").casefold()]
+    assert len(heard) == 1
+    return heard[0], gaps
+
+
+@pytest.mark.parametrize("source_id", ["", "source"])
+def test_hear_about_options_are_the_source_prompt_not_the_phone_code(browser, source_id):
+    from autofill.dom_ui import commit_visible, fit_choice_values
+    from autofill.extract import extract_page
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_my_information_page(source_id=source_id))
+        controls = extract_page(page).controls
+        source = next(control for control in controls if "how did you hear" in control.label.casefold())
+        phone = next(control for control in controls if "country phone code" in control.label.casefold())
+        assert source.selector != phone.selector
+        assert "formField-source" in source.selector or source.selector == "#source"
+        assert "India (+91)" not in [option.label for option in source.options]
+        heard, gaps = _hear_about_gap(page)
+        prompts = [str(item.get("text") or "").casefold() for item in gaps]
+        assert not any("country phone code" in prompt for prompt in prompts)
+        assert heard["options"] == list(_HEAR_ABOUT)
+        assert "India (+91)" not in heard["options"]
+        assert "phone-prompt" not in page.evaluate("() => window.__opens")
+        assert "source-prompt" in page.evaluate("() => window.__opens")
+        reason, canonical = fit_choice_values(heard, ["GM Careers Website"])
+        assert reason == "ok"
+        assert canonical == ["GM Careers Website"]
+        rejected, listed = fit_choice_values(heard, ["India (+91)"])
+        assert rejected == "needs_option"
+        assert listed == list(_HEAR_ABOUT)
+        filled = commit_visible(
+            page,
+            {
+                "selector": heard["selector"],
+                "value": "GM Careers Website",
+                "values": ["GM Careers Website"],
+                "answerType": heard["answerType"],
+            },
+        )
+        assert filled["filled"] is True
+        assert "GM Careers Website" in page.locator("#source-picked").inner_text()
+        assert page.locator("#india").inner_text().strip() == "India (+91)"
+        assert page.evaluate("() => window.__submitted") is False
+        assert "phone-prompt" not in page.evaluate("() => window.__opens")
+    finally:
+        page.close()

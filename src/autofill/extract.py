@@ -104,6 +104,25 @@ EXTRACT_JS = r"""
     return null;
   }
 
+  function isSelectedItemNode(node) {
+    // A pill already chosen on a prompt. It is not that prompt's option list,
+    // and it is not the option list of a different prompt on the same page.
+    if (!node || !node.closest) return false;
+    const auto = ((node.getAttribute && node.getAttribute("data-automation-id")) || "").toLowerCase();
+    if (
+      auto === "selecteditem" ||
+      auto === "selecteditemlist" ||
+      auto === "selecteditemtext" ||
+      auto === "promptselectionlabel"
+    ) {
+      return true;
+    }
+    return !!node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id='selectedItem'], " +
+      "[data-automation-id='selectedItemText']"
+    );
+  }
+
   function isPromptWidget(el) {
     // A multiselect / prompt search box. The site search in the header is not
     // inside a form field, so it stays a search box.
@@ -554,7 +573,27 @@ EXTRACT_JS = r"""
       if (path) return "[data-field-path='" + cssAttr(path) + "'] [role='combobox']";
     }
     const automation = el.getAttribute("data-automation-id");
-    if (automation) return "[data-automation-id='" + CSS.escape(automation) + "']";
+    if (automation) {
+      const bare = "[data-automation-id='" + CSS.escape(automation) + "']";
+      // Workday repeats searchBox and promptIcon on every prompt. The first
+      // Country Phone Code box must not be the selector for How Did You Hear.
+      const field = el.closest && el.closest("[data-automation-id^='formField']");
+      const fieldAuto = field && field !== el ? (field.getAttribute("data-automation-id") || "") : "";
+      if (fieldAuto) {
+        const root = el.getRootNode && el.getRootNode();
+        const scope = root && typeof root.querySelectorAll === "function" ? root : document;
+        let count = 1;
+        try {
+          count = scope.querySelectorAll(bare).length;
+        } catch (error) {
+          count = 1;
+        }
+        if (count > 1) {
+          return "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare;
+        }
+      }
+      return bare;
+    }
     if (el.classList && el.classList.contains("postings-btn")) return tag + ".postings-btn";
     // Unnamed submit buttons still need a selector so they can be reported
     // and so the fill routine can refuse them. The attribute is not a secret.
@@ -674,9 +713,15 @@ EXTRACT_JS = r"""
       } else if (kind === "combobox") {
         const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
         const list = listId ? byId(root, listId) : null;
-        if (list && (list.getAttribute("role") || "") === "listbox") {
-          options = Array.from(list.querySelectorAll("[role='option']")).filter((option) => (
-            !option.disabled && option.getAttribute("aria-disabled") !== "true"
+        // selectedItemList is the value already chosen, often on another field
+        // such as Country Phone Code. Prompt options are a different list.
+        if (list && (list.getAttribute("role") || "") === "listbox" && !isSelectedItemNode(list)) {
+          options = Array.from(list.querySelectorAll(
+            "[role='option'], [data-automation-id='promptOption']"
+          )).filter((option) => (
+            !option.disabled &&
+            option.getAttribute("aria-disabled") !== "true" &&
+            !isSelectedItemNode(option)
           )).map((option) => ({
             value: option.getAttribute("data-value") || textOf(option),
             label: textOf(option),

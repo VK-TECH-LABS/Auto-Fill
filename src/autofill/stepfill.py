@@ -2407,6 +2407,22 @@ _MATCH_VALUE_JS = r"""(hint) => {
       if (!value.trim() || placeholder(label) || placeholder(value)) return "";
       return value;
     }
+    const promptHost = el.closest && el.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    if (promptHost) {
+      const pill = promptHost.querySelector(
+        "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+      );
+      if (pill && !pill.hidden) {
+        const item = pill.closest("[data-automation-id='selectedItem']");
+        const style = window.getComputedStyle(pill);
+        if (!(item && item.hidden) && style.display !== "none" && style.visibility !== "hidden") {
+          const pillText = String(pill.textContent || "").replace(/\s+/g, " ").trim();
+          if (!placeholder(pillText)) return pillText;
+        }
+      }
+    }
     if (role === "combobox" || role === "listbox") {
       const typed = "value" in el ? String(el.value || "") : "";
       if (typed.trim() && !placeholder(typed)) return typed;
@@ -2439,6 +2455,9 @@ _MATCH_VALUE_JS = r"""(hint) => {
   if (id) list = group((node) => node.id === id);
   if (!list.length && automation) {
     list = group((node) => (node.getAttribute("data-automation-id") || "") === automation);
+    // searchBox is on every Workday prompt. Do not read Country Phone Code as
+    // the value of How Did You Hear About Us.
+    if (list.length > 1) list = [];
   }
   if (!list.length && name) list = group((node) => (node.getAttribute("name") || "") === name);
   if (!list.length && label) list = group((node) => labelOf(node) === label);
