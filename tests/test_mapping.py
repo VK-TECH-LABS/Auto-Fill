@@ -1,10 +1,17 @@
-"""Field mapping never invents an answer the profile did not give."""
+"""Field mapping uses the profile, and the job-description rules for expected pay.
+
+It does not invent work authorization, a salary-range maximum, or an unrelated answer.
+"""
 
 from pathlib import Path
 
+from autofill.dom_ui import public_blocking
+from autofill.intents import classify_question
 from autofill.mapping import map_field
 from autofill.models import Control, JobContext, Option
 from autofill.profile import ApplicationAnswer, CandidateProfile
+from autofill.service.schemas import BlockingOut
+from autofill.stepfill import _Ask, _gap_item
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "profile.example.json"
 
@@ -113,6 +120,7 @@ def test_autocomplete_beats_a_vague_label():
 
 def test_work_auth_select_and_sponsorship_radio():
     filled = profile()
+    filled.personal.country = "United States"
     authorized = map_field(
         control(
             "Are you legally authorized to work?",
@@ -141,7 +149,8 @@ def test_work_auth_select_and_sponsorship_radio():
 def test_checkbox_yes_and_no():
     filled = profile()
     background = map_field(control("Willing to undergo a background check", kind="checkbox"), filled)
-    assert background.action == "check"
+    assert background.action == "skip"
+    assert background.field_class == "LEGAL_FIELD"
     felony = map_field(control("Have you been convicted of a felony?", kind="checkbox"), filled)
     assert felony.action == "uncheck"
 
@@ -155,8 +164,8 @@ def test_blank_screening_answer_is_not_invented():
     assert mapped.text == ""
 
 
-def test_approved_answer_overrides_screening_for_the_same_question():
-    """Session approved Q&A wins over screening.* when both match. Other questions stay put."""
+def test_screening_uses_the_profile_first_and_asks_when_an_approved_answer_disagrees():
+    """t60u Req2: Application Profile first, then approved answers. A disagreement is not guessed."""
     person = profile()
     assert person.screening.how_heard == "Online job board"
     assert person.screening.age_18_or_older == "Yes"
@@ -164,11 +173,12 @@ def test_approved_answer_overrides_screening_for_the_same_question():
     person.application_answers = [
         ApplicationAnswer(question="Where did you hear about this role?", answer="Employee referral"),
         ApplicationAnswer(question="Are you age 18 or older?", answer="No"),
+        ApplicationAnswer(question="Have you been convicted of a felony?", answer="No"),
     ]
     heard = map_field(control("How did you hear about this role?"), person)
-    assert heard.action == "fill"
-    assert heard.text == "Employee referral"
-    assert heard.field_class == "APPROVED_QUESTION"
+    assert heard.action == "unanswered"
+    assert heard.field_class == "MANUAL_REVIEW_FIELD"
+    assert "disagree" in heard.reason
     age = map_field(
         control(
             "Are you age 18 or older?",
@@ -177,16 +187,28 @@ def test_approved_answer_overrides_screening_for_the_same_question():
         ),
         person,
     )
-    assert age.action == "select"
-    assert age.option_label == "No"
-    assert age.field_class == "APPROVED_QUESTION"
+    assert age.action == "unanswered"
+    assert age.field_class == "MANUAL_REVIEW_FIELD"
     felony = map_field(control("Have you been convicted of a felony?", kind="checkbox"), person)
     assert felony.action == "uncheck"
     assert felony.text == "No"
+    assert felony.field_class == "PROFILE_FIELD"
     unknown = map_field(control("What is your favorite color?"), person)
     assert unknown.action == "unanswered"
     assert unknown.text == ""
     assert unknown.field_class == "UNKNOWN_FIELD"
+
+
+def test_screening_uses_an_approved_answer_when_the_profile_is_blank():
+    person = profile()
+    person.screening.how_heard = ""
+    person.application_answers = [
+        ApplicationAnswer(question="Where did you hear about this role?", answer="Employee referral"),
+    ]
+    heard = map_field(control("How did you hear about this role?"), person)
+    assert heard.action == "fill"
+    assert heard.text == "Employee referral"
+    assert heard.field_class == "APPROVED_QUESTION"
 
 
 def test_eeo_decline_is_not_selected():
@@ -246,7 +268,7 @@ def test_skill_question_uses_only_listed_skills():
     assert years.key != "years_of_experience_total"
 
 
-def test_salary_uses_profile_floor_and_posted_midpoint():
+def test_salary_uses_profile_floor_and_jd_expectation():
     filled = profile()
     base = map_field(control("Desired salary"), filled)
     assert base.text == "85000"
@@ -255,17 +277,133 @@ def test_salary_uses_profile_floor_and_posted_midpoint():
         filled,
         job=JobContext(posted_salary_min=100000, posted_salary_max=140000),
     )
-    assert posted.text == "120000"
-    below_floor = map_field(
+    # Midpoint 120000 is between 100000 and 130000, so the fill is 115000.
+    assert posted.text == "115000"
+    posted_low = map_field(
         control("Desired salary"),
         filled,
         job=JobContext(posted_salary_min=40000, posted_salary_max=60000),
     )
-    assert below_floor.text == "85000"
+    assert posted_low.text == "50000"
     hourly = map_field(control("Hourly rate"), filled)
     assert hourly.text == str(85000 // 2080)
     ranged = map_field(control("Salary range"), filled)
     assert ranged.text == "85000-100000"
+
+
+def _minimum_only() -> CandidateProfile:
+    return CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "compensation": {"salary_expectation": "120000"},
+        }
+    )
+
+
+def test_jd_single_figure_fills_expected_salary_and_not_a_range():
+    person = _minimum_only()
+    job = JobContext(posted_salary_min=150000)
+    single = map_field(control("Desired salary"), person, job=job)
+    assert single.action == "fill"
+    assert single.text == "140000"
+    ranged = map_field(control("What is your desired salary range?"), person, job=job)
+    assert ranged.action == "unanswered"
+    assert ranged.challenge == "confirm"
+    assert ranged.text == ""
+    assert ranged.text != "140000-140000"
+
+
+def test_related_salary_labels_use_a_saved_minimum():
+    person = _minimum_only()
+    assert classify_question("What is your desired salary range?").intent == "SALARY_EXPECTATION"
+    assert classify_question("Expected pay").intent == "SALARY_EXPECTATION"
+    single = map_field(control("Desired salary"), person)
+    assert single.action == "fill"
+    assert single.text == "120000"
+    assert single.challenge == ""
+    expected = map_field(control("Expected pay"), person)
+    assert expected.key == "salary"
+    assert expected.text == "120000"
+    endpoint = map_field(control("Salary range minimum"), person)
+    assert endpoint.action == "fill"
+    assert endpoint.text == "120000"
+
+
+def test_desired_salary_range_confirms_when_only_a_minimum_is_saved():
+    person = _minimum_only()
+    label = "What is your desired salary range?"
+    mapped = map_field(control(label), person)
+    assert mapped.key == "salary_range"
+    assert mapped.action == "unanswered"
+    assert mapped.text == ""
+    assert mapped.challenge == "confirm"
+    assert mapped.confidence == "low"
+    assert mapped.reason == "salary_range_incomplete"
+    assert mapped.related_fields == ("salary_expectation",)
+    assert "120000" not in mapped.reason
+    gap = _gap_item([control(label, required=True)], person)
+    assert gap["intent"] == "SALARY_EXPECTATION"
+    assert gap["challenge"] == "confirm"
+    assert gap["confidence"] == "LOW"
+    assert gap["salaryShape"] == "range"
+    assert gap["relatedFields"] == ["salary_expectation"]
+    assert gap["kind"] == "MISSING_PROFILE_VALUE"
+    published = public_blocking(gap)
+    assert published is not None
+    assert published["challenge"] == "confirm"
+    assert published["relatedFields"] == ["salary_expectation"]
+    assert published["reason"] == "salary_range_incomplete"
+    assert "120000" not in repr(published)
+    body = BlockingOut.model_validate(published).model_dump(by_alias=True)
+    assert body["challenge"] == "confirm"
+    assert body["salaryShape"] == "range"
+    assert "120000" not in repr(body)
+    plain = BlockingOut(kind="QUESTION", text="Nickname").model_dump(by_alias=True)
+    assert "challenge" not in plain
+    assert "relatedFields" not in plain
+
+
+def test_minimum_alias_does_not_invent_a_range_max():
+    person = CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "compensation": {"minimumSalary": "90000"},
+        }
+    )
+    assert person.compensation.salary_range_min == "90000"
+    assert person.compensation.salary_range_max == ""
+    assert person.compensation.salary_expectation == ""
+    single = map_field(control("Minimum salary"), person)
+    assert single.action == "fill"
+    assert single.text == "90000"
+    ranged = map_field(control("What is your desired salary range?"), person)
+    assert ranged.action == "unanswered"
+    assert ranged.challenge == "confirm"
+    assert ranged.text == ""
+    assert ranged.related_fields == ("salary_range_min",)
+
+
+def test_resolver_question_names_related_salary_fields_without_amounts():
+    match = classify_question("What is your desired salary range?")
+    body = _Ask(
+        controls=[control("What is your desired salary range?")],
+        match=match,
+        include_question=True,
+    ).question_body()
+    assert body["intent"] == "SALARY_EXPECTATION"
+    assert body["salaryShape"] == "range"
+    assert body["relatedFields"] == [
+        "salary_expectation",
+        "salary_range_min",
+        "salary_range_max",
+    ]
+    single = _Ask(
+        controls=[control("Desired salary")],
+        match=classify_question("Desired salary"),
+        include_question=True,
+    ).question_body()
+    assert single["salaryShape"] == "single"
+    assert "relatedFields" not in _Ask(controls=[control("City")], include_question=True).question_body()
 
 
 def test_non_iso_start_date_is_not_forced_into_a_date_input():

@@ -15,6 +15,7 @@ from pathlib import Path
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
 from autofill.dom_ui import (
     checkpoint,
+    choose_native_select,
     control_committed,
     focus_field,
     refill_cleared,
@@ -24,10 +25,10 @@ from autofill.dom_ui import (
 )
 from autofill.extract import challenge_message, extract_page
 from autofill.mapping import MapCursor, map_field
-from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, PageSnapshot
+from autofill.models import Control, FieldOutcome, FillResult, JobContext, MappedField, Option, PageSnapshot
 from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
-from autofill.safeguards import _bound_target, activate, classify_control, is_add_row
+from autofill.safeguards import HumanSubmissionRequired, _bound_target, activate, classify_control, is_add_row
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -93,14 +94,20 @@ def current_session_id() -> str:
     return _SESSION_ID.get() or ""
 
 
-def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> None:
-    """Keep a value the engine wrote and then read back on the control."""
-    hook = _CONFIRMED.get()
-    text = str(value or "")
-    if hook is None or not text.strip():
+def remember_confirmed(control: Control, value: str, *, field_key: str = "", choice: str = "") -> None:
+    """Keep a value the engine wrote and then read back on the control.
+
+    The confirmed-value store puts the same control back after a rewrite.
+    ``choice`` marks a checkbox or radio for that restore. A separate catalogue
+    on the profile reuses a question answer on a later page. Profile fields
+    and consent are not copied into that catalogue.
+    """
+    text = str(value or "").strip()
+    if not text:
         return
-    hook(
-        {
+    hook = _CONFIRMED.get()
+    if hook is not None:
+        record = {
             "value": text,
             "label": control.label or "",
             "name": control.name or "",
@@ -109,6 +116,27 @@ def remember_confirmed(control: Control, value: str, *, field_key: str = "") -> 
             "fieldKey": field_key or "",
             "selector": control.selector or "",
         }
+        if choice:
+            record["choice"] = choice
+        hook(record)
+    from autofill.answers import current_catalogue, note_session_answer
+    from autofill.mapping import question_stem, wrote_us_country
+
+    if wrote_us_country(field_key, text):
+        from autofill.mapping import mark_us_committed
+
+        mark_us_committed()
+    bound = current_catalogue()
+    if bound is None:
+        return
+    profile, employers = bound
+    note_session_answer(
+        profile,
+        stem=question_stem(control),
+        value=text,
+        field_key=field_key,
+        employers=employers,
+        control=control,
     )
 
 
@@ -194,6 +222,62 @@ def _verified_or_blank(control: Control, mapped: MappedField, locator, expected:
     return _outcome(control, mapped, detail="filled")
 
 
+_CHOICE_STATE_JS = r"""(el) => {
+  function selected(node) {
+    if (!node || !node.getAttribute) return false;
+    for (const name of ["aria-pressed", "aria-selected", "aria-checked"]) {
+      if (node.getAttribute(name) === "true") return true;
+    }
+    if (node.checked === true) return true;
+    const cls = String(node.className || "").toLowerCase();
+    return /(^|\s)(selected|is-selected|active|is-active|checked)(\s|$)/.test(cls);
+  }
+  return selected(el) || selected(el.querySelector("input[type='radio'], input[type='checkbox']"));
+}"""
+
+
+def _native_checkbox(control: Control) -> bool:
+    """A real checkbox input. Custom ``role=checkbox`` and switches are reported only."""
+    if control.kind != "checkbox":
+        return False
+    if control.input_type in {"aria-checkbox", "switch", "aria-radio"}:
+        return False
+    if control.role == "switch":
+        return False
+    return True
+
+
+def _yes_no_labels(control: Control) -> bool:
+    names = {(option.label or option.value or "").strip().casefold() for option in control.options}
+    names.discard("")
+    return names == {"yes", "no"}
+
+
+def _choice_selected(target, selector: str) -> bool:
+    """True when the clicked Yes/No button itself reads as chosen.
+
+    A page double without ``evaluate`` counts as chosen, like ``control_committed``.
+    """
+    locator = target.locator(selector)
+    evaluate = getattr(locator, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate(_CHOICE_STATE_JS))
+    except Exception:
+        return False
+
+
+def _file_attached(locator) -> bool:
+    evaluate = getattr(locator, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate("el => !!(el.files && el.files.length)"))
+    except Exception:
+        return False
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
@@ -223,12 +307,48 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             return _verified_or_blank(control, mapped, locator, mapped.text or "")
         if mapped.action == "select":
             if control.kind == "radio":
-                option = target.locator(mapped.option_selector or control.selector)
-                focus_field(target, mapped.option_selector or control.selector)
-                option.check()
-                if not option.is_checked():
-                    return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
-                remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
+                selector = mapped.option_selector or control.selector
+                if control.input_type == "aria-radio":
+                    if not _yes_no_labels(control):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Custom radio left for a person.",
+                        )
+                    from autofill.safeguards import press_aria_radio
+
+                    if not press_aria_radio(target, selector):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Value did not stay on the page.",
+                        )
+                else:
+                    from autofill.safeguards import commit_native_choice
+
+                    if not commit_native_choice(target, selector, on=True):
+                        return _outcome(
+                            control,
+                            mapped,
+                            action="unanswered",
+                            detail="Value did not stay on the page.",
+                        )
+                picked = Control(
+                    kind=control.kind,
+                    name=control.name,
+                    label=control.label,
+                    selector=selector,
+                    automation_id=control.automation_id,
+                    input_type=control.input_type,
+                )
+                remember_confirmed(
+                    picked,
+                    mapped.option_label or mapped.text or "",
+                    field_key=mapped.key or "",
+                    choice="radio",
+                )
                 refresh_preview(page)
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
             if control.kind == "combobox":
@@ -244,15 +364,20 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 from autofill.safeguards import click_choice
 
                 click_choice(target, mapped.option_selector, mapped.option_label)
+                if not _choice_selected(target, mapped.option_selector):
+                    return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
                 remember_confirmed(control, mapped.option_label or mapped.text or "", field_key=mapped.key or "")
                 refresh_preview(page)
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
             expected = mapped.option_label or mapped.option_value or mapped.text or ""
             focus_field(target, control.selector)
-            if mapped.option_value:
-                locator.select_option(value=mapped.option_value)
-            else:
-                locator.select_option(label=mapped.option_label)
+            if not choose_native_select(
+                target,
+                control.selector,
+                label=mapped.option_label or "",
+                value=mapped.option_value or "",
+            ):
+                return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
             shown = _shown_value(locator)
             if not (
                 _value_verified(shown, expected)
@@ -264,29 +389,136 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             refresh_preview(page)
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
-            locator.check()
-            if hasattr(locator, "is_checked") and not locator.is_checked():
+            if not _native_checkbox(control):
+                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
+            from autofill.safeguards import commit_native_choice
+
+            if not commit_native_choice(target, control.selector, on=True):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            remember_confirmed(control, "yes", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
             return _outcome(control, mapped, detail="checked")
         if mapped.action == "uncheck":
-            locator.uncheck()
-            if hasattr(locator, "is_checked") and locator.is_checked():
+            if not _native_checkbox(control):
+                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
+            from autofill.safeguards import commit_native_choice
+
+            if not commit_native_choice(target, control.selector, on=False):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+            remember_confirmed(control, "no", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
             return _outcome(control, mapped, detail="unchecked")
         if mapped.action == "upload":
             locator.set_input_files(mapped.text)
+            if not _file_attached(locator):
+                return _outcome(control, mapped, action="unanswered", detail="File did not stay on the page.")
             return _outcome(control, mapped, detail=Path(mapped.text).name)
     except Exception as exc:
         return _outcome(control, mapped, action="error", detail=str(exc))
     return _outcome(control, mapped, action="unanswered", detail=f"Unsupported action {mapped.action}.")
 
 
+def _accept_standard_checkbox(page, control: Control) -> bool:
+    """Check one required standard-terms box when the session flag is on."""
+    from autofill.mapping import AUTO_CONSENT_CATEGORIES, record_auto_consent, standard_terms_enabled, terms_category
+    from autofill.safeguards import commit_native_choice
+
+    if not standard_terms_enabled() or not _native_checkbox(control):
+        return False
+    if not control.required or not control.selector:
+        return False
+    category = terms_category(control)
+    if category not in AUTO_CONSENT_CATEGORIES:
+        return False
+    if not commit_native_choice(page, control.selector, on=True):
+        return False
+    record_auto_consent(control, category)
+    remember_confirmed(control, "yes", field_key=category, choice="checkbox")
+    return True
+
+
 def _note_manual(control: Control, mapped: MappedField, manual: list[str]) -> None:
     if mapped.field_class in {"MANUAL_REVIEW_FIELD", "LEGAL_FIELD"} or mapped.action == "resume_required":
         label = control.label or control.selector or control.name
         manual.append(f"{label}: {mapped.reason}")
+
+
+def _fill_checkbox_group(
+    page,
+    controls: list[Control],
+    profile: CandidateProfile,
+    *,
+    job: JobContext | None,
+    cursor: MapCursor | None,
+    manual: list[str],
+) -> list[FieldOutcome]:
+    """One checkbox group is one question. A partial option list checks nothing.
+
+    Grouping is the step filler's ``_clusters`` helper. This does not build a
+    second radio grouper. Custom checkboxes stay unclicked.
+    """
+    from autofill.intents import match_all_options
+    from autofill.mapping import map_field, question_stem
+    from autofill.stepfill import _checkbox_label
+
+    visible = [
+        control
+        for control in controls
+        if not (
+            selector_held(control.selector)
+            and (not refill_cleared() or control_committed(page, control.selector))
+        )
+    ]
+    if not visible:
+        return []
+    stem = question_stem(visible[0])
+    synthetic = Control(
+        kind="textarea",
+        label=stem,
+        prompt=visible[0].prompt,
+        group=visible[0].group,
+        name=visible[0].name,
+    )
+    mapped = map_field(synthetic, profile, job=job, cursor=cursor)
+    options = [
+        Option(value=item.selector, label=_checkbox_label(item), selector=item.selector) for item in visible
+    ]
+    values: list[str] = []
+    if mapped.action == "fill" and mapped.text.strip():
+        raw = mapped.text.strip()
+        values = [part.strip() for part in raw.split(",") if part.strip()] if "," in raw else [raw]
+    chosen = match_all_options(values, options) if values else None
+    if chosen is None or any(not _native_checkbox(item) for item in visible):
+        reason = mapped.reason or "No option matched this group."
+        if values and chosen is None and "disagree" not in reason and "Several options" not in reason:
+            reason = f"No option matched profile value {mapped.text!r}."
+        if any(not _native_checkbox(item) for item in visible):
+            reason = "Custom checkbox left for a person."
+        blank = MappedField(
+            key=mapped.key,
+            action="unanswered",
+            field_class=mapped.field_class or "UNKNOWN_FIELD",
+            reason=reason,
+        )
+        outcomes: list[FieldOutcome] = []
+        for control in visible:
+            _note_manual(control, blank, manual)
+            outcomes.append(_outcome(control, blank))
+        return outcomes
+    chosen_selectors = {item.selector for item in chosen}
+    outcomes = []
+    for control in visible:
+        if control.selector not in chosen_selectors:
+            continue
+        check = MappedField(
+            key=mapped.key or "application_answer",
+            action="check",
+            text=_checkbox_label(control),
+            field_class="APPROVED_QUESTION",
+            confidence="high",
+        )
+        outcomes.append(_apply_mapped(page, control, check))
+    return outcomes
 
 
 def fill_one_page(
@@ -306,19 +538,69 @@ def fill_one_page(
     fields: list[FieldOutcome] = []
     manual: list[str] = []
     resume_blocked = False
-    snapshot = extract_page(page)
+    from autofill.mapping import note_page_country
+    from autofill.sms_consent import SMS_INTENT, accept_recruitment_sms, apply_stored_sms_no, begin_sms_pass
+
     for _ in range(4):
         fields = []
         manual = []
         resume_blocked = False
         snapshot = extract_page(page)
+        note_page_country(page, snapshot)
         cursor = MapCursor(page_heading=snapshot.heading)
-        for control in snapshot.controls:
+        from autofill.stepfill import _clusters
+
+        begin_sms_pass()
+        for kind, group in _clusters(snapshot):
             if not checkpoint():
                 break
+            if kind == "multi":
+                fields.extend(
+                    _fill_checkbox_group(
+                        page,
+                        group,
+                        profile,
+                        job=job,
+                        cursor=cursor,
+                        manual=manual,
+                    )
+                )
+                continue
+            control = group[0]
             if selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
+                continue
+            if accept_recruitment_sms(page, control, profile):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(
+                            key=SMS_INTENT,
+                            action="check" if control.kind == "checkbox" else "select",
+                            field_class="APPROVED_QUESTION",
+                        ),
+                        detail="recruitment SMS",
+                    )
+                )
+                continue
+            if apply_stored_sms_no(page, control, profile):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(key=SMS_INTENT, action="select", text="No", field_class="APPROVED_QUESTION"),
+                        detail="recruitment SMS declined",
+                    )
+                )
+                continue
+            if _accept_standard_checkbox(page, control):
+                fields.append(
+                    _outcome(
+                        control,
+                        MappedField(key="STANDARD_TERMS", action="check", field_class="LEGAL_FIELD"),
+                        detail="checked",
+                    )
+                )
                 continue
             mapped = map_field(
                 control,
@@ -459,7 +741,10 @@ def _fill_pages(
         if nxt is None:
             break
         before = navigation_signature(page, snapshot)
-        activate(page, nxt.selector, nxt.name, control_type=nxt.control_type, frame_url=nxt.frame_url)
+        try:
+            activate(page, nxt.selector, nxt.name, control_type=nxt.control_type, frame_url=nxt.frame_url)
+        except HumanSubmissionRequired:
+            break
         clicked.add(nxt.selector)
         advanced, _moved = wait_for_navigation(page, before)
         if not advanced:
@@ -564,10 +849,46 @@ def fill_application(
             "This is an identity-provider login. Auto-Fill does not sign in through SSO.",
         )
 
+    from autofill.mapping import bind_us_page, reset_us_page
+
     ats = detect_ats(target)
     resume = _path_text(resume_path)
     cover = _path_text(cover_letter_path)
+    us_token = bind_us_page()
+    try:
+        return _open_and_fill(
+            profile,
+            url=url,
+            page=page,
+            resume=resume,
+            cover=cover,
+            cover_letter_text=cover_letter_text,
+            job=job,
+            advance_pages=advance_pages,
+            max_pages=max_pages,
+            headless=headless,
+            resume_uploaded=resume_uploaded,
+            ats_name=ats.name if ats else None,
+        )
+    finally:
+        reset_us_page(us_token)
 
+
+def _open_and_fill(
+    profile: CandidateProfile,
+    *,
+    url: str | None,
+    page,
+    resume: str | None,
+    cover: str | None,
+    cover_letter_text: str | None,
+    job: JobContext | None,
+    advance_pages: bool,
+    max_pages: int,
+    headless: bool,
+    resume_uploaded: bool,
+    ats_name: str | None,
+) -> FillResult:
     if page is not None:
         current = getattr(page, "url", "") or ""
         if url and current in _BLANK_URLS:
@@ -581,7 +902,7 @@ def fill_application(
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
-            ats_name=ats.name if ats else None,
+            ats_name=ats_name,
             resume_uploaded=resume_uploaded,
         )
 
@@ -603,7 +924,7 @@ def fill_application(
             job=job,
             advance_pages=advance_pages,
             max_pages=max_pages,
-            ats_name=ats.name if ats else None,
+            ats_name=ats_name,
             resume_uploaded=resume_uploaded,
         )
     finally:

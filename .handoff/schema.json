@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/VK-TECH-LABS/Auto-Fill/.handoff/schema.json",
+  "title": "Auto-Fill developer handoff record",
+  "type": "object",
+  "required": [
+    "task",
+    "developer",
+    "branch",
+    "latest_commit",
+    "pr",
+    "files_touched",
+    "tests",
+    "blockers",
+    "next_action",
+    "updated_at"
+  ],
+  "properties": {
+    "task": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Task slug from the branch, after tharun/ or saiteja/."
+    },
+    "developer": {
+      "type": "string",
+      "enum": ["tharun", "saiteja"]
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^(tharun|saiteja)/.+"
+    },
+    "latest_commit": {
+      "type": "string",
+      "description": "Commit the record describes. The bot commit that only refreshes this file is not this value."
+    },
+    "pr": {
+      "type": "string",
+      "description": "Open pull request URL, or an empty string when there is no pull request yet."
+    },
+    "files_touched": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Repo paths this open task owns. The action sets these from the diff and keeps critical-file claims."
+    },
+    "tests": {
+      "type": "string",
+      "description": "How to verify the task. Preserved once a person or agent sets it. Clear it to let the action refill it."
+    },
+    "blockers": {
+      "type": "string"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "UTC timestamp, YYYY-MM-DDTHH:MM:SSZ."
+    }
+  },
+  "additionalProperties": true
+}

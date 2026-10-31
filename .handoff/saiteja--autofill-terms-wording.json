@@ -1,0 +1,20 @@
+{
+  "task": "autofill-terms-wording",
+  "developer": "saiteja",
+  "branch": "saiteja/autofill-terms-wording",
+  "latest_commit": "9d3fc26df8cff29b384858b6b65fb447d2d0c85e",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/73",
+  "files_touched": [
+    "src/autofill/account_flow.py",
+    "src/autofill/mapping.py",
+    "src/autofill/stepfill.py",
+    "tests/fixtures/account_register_terms.html",
+    "tests/fixtures/application_privacy_ack.html",
+    "tests/test_account_ready.py",
+    "tests/test_terms_wording.py"
+  ],
+  "tests": "pytest tests/test_account_ready.py tests/test_terms_wording.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-10-26T18:01:57Z"
+}

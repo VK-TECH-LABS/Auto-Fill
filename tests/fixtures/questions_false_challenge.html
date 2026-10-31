@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application questions</title></head>
+<body>
+  <h1>Application questions</h1>
+  <p>Just a moment while we check your browser.</p>
+  <p>Check your email. We sent you a code so we can notify you about this application.</p>
+  <fieldset>
+    <legend>Are you legally authorized to work?</legend>
+    <label><input type="radio" name="auth" value="Yes"> Yes</label>
+    <label><input type="radio" name="auth" value="No"> No</label>
+  </fieldset>
+  <label for="resume">Resume</label>
+  <input id="resume" type="file">
+  <label for="referral">Referral code</label>
+  <input id="referral" name="referralCode" maxlength="6" aria-label="Referral code">
+  <label for="first">First Name</label>
+  <input id="first" name="firstName" autocomplete="given-name">
+  <button type="button" id="continue">Continue</button>
+  <button type="submit" id="submit">Submit application</button>
+  <script>
+    window.__continued = false;
+    window.__submitted = false;
+    window.__values = null;
+    document.getElementById("continue").addEventListener("click", () => {
+      window.__continued = true;
+      window.__values = {first: document.getElementById("first").value};
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__submitted = true;
+    });
+  </script>
+</body>
+</html>

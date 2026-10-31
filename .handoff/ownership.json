@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "integration_branch": "staging",
+  "production_branch": "main",
+  "override_label": "handoff-override",
+  "host": "Railway",
+  "notes": "Catalog of critical shared files. An open task is an open pull request from tharun/* or saiteja/*, or a developer branch that has a handoff record and no pull request yet. A pull request fails when it touches a file that open task lists in files_touched, unless it carries the override label. The action rewrites files_touched from the branch diff and keeps critical-file claims that are not in the diff.",
+  "developers": [
+    {
+      "id": "tharun",
+      "branch_prefix": "tharun/"
+    },
+    {
+      "id": "saiteja",
+      "branch_prefix": "saiteja/",
+      "github_login": "Gollapally123"
+    }
+  ],
+  "files": [
+    {
+      "path": "docs/TILEARC_INTEGRATION.md",
+      "area": "tilearc_api_contract",
+      "reason": "In-process contract with TileArc (VK-TECH-LABS/vinayaka)."
+    },
+    {
+      "path": "docs/HTTP_SERVICE.md",
+      "area": "tilearc_api_contract",
+      "reason": "HTTP contract callers, including TileArc, depend on."
+    },
+    {
+      "path": "src/autofill/service/schemas.py",
+      "area": "tilearc_api_contract",
+      "reason": "Request and response bodies for the session API."
+    },
+    {
+      "path": "src/autofill/service/app.py",
+      "area": "tilearc_api_contract",
+      "reason": "HTTP routes that implement the TileArc-facing API."
+    },
+    {
+      "path": "examples/.env.example",
+      "area": "env_config",
+      "reason": "Documented environment variables."
+    },
+    {
+      "path": "src/autofill/service/server.py",
+      "area": "env_config",
+      "reason": "Process environment read at service startup."
+    },
+    {
+      "path": "Dockerfile",
+      "area": "env_config",
+      "reason": "Image runtime environment for the hosted service."
+    },
+    {
+      "path": "src/autofill/credentials.py",
+      "area": "credential_encryption",
+      "reason": "Runtime credential provider and redacted credential objects."
+    },
+    {
+      "path": "src/autofill/service/auth.py",
+      "area": "credential_encryption",
+      "reason": "Service-token digest check and rotation."
+    },
+    {
+      "path": "src/autofill/redact.py",
+      "area": "credential_encryption",
+      "reason": "Log redaction for secrets."
+    },
+    {
+      "path": "src/autofill/login.py",
+      "area": "credential_encryption",
+      "reason": "Password login. Does not create accounts."
+    },
+    {
+      "path": "src/autofill/service/sessions.py",
+      "area": "session_persistence",
+      "reason": "In-memory service session store."
+    },
+    {
+      "path": "src/autofill/session.py",
+      "area": "session_persistence",
+      "reason": "Per-application session identity."
+    },
+    {
+      "path": "src/autofill/safeguards.py",
+      "area": "human_approval",
+      "reason": "HUMAN_SUBMIT_ONLY. Final Submit and Apply stay human."
+    },
+    {
+      "path": "src/autofill/account_flow.py",
+      "area": "human_approval",
+      "reason": "Account-creation detection. Tests must not create real accounts."
+    }
+  ]
+}

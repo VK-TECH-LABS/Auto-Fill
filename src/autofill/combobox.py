@@ -1,13 +1,16 @@
 """Open one combobox and read only the listbox that belongs to it.
 
 A phone-country list that is already on the page is not an option list for a
-different question. Options that appear after the control is opened are read
-from ``aria-controls`` / ``aria-owns``, or from the list inside that control.
+different question. A Workday ``selectedItemList`` is the value already chosen
+on that prompt, not the prompt menu. Options that appear after the control is
+opened are read from ``aria-controls`` / ``aria-owns``, from the list inside
+that form field, or from the open ``promptOption`` menu.
 """
 
 from __future__ import annotations
 
 import re
+import time
 
 from autofill.dom_ui import focus_field, type_char_delay
 from autofill.intents import match_option_exact
@@ -84,11 +87,18 @@ def match_country_option(desired: str, options: list[Option]) -> Option | None:
 
 
 _SCOPED_OPTIONS_JS = r"""
-(selector) => {
+(args) => {
+  const selector = args && args.selector ? args.selector : args;
+  const allowSingle = !!(args && args.allowSingle);
   const el = document.querySelector(selector);
   if (!el) return [];
   function textOf(node) {
     return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+  function optionEnabled(option) {
+    if (!option) return false;
+    if (option.disabled) return false;
+    return option.getAttribute("aria-disabled") !== "true";
   }
   function claimedByOther(list) {
     if (!list.id) return false;
@@ -96,27 +106,146 @@ _SCOPED_OPTIONS_JS = r"""
     const owner = document.querySelector(query);
     return !!(owner && owner !== el);
   }
-  let list = null;
-  const owned = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
-  if (owned) {
-    const node = document.getElementById(owned);
-    if (node && (node.getAttribute("role") || "") === "listbox" && !claimedByOther(node)) list = node;
+  function pageRoot(node) {
+    if (!node || !node.tagName) return true;
+    const tag = node.tagName.toLowerCase();
+    return tag === "body" || tag === "html" || tag === "form";
   }
-  let container = el.closest(".select, [class*='select__'], fieldset") || el.parentElement;
-  for (let depth = 0; container && depth < 4 && !list; depth += 1) {
-    for (const candidate of container.querySelectorAll("[role='listbox']")) {
-      if (!claimedByOther(candidate)) {
-        list = candidate;
+  function isSelectedItemNode(node) {
+    // The Country Phone Code pill ("India (+91)") lives in selectedItemList.
+    // That list is not How Did You Hear About Us's promptOption menu.
+    if (!node || !node.closest) return false;
+    const auto = ((node.getAttribute && node.getAttribute("data-automation-id")) || "").toLowerCase();
+    if (
+      auto === "selecteditem" ||
+      auto === "selecteditemlist" ||
+      auto === "selecteditemtext" ||
+      auto === "promptselectionlabel"
+    ) {
+      return true;
+    }
+    return !!node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id='selectedItem'], " +
+      "[data-automation-id='selectedItemText']"
+    );
+  }
+  function owningField(node) {
+    if (!node || !node.closest) return null;
+    return node.closest("[data-automation-id^='formField']")
+      || node.closest("[data-field-path], fieldset");
+  }
+  let list = null;
+  const owned = (el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "").trim();
+  if (owned) {
+    for (const id of owned.split(/\s+/)) {
+      const node = document.getElementById(id);
+      if (node && (node.getAttribute("role") || "") === "listbox" && !claimedByOther(node)) {
+        list = node;
         break;
       }
     }
-    container = container.parentElement;
   }
-  if (!list) return [];
+  // A list inside this control counts. A list elsewhere on the page does not,
+  // even when it is the only visible listbox.
+  const widget = [
+    ".select",
+    "[class*='select__']",
+    "fieldset",
+    "[data-automation-id='multiSelectContainer']",
+    "[data-automation-id='multiselectInputContainer']",
+  ].join(", ");
+  const owner = owningField(el);
+  let container = el.closest(widget) || el.parentElement;
+  for (let depth = 0; container && depth < 4 && !list; depth += 1) {
+    if (pageRoot(container)) break;
+    // Do not climb out of this form field into a sibling prompt's selected list.
+    if (owner && container !== owner && !owner.contains(container)) break;
+    for (const candidate of container.querySelectorAll("[role='listbox']")) {
+      if (isSelectedItemNode(candidate) || claimedByOther(candidate)) continue;
+      const candidateOwner = owningField(candidate);
+      if (owner && candidateOwner && candidateOwner !== owner) continue;
+      list = candidate;
+      break;
+    }
+    const parent = container.parentElement;
+    if (!parent || pageRoot(parent)) break;
+    if (owner && parent !== owner && !owner.contains(parent)) break;
+    container = parent;
+  }
+  function shown(node) {
+    if (!node || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function optionShown(option) {
+    if (!option || option.hidden) return false;
+    const style = window.getComputedStyle(option);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+  const optionNodes = [];
+  const optionSelector = [
+    "[role='option']",
+    "[data-automation-id='promptOption']",
+    "[data-automation-id='promptLeafNode']",
+    "[data-automation-id='menuItem']",
+  ].join(", ");
+  if (list) {
+    for (const option of list.querySelectorAll(optionSelector)) {
+      if (optionEnabled(option) && optionShown(option) && !isSelectedItemNode(option)) optionNodes.push(option);
+    }
+  }
+  const promptRoot = el.closest(
+    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  );
+  function promptOpen(node) {
+    if (!node) return false;
+    if (node.getAttribute("aria-expanded") === "true") return true;
+    const root = node.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    return !!(root && root.querySelector("[aria-expanded='true']"));
+  }
+  if (!optionNodes.length && promptRoot) {
+    // Workday draws the prompt menu on document.body. A selected pill on
+    // another field is not that menu. Skip the portal when a different prompt
+    // is the one that is open.
+    const anotherOpen = Array.from(document.querySelectorAll(
+      "[data-automation-id='multiSelectContainer'] [aria-expanded='true'], " +
+      "[data-automation-id='multiselectInputContainer'] [aria-expanded='true']"
+    )).some((node) => !promptRoot.contains(node));
+    if (promptOpen(el) || !anotherOpen) {
+      const portalSelector = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode']";
+      for (const option of document.querySelectorAll(portalSelector)) {
+        if (isSelectedItemNode(option)) continue;
+        if (optionEnabled(option) && shown(option)) optionNodes.push(option);
+      }
+    }
+  }
+  if (!optionNodes.length && allowSingle) {
+    // One unclaimed visible list. Two menus means we will not guess which one.
+    // A selected-item list is a value, not a menu.
+    const boxes = [];
+    for (const candidate of document.querySelectorAll("[role='listbox']")) {
+      if (claimedByOther(candidate) || !shown(candidate) || isSelectedItemNode(candidate)) continue;
+      boxes.push(candidate);
+    }
+    if (boxes.length === 1) {
+      for (const option of boxes[0].querySelectorAll(optionSelector)) {
+        if (optionEnabled(option) && optionShown(option)) optionNodes.push(option);
+      }
+    }
+  }
+  if (!optionNodes.length) return [];
   const options = [];
-  for (const option of list.querySelectorAll("[role='option']")) {
+  for (const option of optionNodes) {
     const label = textOf(option);
     if (!label) continue;
+    const nested = option.querySelector(
+      "[role='option'], [data-automation-id='promptOption'], [data-automation-id='promptLeafNode']"
+    );
+    if (nested && nested !== option && textOf(nested) === label) continue;
     if (!option.id) option.setAttribute("data-autofill-option", String(options.length));
     const itemSelector = option.id
       ? "#" + CSS.escape(option.id)
@@ -152,6 +281,10 @@ _COMMIT_JS = r"""
     return text === wanted || text.indexOf(wanted) !== -1 || wanted.indexOf(text) !== -1;
   }
   const field = el.closest(".field, .select, fieldset") || el.parentElement;
+  const promptRoot = el.closest(
+    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  );
+  const fieldRoot = el.closest("[data-automation-id^='formField']");
   let error = el.getAttribute("aria-invalid") === "true";
   if (field) {
     const nodes = field.querySelectorAll("[role='alert'], .field-error, .error-message, .select-error, .error");
@@ -163,7 +296,8 @@ _COMMIT_JS = r"""
   }
   let hiddenOk = false;
   let tracksValue = false;
-  const root = field || el.parentElement || document.body;
+  const root = (promptRoot && fieldRoot) || promptRoot || field || el.parentElement || document.body;
+  if (promptRoot) tracksValue = true;
   function hiddenControl(node) {
     if (!node || node === el) return false;
     const type = (node.getAttribute("type") || "").toLowerCase();
@@ -191,12 +325,31 @@ _COMMIT_JS = r"""
     const active = document.getElementById(activeId);
     if (active && matches(active.textContent)) ariaOk = true;
   }
+  const pillSelector = [
+    "[data-automation-id='selectedItem']",
+    "[data-automation-id='selectedItemText']",
+    "[data-automation-id*='selectedItem']",
+  ].join(", ");
+  const pills = root.querySelectorAll(pillSelector);
+  if (pills.length) {
+    tracksValue = true;
+    for (const pill of pills) {
+      if (matches(pill.textContent)) shownOk = true;
+    }
+  }
   const picked = root.querySelector("[role='option'][aria-selected='true']");
   if (picked) {
     tracksValue = true;
     if (matches(picked.textContent)) ariaOk = true;
   }
-  return { error, hiddenOk, shownOk, ariaOk, tracksValue };
+  let inputOk = false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") inputOk = fold(el.value) === wanted;
+  let buttonOk = false;
+  if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
+    buttonOk = fold(el.innerText || el.textContent) === wanted;
+  }
+  return { error, hiddenOk, shownOk, ariaOk, tracksValue, inputOk, buttonOk };
 }
 """
 
@@ -208,21 +361,29 @@ def _pause(page, millis: int) -> None:
     pause(millis)
 
 
-def _combobox_committed(page, selector: str, label: str) -> bool:
+def _combobox_committed(page, selector: str, label: str, *, accept_input: bool = False) -> bool:
+    """True only when the widget shows the choice. A click that changes nothing is not a commit.
+
+    The search input counts only when ``accept_input`` is set. Typing a filter
+    leaves that same text in the box before a choice exists.
+    """
     try:
         state = page.evaluate(_COMMIT_JS, {"selector": selector, "label": label}) or {}
     except Exception:
         return False
     if not isinstance(state, dict) or state.get("error"):
         return False
-    if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk"):
+    if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk") or state.get("buttonOk"):
         return True
-    return not bool(state.get("tracksValue"))
+    return bool(accept_input and state.get("inputOk"))
 
 
-def _read_options(page, selector: str) -> list[Option]:
+def _read_options(page, selector: str, *, allow_single: bool = False) -> list[Option]:
     try:
-        raw = page.evaluate(_SCOPED_OPTIONS_JS, selector) or []
+        raw = page.evaluate(
+            _SCOPED_OPTIONS_JS,
+            {"selector": selector, "allowSingle": allow_single},
+        ) or []
     except Exception:
         return []
     found: list[Option] = []
@@ -253,15 +414,71 @@ def _filter_terms(desired: str) -> list[str]:
     return [desired]
 
 
-def _poll_options(page, selector: str, attempts: int, delay_ms: int) -> list[Option]:
-    found: list[Option] = []
-    for _ in range(attempts):
+def _await_menu(page, selector: str, timeout_ms: int) -> list[Option]:
+    """Read the open menu until options appear or ``timeout_ms`` passes."""
+    found = _read_options(page, selector)
+    if found or timeout_ms <= 0 or getattr(page, "wait_for_timeout", None) is None:
+        return found
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        _pause(page, 50)
         found = _read_options(page, selector)
         if found:
             return found
-        if getattr(page, "wait_for_timeout", None) is None:
-            break
-        _pause(page, delay_ms)
+    return found
+
+
+_OPENER_JS = r"""
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return "";
+  const widget = [
+    "[data-automation-id='multiSelectContainer']",
+    "[data-automation-id='multiselectInputContainer']",
+    ".select",
+    ".select__control",
+  ].join(", ");
+  const root = el.closest(widget) || el.parentElement;
+  const icon = root && root.querySelector(
+    "[data-automation-id='promptIcon'], [data-automation-id='promptSearchButton']"
+  );
+  function mark(node) {
+    if (!node || node === el) return "";
+    if (node.id) return "#" + CSS.escape(node.id);
+    if (!node.getAttribute("data-autofill-open")) node.setAttribute("data-autofill-open", "prompt");
+    return "[data-autofill-open='prompt']";
+  }
+  if (icon) return mark(icon);
+  const control = el.closest(".select__control");
+  if (control && control !== el) return mark(control);
+  return "";
+}
+"""
+
+
+def _click_fallback_opener(page, selector: str) -> bool:
+    """Click the prompt icon or the closed control when the input click did not open a menu."""
+    try:
+        opener = str(page.evaluate(_OPENER_JS, selector) or "")
+    except Exception:
+        return False
+    if not opener or opener == selector:
+        return False
+    try:
+        open_combobox(page, opener)
+    except Exception:
+        return False
+    return True
+
+
+def _open_for_options(page, selector: str) -> list[Option]:
+    """Open the menu and wait. An async or portaled list is not read before it exists."""
+    open_combobox(page, selector)
+    found = _await_menu(page, selector, 400)
+    if found:
+        return found
+    if _click_fallback_opener(page, selector):
+        return _await_menu(page, selector, 1500)
     return found
 
 
@@ -285,19 +502,23 @@ def _type_filter(page, selector: str, text: str) -> None:
 
 
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
-    """Open the menu once, read option text, and close it."""
+    """Open the menu once, read option text, and close it.
+
+    The prompt icon is clicked when the input click does not reveal options.
+    Workday search prompts open from that icon, and the menu is ``promptOption``
+    rows, not another field's selected pills.
+    """
     if not selector:
         return []
     focus_field(page, selector)
     try:
-        open_combobox(page, selector)
-        found = _poll_options(page, selector, 6, 80)
+        found = _open_for_options(page, selector)
     except Exception:
         found = []
     labels: list[str] = []
     for option in found:
         label = (option.label or option.value).strip()
-        if not label:
+        if not label or label in labels:
             continue
         labels.append(label[:200])
         if len(labels) >= limit:
@@ -309,8 +530,20 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
     return labels
 
 
-def _keyboard_commit(page, selector: str, desired: str) -> None:
-    """Type the option into the combobox input and confirm with Enter."""
+def _same_option(left: Option, right: Option) -> bool:
+    wanted = _fold(right.label) or _fold(right.value)
+    if not wanted:
+        return False
+    return wanted in {_fold(left.label), _fold(left.value)}
+
+
+def _keyboard_commit(page, selector: str, desired: str, match: Option | None = None) -> None:
+    """Type the option and confirm it.
+
+    ArrowDown is pressed only when the first visible row is that option.
+    Enter otherwise confirms a widget that commits the typed label, and does
+    not highlight a different first row.
+    """
     field = page.locator(selector)
     try:
         page.evaluate(_BLOCK_SUBMIT_JS)
@@ -320,6 +553,19 @@ def _keyboard_commit(page, selector: str, desired: str) -> None:
             target = inner.first
         target.fill("")
         target.press_sequentially(desired, delay=type_char_delay())
+        found = _await_menu(page, selector, 800)
+        if match is not None and found and _same_option(found[0], match):
+            target.press("ArrowDown")
+        # Enter confirms the row. It must not activate the form's submit button.
+        target.evaluate(
+            """(el) => {
+              if (el.dataset.autofillEnterHeld) return;
+              el.dataset.autofillEnterHeld = "1";
+              el.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") event.preventDefault();
+              }, true);
+            }"""
+        )
         target.press("Enter")
     except Exception:
         return
@@ -330,7 +576,10 @@ _BLOCK_SUBMIT_JS = """
 () => {
   if (window.__autofillBlockSubmit) return;
   window.__autofillBlockSubmit = true;
-  document.addEventListener("submit", (event) => event.preventDefault(), true);
+  document.addEventListener("submit", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
 }
 """
 
@@ -344,13 +593,17 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     if not selector or not desired.strip():
         return None
     focus_field(page, selector)
-    open_combobox(page, selector)
-    found = _poll_options(page, selector, 4, 50)
+    found = _open_for_options(page, selector)
+    if not found:
+        # A prompt list that is not wired with aria-controls, and is the only open menu.
+        found = _read_options(page, selector, allow_single=True)
+    typed = False
     match = _match_desired(desired, found)
     if match is None:
         for term in _filter_terms(desired):
             _type_filter(page, selector, term)
-            found = _poll_options(page, selector, 10, 80)
+            typed = True
+            found = _await_menu(page, selector, 1500)
             match = _match_desired(desired, found)
             if match is not None:
                 break
@@ -359,10 +612,10 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return None
     click_choice(page, match.selector, match.label)
     _pause(page, 50)
-    if _combobox_committed(page, selector, match.label):
+    if _combobox_committed(page, selector, match.label, accept_input=not typed):
         return match
-    _keyboard_commit(page, selector, desired)
-    if _combobox_committed(page, selector, match.label):
+    _keyboard_commit(page, selector, desired, match)
+    if _combobox_committed(page, selector, match.label, accept_input=True):
         return match
     dismiss_combobox(page)
     return None

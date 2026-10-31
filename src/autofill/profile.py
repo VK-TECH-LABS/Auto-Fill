@@ -193,6 +193,16 @@ class ApplicationAnswer:
 
     question: str
     answer: str
+    # TileArc's canonical intent for this saved answer (e.g. SPONSORSHIP_FUTURE),
+    # when known. It is checked against the question text before it is used.
+    intent: str = ""
+    # Employer this answer belongs to. Empty means the host did not name one.
+    # Previously-employed answers are not reused for a different employer.
+    employer: str = ""
+    # True when this fill verified the value. A host-supplied row stays False.
+    from_session: bool = False
+    # Catalogue key. Recruitment SMS is ``recruitment_sms_consent``.
+    key: str = ""
 
 
 @dataclass
@@ -362,9 +372,30 @@ def _accept_extended_shape(data: dict) -> dict:
     merged["personal"] = personal
 
     compensation = dict(_section(merged, "compensation"))
-    if merged.get("salaryExpectation") not in (None, "") and not compensation.get("salary_expectation"):
-        compensation["salary_expectation"] = merged["salaryExpectation"]
-        merged["compensation"] = compensation
+    # A saved minimum is the floor or the low end of a range. It is not a max.
+    _compensation_aliases = {
+        "salaryExpectation": "salary_expectation",
+        "desiredSalary": "salary_expectation",
+        "desired_salary": "salary_expectation",
+        "minimumSalary": "salary_range_min",
+        "minimum_salary": "salary_range_min",
+        "salaryMin": "salary_range_min",
+        "salary_min": "salary_range_min",
+        "salaryRangeMin": "salary_range_min",
+        "salaryRangeMax": "salary_range_max",
+        "maximumSalary": "salary_range_max",
+        "maximum_salary": "salary_range_max",
+        "salaryMax": "salary_range_max",
+        "salary_max": "salary_range_max",
+    }
+    for source, dest in _compensation_aliases.items():
+        incoming = merged.get(source)
+        if incoming not in (None, "") and not compensation.get(dest):
+            compensation[dest] = incoming
+        nested = compensation.get(source)
+        if nested not in (None, "") and not compensation.get(dest):
+            compensation[dest] = nested
+    merged["compensation"] = compensation
 
     work = dict(_section(merged, "work_authorization"))
     raw_auth = merged.get("workAuthorization")
@@ -437,8 +468,37 @@ def _project_list(raw: object) -> list[Project]:
     ]
 
 
+def _stored_intent(value: str) -> str:
+    """Keep a host intent. ``SMS_CONSENT`` is the recruitment-SMS alias."""
+    from autofill.sms_consent import canonical_sms_intent
+
+    return canonical_sms_intent(value)[:64]
+
+
+def _answer_row(entry: dict) -> ApplicationAnswer:
+    """One application answer. Recruitment SMS is normalized to the host key."""
+    from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer, canonical_sms_key
+
+    question = _text(entry, "question")
+    intent = _stored_intent(_text(entry, "intent"))
+    key = canonical_sms_key(_text(entry, "key")) or canonical_sms_key(question)
+    if intent == SMS_INTENT:
+        key = key or SMS_KEY
+    if key == SMS_KEY and not intent:
+        intent = SMS_INTENT
+    if not question and key:
+        question = key
+    answer = _text(entry, "answer")
+    if key == SMS_KEY or intent == SMS_INTENT:
+        answer = canonical_sms_answer(answer)
+    return ApplicationAnswer(
+        question=question,
+        answer=answer,
+        intent=intent,
+        employer=_text(entry, "employer")[:200],
+        key=key,
+    )
+
+
 def _answer_list(raw: object) -> list[ApplicationAnswer]:
-    return [
-        ApplicationAnswer(question=_text(entry, "question"), answer=_text(entry, "answer"))
-        for entry in _objects(raw, "applicationAnswers")
-    ]
+    return [_answer_row(entry) for entry in _objects(raw, "applicationAnswers")]

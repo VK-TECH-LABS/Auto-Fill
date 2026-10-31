@@ -19,7 +19,7 @@ from typing import Any
 
 from autofill.adapters import adapter_for, page_step
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats, site_domain
-from autofill.credentials import CredentialProvider, SiteContext
+from autofill.credentials import CredentialProvider, SiteContext, credential_scope
 from autofill.dom_ui import (
     attach_page,
     begin_run,
@@ -35,18 +35,29 @@ from autofill.dom_ui import (
 )
 from autofill.extract import challenge_message, extract_page
 from autofill.fill import fill_one_page
-from autofill.login import LoginDetector, account_decision, account_view, run_login, score_account, verification_present
+from autofill.login import (
+    LoginDetector,
+    account_decision,
+    account_view,
+    run_login,
+    score_account,
+    stop_account,
+    verification_present,
+)
 from autofill.mapping import bind_standard_terms, consume_auto_consents
 from autofill.models import FillResult, JobContext
 from autofill.pagewait import (
     classify_page,
     current_page_type,
     find_entry_control,
+    has_application_submit,
     icims_login_gate,
     invalid_field_messages,
+    is_job_closed,
     is_login_wall,
     is_review,
     is_site_error,
+    navigation_changed,
     navigation_signature,
     note_page_type,
     register_pane,
@@ -67,9 +78,12 @@ from autofill.safeguards import (
     HumanSubmissionRequired,
     activate,
     activate_entry,
+    dismiss_cookie_banner,
     field_class_for_button,
+    install_final_submit_guard,
     is_add_row,
     is_forward_navigation,
+    release_final_submit_guard,
 )
 from autofill.session import SessionStore
 from autofill.stepfill import (
@@ -112,6 +126,11 @@ class Status:
     NAVIGATION_STALLED = "NAVIGATION_STALLED"
 
 
+# A write can reveal the next controls. The step is filled again at most this
+# many times, then whatever is still empty is one human stop.
+REVEAL_ATTEMPTS = 3
+
+
 @dataclass
 class AutofillOptions:
     """Per-call options. ``page`` is an existing Playwright page when the host has one."""
@@ -142,12 +161,26 @@ class AutofillOptions:
     resume_prepared: bool = False
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    # Why the last prepared attach failed: {"reason", "siteErrors"}. None when it
+    # was not tried or the verifier accepted the file. No file name, no bytes.
+    resume_failure: dict[str, Any] | None = None
     on_paint: Any = None
     on_page: Any = None
     on_navigation: Any = None
+    on_observed: Any = None
+    on_nav_block: Any = None
+    # (selector, name, signature) of a Next that already ran on this page.
+    # The same control is not pressed again while that signature is current.
+    nav_block: tuple | None = None
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
+    # The service registered a Workday account in this session and no person has
+    # pressed Continue since. A Sign In pane now means "verify the email first".
+    verify_pending: bool = False
+    # Local helper: called between pages and before Next/entry clicks. It
+    # raises when a newer Apply replaced this fill. The hosted runner leaves it unset.
+    cancel_check: Any = None
 
 
 @dataclass
@@ -178,12 +211,15 @@ class ApplicationResult:
     completed_keys: list[str] = field(default_factory=list)
     resume_verified_now: bool = False
     resume_site_errors: list[str] = field(default_factory=list)
+    resume_failure: dict[str, Any] | None = None
     page_type: str = ""
     auto_consents: list[dict[str, Any]] = field(default_factory=list)
     entry_clicks: int = 0
     next_clicks: int = 0
     pages_advanced: int = 0
     last_navigation: dict[str, str] | None = None
+    # Route, visible fields, and heading when this stop was collected.
+    page_signature: tuple | None = None
 
     def __post_init__(self) -> None:
         if not self.stopped_before_submit:
@@ -250,6 +286,16 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
     if active is not None:
         kwargs.setdefault("resume_verified_now", active.resume_verified_now)
         kwargs.setdefault("resume_site_errors", list(active.resume_site_errors))
+        if active.resume_failure is not None:
+            kwargs.setdefault("resume_failure", dict(active.resume_failure))
+    pending = _PENDING_ACCOUNT.get()
+    if pending is not None:
+        _PENDING_ACCOUNT.set(None)
+        if pending[0] == status and pending[1] is not None and kwargs.get("account") is None:
+            if status == Status.ACCOUNT_CREATION_REQUIRED or (
+                active is not None and _protocol_070(active)
+            ):
+                kwargs["account"] = pending[1]
     progress, blocking, open_items = finalize_run(status)
     state = current_run()
     if "completed_keys" not in kwargs and state is not None:
@@ -269,6 +315,10 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         **kwargs,
     )
     result.page_type = current_page_type()
+    if result.page_type == "JOB_CLOSED":
+        result.progress["stage"] = "CLOSED"
+        result.progress["currentLabel"] = "Job closed"
+        result.progress["percent"] = 0
     result.auto_consents = consume_auto_consents()
     nav = _navigation_record()
     result.entry_clicks = int(nav["entryClicks"])
@@ -332,6 +382,9 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
     if resettle_account(page, snapshot):
         snapshot = extract_page(page)
         note_snapshot(snapshot)
+    opened = _open_email_sign_in_once(page, snapshot, session)
+    if opened is not None:
+        return _pane_stop(page, opened, session, opts, ats_name, **extra)
     url = _page_url(page)
     extra.setdefault("fields_detected", len(visible_fields(snapshot)))
     login_status = str(extra.pop("login_status", "NOT_REQUIRED"))
@@ -343,6 +396,17 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ats=ats_name,
             login_status=login_status,
             messages=[challenge_message(snapshot)],
+            **extra,
+        )
+    if is_job_closed(snapshot):
+        note_page_type("JOB_CLOSED")
+        session.mark(Status.FAILED_FINAL)
+        return snapshot, _result(
+            session,
+            status=Status.FAILED_FINAL,
+            ats=ats_name,
+            login_status=login_status,
+            messages=["job_expired"],
             **extra,
         )
     if is_site_error(snapshot):
@@ -357,7 +421,10 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     kind = classify_page(snapshot, url=url)
-    if not opts.human_resolved and (register_pane(snapshot) or kind == "ACCOUNT"):
+    # A Create Account form is checked before any Sign In rule, and Continue
+    # (``human_resolved``) does not skip it: the form is still in front of us.
+    # Only the weaker text-only ACCOUNT page type is left to the person.
+    if register_pane(snapshot) or (not opts.human_resolved and kind == "ACCOUNT"):
         _this_page_counts(extra, snapshot)
         decision = account_decision(snapshot, url, ats_name)
         if decision is not None and decision.status == Status.ACCOUNT_CREATION_REQUIRED:
@@ -396,20 +463,15 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
         snapshot.password_present or password_fields
     ):
         _this_page_counts(extra, snapshot)
-        session.mark("LOGIN_FAILED")
-        return snapshot, _attach_login_account(
-            _result(
-                session,
-                status=Status.LOGIN_REQUIRED,
-                ats=ats_name,
-                login_status="LOGIN_REQUIRED",
-                messages=["Sign-in is required before the application form. Nothing was typed."],
-                **extra,
-            ),
+        return snapshot, _login_stop(
+            session,
             snapshot,
             url,
             ats_name,
             opts,
+            messages=["Sign-in is required before the application form. Nothing was typed."],
+            login_status=login_status,
+            **extra,
         )
     if not opts.human_resolved and kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
         _this_page_counts(extra, snapshot)
@@ -425,41 +487,29 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             ],
             **extra,
         )
-    if register_pane(snapshot) and not opts.human_resolved:
-        _this_page_counts(extra, snapshot)
-        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
-        scored = score_account(snapshot, url)
-        return snapshot, _result(
-            session,
-            status=Status.ACCOUNT_CREATION_REQUIRED,
-            ats=ats_name,
-            login_status=login_status,
-            messages=["Create an employer account. Nothing was typed."],
-            account=account_view(snapshot, url, ats_name, mode="register", alternate=scored.alternate),
-            **extra,
-        )
+    # A page with no fields is not a form, except the last step whose only
+    # control is Submit application. That stop is READY, decided below.
     if kind == "CONFIRMATION" or (
-        not opts.human_resolved and not visible_fields(snapshot) and not is_review(snapshot) and kind not in {
+        not opts.human_resolved
+        and not visible_fields(snapshot)
+        and not is_review(snapshot)
+        and not has_application_submit(snapshot)
+        and kind not in {
             "APPLICATION_FORM",
             "REVIEW",
         }
     ):
         if not opts.human_resolved and (sign_in_pane(snapshot) or is_login_wall(snapshot)):
             _this_page_counts(extra, snapshot)
-            session.mark("LOGIN_FAILED")
-            return snapshot, _attach_login_account(
-                _result(
-                    session,
-                    status=Status.LOGIN_REQUIRED,
-                    ats=ats_name,
-                    login_status="LOGIN_REQUIRED",
-                    messages=["Sign-in is required before the application form. Nothing was typed."],
-                    **extra,
-                ),
+            return snapshot, _login_stop(
+                session,
                 snapshot,
                 url,
                 ats_name,
                 opts,
+                messages=["Sign-in is required before the application form. Nothing was typed."],
+                login_status=login_status,
+                **extra,
             )
         _this_page_counts(extra, snapshot)
         session.mark(Status.NO_FORM_FOUND)
@@ -472,6 +522,36 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     return snapshot, None
+
+
+def _open_email_sign_in_once(page, snapshot, session):
+    """On a Google / Apple / LinkedIn chooser, open the email sign-in form once.
+
+    Workday tenants such as KLA show only identity-provider buttons and a
+    "Sign in with email" button until that button is clicked. Without the click
+    the run stopped on "Sign in inside the preview" even with saved credentials.
+    Identity-provider buttons are never clicked here.
+    """
+    from autofill.login import email_sign_in_button, open_email_sign_in
+
+    if "OPEN_EMAIL_SIGN_IN" in session.steps or snapshot.captcha_present:
+        return None
+    if email_sign_in_button(snapshot) is None:
+        return None
+    on_sign_in = (
+        sign_in_pane(snapshot)
+        or is_login_wall(snapshot)
+        or classify_page(snapshot, url=_page_url(page)) == "LOGIN"
+    )
+    if not on_sign_in:
+        return None
+    session.steps.append("OPEN_EMAIL_SIGN_IN")
+    fresh = open_email_sign_in(page, snapshot)
+    if fresh is None:
+        return None
+    note_snapshot(fresh)
+    logger.info("session=%s email_sign_in=opened", session.session_id)
+    return fresh
 
 
 def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
@@ -495,6 +575,162 @@ def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str 
     )
 
 
+_CREATE_ACCOUNT_MESSAGE = "Create an employer account. Nothing was typed."
+
+
+def _login_stop(
+    session,
+    snapshot,
+    url: str,
+    ats_name: str | None,
+    opts: AutofillOptions,
+    *,
+    messages: list[str],
+    login_status: str = "NOT_REQUIRED",
+    **extra,
+) -> ApplicationResult:
+    """A Sign In stop, unless the page is really a Create Account form.
+
+    A page that scores as Create Account (Verify / Confirm password, Workday
+    ``createAccount*`` ids) is reported as ``ACCOUNT_CREATION_REQUIRED`` with a
+    ``mode=register`` account, even when a Sign In link or tab is visible.
+    """
+    status, account = stop_account(snapshot, url, ats_name, Status.LOGIN_REQUIRED)
+    if status == Status.ACCOUNT_CREATION_REQUIRED:
+        logger.info("session=%s account_stop=register source=sign_in_check", session.session_id)
+        note_page_type("ACCOUNT")
+        session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+        return _result(
+            session,
+            status=Status.ACCOUNT_CREATION_REQUIRED,
+            ats=ats_name,
+            login_status=login_status,
+            messages=[_CREATE_ACCOUNT_MESSAGE],
+            account=account,
+            **extra,
+        )
+    session.mark("LOGIN_FAILED")
+    return _attach_login_account(
+        _result(
+            session,
+            status=Status.LOGIN_REQUIRED,
+            ats=ats_name,
+            login_status="LOGIN_REQUIRED",
+            messages=messages,
+            **extra,
+        ),
+        snapshot,
+        url,
+        ats_name,
+        opts,
+    )
+
+
+def _account_sign_in_pane(snapshot, url: str) -> bool:
+    """A Sign In pane by the account scorer (Workday's email box is type=text).
+
+    ``sign_in_pane`` treats any plain text input as an application field, so after
+    Continue (``human_resolved``) a Workday Sign In pane was filled as if it were the
+    application (status FILLED, nobody signed in). Continue after the verify card
+    must sign in once instead.
+    """
+    from autofill.account_flow import _returned_to_sign_in
+
+    try:
+        return _returned_to_sign_in(snapshot, url)
+    except Exception:
+        return False
+
+
+def _verify_first(opts: AutofillOptions, ats_name: str | None, url: str) -> bool:
+    """A Workday account registered in this session is still waiting for its verification email."""
+    from autofill.account_flow import _is_workday
+
+    return bool(opts.verify_pending) and _protocol_070(opts) and _is_workday(ats_name, url)
+
+
+def _verify_before_sign_in(session, snapshot, url: str, ats_name: str | None) -> ApplicationResult:
+    """Park on the existing verify card. Nothing is typed into Sign In."""
+    from autofill.account_flow import _VERIFY_FIRST_MESSAGE
+
+    try:
+        account = account_view(snapshot, url, ats_name, mode="login", alternate=False)
+    except Exception:
+        account = None
+    if account is not None:
+        account["verifyBeforeSignIn"] = True
+    logger.info("session=%s verify_before_sign_in=true reason=registered_unverified", session.session_id)
+    session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+    return _result(
+        session,
+        status=Status.EMAIL_VERIFICATION_REQUIRED,
+        ats=ats_name,
+        login_status="LOGIN_REQUIRED",
+        messages=[_VERIFY_FIRST_MESSAGE],
+        account=account,
+    )
+
+
+def _login_failed(
+    session,
+    page,
+    url: str,
+    ats_name: str | None,
+    secrets: list[str],
+    *,
+    verify_card: bool = False,
+) -> ApplicationResult:
+    """LOGIN_FAILED with the site's own banner and a plain reason. Nothing is retried.
+
+    With ``verify_card`` (protocol 0.7.0) an "account not verified" banner stops on
+    EMAIL_VERIFICATION_REQUIRED instead: Companion shows the verify card, refuses
+    saved-login typing there, and Continue signs in once after the person verifies.
+    """
+    from autofill.login import LOGIN_FAILED_MESSAGES, login_failure_reason, redact_site_error
+
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        snapshot = None
+    reason = "rejected"
+    errors: list[str] = []
+    account = None
+    if snapshot is not None:
+        reason = login_failure_reason(snapshot)
+        for raw in [snapshot.banner, *snapshot.alerts]:
+            cleaned = redact_site_error(raw, secrets)
+            if cleaned and cleaned not in errors:
+                errors.append(cleaned)
+        try:
+            account = account_view(snapshot, url, ats_name, mode="login", alternate=False, site_errors=errors[:5])
+        except Exception:
+            account = None
+    if account is not None:
+        account["loginFailure"] = reason
+    logger.info("session=%s login_failed reason=%s site_errors=%d", session.session_id, reason, len(errors))
+    if verify_card and reason == "unverified":
+        if account is not None:
+            account["verifyBeforeSignIn"] = True
+        logger.info("session=%s verify_before_sign_in=true reason=login_unverified", session.session_id)
+        session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+        return _result(
+            session,
+            status=Status.EMAIL_VERIFICATION_REQUIRED,
+            ats=ats_name,
+            login_status="LOGIN_FAILED",
+            messages=[LOGIN_FAILED_MESSAGES[reason]],
+            account=account,
+        )
+    return _result(
+        session,
+        status=Status.LOGIN_FAILED,
+        ats=ats_name,
+        login_status="LOGIN_FAILED",
+        messages=[LOGIN_FAILED_MESSAGES[reason]],
+        account=account,
+    )
+
+
 def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_name: str | None, opts: AutofillOptions):
     if not _protocol_070(opts) or result.status != Status.LOGIN_REQUIRED:
         return result
@@ -508,6 +744,13 @@ def _attach_login_account(result: ApplicationResult, snapshot, url: str, ats_nam
     if int(result.progress.get("requiredTotal") or 0) <= 0:
         result.progress["percent"] = workflow_percent(Status.LOGIN_REQUIRED, "LOGIN", 0, 0)
     return result
+
+
+def _cancel_point(opts: AutofillOptions) -> None:
+    """Stop a superseded local fill. The hook raises; nothing is clicked after it."""
+    hook = getattr(opts, "cancel_check", None)
+    if hook is not None:
+        hook()
 
 
 def _maybe_reattach(page, opts: AutofillOptions) -> None:
@@ -524,6 +767,19 @@ def _maybe_reattach(page, opts: AutofillOptions) -> None:
         opts.resume_bytes,
         session_id=opts.session_id,
     )
+
+
+RESUME_FAILURE_REASONS = ("no_upload_control", "ats_rejected", "not_confirmed")
+
+
+def resume_failure_view(report: dict | None) -> dict[str, Any]:
+    """Public failure reason for a resume attach. Strings capped, nothing identifying."""
+    report = report or {}
+    reason = str(report.get("reason") or "")
+    if reason not in RESUME_FAILURE_REASONS:
+        reason = "not_confirmed"
+    errors = [str(item).strip()[:200] for item in report.get("siteErrors") or [] if str(item).strip()][:5]
+    return {"reason": reason, "siteErrors": errors}
 
 
 def _attach_prepared(page, opts: AutofillOptions) -> str:
@@ -546,9 +802,11 @@ def _attach_prepared(page, opts: AutofillOptions) -> str:
         opts.resume_uploaded = True
         opts.resume_verified_now = True
         opts.resume_prepared = False
+        opts.resume_failure = None
         post_upload_refill(page, session_id=opts.session_id)
         return "attached"
     opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
+    opts.resume_failure = resume_failure_view(report)
     return "failed"
 
 
@@ -642,13 +900,29 @@ def autofill_application(
     owns_browser = page is None
     playwright = None
     browser = None
+    from autofill.answers import bind_catalogue, employer_keys, reset_catalogue
     from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
+    from autofill.mapping import bind_us_page, reset_us_page
 
     confirmed_token = None
     session_token = None
+    catalogue_token = None
+    us_token = None
+    guard_page = None
     try:
+        us_token = bind_us_page()
         confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
         session_token = bind_session_id(opts.session_id)
+        catalogue_token = bind_catalogue(
+            candidate_profile,
+            employer_keys(
+                company=opts.job.company if opts.job is not None else "",
+                url=application_url,
+            ),
+        )
+        from autofill.sms_consent import bind_sms_scope
+
+        bind_sms_scope(candidate_profile, opts.candidate_id or candidate_profile.candidate_id)
         if page is None:
             from playwright.sync_api import sync_playwright
 
@@ -658,6 +932,8 @@ def autofill_application(
             attach_page(page)
             page.goto(application_url)
 
+        install_final_submit_guard(page)
+        guard_page = page
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if is_site_error(snapshot):
             note_page_type("SITE_ERROR")
@@ -726,30 +1002,39 @@ def autofill_application(
                 login_status="NOT_REQUIRED",
                 messages=["Password field is mixed with the application. Auto-Fill will not create an account."],
             )
-        if mode in {"password", "email_first"} and not opts.human_resolved:
+        # Continue on a sign-in form that is still showing uses saved credentials,
+        # then fills the application. It never creates an account. A Create Account
+        # pane already returned above.
+        if mode in {"password", "email_first"} and (
+            not opts.human_resolved
+            or sign_in_pane(snapshot)
+            or _account_sign_in_pane(snapshot, getattr(page, "url", "") or application_url)
+        ):
             context = SiteContext(
                 url=application_url,
-                domain=domain,
+                domain=credential_scope(application_url, ats_name),
                 ats=ats_name,
                 candidate_id=session.candidate_id,
                 session_id=session.session_id,
             )
             creds = credential_provider.get_credentials(context, session.candidate_id) if credential_provider else None
             if creds is None or not creds.password or not (creds.email or creds.username):
-                session.mark("LOGIN_FAILED")
-                return _attach_login_account(
-                    _result(
-                        session,
-                        status=Status.LOGIN_REQUIRED,
-                        ats=ats_name,
-                        login_status="LOGIN_REQUIRED",
-                        messages=["No credentials for this candidate and site. Nothing was typed."],
-                    ),
+                return _login_stop(
+                    session,
                     snapshot,
                     getattr(page, "url", "") or application_url,
                     ats_name,
                     opts,
+                    messages=["No credentials for this candidate and site. Nothing was typed."],
+                    login_status="NOT_REQUIRED",
                 )
+            here = getattr(page, "url", "") or application_url
+            if _verify_first(opts, ats_name, here):
+                # RC-V1 (BW 2026-10-27): the account was just created and the
+                # site now shows Sign In. Typing the new password before the
+                # verification email is opened fails ("verify your account")
+                # and counts toward a lockout. Stop on the verify card instead.
+                return _verify_before_sign_in(session, snapshot, here, ats_name)
             outcome, login_steps = run_login(page, creds)
             session.steps.extend(login_steps)
             if login_steps:
@@ -764,12 +1049,13 @@ def autofill_application(
                 )
             if outcome != "AUTHENTICATED":
                 session.mark("LOGIN_FAILED")
-                return _result(
+                return _login_failed(
                     session,
-                    status=Status.LOGIN_FAILED,
-                    ats=ats_name,
-                    login_status="LOGIN_FAILED",
-                    messages=["Login failed. The application was not filled."],
+                    page,
+                    getattr(page, "url", "") or application_url,
+                    ats_name,
+                    [value for value in (creds.email, creds.username, creds.password) if value],
+                    verify_card=_protocol_070(opts),
                 )
             login_status = "AUTHENTICATED"
         else:
@@ -796,8 +1082,11 @@ def autofill_application(
         submit_controls: list[str] = []
         seen: set[tuple[str, ...]] = set()
         resume_seen = False
-        nav_block: tuple | None = None
+        nav_block = _initial_nav_block(opts)
+        turned = False
+        landed = False
         for index in range(opts.max_pages):
+            _cancel_point(opts)
             _maybe_reattach(page, opts)
             snapshot = _timed_extract(page, opts, run_started, inspect_state)
             if snapshot.captcha_present:
@@ -863,8 +1152,24 @@ def autofill_application(
             )
             if stopped is not None:
                 return stopped
+            _note_observed(page, opts)
             visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
             if visible in seen:
+                if turned:
+                    detected, filled, skipped = _counts(fields)
+                    session.mark(Status.NAVIGATION_STALLED)
+                    return _result(
+                        session,
+                        status=Status.NAVIGATION_STALLED,
+                        ats=ats_name,
+                        login_status=login_status,
+                        fields_detected=detected,
+                        fields_filled=filled,
+                        fields_skipped=skipped,
+                        manual_actions=manual,
+                        messages=["navigation_stalled"],
+                        submit_controls=submit_controls,
+                    )
                 break
             seen.add(visible)
             for button in snapshot.buttons:
@@ -990,7 +1295,10 @@ def autofill_application(
                 )
 
             alert = validation_message(snapshot)
-            if alert:
+            # A banner that rode along onto a step we just opened, with no
+            # flagged field, is not a reason to stop. The page we were already
+            # on still stops before Next.
+            if alert and not (landed and not _aria_invalid(page)):
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 detected, filled, skipped = _counts(fields)
                 return _result(
@@ -1005,16 +1313,20 @@ def autofill_application(
                     messages=[alert],
                     submit_controls=submit_controls,
                 )
+            landed = False
             current_sig = navigation_signature(page, snapshot)
-            if nav_block is not None and nav_block[2] != current_sig:
+            if _release_block(nav_block, current_sig):
                 nav_block = None
-            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
-            if nxt is None:
+            nxt = _next_button(snapshot, nav_block)
+            if nxt is None or index + 1 >= opts.max_pages:
                 break
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except HumanSubmissionRequired:
+                break
             except NavigationStalled:
+                _forward_block(opts, nxt, current_sig)
                 detected, filled, skipped = _counts(fields)
                 session.mark(Status.NAVIGATION_STALLED)
                 return _result(
@@ -1029,7 +1341,8 @@ def autofill_application(
                     messages=["navigation_stalled"],
                     submit_controls=submit_controls,
                 )
-            if validation_message(snapshot):
+            moved = navigation_changed(current_sig, page, snapshot)
+            if validation_message(snapshot) and not moved:
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 detected, filled, skipped = _counts(fields)
                 return _result(
@@ -1044,7 +1357,9 @@ def autofill_application(
                     messages=[validation_message(snapshot)],
                     submit_controls=submit_controls,
                 )
-            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
+            nav_block = _forward_block(opts, nxt, current_sig)
+            turned = True
+            landed = moved
 
         if resume_seen:
             session.mark("CONTINUE_AFTER_RESUME")
@@ -1127,11 +1442,17 @@ def autofill_application(
             timings=_timings(opts),
         )
     finally:
+        if guard_page is not None:
+            release_final_submit_guard(guard_page)
         reset_location_profile(_profile_token)
         if confirmed_token is not None:
             reset_confirmed(confirmed_token)
         if session_token is not None:
             reset_session_id(session_token)
+        if catalogue_token is not None:
+            reset_catalogue(catalogue_token)
+        if us_token is not None:
+            reset_us_page(us_token)
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:
@@ -1254,6 +1575,16 @@ def _no_form_messages() -> list[str]:
     ]
 
 
+_PENDING_ACCOUNT: contextvars.ContextVar[tuple[str, dict | None] | None] = contextvars.ContextVar(
+    "autofill_pending_account", default=None
+)
+
+
+def _ats_for(page) -> str | None:
+    info = detect_ats(_page_url(page))
+    return info.name if info else None
+
+
 def _terminal_status(
     page,
     snapshot,
@@ -1272,9 +1603,15 @@ def _terminal_status(
         required_total=required_total,
         submit_names=submit_names,
     )
-    if decision == "ACCOUNT":
-        return Status.ACCOUNT_CREATION_REQUIRED, ["Create an employer account. Nothing was typed."]
-    if decision == "LOGIN":
+    _PENDING_ACCOUNT.set(None)
+    if decision in {"ACCOUNT", "LOGIN"}:
+        wanted = Status.ACCOUNT_CREATION_REQUIRED if decision == "ACCOUNT" else Status.LOGIN_REQUIRED
+        status, account = stop_account(snapshot, _page_url(page), _ats_for(page), wanted)
+        _PENDING_ACCOUNT.set((status, account))
+        if status == Status.ACCOUNT_CREATION_REQUIRED:
+            if decision == "LOGIN":
+                note_page_type("ACCOUNT")
+            return Status.ACCOUNT_CREATION_REQUIRED, [_CREATE_ACCOUNT_MESSAGE]
         return Status.LOGIN_REQUIRED, ["Sign-in is required before the application form. Nothing was typed."]
     if decision == "JOB":
         reason = "job_description" if current_page_type() == "JOB_DESCRIPTION" else "apply_entry"
@@ -1282,6 +1619,8 @@ def _terminal_status(
             "This page is a job description. Auto-Fill did not find an application form.",
             reason,
         ]
+    if decision == "JOB_CLOSED":
+        return Status.FAILED_FINAL, ["job_expired"]
     if decision == "SITE_ERROR":
         return Status.FAILED_RETRYABLE, site_error_messages(snapshot)
     if decision == "CAPTCHA":
@@ -1318,6 +1657,66 @@ def _adopt_page(opts: AutofillOptions, new_page):
     return new_page
 
 
+def _initial_nav_block(opts: AutofillOptions) -> tuple | None:
+    """A Next this recovery already pressed. Anything else is ignored."""
+    block = opts.nav_block
+    if isinstance(block, tuple) and len(block) == 3:
+        return block
+    return None
+
+
+def _note_observed(page, opts: AutofillOptions) -> None:
+    """Tell the local helper which page is about to be filled.
+
+    A browser crash propagates so the helper can reconnect once. Any other
+    hook failure is ignored and the fill continues.
+    """
+    hook = opts.on_observed
+    if hook is None:
+        return
+    try:
+        hook(page)
+    except Exception as exc:
+        if is_browser_crash(exc):
+            raise
+        return
+
+
+def _publish_nav_block(opts: AutofillOptions, block: tuple) -> None:
+    """Remember the Next that just ran on this signature. The hook must not type."""
+    hook = opts.on_nav_block
+    if hook is None:
+        return
+    try:
+        hook(block)
+    except Exception:
+        return
+
+
+def _forward_block(opts: AutofillOptions, button, signature: tuple) -> tuple:
+    """Key the block to the page the click happened on, not the page it opened."""
+    block = (button.selector, button.name, signature)
+    _publish_nav_block(opts, block)
+    return block
+
+
+def _release_block(block: tuple | None, current_sig: tuple) -> bool:
+    """Drop the block when the route or the heading changed.
+
+    A click that only reveals fields keeps the same step. The same Next stays
+    ineligible so it is not pressed again. A new heading or route is the next
+    step, and a stable Save and Continue there is eligible.
+    """
+    if block is None:
+        return False
+    before = block[2]
+    if before == current_sig:
+        return False
+    if not isinstance(before, tuple) or len(before) < 3 or len(current_sig) < 3:
+        return True
+    return before[0] != current_sig[0] or before[2] != current_sig[2]
+
+
 def _log_move(session_id: str, action: str, result: str) -> None:
     """``result`` is a token. The label, URL, and candidate values stay out of the log."""
     logger.info("session=%s action=%s result=%s", session_id, action, result)
@@ -1349,8 +1748,10 @@ def _log_move(session_id: str, action: str, result: str) -> None:
 def _next_button(snapshot, block: tuple | None = None):
     """The forward control on this step. Submit, Send, and Complete stay unclicked.
 
-    ``block`` is ``(selector, name, signature)`` for a click that already moved
-    the page. The same control is not pressed again while that page is showing.
+    ``block`` is ``(selector, name, signature)`` for a click on that signature.
+    The same control is not pressed again while that page is still showing.
+    A later step with the same selector and name is eligible once the
+    signature changes.
     """
     for button in snapshot.buttons:
         if button.disabled or button.in_ad or button.in_header or not button.in_main:
@@ -1390,13 +1791,22 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
     for _ in range(2):
         if snapshot.captcha_present:
             return page, snapshot
+        if is_job_closed(snapshot):
+            note_page_type("JOB_CLOSED")
+            return page, snapshot
         kind = _observe_page(page, snapshot)
         if kind not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
             return page, snapshot
-        button = find_entry_control(snapshot)
+        button = find_entry_control(snapshot, on_posting=True)
         if button is None:
             return page, snapshot
         before = navigation_signature(page, snapshot)
+        try:
+            dismiss_cookie_banner(page)
+        except Exception as exc:
+            if is_browser_crash(exc) or is_ats_timeout(exc):
+                raise
+        _cancel_point(opts)
         try:
             new_page = activate_entry(
                 page,
@@ -1408,6 +1818,10 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
                 href=button.href,
                 role=button.role,
                 frame_url=button.frame_url,
+                in_header=button.in_header,
+                in_ad=button.in_ad,
+                in_main=button.in_main,
+                on_posting=True,
             )
         except HumanSubmissionRequired:
             raise
@@ -1437,6 +1851,15 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
 _RESUME_NAMED = re.compile(r"\b(resume|résumé|cv|curriculum vitae)\b", re.IGNORECASE)
 
 
+def _aria_invalid(page) -> bool:
+    """True when a control is flagged. A role=alert banner alone is not a flag."""
+    try:
+        found = page.evaluate("() => !!document.querySelector('[aria-invalid=true]')")
+    except Exception:
+        return False
+    return bool(found)
+
+
 def _same_route(page, before: tuple) -> bool:
     """True when the URL route is the one recorded before the click."""
     from urllib.parse import urlparse
@@ -1457,12 +1880,19 @@ def _activate_forward(page, button, session, opts: AutofillOptions, started: flo
     """
     before = navigation_signature(page, snapshot)
     next_started = time.perf_counter()
+    _cancel_point(opts)
     activate(page, button.selector, button.name, control_type=button.control_type, frame_url=button.frame_url)
     advanced, fresh = _confirm_move(page, before, opts, started, state)
     _add_ms(opts, "nextMs", next_started)
     if fresh is None:
         _log_move(session.session_id, "next", "stalled")
         raise NavigationStalled("next")
+    route_changed = not _same_route(page, before)
+    heading_changed = bool(fresh) and navigation_signature(page, fresh)[2] != before[2]
+    if advanced and (route_changed or heading_changed) and not _aria_invalid(page):
+        # A new step with a leftover banner and no flagged control is an advance.
+        _log_move(session.session_id, "next", "advanced")
+        return page, fresh
     if (
         advanced
         and not fresh.captcha_present
@@ -1539,6 +1969,21 @@ def _blocks(item: dict) -> bool:
     return bool(item.get("required", True)) or item.get("kind") == "OPTION_MISMATCH"
 
 
+_STRUCTURE_ACTIONS = frozenset({"select", "check", "uncheck"})
+
+
+def _reveal_settle_ms(fields: list) -> int:
+    """A choice can reveal the next controls after a short timer. Text does not.
+
+    Jobvite reveals the rest of the step 300 ms after the country select, so a
+    select, check, or uncheck still waits. A text-only step does not.
+    """
+    for item in fields:
+        if getattr(item, "action", "") in _STRUCTURE_ACTIONS:
+            return 600
+    return 40
+
+
 def _revealed_fields(page, snapshot, settle_ms: int = 600) -> bool:
     """True when visible fields appeared on the same step after the last write."""
     if page is None or snapshot is None or getattr(page, "wait_for_timeout", None) is None:
@@ -1606,8 +2051,12 @@ def _run_resolver_pages(
             questions=gaps,
         )
 
-    nav_block: tuple | None = None
+    nav_block = _initial_nav_block(opts)
+    turned = False
+    landed = False
+    leave_pages = False
     for index in range(opts.max_pages):
+        _cancel_point(opts)
         _maybe_reattach(page, opts)
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if snapshot.captcha_present:
@@ -1626,6 +2075,9 @@ def _run_resolver_pages(
             return stopped
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
+            if turned:
+                session.mark(Status.NAVIGATION_STALLED)
+                return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
             break
         seen.add(visible)
         _remember_submit(snapshot, submit_controls)
@@ -1634,7 +2086,7 @@ def _run_resolver_pages(
         on_review = step_name == "review" or "review" in snapshot.heading.casefold()
         flags = FillFlags()
         recheck = False
-        for attempt in range(3):
+        for attempt in range(REVEAL_ATTEMPTS):
             fill_started = time.perf_counter()
             outcome = fill_resolved_page(
                 page,
@@ -1655,7 +2107,11 @@ def _run_resolver_pages(
                 _remember_submit(snapshot, submit_controls)
             blocking = [item for item in outcome.manual_questions if _blocks(item)]
             optional = [item for item in outcome.manual_questions if not _blocks(item)]
-            if attempt < 2 and _revealed_fields(page, outcome.snapshot or snapshot):
+            if attempt < REVEAL_ATTEMPTS - 1 and _revealed_fields(
+                page,
+                outcome.snapshot or snapshot,
+                settle_ms=_reveal_settle_ms(outcome.fields),
+            ):
                 # The write opened more of this step (a consent gate or a
                 # conditional section). Fill what appeared before deciding.
                 continue
@@ -1717,25 +2173,32 @@ def _run_resolver_pages(
             if held is not None:
                 return held
             alert = validation_message(snapshot)
-            if alert and not recheck:
+            suppress_landed_banner = bool(landed and alert and not _aria_invalid(page))
+            if alert and not recheck and not suppress_landed_banner:
                 updated = flags_for_alerts(validation_blob(snapshot), flags)
-                if updated != flags and attempt < 2:
+                if updated != flags and attempt < REVEAL_ATTEMPTS - 1:
                     flags = updated
                     recheck = True
                     continue
                 session.mark(Status.MANUAL_ANSWER_REQUIRED)
                 return finish(Status.MANUAL_ANSWER_REQUIRED, [alert, *invalid_field_messages(page)])
+            landed = False
             recheck = False
             current_sig = navigation_signature(page, snapshot)
-            if nav_block is not None and nav_block[2] != current_sig:
+            if _release_block(nav_block, current_sig):
                 nav_block = None
-            nxt = _next_button(snapshot, nav_block if nav_block and nav_block[2] == current_sig else None)
-            if nxt is None:
+            nxt = _next_button(snapshot, nav_block)
+            if nxt is None or index + 1 >= opts.max_pages:
+                leave_pages = True
                 break
             session.mark("NEXT_PAGE")
             try:
                 page, snapshot = _activate_forward(page, nxt, session, opts, run_started, inspect_state, snapshot)
+            except HumanSubmissionRequired:
+                leave_pages = True
+                break
             except NavigationStalled:
+                _forward_block(opts, nxt, current_sig)
                 session.mark(Status.NAVIGATION_STALLED)
                 return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
             if snapshot.captcha_present:
@@ -1744,7 +2207,8 @@ def _run_resolver_pages(
                     Status.CAPTCHA_REQUIRED,
                     [challenge_message(snapshot)],
                 )
-            if validation_message(snapshot):
+            moved = navigation_changed(current_sig, page, snapshot)
+            if validation_message(snapshot) and not moved:
                 named = invalid_field_messages(page)
                 if not opts.resume_uploaded and any(_RESUME_NAMED.search(item) for item in named):
                     # The employer flagged the resume, which this step hid behind
@@ -1756,14 +2220,18 @@ def _run_resolver_pages(
                         Status.RESUME_UPLOAD_REQUIRED,
                         ["Upload the resume that was already downloaded, then continue with resumeUploaded.", *named],
                     )
-                if attempt == 2:
+                if attempt == REVEAL_ATTEMPTS - 1:
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)
                     return finish(
                         Status.MANUAL_ANSWER_REQUIRED,
                         [validation_message(snapshot), *invalid_field_messages(page)],
                     )
                 continue
-            nav_block = (nxt.selector, nxt.name, navigation_signature(page, snapshot))
+            nav_block = _forward_block(opts, nxt, current_sig)
+            turned = True
+            landed = moved
+            break
+        if leave_pages:
             break
 
     snapshot = _timed_extract(page, opts, run_started, inspect_state)

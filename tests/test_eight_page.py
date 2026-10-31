@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from autofill import AutofillOptions, Credentials, MemoryCredentialProvider, Status, autofill_application
+from autofill.credentials import credential_scope
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 
@@ -20,7 +21,6 @@ FIXTURE = Path(__file__).parent / "fixtures" / "eight_page_application.html"
 PASSWORD = "synthetic-password-candidate-a"
 TOKEN = "synthetic-resolver-token-0123456789abcdef"
 URL = "https://boards.greenhouse.io/example/jobs/1"
-DOMAIN = "boards.greenhouse.io"
 CANARY = "CanaryNameShouldNotFill"
 
 ANSWERS = {
@@ -182,7 +182,11 @@ def _profile() -> CandidateProfile:
 
 def _provider() -> MemoryCredentialProvider:
     store = MemoryCredentialProvider()
-    store.put("ref-a", DOMAIN, Credentials(site=DOMAIN, email="avery.example@example.com", password=PASSWORD))
+    store.put(
+        "ref-a",
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="avery.example@example.com", password=PASSWORD),
+    )
     return store
 
 

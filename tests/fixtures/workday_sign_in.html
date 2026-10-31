@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Analyst | Example Workday Careers</title></head>
+<body>
+<!-- Synthetic Workday-style Sign In step: the regression twin of workday_create_account.html. No real data. -->
+<header data-automation-id="header">
+  <a href="#home" data-automation-id="logoLink">Example Careers</a>
+  <button type="button" data-automation-id="utilityButtonSignIn">Sign In</button>
+  <button type="button" data-automation-id="searchForJobsButton">Search for Jobs</button>
+</header>
+<main>
+  <h2 data-automation-id="jobPostingHeader">Example Analyst</h2>
+  <div data-automation-id="signInPage">
+    <h2 data-automation-id="headingText">Sign In</h2>
+    <form onsubmit="return false" novalidate>
+      <div data-automation-id="formField-email">
+        <label for="input-4">Email Address<abbr title="required">*</abbr></label>
+        <input id="input-4" type="text" data-automation-id="email" aria-required="true" autocomplete="username">
+      </div>
+      <div data-automation-id="formField-password">
+        <label for="input-5">Password<abbr title="required">*</abbr></label>
+        <input id="input-5" type="password" data-automation-id="password" aria-required="true">
+      </div>
+      <button type="button" data-automation-id="forgotPasswordLink">Forgot your password?</button>
+      <div style="position: relative">
+        <div role="button" tabindex="0" aria-label="Sign In" data-automation-id="click_filter"
+             style="position:absolute;inset:0;cursor:pointer"></div>
+        <button type="submit" tabindex="-1" aria-hidden="true" data-automation-id="signInSubmitButton">Sign In</button>
+      </div>
+    </form>
+    <p>Don't have an account yet? <button type="button" data-automation-id="createAccountLink">Create Account</button></p>
+  </div>
+</main>
+<script>
+window.__signedIn = 0;
+document.querySelector("[data-automation-id='click_filter']").addEventListener("click", function () {
+  window.__signedIn += 1;
+});
+</script>
+</body>
+</html>

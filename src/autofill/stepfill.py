@@ -44,18 +44,23 @@ from autofill.intents import (
     match_option_exact,
     may_fill,
     normalize_question,
+    pick_option,
     question_hash,
     sanitize_question,
 )
 from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
+    _wants_national_digits,
     acknowledgement_kind,
+    attestation_manual,
     haystack,
     is_consent_choice,
+    is_demographic_control,
     is_honeypot,
     map_field,
     match_field_key,
     mentions_work_history,
+    national_phone_digits,
     normalize,
     record_auto_consent,
     standard_terms_enabled,
@@ -66,6 +71,7 @@ from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
 from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice, dismiss_combobox
+from autofill.salary import SALARY_RELATED_FIELDS, salary_fill_allowed, salary_shape
 
 logger = logging.getLogger("autofill.stepfill")
 
@@ -79,6 +85,17 @@ def bind_location_profile(profile: CandidateProfile | None) -> Token:
 
 def reset_location_profile(token: Token) -> None:
     _LOCATION_PROFILE.reset(token)
+
+
+def current_location_profile() -> CandidateProfile | None:
+    """The profile bound for this fill, if one was."""
+    return _LOCATION_PROFILE.get()
+
+
+def _us_on_page() -> bool:
+    from autofill.mapping import us_context
+
+    return us_context(current_location_profile())
 
 _LEGAL_RE = re.compile(
     r"\b(i agree|i certify|i acknowledge|terms of (service|use)|privacy policy|attest|e-?sign|legal attestation)\b"
@@ -174,8 +191,9 @@ def validation_blob(snapshot: PageSnapshot) -> str:
 
 def flags_for_alerts(blob: str, previous: FillFlags) -> FillFlags:
     """Turn a validation message into a bounded correction."""
+    phone_format = "invalid phone" in blob or ("phone" in blob and "valid format" in blob)
     return FillFlags(
-        digits_phone=previous.digits_phone or "invalid phone" in blob,
+        digits_phone=previous.digits_phone or phone_format,
         us_dates=previous.us_dates or "valid date" in blob,
         aliases=previous.aliases or "select one" in blob or "required" in blob,
     )
@@ -197,6 +215,9 @@ def fill_resolved_page(
     if resume_uploaded:
         settle_form(page)
     snapshot = extract_page(page)
+    from autofill.mapping import note_page_country
+
+    note_page_country(page, snapshot)
     outcome = ResolvedPage(snapshot=snapshot)
     clusters = _clusters(snapshot)
     requests: list[_Ask] = []
@@ -214,6 +235,13 @@ def fill_resolved_page(
         requests.append(ask)
 
     field_keys = _requested_field_keys(requests)
+    if _dependent_region_pending(snapshot):
+        # A state menu that is still disabled, or still only a placeholder, is
+        # not a cluster yet. Ask for the region now so it can be chosen after
+        # the country select enables it.
+        for key in ("address.region", "address.state"):
+            if key not in field_keys:
+                field_keys.append(key)
     questions = [ask.question_body() for ask in requests if ask.include_question]
     outcome.requested_fields = field_keys
     outcome.requested_intents = [ask.match.intent if ask.match else None for ask in requests if ask.include_question]
@@ -242,6 +270,7 @@ def fill_resolved_page(
             session_id=session_id,
             preserve_filled=resume_uploaded,
         )
+        _fill_region_after_country(page, response, outcome)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -297,6 +326,10 @@ class _Ask:
         }
         if token:
             body["fieldToken"] = token
+        if self.match is not None and self.match.intent == "SALARY_EXPECTATION":
+            # Related compensation keys. Values stay on the Companion side.
+            body["salaryShape"] = salary_shape(text)
+            body["relatedFields"] = list(SALARY_RELATED_FIELDS)
         return body
 
 
@@ -357,23 +390,29 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
     control = controls[0]
-    if control.kind == "buttons":
-        text = _question_text(controls)
-        options = _option_labels(controls)
-        match = classify_question(text, options, hook=hook)
-        return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "password" or control.input_type == "password":
         return None
     if is_honeypot(control):
         return None
     blob = haystack(control)
     role = acknowledgement_kind(control)
-    if is_consent_choice(control):
-        return _Ask(controls=controls, consent=True, consent_choice=True)
-    if role == "marketing":
-        return None
-    if control.kind == "checkbox" and (role == "consent" or _LEGAL_RE.search(blob)):
-        return _Ask(controls=controls, consent=True)
+    if not is_demographic_control(control):
+        if is_consent_choice(control):
+            return _Ask(controls=controls, consent=True, consent_choice=True)
+        if role == "marketing" and not control.required:
+            return None
+        manual_statement = role in {"consent", "marketing"} or _LEGAL_RE.search(blob) or attestation_manual(control)
+        if manual_statement:
+            # An optional attestation that the employer did not mark required stays
+            # unchecked and does not become a blocker. Required ones pause.
+            if attestation_manual(control) and role == "factual" and not control.required:
+                return None
+            return _Ask(controls=controls, consent=True)
+    if control.kind == "buttons":
+        text = _question_text(controls)
+        options = _option_labels(controls)
+        match = classify_question(text, options, hook=hook, us_on_page=_us_on_page())
+        return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if _is_application_resume(control):
             return _Ask(controls=controls, field_key="resume.file")
@@ -382,7 +421,7 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         return _Ask(controls=controls, field_key="location", compose_location=True)
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
-    match = classify_question(text, options, hook=hook)
+    match = classify_question(text, options, hook=hook, us_on_page=_us_on_page())
     if match.intent == "REFERRAL":
         return _Ask(controls=controls, match=match, include_question=True)
     internal = None if kind == "multi" else match_field_key(control)
@@ -622,6 +661,154 @@ _CITY_ALIASES = {
     "new york": ("nyc", "new york city"),
     "new york city": ("nyc", "new york"),
 }
+
+_REGION_LABELS = frozenset({"state", "province", "region", "state province", "province state"})
+
+
+def _is_region_control(control: Control) -> bool:
+    """An address state or province menu. A longer question that mentions a state is not one."""
+    if control.kind not in {"select", "combobox"}:
+        return False
+    label = normalize(control.label or control.aria_label or "")
+    return label in _REGION_LABELS
+
+
+def _region_names(value: str) -> set[str]:
+    """Abbreviation and full name from ``_STATES``. ``CA`` and ``California`` are one state."""
+    token = normalize(value)
+    if not token:
+        return set()
+    names = {token}
+    canonical = _STATES.get(token, "")
+    if not canonical:
+        for short, name in _STATES.items():
+            if token == name:
+                canonical = name
+                names.add(short)
+                break
+    if canonical:
+        names.add(canonical)
+        for short, name in _STATES.items():
+            if name == canonical:
+                names.add(short)
+                names.add(name)
+    return {item for item in names if item}
+
+
+def match_region_option(desired: str, options: list[Option]) -> Option | None:
+    """Match a state or province label using the full state table."""
+    names = _region_names(desired)
+    if not names:
+        return None
+    for option in options:
+        if normalize(option.label) in names or normalize(option.value) in names:
+            return option
+    return None
+
+
+def _dependent_region_pending(snapshot: PageSnapshot) -> bool:
+    for control in snapshot.controls:
+        if control.hidden or not _is_region_control(control):
+            continue
+        if control.disabled or not control.options:
+            return True
+    return False
+
+
+def _find_region_control(snapshot: PageSnapshot) -> Control | None:
+    found = [control for control in snapshot.controls if _is_region_control(control) and not control.hidden]
+    if not found:
+        return None
+    for control in found:
+        if control.disabled or not control.options:
+            return control
+    return found[0]
+
+
+def _region_text(fields: dict) -> str:
+    return str(fields.get("address.region") or fields.get("address.state") or "").strip()
+
+
+def _country_was_set(outcome: ResolvedPage) -> bool:
+    return any(item.action == "select" and item.key == "address.country" for item in outcome.fields)
+
+
+def _drop_manual_selector(outcome: ResolvedPage, selector: str) -> None:
+    before = len(outcome.manual_questions)
+    outcome.manual_questions = [
+        item for item in outcome.manual_questions if str(item.get("selector") or "") != selector
+    ]
+    removed = before - len(outcome.manual_questions)
+    if not removed:
+        return
+    kept: list[str] = []
+    for line in outcome.manual_actions:
+        if removed and line.endswith("manual answer required"):
+            removed -= 1
+            continue
+        kept.append(line)
+    outcome.manual_actions = kept
+
+
+def _fill_region_after_country(page, response: ResolverResponse, outcome: ResolvedPage) -> None:
+    """Choose the state after the country select has enabled it or replaced its options.
+
+    The first pass skips a disabled state menu and cannot see options that do
+    not exist yet. This waits, then writes once. A state that already holds a
+    value is left alone.
+    """
+    if page is None or not _country_was_set(outcome):
+        return
+    region = _region_text(response.fields)
+    if not region:
+        return
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    control = _find_region_control(snapshot)
+    if control is None:
+        return
+    if not control.disabled and control.selector and control_committed(page, control.selector):
+        return
+    deadline = time.monotonic() + 2.0
+    option: Option | None = None
+    while True:
+        if not control.disabled:
+            option = match_region_option(region, control.options)
+            if option is not None:
+                break
+        if time.monotonic() >= deadline or getattr(page, "wait_for_timeout", None) is None:
+            option = match_region_option(region, control.options) if not control.disabled else None
+            break
+        _pause(page, 100)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return
+        nxt = _find_region_control(snapshot)
+        if nxt is not None:
+            control = nxt
+    if control.disabled or option is None:
+        return
+    if control.selector and control_committed(page, control.selector):
+        return
+    mapped = MappedField(
+        key="address.region",
+        action="select",
+        text=region,
+        option_label=option.label,
+        option_value=option.value,
+        option_selector=option.selector,
+        field_class="PROFILE_FIELD",
+        confidence="high",
+    )
+    written = apply_mapped(page, control, mapped)
+    outcome.fields.append(written)
+    if written.action == "select":
+        _drop_manual_selector(outcome, control.selector)
+
+
 _LOCATION_OPTIONS_JS = r"""
 (selector) => {
   const el = document.querySelector(selector);
@@ -1764,6 +1951,9 @@ def _apply(
     # A missing resume is recorded after the other controls. It must not skip them.
     ordered = [ask for ask in requests if ask.field_key != "resume.file"]
     ordered.extend(ask for ask in requests if ask.field_key == "resume.file")
+    from autofill.sms_consent import begin_sms_pass
+
+    begin_sms_pass()
     shared = (by_intent, unnamed, by_key, unclassified, rows, employment_index)
     for ask in ordered:
         if not checkpoint():
@@ -1826,19 +2016,72 @@ def _apply_ask(
         _apply_resume(page, ask, response, outcome)
         return
     if ask.consent:
-        if not any(control.required for control in ask.controls):
-            return
+        required = any(control.required for control in ask.controls)
         if _cluster_committed(page, ask.controls):
             return
-        if _accept_standard_term(page, ask):
+        from autofill.answers import current_catalogue
+        from autofill.sms_consent import (
+            SMS_INTENT,
+            SMS_KEY,
+            accept_recruitment_sms,
+            apply_stored_sms_no,
+            is_recruitment_sms_control,
+            note_sms_block,
+            skip_resolved_sms,
+            sms_blocked_this_pass,
+        )
+
+        bound = current_catalogue()
+        profile = bound[0] if bound is not None else None
+        control = ask.controls[0]
+        if accept_recruitment_sms(page, control, profile):
+            outcome.fields.append(
+                FieldOutcome(
+                    selector=control.selector,
+                    label=control.label,
+                    key=SMS_INTENT,
+                    action="check" if control.kind == "checkbox" else "select",
+                    detail="recruitment SMS",
+                    field_class="APPROVED_QUESTION",
+                )
+            )
             return
-        statement = _consent_statement(ask.controls[0])
+        if apply_stored_sms_no(page, control, profile):
+            outcome.fields.append(
+                FieldOutcome(
+                    selector=control.selector,
+                    label=control.label,
+                    key=SMS_KEY,
+                    action="select",
+                    detail="recruitment SMS declined",
+                    field_class="APPROVED_QUESTION",
+                )
+            )
+            return
+        if skip_resolved_sms(control, profile):
+            return
+        if is_recruitment_sms_control(control) and (sms_blocked_this_pass() or not required):
+            return
+        if required and _accept_standard_term(page, ask):
+            return
+        if not required and ask.consent_choice:
+            return
+        statement = _consent_statement(control)
+        sms = is_recruitment_sms_control(control)
+        if sms:
+            note_sms_block()
         _manual(
             outcome,
-            IntentMatch(None, "unknown", "none", statement),
-            blocking=True,
+            IntentMatch(
+                SMS_INTENT if sms else None,
+                "HIGH" if sms else "unknown",
+                "level1" if sms else "none",
+                statement,
+            ),
+            blocking=required,
             controls=ask.controls,
             kind="CONSENT_CHOICE" if ask.consent_choice else "CONSENT",
+            field_key=SMS_KEY if sms else None,
         )
         return
     if ask.compose_location:
@@ -1892,8 +2135,11 @@ def _apply_ask(
         return
     raw_value = response.fields.get(ask.field_key, "")
     text = "" if raw_value is None else str(raw_value)
-    if ask.field_key == "phone" and flags.digits_phone:
-        text = "".join(character for character in text if character.isdigit())
+    # A national box beside a calling-code menu rejects "+1 …". A format alert
+    # on a later pass uses the same rule, so the leading country digit is not
+    # typed again as if it were part of the subscriber number.
+    if ask.field_key == "phone" and (_wants_national_digits(ask.controls[0]) or flags.digits_phone):
+        text = national_phone_digits(text)
     if flags.us_dates and _looks_iso(text):
         text = _force_us_date(text)
     _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
@@ -2216,6 +2462,22 @@ _MATCH_VALUE_JS = r"""(hint) => {
       if (!value.trim() || placeholder(label) || placeholder(value)) return "";
       return value;
     }
+    const promptHost = el.closest && el.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    if (promptHost) {
+      const pill = promptHost.querySelector(
+        "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+      );
+      if (pill && !pill.hidden) {
+        const item = pill.closest("[data-automation-id='selectedItem']");
+        const style = window.getComputedStyle(pill);
+        if (!(item && item.hidden) && style.display !== "none" && style.visibility !== "hidden") {
+          const pillText = String(pill.textContent || "").replace(/\s+/g, " ").trim();
+          if (!placeholder(pillText)) return pillText;
+        }
+      }
+    }
     if (role === "combobox" || role === "listbox") {
       const typed = "value" in el ? String(el.value || "") : "";
       if (typed.trim() && !placeholder(typed)) return typed;
@@ -2248,6 +2510,9 @@ _MATCH_VALUE_JS = r"""(hint) => {
   if (id) list = group((node) => node.id === id);
   if (!list.length && automation) {
     list = group((node) => (node.getAttribute("data-automation-id") || "") === automation);
+    // searchBox is on every Workday prompt. Do not read Country Phone Code as
+    // the value of How Did You Hear About Us.
+    if (list.length > 1) list = [];
   }
   if (!list.length && name) list = group((node) => (node.getAttribute("name") || "") === name);
   if (!list.length && label) list = group((node) => labelOf(node) === label);
@@ -2352,6 +2617,8 @@ def _confirmed_hint(record: dict) -> dict[str, str]:
         "name": str(record.get("name") or ""),
         "elementId": str(record.get("elementId") or ""),
         "automationId": str(record.get("automationId") or ""),
+        "selector": str(record.get("selector") or ""),
+        "choice": str(record.get("choice") or ""),
     }
 
 
@@ -2619,8 +2886,138 @@ def _harvest_name_records(page, records: list[dict]) -> None:
         )
 
 
+def _choice_record_is_consent(record: dict) -> bool:
+    """Consent and attestations are not written back. The next pass pauses them."""
+    label = str(record.get("label") or "")
+    value = str(record.get("value") or "")
+    control = Control(
+        kind="checkbox" if str(record.get("choice") or "") == "checkbox" else "radio",
+        label=label,
+        prompt=label,
+        options=[Option(value, value)] if value else [],
+    )
+    if acknowledgement_kind(control) in {"consent", "marketing"}:
+        return True
+    return attestation_manual(control) or is_demographic_control(control)
+
+
+_FIND_CHOICE_JS = r"""(hint) => {
+  function visible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
+  }
+  function labelOf(el) {
+    const wrap = el.closest ? el.closest("label") : null;
+    const raw = wrap ? wrap.innerText : (el.getAttribute("aria-label") || el.innerText || el.value || "");
+    return String(raw || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  function selected(el) {
+    const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") return !!el.checked;
+    return el.getAttribute("aria-checked") === "true";
+  }
+  function cssOf(el) {
+    if (el.id) return "#" + CSS.escape(el.id);
+    return "";
+  }
+  const choice = String(hint.choice || "");
+  const want = String(hint.value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const nodes = Array.from(document.querySelectorAll(
+    "input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio'], [role='switch']"
+  )).filter(visible);
+  let el = null;
+  let via = "none";
+  if (hint.selector) {
+    try {
+      const found = document.querySelector(hint.selector);
+      if (found && visible(found)) {
+        el = found;
+        via = "selector";
+      }
+    } catch (error) {
+      el = null;
+    }
+  }
+  if (!el && hint.elementId) {
+    el = nodes.find((node) => node.id === hint.elementId) || null;
+    if (el) via = "id";
+  }
+  if (!el && hint.name) {
+    const group = nodes.filter((node) => (node.getAttribute("name") || "") === hint.name);
+    el = group.find((node) => {
+      const value = String(node.value || "").trim().toLowerCase();
+      return labelOf(node) === want || value === want;
+    }) || null;
+    if (!el && choice === "checkbox" && group.length === 1) el = group[0];
+    if (el) via = "name";
+  }
+  if (!el && hint.label) {
+    const folded = String(hint.label || "").replace(/\s+/g, " ").trim().toLowerCase();
+    el = nodes.find((node) => labelOf(node) === folded) || null;
+    if (el) via = "label";
+  }
+  if (!el) return {selector: "", via: "none", selected: false, role: ""};
+  const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  const native = el.tagName === "INPUT" && (type === "checkbox" || type === "radio");
+  return {
+    selector: cssOf(el) || String(hint.selector || ""),
+    via: via,
+    selected: selected(el),
+    role: role || type,
+    native: native,
+  };
+}"""
+
+
+def _restore_choice(page, record: dict) -> dict | None:
+    """Put a factual checkbox or radio back. Consent is left empty so it pauses."""
+    if _choice_record_is_consent(record):
+        return {"via": "consent", "result": "skipped"}
+    hint = _confirmed_hint(record)
+    from autofill.safeguards import commit_native_choice, press_aria_radio
+
+    missed: dict | None = None
+    for target in _frame_targets(page):
+        evaluate = getattr(target, "evaluate", None)
+        if evaluate is None:
+            continue
+        try:
+            found = evaluate(_FIND_CHOICE_JS, hint)
+        except Exception:
+            continue
+        if not isinstance(found, dict):
+            continue
+        selector = str(found.get("selector") or "")
+        via = str(found.get("via") or "none")
+        if not selector:
+            missed = {"via": via, "result": "miss"}
+            continue
+        role = str(found.get("role") or "")
+        want = str(hint.get("value") or "")
+        turn_on = hint.get("choice") == "radio" or want.casefold() not in {"no", "false", "unchecked"}
+        if bool(found.get("selected")) is turn_on:
+            return {"via": via, "result": "kept"}
+        if found.get("native"):
+            ok = commit_native_choice(target, selector, on=turn_on)
+        elif role == "radio":
+            ok = press_aria_radio(target, selector)
+        else:
+            ok = False
+        if ok:
+            return {"via": via, "result": "restored"}
+        missed = {"via": via, "result": "miss"}
+    return missed
+
+
 def _restore_one(page, record: dict) -> dict | None:
     """Match one confirmed value. A miss on the top document tries the frames."""
+    if str(record.get("choice") or "") in {"checkbox", "radio"}:
+        return _restore_choice(page, record)
     hint = _confirmed_hint(record)
     missed: dict | None = None
     for target in _frame_targets(page):
@@ -2678,7 +3075,7 @@ def post_upload_refill(
         if isinstance(outcome, dict):
             via = str(outcome.get("via") or "none")
             result = str(outcome.get("result") or "miss")
-            if result not in {"miss", "kept", "restored"}:
+            if result not in {"miss", "kept", "restored", "skipped"}:
                 result = "miss"
         if result == "restored":
             restored += 1
@@ -2874,6 +3271,16 @@ def _apply_resume(
         _skip(control, outcome, "resume.file", "Resume file was not attached.")
 
 
+def _salary_answer_ok(match: IntentMatch, answer: ResolverAnswer | None) -> bool:
+    """True when a resolver salary answer is HIGH and covers the question shape."""
+    if answer is None:
+        return False
+    if not (may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)):
+        return False
+    value = answer.value or (answer.values[0] if answer.values else "")
+    return salary_fill_allowed(match.text, value, confidence=answer.confidence)
+
+
 def _saved_unknown(match: IntentMatch, answer: ResolverAnswer) -> bool:
     """TileArc already matched this exact question text to a saved answer."""
     return match.intent is None and answer.confidence == "HIGH" and answer.source == "saved_answer"
@@ -2899,6 +3306,21 @@ def _apply_question(
             match,
             blocking=any(item.required for item in ask.controls),
             controls=ask.controls,
+        )
+        return
+    if match.intent == "SALARY_EXPECTATION" and not _salary_answer_ok(match, answer):
+        # A minimum, or a HIGH single number, is not a range. Ask the person.
+        shape = salary_shape(match.text)
+        _manual(
+            outcome,
+            match,
+            blocking=_question_blocks(ask.controls, answer),
+            controls=ask.controls,
+            challenge="confirm",
+            related_fields=SALARY_RELATED_FIELDS,
+            salary_shape_name=shape,
+            answer_confidence="LOW",
+            challenge_reason="salary_range_incomplete" if shape == "range" else "salary_needs_confirm",
         )
         return
     if answer is None or not (
@@ -2929,9 +3351,15 @@ def _apply_question(
         return
     if control.kind == "buttons":
         desired = answer.value or (answer.values[0] if answer.values else "")
-        option = match_option_exact(desired, control.options)
-        if option is None or not option.selector:
-            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
+        status, option = pick_option(desired, control.options)
+        if status != "match" or option is None or not option.selector:
+            _manual(
+                outcome,
+                match,
+                blocking=True,
+                controls=ask.controls,
+                kind="AMBIGUOUS_OPTION" if status == "ambiguous" else "OPTION_MISMATCH",
+            )
             return
         click_choice(page, option.selector, option.label)
         if _button_requires_selected_state(page, option.selector) and not control_committed(
@@ -2942,6 +3370,7 @@ def _apply_question(
             if any(item.required for item in ask.controls):
                 _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
+        remember_confirmed(control, option.label, field_key=match.intent or "")
         outcome.fields.append(
             FieldOutcome(
                 selector=option.selector,
@@ -2959,6 +3388,7 @@ def _apply_question(
         if picked is None:
             _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
+        remember_confirmed(control, picked.label, field_key=match.intent or "")
         outcome.fields.append(
             FieldOutcome(
                 selector=control.selector,
@@ -2972,9 +3402,15 @@ def _apply_question(
         return
     if control.kind in {"radio", "select"}:
         desired = answer.value or (answer.values[0] if answer.values else "")
-        option = match_option_exact(desired, control.options)
-        if option is None:
-            _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
+        status, option = pick_option(desired, control.options)
+        if status != "match" or option is None:
+            _manual(
+                outcome,
+                match,
+                blocking=True,
+                controls=ask.controls,
+                kind="AMBIGUOUS_OPTION" if status == "ambiguous" else "OPTION_MISMATCH",
+            )
             return
         mapped = MappedField(
             key=match.intent,
@@ -3232,6 +3668,11 @@ def _manual(
     kind: str | None = None,
     field_key: str | None = None,
     option_labels: list[str] | None = None,
+    challenge: str = "",
+    related_fields: tuple[str, ...] = (),
+    salary_shape_name: str = "",
+    answer_confidence: str = "",
+    challenge_reason: str = "",
 ) -> None:
     if kind:
         kind = canonical_blocker_kind(kind)
@@ -3266,6 +3707,13 @@ def _manual(
         "selector": primary.selector if primary is not None else "",
         "kind": _item_kind(match.intent, kind, field_key),
     }
+    if challenge:
+        # Names only. The saved salary amount stays off this payload.
+        entry["challenge"] = challenge
+        entry["relatedFields"] = [name for name in related_fields if name]
+        entry["salaryShape"] = salary_shape_name
+        entry["confidence"] = answer_confidence or "LOW"
+        entry["reason"] = challenge_reason
     if not any(_same_question(item, entry) for item in outcome.manual_questions):
         outcome.manual_questions.append(entry)
     label = match.intent or "unknown"
@@ -3458,14 +3906,18 @@ def _lookup_keys(text: str, question_id: str = "") -> list[str]:
 
 def _index_answers(
     response: ResolverResponse,
-) -> tuple[dict[str, ResolverAnswer], list[ResolverAnswer], dict[str, ResolverAnswer]]:
-    """Known intents by name. Unknown answers pair by text, id, or hash."""
-    by_intent: dict[str, ResolverAnswer] = {}
+) -> tuple[dict[str, list[ResolverAnswer]], list[ResolverAnswer], dict[str, ResolverAnswer]]:
+    """Known intents by name. Unknown answers pair by text, id, or hash.
+
+    Every row for an intent is kept. Two values for one intent are not collapsed
+    to the first one.
+    """
+    by_intent: dict[str, list[ResolverAnswer]] = {}
     unnamed: list[ResolverAnswer] = []
     by_key: dict[str, ResolverAnswer] = {}
     for item in response.answers:
         if item.intent:
-            by_intent.setdefault(item.intent, item)
+            by_intent.setdefault(item.intent, []).append(item)
             continue
         unnamed.append(item)
         for key in _lookup_keys(item.text, item.question_id):
@@ -3484,17 +3936,70 @@ def _unclassified_count(requests: list[_Ask]) -> int:
     return count
 
 
+def _resolver_value(item: ResolverAnswer) -> str:
+    if item.value:
+        return item.value
+    if len(item.values) == 1:
+        return item.values[0]
+    return ""
+
+
 def _take_answer(
     match: IntentMatch,
-    by_intent: dict[str, ResolverAnswer],
+    by_intent: dict[str, list[ResolverAnswer]],
     unnamed: list[ResolverAnswer],
     by_key: dict[str, ResolverAnswer],
     *,
     unclassified: int = 1,
     question_id: str = "",
+    us_on_page: bool | None = None,
+    employers: tuple[str, ...] = (),
 ) -> ResolverAnswer | None:
     if match.intent:
-        return by_intent.get(match.intent)
+        from autofill.answers import match_answer
+        from autofill.intents import UNFILLED_INTENTS
+        from autofill.mapping import normalize
+        from autofill.profile import ApplicationAnswer
+
+        if match.intent in UNFILLED_INTENTS:
+            return None
+        rows = list(by_intent.get(match.intent) or [])
+        if not rows:
+            return None
+        if any(len(item.values) > 1 for item in rows):
+            unique = {tuple(item.values) for item in rows}
+            if len(unique) != 1:
+                return None
+            return rows[0]
+        on_page = _us_on_page() if us_on_page is None else us_on_page
+        if not employers:
+            from autofill.answers import current_employers
+
+            employers = current_employers()
+        employer = next((item for item in employers if item.strip()), "")
+        catalogue = [
+            ApplicationAnswer(
+                question=item.text or match.text,
+                answer=_resolver_value(item),
+                intent=item.intent or "",
+                employer=employer,
+            )
+            for item in rows
+            if _resolver_value(item)
+        ]
+        picked = match_answer(
+            match.text,
+            catalogue,
+            normalize=normalize,
+            us_on_page=on_page,
+            employers=employers,
+        )
+        if picked is None:
+            return None
+        for item in rows:
+            if _resolver_value(item) == picked:
+                return item
+        return None
     keys = [question_id.strip().lower()] if question_id.strip() else []
     keys.extend(_lookup_keys(match.text))
     seen: set[str] = set()
@@ -3675,22 +4180,13 @@ def _usable_question(text: str, controls: list[Control]) -> str:
 
 
 def _question_text(controls: list[Control]) -> str:
-    control = controls[0]
-    if len(controls) > 1 or control.kind == "radio" or control.kind == "checkbox":
-        for raw in (control.group, control.prompt):
-            text = _usable_question(raw, controls)
-            if text:
-                return text
-        if len(controls) > 1 or control.kind == "radio":
-            for raw in (control.label, control.aria_label):
-                text = _usable_question(raw, controls)
-                if text:
-                    return text
-            return ""
-    for raw in (control.label, control.aria_label, control.placeholder, control.prompt):
-        text = _usable_question(raw, controls)
-        if text:
-            return text
+    """One question stem shared with the profile catalogue. Not the field haystack."""
+    from autofill.mapping import question_stem
+
+    for control in controls:
+        stem = question_stem(control)
+        if stem:
+            return stem
     return ""
 
 
@@ -3988,21 +4484,28 @@ def _accept_standard_term(page, ask) -> bool:
     """Check one required terms box when the session flag allows it.
 
     Consent choices, marketing, and every unusual attestation stay blockers.
-    The check is ``locator.check``, not a click.
+    The check is the verified ``check_registered`` routine used on account
+    pages (pointer check, forced check, then its label), and the box counts
+    only when the page reports it checked afterwards.
     """
     if ask.consent_choice or not standard_terms_enabled():
         return False
     if len(ask.controls) != 1:
         return False
     control = ask.controls[0]
-    if control.kind != "checkbox" or not control.required:
+    if control.kind != "checkbox" or control.input_type in {"aria-checkbox", "switch"} or not control.required:
         return False
     category = terms_category(control)
     if category not in AUTO_CONSENT_CATEGORIES:
         return False
+    from autofill.account_flow import check_registered
+
     try:
-        page.locator(control.selector).check()
+        verified = check_registered(page, control.selector)
     except Exception:
+        verified = False
+    if not verified:
+        logger.info("auto_consent category=%s result=failed", category)
         return False
     record_auto_consent(control, category)
     return True
@@ -4016,16 +4519,23 @@ def _consent_statement(control: Control) -> str:
 
 def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
     text = _question_text(controls) or controls[0].label
+    if is_demographic_control(controls[0]):
+        return "DEMOGRAPHIC"
     if is_consent_choice(controls[0]):
         return "CONSENT_CHOICE"
-    if controls[0].kind == "checkbox" and acknowledgement_kind(controls[0]) == "consent":
+    if acknowledgement_kind(controls[0]) == "consent" or attestation_manual(controls[0]):
         return "CONSENT"
     if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
         return "DEMOGRAPHIC"
-    match = classify_question(text, _option_labels(controls))
+    match = classify_question(text, _option_labels(controls), us_on_page=_us_on_page())
     if match.intent in DEMOGRAPHIC_INTENTS or _eeo(text) or _eeo(controls[0].label):
         return "DEMOGRAPHIC"
-    if mapped is not None and "No option matched" in (mapped.reason or ""):
+    reason = (mapped.reason or "") if mapped is not None else ""
+    if "Saved answers disagree" in reason:
+        return "ANSWER_CONFLICT"
+    if "Several options match" in reason:
+        return "AMBIGUOUS_OPTION"
+    if "No option matched" in reason:
         return "OPTION_MISMATCH"
     if (mapped is not None and mapped.key) or match_field_key(controls[0]):
         return "MISSING_PROFILE_VALUE"
@@ -4108,19 +4618,24 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         loaded = [label for label in _load_place_options(page, primary.selector, query) if _keep_option(label)]
         if loaded:
             options = [sanitize_question(label, limit=80) for label in loaded]
-    match = classify_question(text, options)
+    match = classify_question(text, options, us_on_page=_us_on_page())
     named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
     intent = match.intent if named else None
     if kind != "DEMOGRAPHIC" and intent in DEMOGRAPHIC_INTENTS:
         intent = None
+    from autofill.sms_consent import SMS_INTENT, SMS_KEY, gap_intent
+
+    intent = gap_intent(primary, intent)
     names = {label.casefold() for label in options}
     if primary.kind == "buttons" and "yes" in names and "no" in names:
         field_key = None
         if kind == "MISSING_PROFILE_VALUE":
             kind = "QUESTION"
+    if intent == SMS_INTENT:
+        field_key = SMS_KEY
     digest = _question_digest(text, primary) or None
     multi = len(controls) > 1 and any(item.kind == "checkbox" for item in controls)
-    return {
+    result = {
         "intent": intent,
         "text": text,
         "blocking": True,
@@ -4133,6 +4648,14 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         "selector": primary.selector,
         "kind": kind,
     }
+    if mapped is not None and mapped.challenge == "confirm":
+        # The profile has a related salary value that does not cover this question.
+        result["challenge"] = "confirm"
+        result["confidence"] = "LOW"
+        result["relatedFields"] = list(mapped.related_fields)
+        result["salaryShape"] = salary_shape(text)
+        result["reason"] = mapped.reason
+    return result
 
 
 def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4162,6 +4685,10 @@ def _merge_gap_items(gaps: list[dict[str, Any]], existing: list[dict[str, Any]])
             chosen["kind"] = gap.get("kind")
         if not chosen.get("options") and gap.get("options"):
             chosen["options"] = list(gap.get("options") or [])
+        if gap.get("challenge") and not chosen.get("challenge"):
+            for hint in ("challenge", "confidence", "relatedFields", "salaryShape", "reason"):
+                if gap.get(hint):
+                    chosen[hint] = gap.get(hint)
         merged.append(chosen)
     return merged
 
@@ -4192,6 +4719,9 @@ def inspect_required(
     Choice items that are still missing a list are read afterwards. A full
     fill leaves the cap unset.
     """
+    from autofill.sms_consent import begin_sms_pass, collapse_sms_gaps, sms_stored_choice
+
+    begin_sms_pass()
     snapshot = _live_snapshot(page, snapshot)
     clusters = _gap_clusters(snapshot)
     committed: set[str] = set()
@@ -4214,6 +4744,7 @@ def inspect_required(
     sync_required_progress(committed, open_keys)
     if prior:
         gaps = _merge_gap_items(gaps, prior)
+    gaps = collapse_sms_gaps(gaps, skip_all=profile is not None and sms_stored_choice(profile) == "no")
     if page is not None:
         ensure_blocker_options(page, gaps)
     return gaps, len(clusters), committed_clusters

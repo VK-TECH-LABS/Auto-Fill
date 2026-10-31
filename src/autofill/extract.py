@@ -64,6 +64,154 @@ EXTRACT_JS = r"""
     return folded === "select" || folded === "please select" || folded === "choose" || folded === "choose one";
   }
 
+  function isGenericPrompt(text) {
+    // "Search" is the placeholder on a prompt widget, not the question.
+    const folded = cleanPrompt(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (!folded) return false;
+    if (isPlaceholderPrompt(text)) return true;
+    return (
+      folded === "search" ||
+      folded === "type to search" ||
+      folded === "search options" ||
+      folded === "start typing" ||
+      folded === "select an option"
+    );
+  }
+
+  function fieldQuestionNode(el) {
+    // The question label for a prompt lives on the form field, not on the
+    // inner search box. The nearest form field wins so a later question is
+    // not pulled in.
+    let node = el;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      const auto = (node.getAttribute && node.getAttribute("data-automation-id")) || "";
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (auto.indexOf("formField") !== 0 && tag !== "fieldset") continue;
+      const labels = node.querySelectorAll("label, legend, [data-automation-id='formLabel']");
+      for (const label of labels) {
+        if (label.contains(el)) continue;
+        const text = cleanPrompt(textOf(label));
+        if (!text || isGenericPrompt(text) || isSectionHeading(label, text)) continue;
+        const targetId = label.getAttribute("for") || "";
+        if (targetId && el.id && targetId !== el.id) continue;
+        if (targetId && !el.id) {
+          const target = document.getElementById(targetId);
+          if (target && target !== el && !target.contains(el) && !el.contains(target)) continue;
+        }
+        return label;
+      }
+    }
+    return null;
+  }
+
+  function isSelectedItemNode(node) {
+    // A pill already chosen on a prompt. It is not that prompt's option list,
+    // and it is not the option list of a different prompt on the same page.
+    if (!node || !node.closest) return false;
+    const auto = ((node.getAttribute && node.getAttribute("data-automation-id")) || "").toLowerCase();
+    if (
+      auto === "selecteditem" ||
+      auto === "selecteditemlist" ||
+      auto === "selecteditemtext" ||
+      auto === "promptselectionlabel"
+    ) {
+      return true;
+    }
+    return !!node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id='selectedItem'], " +
+      "[data-automation-id='selectedItemText']"
+    );
+  }
+
+  function isPromptWidget(el) {
+    // A multiselect / prompt search box. The site search in the header is not
+    // inside a form field, so it stays a search box.
+    const host = el.closest && el.closest(
+      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    );
+    if (host) return true;
+    const auto = (el.getAttribute("data-automation-id") || "").toLowerCase();
+    if (auto === "searchbox" || auto === "monikersearchbox" || auto === "promptsearchbox") {
+      return !!fieldQuestionNode(el);
+    }
+    const parent = el.parentElement;
+    if (
+      parent &&
+      parent.querySelector("[data-automation-id='promptIcon'], [data-automation-id='promptSearchButton']")
+    ) {
+      return !!fieldQuestionNode(el);
+    }
+    return false;
+  }
+
+  function isPhoneInput(el) {
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    const auto = (el.getAttribute("autocomplete") || "").toLowerCase();
+    if (type === "tel" || auto === "tel" || auto === "tel-national" || auto.indexOf("tel") === 0) return true;
+    const id = (
+      (el.id || "") + " " + (el.getAttribute("name") || "") + " " + (el.getAttribute("data-automation-id") || "")
+    ).toLowerCase();
+    return /phone|mobile|telephone/.test(id);
+  }
+
+  function looksLikeCallingCode(node) {
+    if (!node || !node.getAttribute) return false;
+    const blob = (
+      (node.getAttribute("data-automation-id") || "") + " " +
+      (node.id || "") + " " +
+      (node.getAttribute("name") || "")
+    ).toLowerCase();
+    if (
+      /countryphonecode|country-phone-code|phone-country|phonecountry|callingcode|dialcode|countrycode|phone-code|phone_code/.test(
+        blob
+      )
+    ) {
+      return true;
+    }
+    const label = controlLabel(node);
+    return (
+      label === "country code" ||
+      label === "phone country" ||
+      label === "country phone code" ||
+      label === "phone code" ||
+      label === "calling code" ||
+      label === "dial code"
+    );
+  }
+
+  function menuHasDialCode(node) {
+    const bits = [node.value || "", node.getAttribute("aria-label") || "", node.getAttribute("placeholder") || ""];
+    if (node.options) {
+      for (const option of Array.from(node.options).slice(0, 12)) bits.push(option.textContent || "");
+    }
+    return /\+\d{1,4}/.test(bits.join(" "));
+  }
+
+  function nationalPhone(el) {
+    // A phone box that shares a small group with one calling-code menu.
+    // An address Country further down the form is outside that group.
+    if (!isPhoneInput(el)) return false;
+    const auto = (el.getAttribute("autocomplete") || "").toLowerCase();
+    const mode = (el.getAttribute("inputmode") || "").toLowerCase();
+    if (auto === "tel-national" || mode === "numeric") return true;
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "form" || tag === "body" || tag === "html") break;
+      const menus = node.querySelectorAll("select, [role='combobox'], input[role='combobox']");
+      let codes = 0;
+      let menusInScope = 0;
+      for (const menu of menus) {
+        if (menu === el || (menu.contains && menu.contains(el))) continue;
+        menusInScope += 1;
+        if (looksLikeCallingCode(menu) || menuHasDialCode(menu)) codes += 1;
+      }
+      if (codes === 1 && menusInScope <= 2) return true;
+      if (menusInScope > 2) break;
+    }
+    return false;
+  }
+
   function isSectionHeading(node, text) {
     // "ADDITIONAL INFORMATION" is a section title, not a question.
     const cleaned = cleanPrompt(text);
@@ -139,6 +287,133 @@ EXTRACT_JS = r"""
     return "";
   }
 
+  function formFieldQuestion(el) {
+    const field = el.closest("[data-automation-id^='formField'], [data-field-path]");
+    if (!field) return "";
+    const option = optionText(el) || cleanPrompt(textOf(el));
+    const labelled = field.getAttribute("aria-labelledby") || "";
+    if (labelled) {
+      const node = document.getElementById(labelled.split(/\s+/)[0]);
+      if (node && !node.contains(el)) {
+        const text = cleanPrompt(textOf(node));
+        if (text && text !== option && !isSectionHeading(node, text)) return text;
+      }
+    }
+    const labels = field.querySelectorAll("label, legend");
+    for (const label of labels) {
+      if (!label || label.contains(el)) continue;
+      const text = cleanPrompt(textOf(label));
+      if (!text || text === option || text.length > 200 || isSectionHeading(label, text)) continue;
+      return text;
+    }
+    return "";
+  }
+
+  function radioContainer(el) {
+    return el.closest("[role='radiogroup'], fieldset, [data-field-path]") || null;
+  }
+
+  function containerKey(box, el) {
+    if (box) {
+      if (box.id) return "id:" + box.id;
+      const path = box.getAttribute("data-field-path") || box.getAttribute("data-automation-id") || "";
+      if (path) return "path:" + path;
+      if (!box.getAttribute("data-autofill-radio-group")) {
+        box.setAttribute("data-autofill-radio-group", Math.random().toString(36).slice(2));
+      }
+      return "mark:" + box.getAttribute("data-autofill-radio-group");
+    }
+    const parent = el.parentElement;
+    if (parent) {
+      const peers = Array.from(parent.querySelectorAll("input[type='radio']")).filter((radio) => {
+        if (radio.getAttribute("name")) return false;
+        const label = radio.closest("label");
+        return radio.parentElement === parent || (label && label.parentElement === parent);
+      });
+      if (peers.length > 1) {
+        if (!parent.getAttribute("data-autofill-radio-group")) {
+          parent.setAttribute("data-autofill-radio-group", Math.random().toString(36).slice(2));
+        }
+        return "parent:" + parent.getAttribute("data-autofill-radio-group");
+      }
+    }
+    return "solo:" + (el.id || selectorFor(el));
+  }
+
+  function nativeRadioGroup(root, el) {
+    const name = el.getAttribute("name") || "";
+    if (name) {
+      return Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
+    }
+    const box = radioContainer(el);
+    const scope = box || el.parentElement || el;
+    return Array.from(scope.querySelectorAll("input[type='radio']")).filter((radio) => {
+      if (radio.getAttribute("name")) return false;
+      if (box) return radioContainer(radio) === box;
+      const parent = el.parentElement;
+      const label = radio.closest("label");
+      return radio.parentElement === parent || (label && label.parentElement === parent);
+    });
+  }
+
+  function radioOptionLabel(radio) {
+    const wrapping = radio.closest("label");
+    if (wrapping) return cleanPrompt(textOf(wrapping));
+    if (radio.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(radio.id) + "']");
+      if (explicit) return cleanPrompt(textOf(explicit));
+    }
+    const next = radio.nextElementSibling;
+    if (next && next.tagName && next.tagName.toLowerCase() === "label") {
+      if (!next.querySelector("input, select, textarea")) return cleanPrompt(textOf(next));
+    }
+    const role = (radio.getAttribute("role") || "").toLowerCase();
+    if (role === "radio") return cleanPrompt(radio.getAttribute("aria-label") || textOf(radio));
+    return radio.value || "";
+  }
+
+  function pushRadioControl(group) {
+    const visible = group.filter((radio) => radio);
+    if (!visible.length) return;
+    const first = visible[0];
+    const fieldset = first.closest("fieldset");
+    const legend = fieldset ? fieldset.querySelector("legend") : null;
+    const question = groupQuestion(first) || formFieldQuestion(first);
+    const options = visible.map((radio) => ({
+      value: radio.value || radioOptionLabel(radio),
+      label: radioOptionLabel(radio),
+      selector: selectorFor(radio),
+    })).filter((option) => option.selector && option.label);
+    if (!options.length) return;
+    const native = (first.tagName || "").toLowerCase() === "input";
+    controls.push({
+      kind: "radio",
+      name: first.getAttribute("name") || "",
+      elementId: first.id || "",
+      label: question || radioOptionLabel(first),
+      placeholder: "",
+      ariaLabel: first.getAttribute("aria-label") || "",
+      autocomplete: "",
+      required: visible.some((radio) => (
+        radio.required ||
+        radio.getAttribute("aria-required") === "true" ||
+        controlMarkedRequired(radio) ||
+        controlMarkedRequired(radioContainer(radio))
+      )),
+      hidden: visible.every((radio) => isHidden(radio)),
+      disabled: visible.every((radio) => radio.disabled || radio.getAttribute("aria-disabled") === "true"),
+      readOnly: false,
+      options,
+      selector: options[0].selector,
+      inputMode: "",
+      inputType: native ? "radio" : "aria-radio",
+      role: "radio",
+      nearby: "",
+      group: textOf(legend) || question,
+      prompt: question,
+    });
+  }
+
   function stripStar(text) {
     return cleanPrompt(text).replace(/[\s*✱＊]+$/g, "").trim();
   }
@@ -200,7 +475,7 @@ EXTRACT_JS = r"""
       }
     }
     const aria = el.getAttribute("aria-label");
-    if (aria) bits.push(aria.trim());
+    if (aria && !isGenericPrompt(aria)) bits.push(aria.trim());
     if (!bits.length) {
       const option = optionText(el);
       if (option) bits.push(option);
@@ -228,7 +503,7 @@ EXTRACT_JS = r"""
           const tag = prev.tagName ? prev.tagName.toLowerCase() : "";
           if (tag === "label" || tag === "legend") {
             const text = textOf(prev);
-            if (text && !isSectionHeading(prev, text) && !isPlaceholderPrompt(text)) found = text;
+            if (text && !isSectionHeading(prev, text) && !isGenericPrompt(text)) found = text;
           }
           const blocks =
             tag === "input" ||
@@ -242,7 +517,7 @@ EXTRACT_JS = r"""
             const inner = prev.querySelector && prev.querySelector("label, legend");
             if (inner && !isHidden(inner)) {
               const text = textOf(inner);
-              if (text && !isSectionHeading(inner, text) && !isPlaceholderPrompt(text)) found = text;
+              if (text && !isSectionHeading(inner, text) && !isGenericPrompt(text)) found = text;
             }
           }
           if (!found) {
@@ -252,7 +527,7 @@ EXTRACT_JS = r"""
               text &&
               text.length <= 200 &&
               !isSectionHeading(prev, text) &&
-              !isPlaceholderPrompt(text) &&
+              !isGenericPrompt(text) &&
               (
                 cls.indexOf("question") !== -1 ||
                 cls.indexOf("application-label") !== -1 ||
@@ -269,6 +544,10 @@ EXTRACT_JS = r"""
       }
       if (found) bits.push(found);
     }
+    if (!bits.length) {
+      const question = fieldQuestionNode(el);
+      if (question) bits.push(textOf(question));
+    }
     return dedupeBits(bits);
   }
 
@@ -278,7 +557,10 @@ EXTRACT_JS = r"""
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute("type") || "").toLowerCase();
     if (name && (type === "radio" || type === "checkbox")) {
-      return tag + "[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(el.value || "") + "']";
+      const attr = el.getAttribute("value");
+      const base = tag + "[type='" + type + "'][name='" + CSS.escape(name) + "']";
+      if (attr === null) return base;
+      return base + "[value='" + CSS.escape(attr) + "']";
     }
     if (name) return tag + "[name='" + CSS.escape(name) + "']";
     const fieldPath = el.closest && el.closest("[data-field-path]");
@@ -291,7 +573,27 @@ EXTRACT_JS = r"""
       if (path) return "[data-field-path='" + cssAttr(path) + "'] [role='combobox']";
     }
     const automation = el.getAttribute("data-automation-id");
-    if (automation) return "[data-automation-id='" + CSS.escape(automation) + "']";
+    if (automation) {
+      const bare = "[data-automation-id='" + CSS.escape(automation) + "']";
+      // Workday repeats searchBox and promptIcon on every prompt. The first
+      // Country Phone Code box must not be the selector for How Did You Hear.
+      const field = el.closest && el.closest("[data-automation-id^='formField']");
+      const fieldAuto = field && field !== el ? (field.getAttribute("data-automation-id") || "") : "";
+      if (fieldAuto) {
+        const root = el.getRootNode && el.getRootNode();
+        const scope = root && typeof root.querySelectorAll === "function" ? root : document;
+        let count = 1;
+        try {
+          count = scope.querySelectorAll(bare).length;
+        } catch (error) {
+          count = 1;
+        }
+        if (count > 1) {
+          return "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare;
+        }
+      }
+      return bare;
+    }
     if (el.classList && el.classList.contains("postings-btn")) return tag + ".postings-btn";
     // Unnamed submit buttons still need a selector so they can be reported
     // and so the fill routine can refuse them. The attribute is not a secret.
@@ -301,9 +603,27 @@ EXTRACT_JS = r"""
     return "[data-autofill-target='" + el.getAttribute("data-autofill-target") + "']";
   }
 
+  function inTilearcPopup(el) {
+    let node = el;
+    while (node) {
+      if (node.nodeType === 1) {
+        if (node.id === "tilearc-answer-popup") return true;
+        if (node.getAttribute && node.getAttribute("data-tilearc-popup")) return true;
+      }
+      const root = node.getRootNode ? node.getRootNode() : null;
+      if (root && root.host && root.host !== node) {
+        node = root.host;
+        continue;
+      }
+      node = node.parentElement || null;
+    }
+    return false;
+  }
+
   function eachRoot(root, visit) {
     visit(root);
     for (const el of root.querySelectorAll("*")) {
+      if (el.id === "tilearc-answer-popup" || (el.getAttribute && el.getAttribute("data-tilearc-popup"))) continue;
       if (el.shadowRoot) eachRoot(el.shadowRoot, visit);
     }
   }
@@ -341,6 +661,7 @@ EXTRACT_JS = r"""
   eachRoot(document, (root) => {
     const rootKey = root.host ? (root.host.id || "shadow") : "document";
     for (const el of root.querySelectorAll("input, select, textarea")) {
+      if (inTilearcPopup(el)) continue;
       const tag = el.tagName.toLowerCase();
       const inputType = tag === "textarea"
         ? "textarea"
@@ -351,44 +672,11 @@ EXTRACT_JS = r"""
 
       if (inputType === "radio") {
         const name = el.getAttribute("name") || "";
-        const groupKey = rootKey + "::" + name;
-        if (!name || seenRadios.has(groupKey)) continue;
+        const box = radioContainer(el);
+        const groupKey = name ? rootKey + "::name::" + name : rootKey + "::" + containerKey(box, el);
+        if (seenRadios.has(groupKey)) continue;
         seenRadios.add(groupKey);
-        const group = Array.from(root.querySelectorAll("input[type='radio'][name='" + CSS.escape(name) + "']"));
-        const fieldset = el.closest("fieldset");
-        const legend = fieldset ? fieldset.querySelector("legend") : null;
-        const question = groupQuestion(el);
-        const options = group.map((radio) => ({
-          value: radio.value || "",
-          label: textOf(radio.closest("label")) || radio.value || "",
-          selector: selectorFor(radio),
-        })).filter((option) => option.selector);
-        if (!options.length) continue;
-        controls.push({
-          kind: "radio",
-          name,
-          elementId: el.id || "",
-          label: question,
-          placeholder: "",
-          ariaLabel: el.getAttribute("aria-label") || "",
-          autocomplete: "",
-          required: group.some((radio) => (
-            radio.required ||
-            radio.getAttribute("aria-required") === "true" ||
-            controlMarkedRequired(radio)
-          )),
-          hidden: group.every((radio) => isHidden(radio)),
-          disabled: group.every((radio) => radio.disabled),
-          readOnly: false,
-          options,
-          selector: options[0].selector,
-          inputMode: "",
-          inputType: "radio",
-          role: "radio",
-          nearby: "",
-          group: textOf(legend) || question,
-          prompt: question,
-        });
+        pushRadioControl(nativeRadioGroup(root, el));
         continue;
       }
 
@@ -410,10 +698,14 @@ EXTRACT_JS = r"""
       if (classToken.indexOf("select__input") !== -1 || (el.closest && el.closest(".select__control"))) {
         kind = "combobox";
       }
+      const promptWidget = isPromptWidget(el);
+      if (promptWidget) kind = "combobox";
 
       let options = [];
       if (tag === "select") {
-        options = Array.from(el.options).map((option) => ({
+        options = Array.from(el.options).filter((option) => (
+          !option.disabled && option.getAttribute("aria-disabled") !== "true"
+        )).map((option) => ({
           value: option.value,
           label: (option.textContent || "").replace(/\s+/g, " ").trim(),
           selector: "",
@@ -421,8 +713,16 @@ EXTRACT_JS = r"""
       } else if (kind === "combobox") {
         const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
         const list = listId ? byId(root, listId) : null;
-        if (list && (list.getAttribute("role") || "") === "listbox") {
-          options = Array.from(list.querySelectorAll("[role='option']")).map((option) => ({
+        // selectedItemList is the value already chosen, often on another field
+        // such as Country Phone Code. Prompt options are a different list.
+        if (list && (list.getAttribute("role") || "") === "listbox" && !isSelectedItemNode(list)) {
+          options = Array.from(list.querySelectorAll(
+            "[role='option'], [data-automation-id='promptOption']"
+          )).filter((option) => (
+            !option.disabled &&
+            option.getAttribute("aria-disabled") !== "true" &&
+            !isSelectedItemNode(option)
+          )).map((option) => ({
             value: option.getAttribute("data-value") || textOf(option),
             label: textOf(option),
             selector: selectorFor(option),
@@ -445,7 +745,8 @@ EXTRACT_JS = r"""
             el.getAttribute("aria-required") === "true" ||
             (kind === "checkbox" && controlMarkedRequired(el)) ||
             (
-              (role === "combobox" ||
+              (promptWidget ||
+                role === "combobox" ||
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
                 classToken.indexOf("autocomplete") !== -1) &&
               controlMarkedRequired(el)
@@ -459,16 +760,17 @@ EXTRACT_JS = r"""
         inputType,
         role,
         nearby: textOf(headingNode).slice(0, 160),
-        group: legendText(el),
+        group: legendText(el) || (inputType === "checkbox" ? formFieldQuestion(el) : ""),
         prompt: inputType === "checkbox" ? groupQuestion(el) : "",
         automationId: el.getAttribute("data-automation-id") || "",
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
         phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
+        nationalPhone: nationalPhone(el),
       });
     }
 
     for (const el of root.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")) {
-      if (isHidden(el)) continue;
+      if (inTilearcPopup(el) || isHidden(el)) continue;
       const href = el.getAttribute("href") || "";
       let name = (el.innerText || el.value || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
       if (!name && /apply/i.test(href)) name = "Apply";
@@ -488,6 +790,70 @@ EXTRACT_JS = r"""
         inAd: place.inAd,
         inMain: place.inMain,
         disabled: isDisabled(el),
+      });
+    }
+  });
+
+  // Custom checkbox, switch, and radio widgets. A native input inside the
+  // widget is already recorded. These are reported and not clicked here.
+  eachRoot(document, (root) => {
+    const rootKey = root.host ? (root.host.id || "shadow") : "document";
+    const seenAriaRadios = new Set();
+    for (const el of root.querySelectorAll("[role='radio']")) {
+      if (isHidden(el)) continue;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      const type = (el.getAttribute("type") || "").toLowerCase();
+      if (tag === "input" || tag === "button" || tag === "a" || type === "submit" || type === "button") continue;
+      if ((el.getAttribute("role") || "").toLowerCase() === "button") continue;
+      if (el.querySelector("input[type='radio']")) continue;
+      const box = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      const key = rootKey + "::aria::" + containerKey(box, el);
+      if (seenAriaRadios.has(key)) continue;
+      seenAriaRadios.add(key);
+      const scope = box || el;
+      const group = Array.from(scope.querySelectorAll("[role='radio']")).filter((radio) => {
+        if (isHidden(radio)) return false;
+        const radioTag = radio.tagName ? radio.tagName.toLowerCase() : "";
+        if (radioTag === "input" || radioTag === "button" || radioTag === "a") return false;
+        if (radio.querySelector("input[type='radio']")) return false;
+        return radio.closest("[role='radiogroup'], fieldset, [data-field-path]") === box
+          || radio.parentElement === box;
+      });
+      pushRadioControl(group.length ? group : [el]);
+    }
+    for (const el of root.querySelectorAll("[role='checkbox'], [role='switch']")) {
+      if (isHidden(el)) continue;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (tag === "input" || tag === "button" || tag === "a") continue;
+      if (el.querySelector("input[type='checkbox'], input[type='radio']")) continue;
+      const yesno = el.closest("[class*='yesno'], .ashby-application-form-input-yesno");
+      if (yesno && yesno.querySelector("button, [role='button']")) continue;
+      const roleName = (el.getAttribute("role") || "").toLowerCase();
+      const selector = selectorFor(el);
+      if (!selector || controls.some((control) => control.selector === selector)) continue;
+      const question = groupQuestion(el) || formFieldQuestion(el);
+      const own = cleanPrompt(el.getAttribute("aria-label") || textOf(el));
+      controls.push({
+        kind: "checkbox",
+        name: el.getAttribute("name") || "",
+        elementId: el.id || "",
+        label: own || question,
+        placeholder: "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        autocomplete: "",
+        required: el.getAttribute("aria-required") === "true" || controlMarkedRequired(el),
+        hidden: false,
+        disabled: el.getAttribute("aria-disabled") === "true",
+        readOnly: false,
+        options: [],
+        selector,
+        inputMode: "",
+        inputType: roleName === "switch" ? "switch" : "aria-checkbox",
+        role: roleName,
+        nearby: "",
+        group: question && question !== own ? question : formFieldQuestion(el),
+        prompt: question && question !== own ? question : "",
+        automationId: el.getAttribute("data-automation-id") || "",
       });
     }
   });
@@ -595,7 +961,7 @@ EXTRACT_JS = r"""
       const prev = node.previousElementSibling;
       if (prev && prev.tagName && prev.tagName.toLowerCase() === "label") return prev;
     }
-    return null;
+    return fieldQuestionNode(el);
   }
 
   function controlMarkedRequired(el) {
@@ -941,13 +1307,7 @@ EXTRACT_JS = r"""
   for (const phrase of wallPhrases) {
     if (wallText.indexOf(phrase) !== -1) botWall = true;
   }
-  if (botWall) captcha = true;
-  const challengeSelector = [
-    ".h-captcha",
-    ".g-recaptcha",
-    ".cf-turnstile",
-    "#px-captcha",
-    ".px-captcha",
+  const frameSelector = [
     "iframe[src*='hcaptcha.com']",
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='arkoselabs']",
@@ -955,11 +1315,87 @@ EXTRACT_JS = r"""
     "iframe[src*='captcha-delivery']",
     "iframe[src*='recaptcha']",
   ].join(", ");
+  const challengeSelector = [
+    ".h-captcha",
+    ".g-recaptcha",
+    ".cf-turnstile",
+    "#px-captcha",
+    ".px-captcha",
+    frameSelector,
+  ].join(", ");
+  function challengeCopy(el) {
+    const text = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    return (
+      text.indexOf("i'm not a robot") !== -1 ||
+      text.indexOf("i’m not a robot") !== -1 ||
+      text.indexOf("i am not a robot") !== -1 ||
+      text.indexOf("verify you are human") !== -1 ||
+      text.indexOf("verify you are a human") !== -1 ||
+      text.indexOf("press and hold") !== -1 ||
+      text.indexOf("press & hold") !== -1
+    );
+  }
+  function interactiveChallenge(el) {
+    // An empty sized holder is not a widget. A shown iframe or checkbox copy is.
+    if (!challengeShown(el)) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+    if (tag === "iframe") return true;
+    if (el.querySelectorAll) {
+      for (const frame of el.querySelectorAll(frameSelector)) {
+        if (challengeShown(frame)) return true;
+      }
+    }
+    return challengeCopy(el);
+  }
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll(challengeSelector)) {
-      if (challengeShown(el)) captcha = true;
+      if (interactiveChallenge(el)) captcha = true;
     }
   });
+  function applicationFieldsVisible() {
+    for (const control of controls) {
+      if (control.hidden || control.disabled) continue;
+      const kind = String(control.kind || "");
+      const inputType = String(control.inputType || "").toLowerCase();
+      if (
+        kind === "password" ||
+        inputType === "password" ||
+        inputType === "hidden" ||
+        inputType === "search"
+      ) {
+        continue;
+      }
+      const blob = [
+        control.label,
+        control.ariaLabel,
+        control.placeholder,
+        control.name,
+        control.nearby,
+        control.prompt,
+      ].join(" ").toLowerCase();
+      if (/\b(language|locale)\b/.test(blob) && !/\b(e-?mail|phone|mobile|name)\b/.test(blob)) continue;
+      if (
+        kind === "text" ||
+        kind === "textarea" ||
+        kind === "select" ||
+        kind === "combobox" ||
+        kind === "file" ||
+        kind === "radio" ||
+        kind === "checkbox" ||
+        inputType === "email" ||
+        inputType === "tel" ||
+        inputType === "number"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // A wall phrase beside a real application form is not a challenge. A
+  // full-page wall with no fillable fields still is.
+  if (applicationFieldsVisible()) botWall = false;
+  else if (botWall) captcha = true;
   const links = [];
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll("a[href], [role='link']")) {
@@ -986,9 +1422,21 @@ EXTRACT_JS = r"""
     }
   });
   const automationIds = [];
+  // Workday draws Create Account / Sign In as an aria-hidden button under a
+  // click_filter overlay. That button is still on screen and names the pane.
+  const paneIds = new Set(["createAccountSubmitButton", "signInSubmitButton"]);
+  function renderedButAriaHidden(el) {
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden) return false;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    }
+    return true;
+  }
   eachRoot(document, (root) => {
     for (const el of root.querySelectorAll("[data-automation-id]")) {
-      if (isHidden(el)) continue;
+      const paneId = paneIds.has(el.getAttribute("data-automation-id") || "");
+      if (isHidden(el) && !(paneId && renderedButAriaHidden(el))) continue;
       const id = el.getAttribute("data-automation-id");
       if (id && automationIds.indexOf(id) === -1) automationIds.push(id);
     }
@@ -1049,7 +1497,8 @@ EXTRACT_JS = r"""
         for (const child of Array.from(wrap.children || [])) {
           if (child.contains && child.contains(el)) continue;
           const tag = child.tagName ? child.tagName.toLowerCase() : "";
-          if (tag === "ul" || tag === "ol") push(child);
+          // A progress bar or nav list beside the form is not a password rule.
+          if ((tag === "ul" || tag === "ol") && looksLikeRules(child)) push(child);
           else if (policyId(child) && !pushLists(child)) push(child);
         }
         let sib = wrap.nextElementSibling;
@@ -1160,6 +1609,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 automation_id=str(raw.get("automationId", "") or ""),
                 max_length=_max_length(raw.get("maxLength")),
                 phone_adjacent=bool(raw.get("phoneAdjacent", False)),
+                national_phone=bool(raw.get("nationalPhone", False)),
             )
         )
     buttons = [
@@ -1301,6 +1751,7 @@ _FINGERPRINT_JS = r"""() => {
       bits.push([el.id || "", el.getAttribute("data-automation-id") || "", type, value].join(":"));
     }
     for (const el of node.querySelectorAll("*")) {
+      if (el.id === "tilearc-answer-popup" || (el.getAttribute && el.getAttribute("data-tilearc-popup"))) continue;
       if (el.shadowRoot) walk(el.shadowRoot);
     }
   }

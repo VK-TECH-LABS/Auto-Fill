@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Apply: Night Operator</title></head>
+<body>
+  <main id="stage"></main>
+  <script>
+    window.__submitted = false;
+    window.__clicked = [];
+    let index = 0;
+    function render() {
+      const stage = document.getElementById("stage");
+      if (index === 0) {
+        stage.innerHTML = `
+          <h1>Your details</h1>
+          <form id="page1" onsubmit="return false">
+            <label for="name">Full name</label>
+            <input id="name" name="name" autocomplete="name" required>
+            <label for="email">Email</label>
+            <input id="email" type="email" name="email" autocomplete="email" required>
+            <fieldset>
+              <legend>Are you willing to work rotating night shifts? *</legend>
+              <p class="help">Shifts rotate every two weeks.</p>
+              <label><input type="radio" name="nights" value="yes" required> Yes</label>
+              <label><input type="radio" name="nights" value="no" required> No</label>
+            </fieldset>
+            <button id="forward" type="button">Next</button>
+          </form>`;
+      } else {
+        stage.innerHTML = `
+          <h1>A few more questions</h1>
+          <form id="page2">
+            <label for="tool">Which forklift brand have you operated most? *</label>
+            <input id="tool" name="tool" required>
+            <button id="submit" type="submit">Submit application</button>
+          </form>`;
+        document.getElementById("page2").addEventListener("submit", (event) => {
+          event.preventDefault();
+          window.__submitted = true;
+        });
+      }
+      const forward = document.getElementById("forward");
+      if (forward) {
+        forward.addEventListener("click", () => {
+          const picked = document.querySelector("input[name=nights]:checked");
+          window.__clicked.push("Next");
+          if (!picked || !document.getElementById("name").value || !document.getElementById("email").value) return;
+          index += 1;
+          render();
+        });
+      }
+    }
+    render();
+  </script>
+</body>
+</html>

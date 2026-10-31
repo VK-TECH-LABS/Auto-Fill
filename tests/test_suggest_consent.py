@@ -392,7 +392,11 @@ def test_consent_blocks_ready_and_marketing_stays_unchecked(browser):
             selector="#auth",
             required=True,
         )
-        assert map_field(factual, _profile()).action == "check"
+        # A country-less work-authorization box uses the profile fact only when
+        # the address country is the United States.
+        authorized = _profile()
+        authorized.personal.country = "United States"
+        assert map_field(factual, authorized).action == "check"
         privacy = next(
             control
             for control in snapshot.controls

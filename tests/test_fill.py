@@ -70,6 +70,7 @@ def test_sample_form_is_filled_and_not_submitted(browser, tmp_path):
     resume = tmp_path / "resume.pdf"
     resume.write_bytes(b"%PDF-1.4\n% fictional resume for the autofill fixture\n")
     profile = CandidateProfile.load(EXAMPLE)
+    profile.personal.country = "United States"
     page = browser.new_page()
     try:
         page.goto(SAMPLE.as_uri())
@@ -96,7 +97,7 @@ def test_sample_form_is_filled_and_not_submitted(browser, tmp_path):
         assert page.locator("#auth").input_value() == "Yes"
         assert page.locator("#sponsor-no").is_checked()
         assert page.locator("#sponsor-yes").is_checked() is False
-        assert page.locator("#background").is_checked()
+        assert page.locator("#background").is_checked() is False
         assert page.locator("#gender").input_value() == ""
         assert "fictional" in page.locator("#cover").input_value()
         assert page.locator("#pronouns").input_value() == ""
