@@ -315,6 +315,8 @@ JURISDICTION_INTENTS = frozenset(
 _COUNTRIES: tuple[tuple[str, str], ...] = (
     ("united states", "US"),
     ("america", "US"),
+    # Bare "US" after normalization. "U.S." is already folded to "united states".
+    ("us", "US"),
     ("canada", "CA"),
     ("canadian", "CA"),
     ("united kingdom", "UK"),
@@ -346,15 +348,49 @@ _COUNTRIES: tuple[tuple[str, str], ...] = (
     ("philippines", "PH"),
 )
 
-def jurisdiction(text: str) -> frozenset[str]:
-    """Countries named in a question. None named means the United States."""
+def countries_named(text: str) -> frozenset[str]:
+    """Country codes written in the question. Empty when the text names none."""
     folded = normalize_question(text)
-    found = {
+    return frozenset(
         code
         for phrase, code in _COUNTRIES
         if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", folded)
+    )
+
+
+def jurisdiction(text: str) -> frozenset[str]:
+    """Countries named in a question. None named means the United States.
+
+    Callers that must not assume the United States use ``countries_named``
+    and ``classify_question(..., us_on_page=...)``.
+    """
+    return countries_named(text) or frozenset({"US"})
+
+
+def country_is_us(value: str) -> bool:
+    """True for a United States country label. A blank value is not the United States."""
+    token = normalize(value)
+    return token in {
+        "us",
+        "usa",
+        "u s",
+        "u s a",
+        "united states",
+        "united states of america",
+        "america",
     }
-    return frozenset(found or {"US"})
+
+
+def _us_work_auth_applies(text: str, *, us_on_page: bool) -> bool:
+    """A work-authorization intent applies only to an explicit U.S. question.
+
+    A question that names no country is the United States only when this
+    page's address country is already the United States.
+    """
+    named = countries_named(text)
+    if not named:
+        return us_on_page
+    return named == frozenset({"US"})
 
 
 def normalize_question(text: str) -> str:
@@ -548,13 +584,19 @@ def classify_question(
     options: list[str] | None = None,
     *,
     hook: Level3Hook | None = None,
+    us_on_page: bool = False,
 ) -> IntentMatch:
-    """Classify one question. The hook is skipped unless the caller passes it."""
+    """Classify one question. The hook is skipped unless the caller passes it.
+
+    ``us_on_page`` is true when this application's address country is the
+    United States. A work-authorization question that names no country is
+    not treated as a U.S. question unless that flag is set.
+    """
     sanitized = sanitize_question(text)
     if not sanitized:
         return IntentMatch(None, "unknown", "none", "")
     level1 = _level1(sanitized)
-    if level1 in JURISDICTION_INTENTS and jurisdiction(sanitized) != frozenset({"US"}):
+    if level1 in JURISDICTION_INTENTS and not _us_work_auth_applies(sanitized, us_on_page=us_on_page):
         # "Authorized to work in Canada?" is not the U.S. question. No U.S. answer is reused for it.
         return IntentMatch(None, "unknown", "jurisdiction", sanitized)
     if level1 is not None:
@@ -563,7 +605,7 @@ def classify_question(
     if (
         semantic is not None
         and semantic.intent in JURISDICTION_INTENTS
-        and jurisdiction(sanitized) != frozenset({"US"})
+        and not _us_work_auth_applies(sanitized, us_on_page=us_on_page)
     ):
         semantic = None
     if semantic is not None and semantic.confidence == "HIGH":

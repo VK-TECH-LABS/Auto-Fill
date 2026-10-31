@@ -85,6 +85,17 @@ def bind_location_profile(profile: CandidateProfile | None) -> Token:
 def reset_location_profile(token: Token) -> None:
     _LOCATION_PROFILE.reset(token)
 
+
+def current_location_profile() -> CandidateProfile | None:
+    """The profile bound for this fill, if one was."""
+    return _LOCATION_PROFILE.get()
+
+
+def _us_on_page() -> bool:
+    from autofill.mapping import us_context
+
+    return us_context(current_location_profile())
+
 _LEGAL_RE = re.compile(
     r"\b(i agree|i certify|i acknowledge|terms of (service|use)|privacy policy|attest|e-?sign|legal attestation)\b"
 )
@@ -203,6 +214,9 @@ def fill_resolved_page(
     if resume_uploaded:
         settle_form(page)
     snapshot = extract_page(page)
+    from autofill.mapping import note_page_country
+
+    note_page_country(page, snapshot)
     outcome = ResolvedPage(snapshot=snapshot)
     clusters = _clusters(snapshot)
     requests: list[_Ask] = []
@@ -396,7 +410,7 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
     if control.kind == "buttons":
         text = _question_text(controls)
         options = _option_labels(controls)
-        match = classify_question(text, options, hook=hook)
+        match = classify_question(text, options, hook=hook, us_on_page=_us_on_page())
         return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
         if _is_application_resume(control):
@@ -406,7 +420,7 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         return _Ask(controls=controls, field_key="location", compose_location=True)
     text = _question_text(controls if kind == "multi" else [control])
     options = _option_labels(controls)
-    match = classify_question(text, options, hook=hook)
+    match = classify_question(text, options, hook=hook, us_on_page=_us_on_page())
     if match.intent == "REFERRAL":
         return _Ask(controls=controls, match=match, include_question=True)
     internal = None if kind == "multi" else match_field_key(control)
@@ -3275,6 +3289,7 @@ def _apply_question(
             if any(item.required for item in ask.controls):
                 _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
+        remember_confirmed(control, option.label, field_key=match.intent or "")
         outcome.fields.append(
             FieldOutcome(
                 selector=option.selector,
@@ -3292,6 +3307,7 @@ def _apply_question(
         if picked is None:
             _manual(outcome, match, blocking=True, controls=ask.controls, kind="OPTION_MISMATCH")
             return
+        remember_confirmed(control, picked.label, field_key=match.intent or "")
         outcome.fields.append(
             FieldOutcome(
                 selector=control.selector,
@@ -3803,14 +3819,18 @@ def _lookup_keys(text: str, question_id: str = "") -> list[str]:
 
 def _index_answers(
     response: ResolverResponse,
-) -> tuple[dict[str, ResolverAnswer], list[ResolverAnswer], dict[str, ResolverAnswer]]:
-    """Known intents by name. Unknown answers pair by text, id, or hash."""
-    by_intent: dict[str, ResolverAnswer] = {}
+) -> tuple[dict[str, list[ResolverAnswer]], list[ResolverAnswer], dict[str, ResolverAnswer]]:
+    """Known intents by name. Unknown answers pair by text, id, or hash.
+
+    Every row for an intent is kept. Two values for one intent are not collapsed
+    to the first one.
+    """
+    by_intent: dict[str, list[ResolverAnswer]] = {}
     unnamed: list[ResolverAnswer] = []
     by_key: dict[str, ResolverAnswer] = {}
     for item in response.answers:
         if item.intent:
-            by_intent.setdefault(item.intent, item)
+            by_intent.setdefault(item.intent, []).append(item)
             continue
         unnamed.append(item)
         for key in _lookup_keys(item.text, item.question_id):
@@ -3829,17 +3849,70 @@ def _unclassified_count(requests: list[_Ask]) -> int:
     return count
 
 
+def _resolver_value(item: ResolverAnswer) -> str:
+    if item.value:
+        return item.value
+    if len(item.values) == 1:
+        return item.values[0]
+    return ""
+
+
 def _take_answer(
     match: IntentMatch,
-    by_intent: dict[str, ResolverAnswer],
+    by_intent: dict[str, list[ResolverAnswer]],
     unnamed: list[ResolverAnswer],
     by_key: dict[str, ResolverAnswer],
     *,
     unclassified: int = 1,
     question_id: str = "",
+    us_on_page: bool | None = None,
+    employers: tuple[str, ...] = (),
 ) -> ResolverAnswer | None:
     if match.intent:
-        return by_intent.get(match.intent)
+        from autofill.answers import match_answer
+        from autofill.intents import UNFILLED_INTENTS
+        from autofill.mapping import normalize
+        from autofill.profile import ApplicationAnswer
+
+        if match.intent in UNFILLED_INTENTS:
+            return None
+        rows = list(by_intent.get(match.intent) or [])
+        if not rows:
+            return None
+        if any(len(item.values) > 1 for item in rows):
+            unique = {tuple(item.values) for item in rows}
+            if len(unique) != 1:
+                return None
+            return rows[0]
+        on_page = _us_on_page() if us_on_page is None else us_on_page
+        if not employers:
+            from autofill.answers import current_employers
+
+            employers = current_employers()
+        employer = next((item for item in employers if item.strip()), "")
+        catalogue = [
+            ApplicationAnswer(
+                question=item.text or match.text,
+                answer=_resolver_value(item),
+                intent=item.intent or "",
+                employer=employer,
+            )
+            for item in rows
+            if _resolver_value(item)
+        ]
+        picked = match_answer(
+            match.text,
+            catalogue,
+            normalize=normalize,
+            us_on_page=on_page,
+            employers=employers,
+        )
+        if picked is None:
+            return None
+        for item in rows:
+            if _resolver_value(item) == picked:
+                return item
+        return None
     keys = [question_id.strip().lower()] if question_id.strip() else []
     keys.extend(_lookup_keys(match.text))
     seen: set[str] = set()
@@ -4020,22 +4093,13 @@ def _usable_question(text: str, controls: list[Control]) -> str:
 
 
 def _question_text(controls: list[Control]) -> str:
-    control = controls[0]
-    if len(controls) > 1 or control.kind == "radio" or control.kind == "checkbox":
-        for raw in (control.group, control.prompt):
-            text = _usable_question(raw, controls)
-            if text:
-                return text
-        if len(controls) > 1 or control.kind == "radio":
-            for raw in (control.label, control.aria_label):
-                text = _usable_question(raw, controls)
-                if text:
-                    return text
-            return ""
-    for raw in (control.label, control.aria_label, control.placeholder, control.prompt):
-        text = _usable_question(raw, controls)
-        if text:
-            return text
+    """One question stem shared with the profile catalogue. Not the field haystack."""
+    from autofill.mapping import question_stem
+
+    for control in controls:
+        stem = question_stem(control)
+        if stem:
+            return stem
     return ""
 
 
@@ -4376,7 +4440,7 @@ def _gap_kind(controls: list[Control], mapped: MappedField | None) -> str:
         return "CONSENT"
     if mapped is not None and mapped.key in _DEMOGRAPHIC_KEYS:
         return "DEMOGRAPHIC"
-    match = classify_question(text, _option_labels(controls))
+    match = classify_question(text, _option_labels(controls), us_on_page=_us_on_page())
     if match.intent in DEMOGRAPHIC_INTENTS or _eeo(text) or _eeo(controls[0].label):
         return "DEMOGRAPHIC"
     if mapped is not None and "No option matched" in (mapped.reason or ""):
@@ -4462,7 +4526,7 @@ def _gap_item(controls: list[Control], profile: CandidateProfile | None, page=No
         loaded = [label for label in _load_place_options(page, primary.selector, query) if _keep_option(label)]
         if loaded:
             options = [sanitize_question(label, limit=80) for label in loaded]
-    match = classify_question(text, options)
+    match = classify_question(text, options, us_on_page=_us_on_page())
     named = bool(match.intent) and (match.intent in DEMOGRAPHIC_INTENTS or match.confidence == "HIGH")
     intent = match.intent if named else None
     if kind != "DEMOGRAPHIC" and intent in DEMOGRAPHIC_INTENTS:

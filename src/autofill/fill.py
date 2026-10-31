@@ -95,23 +95,48 @@ def current_session_id() -> str:
 
 
 def remember_confirmed(control: Control, value: str, *, field_key: str = "", choice: str = "") -> None:
-    """Keep a value the engine wrote and then read back on the control."""
-    hook = _CONFIRMED.get()
-    text = str(value or "")
-    if hook is None or not text.strip():
+    """Keep a value the engine wrote and then read back on the control.
+
+    The confirmed-value store puts the same control back after a rewrite.
+    ``choice`` marks a checkbox or radio for that restore. A separate catalogue
+    on the profile reuses a question answer on a later page. Profile fields
+    and consent are not copied into that catalogue.
+    """
+    text = str(value or "").strip()
+    if not text:
         return
-    record = {
-        "value": text,
-        "label": control.label or "",
-        "name": control.name or "",
-        "elementId": control.element_id or "",
-        "automationId": control.automation_id or "",
-        "fieldKey": field_key or "",
-        "selector": control.selector or "",
-    }
-    if choice:
-        record["choice"] = choice
-    hook(record)
+    hook = _CONFIRMED.get()
+    if hook is not None:
+        record = {
+            "value": text,
+            "label": control.label or "",
+            "name": control.name or "",
+            "elementId": control.element_id or "",
+            "automationId": control.automation_id or "",
+            "fieldKey": field_key or "",
+            "selector": control.selector or "",
+        }
+        if choice:
+            record["choice"] = choice
+        hook(record)
+    from autofill.answers import current_catalogue, note_session_answer
+    from autofill.intents import country_is_us
+    from autofill.mapping import mark_us_committed, question_stem
+
+    if field_key == "country" and country_is_us(text):
+        mark_us_committed()
+    bound = current_catalogue()
+    if bound is None:
+        return
+    profile, employers = bound
+    note_session_answer(
+        profile,
+        stem=question_stem(control),
+        value=text,
+        field_key=field_key,
+        employers=employers,
+        control=control,
+    )
 
 
 _SET_NATIVE = """
@@ -434,12 +459,14 @@ def fill_one_page(
     fields: list[FieldOutcome] = []
     manual: list[str] = []
     resume_blocked = False
-    snapshot = extract_page(page)
+    from autofill.mapping import note_page_country
+
     for _ in range(4):
         fields = []
         manual = []
         resume_blocked = False
         snapshot = extract_page(page)
+        note_page_country(page, snapshot)
         cursor = MapCursor(page_heading=snapshot.heading)
         for control in snapshot.controls:
             if not checkpoint():

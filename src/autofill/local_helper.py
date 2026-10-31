@@ -78,7 +78,7 @@ from autofill.local_attach import (
     validate_application_url,
 )
 from autofill.mapping import option_stance
-from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
+from autofill.profile import CandidateProfile, ProfileError
 from autofill.resume_fetch import MAX_RESUME_BYTES, resume_filename
 from autofill.safeguards import HumanSubmissionRequired
 
@@ -2140,18 +2140,23 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
     profile = job.profile
     if profile is None:
         return
-    if canonical_blocker_kind(item.get("kind")) in _NO_SESSION_REUSE_KINDS:
+    kind = canonical_blocker_kind(item.get("kind"))
+    if kind in _NO_SESSION_REUSE_KINDS:
         return
     question = str(item.get("text") or "").strip()
     values = [str(value) for value in target.get("values") or [] if str(value).strip()]
     if not question or len(values) != 1:
         return
-    answers = getattr(profile, "application_answers", None)
-    if not isinstance(answers, list):
-        return
-    if any(str(getattr(row, "question", "")).strip().casefold() == question.casefold() for row in answers):
-        return
-    answers.append(ApplicationAnswer(question=question, answer=values[0], intent=str(item.get("intent") or "")))
+    from autofill.answers import employer_keys, note_session_answer
+
+    note_session_answer(
+        profile,
+        stem=question,
+        value=values[0],
+        intent=str(item.get("intent") or ""),
+        kind=kind,
+        employers=employer_keys(url=job.application_url),
+    )
 
 
 def _public_status(job: LocalJob) -> str:

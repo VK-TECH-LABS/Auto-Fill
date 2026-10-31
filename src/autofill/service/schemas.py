@@ -44,6 +44,8 @@ class ApprovedAnswerIn(BaseModel):
 
     question: str = Field(min_length=1, max_length=500)
     answer: str = Field(min_length=1, max_length=2000)
+    intent: str = Field(default="", max_length=64)
+    employer: str = Field(default="", max_length=200)
 
     @field_validator("question", "answer")
     @classmethod
@@ -52,6 +54,21 @@ class ApprovedAnswerIn(BaseModel):
         if not cleaned:
             raise ValueError("must not be blank")
         return cleaned
+
+    @field_validator("intent")
+    @classmethod
+    def _known_intent(cls, value: str) -> str:
+        from autofill.intents import PROTOCOL_INTENTS
+
+        cleaned = value.strip().upper()
+        if cleaned and cleaned not in PROTOCOL_INTENTS:
+            raise ValueError("intent is not a known question intent")
+        return cleaned
+
+    @field_validator("employer")
+    @classmethod
+    def _employer(cls, value: str) -> str:
+        return value.strip()
 
 
 class ResolverIn(BaseModel):
