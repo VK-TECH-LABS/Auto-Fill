@@ -1992,25 +1992,37 @@ def _apply_ask(
     by_intent, unnamed, by_key, unclassified, rows, employment_index = shared
     if preserve_filled and ask.controls and _keep_filled(page, ask.controls):
         control = ask.controls[0]
-        key = ask.field_key or (ask.match.intent if ask.match else "") or ""
-        if control.kind in {"text", "textarea", "combobox", "select"}:
-            _remember_shown(page, control, key)
-            outcome.fields.append(
-                FieldOutcome(
-                    selector=control.selector,
-                    label=control.label,
-                    key=key or None,
-                    action="fill",
-                    detail="already set",
-                    field_class="PROFILE_FIELD",
+        # A listbox keeps going so a wrong Yes/No is replaced by the approved answer.
+        if not (control.kind == "buttons" and control.role == "listbox"):
+            key = ask.field_key or (ask.match.intent if ask.match else "") or ""
+            if control.kind in {"text", "textarea", "combobox", "select"}:
+                _remember_shown(page, control, key)
+                outcome.fields.append(
+                    FieldOutcome(
+                        selector=control.selector,
+                        label=control.label,
+                        key=key or None,
+                        action="fill",
+                        detail="already set",
+                        field_class="PROFILE_FIELD",
+                    )
                 )
-            )
-        return
-    if any(selector_held(control.selector) for control in ask.controls) and (
-        not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls)
+            return
+    listbox = bool(
+        ask.controls and ask.controls[0].kind == "buttons" and ask.controls[0].role == "listbox"
+    )
+    if (
+        not listbox
+        and any(selector_held(control.selector) for control in ask.controls)
+        and (not refill_cleared() or all(control_committed(page, control.selector) for control in ask.controls))
     ):
         return
-    if ask.controls and ask.controls[0].kind == "buttons" and control_committed(page, ask.controls[0].selector):
+    if (
+        ask.controls
+        and ask.controls[0].kind == "buttons"
+        and ask.controls[0].role != "listbox"
+        and control_committed(page, ask.controls[0].selector)
+    ):
         return
     if ask.controls:
         from autofill.combobox import attach_listbox_options
@@ -3356,9 +3368,10 @@ def _apply_question(
         return
     if control.kind == "buttons" and control.role == "listbox":
         from autofill.combobox import select_listbox_button
+        from autofill.dom_ui import listbox_choice_for
 
         desired = answer.value or (answer.values[0] if answer.values else "")
-        picked = select_listbox_button(page, control.selector, desired)
+        picked = select_listbox_button(page, control.selector, desired, question=control.label or "")
         if picked is None:
             _manual(
                 outcome,
@@ -3369,13 +3382,21 @@ def _apply_question(
             )
             return
         remember_confirmed(control, picked.label, field_key=match.intent or "")
+        audit = listbox_choice_for(control.selector)
+        detail = picked.label
+        if audit:
+            detail = (
+                f"intended={audit.get('intended') or ''} "
+                f"clicked={audit.get('clicked') or ''} "
+                f"shown={audit.get('shown') or ''}"
+            )
         outcome.fields.append(
             FieldOutcome(
                 selector=control.selector,
                 label=control.label,
                 key=match.intent,
                 action="select",
-                detail=picked.label,
+                detail=detail,
                 field_class="APPROVED_QUESTION",
             )
         )

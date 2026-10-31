@@ -2179,6 +2179,8 @@ def _result_brief(result: ApplicationResult) -> dict[str, Any]:
         "stopped_before_submit": result.stopped_before_submit,
         "submit_controls": list(result.submit_controls),
     }
+    if result.listbox_choices:
+        body["listbox_choices"] = [dict(item) for item in result.listbox_choices]
     account = result.account if isinstance(result.account, dict) else None
     if account:
         body["account"] = _public_account(account)

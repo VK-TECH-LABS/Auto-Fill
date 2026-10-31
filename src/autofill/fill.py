@@ -369,13 +369,28 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 return _outcome(control, mapped, detail=chosen.label)
             if control.kind == "buttons" and control.role == "listbox":
                 from autofill.combobox import select_listbox_button
+                from autofill.dom_ui import listbox_choice_for
 
-                chosen = select_listbox_button(target, control.selector, mapped.option_label or mapped.text or "")
+                intended = mapped.option_label or mapped.text or ""
+                chosen = select_listbox_button(
+                    target,
+                    control.selector,
+                    intended,
+                    question=control.label or control.prompt or "",
+                )
                 if chosen is None:
                     return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
                 remember_confirmed(control, chosen.label, field_key=mapped.key or "")
                 refresh_preview(page)
-                return _outcome(control, mapped, detail=chosen.label)
+                audit = listbox_choice_for(control.selector)
+                detail = chosen.label
+                if audit:
+                    detail = (
+                        f"intended={audit.get('intended') or ''} "
+                        f"clicked={audit.get('clicked') or ''} "
+                        f"shown={audit.get('shown') or ''}"
+                    )
+                return _outcome(control, mapped, detail=detail)
             if control.kind == "buttons" and mapped.option_selector:
                 from autofill.safeguards import click_choice
 
@@ -583,7 +598,9 @@ def fill_one_page(
                 )
                 continue
             control = group[0]
-            if selector_held(control.selector) and (
+            # A listbox that already shows the wrong Yes/No is selected again.
+            # Other held controls stay as the person left them.
+            if control.role != "listbox" and selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
                 continue

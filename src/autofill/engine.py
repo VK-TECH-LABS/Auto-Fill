@@ -214,6 +214,8 @@ class ApplicationResult:
     resume_failure: dict[str, Any] | None = None
     page_type: str = ""
     auto_consents: list[dict[str, Any]] = field(default_factory=list)
+    # Approved answer and the row that was clicked, for each listbox on this fill.
+    listbox_choices: list[dict[str, str]] = field(default_factory=list)
     entry_clicks: int = 0
     next_clicks: int = 0
     pages_advanced: int = 0
@@ -248,6 +250,7 @@ class ApplicationResult:
             "timings": dict(self.timings),
             "progress": dict(self.progress),
             "blocking": dict(self.blocking) if self.blocking else None,
+            "listboxChoices": [dict(item) for item in self.listbox_choices],
         }
 
 
@@ -320,6 +323,8 @@ def _result(session, *, status: str, ats: str | None, login_status: str, **kwarg
         result.progress["currentLabel"] = "Job closed"
         result.progress["percent"] = 0
     result.auto_consents = consume_auto_consents()
+    if state is not None:
+        result.listbox_choices = [dict(item) for item in state.listbox_choices]
     nav = _navigation_record()
     result.entry_clicks = int(nav["entryClicks"])
     result.next_clicks = int(nav["nextClicks"])
