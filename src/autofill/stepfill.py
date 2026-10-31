@@ -218,6 +218,13 @@ def fill_resolved_page(
         requests.append(ask)
 
     field_keys = _requested_field_keys(requests)
+    if _dependent_region_pending(snapshot):
+        # A state menu that is still disabled, or still only a placeholder, is
+        # not a cluster yet. Ask for the region now so it can be chosen after
+        # the country select enables it.
+        for key in ("address.region", "address.state"):
+            if key not in field_keys:
+                field_keys.append(key)
     questions = [ask.question_body() for ask in requests if ask.include_question]
     outcome.requested_fields = field_keys
     outcome.requested_intents = [ask.match.intent if ask.match else None for ask in requests if ask.include_question]
@@ -246,6 +253,7 @@ def fill_resolved_page(
             session_id=session_id,
             preserve_filled=resume_uploaded,
         )
+        _fill_region_after_country(page, response, outcome)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -630,6 +638,154 @@ _CITY_ALIASES = {
     "new york": ("nyc", "new york city"),
     "new york city": ("nyc", "new york"),
 }
+
+_REGION_LABELS = frozenset({"state", "province", "region", "state province", "province state"})
+
+
+def _is_region_control(control: Control) -> bool:
+    """An address state or province menu. A longer question that mentions a state is not one."""
+    if control.kind not in {"select", "combobox"}:
+        return False
+    label = normalize(control.label or control.aria_label or "")
+    return label in _REGION_LABELS
+
+
+def _region_names(value: str) -> set[str]:
+    """Abbreviation and full name from ``_STATES``. ``CA`` and ``California`` are one state."""
+    token = normalize(value)
+    if not token:
+        return set()
+    names = {token}
+    canonical = _STATES.get(token, "")
+    if not canonical:
+        for short, name in _STATES.items():
+            if token == name:
+                canonical = name
+                names.add(short)
+                break
+    if canonical:
+        names.add(canonical)
+        for short, name in _STATES.items():
+            if name == canonical:
+                names.add(short)
+                names.add(name)
+    return {item for item in names if item}
+
+
+def match_region_option(desired: str, options: list[Option]) -> Option | None:
+    """Match a state or province label using the full state table."""
+    names = _region_names(desired)
+    if not names:
+        return None
+    for option in options:
+        if normalize(option.label) in names or normalize(option.value) in names:
+            return option
+    return None
+
+
+def _dependent_region_pending(snapshot: PageSnapshot) -> bool:
+    for control in snapshot.controls:
+        if control.hidden or not _is_region_control(control):
+            continue
+        if control.disabled or not control.options:
+            return True
+    return False
+
+
+def _find_region_control(snapshot: PageSnapshot) -> Control | None:
+    found = [control for control in snapshot.controls if _is_region_control(control) and not control.hidden]
+    if not found:
+        return None
+    for control in found:
+        if control.disabled or not control.options:
+            return control
+    return found[0]
+
+
+def _region_text(fields: dict) -> str:
+    return str(fields.get("address.region") or fields.get("address.state") or "").strip()
+
+
+def _country_was_set(outcome: ResolvedPage) -> bool:
+    return any(item.action == "select" and item.key == "address.country" for item in outcome.fields)
+
+
+def _drop_manual_selector(outcome: ResolvedPage, selector: str) -> None:
+    before = len(outcome.manual_questions)
+    outcome.manual_questions = [
+        item for item in outcome.manual_questions if str(item.get("selector") or "") != selector
+    ]
+    removed = before - len(outcome.manual_questions)
+    if not removed:
+        return
+    kept: list[str] = []
+    for line in outcome.manual_actions:
+        if removed and line.endswith("manual answer required"):
+            removed -= 1
+            continue
+        kept.append(line)
+    outcome.manual_actions = kept
+
+
+def _fill_region_after_country(page, response: ResolverResponse, outcome: ResolvedPage) -> None:
+    """Choose the state after the country select has enabled it or replaced its options.
+
+    The first pass skips a disabled state menu and cannot see options that do
+    not exist yet. This waits, then writes once. A state that already holds a
+    value is left alone.
+    """
+    if page is None or not _country_was_set(outcome):
+        return
+    region = _region_text(response.fields)
+    if not region:
+        return
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    control = _find_region_control(snapshot)
+    if control is None:
+        return
+    if not control.disabled and control.selector and control_committed(page, control.selector):
+        return
+    deadline = time.monotonic() + 2.0
+    option: Option | None = None
+    while True:
+        if not control.disabled:
+            option = match_region_option(region, control.options)
+            if option is not None:
+                break
+        if time.monotonic() >= deadline or getattr(page, "wait_for_timeout", None) is None:
+            option = match_region_option(region, control.options) if not control.disabled else None
+            break
+        _pause(page, 100)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return
+        nxt = _find_region_control(snapshot)
+        if nxt is not None:
+            control = nxt
+    if control.disabled or option is None:
+        return
+    if control.selector and control_committed(page, control.selector):
+        return
+    mapped = MappedField(
+        key="address.region",
+        action="select",
+        text=region,
+        option_label=option.label,
+        option_value=option.value,
+        option_selector=option.selector,
+        field_class="PROFILE_FIELD",
+        confidence="high",
+    )
+    written = apply_mapped(page, control, mapped)
+    outcome.fields.append(written)
+    if written.action == "select":
+        _drop_manual_selector(outcome, control.selector)
+
+
 _LOCATION_OPTIONS_JS = r"""
 (selector) => {
   const el = document.querySelector(selector);

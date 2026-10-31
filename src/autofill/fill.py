@@ -15,6 +15,7 @@ from pathlib import Path
 from autofill.ats import detect_ats, is_blocked_sso, is_manual_ats
 from autofill.dom_ui import (
     checkpoint,
+    choose_native_select,
     control_committed,
     focus_field,
     refill_cleared,
@@ -290,10 +291,13 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
             expected = mapped.option_label or mapped.option_value or mapped.text or ""
             focus_field(target, control.selector)
-            if mapped.option_value:
-                locator.select_option(value=mapped.option_value)
-            else:
-                locator.select_option(label=mapped.option_label)
+            if not choose_native_select(
+                target,
+                control.selector,
+                label=mapped.option_label or "",
+                value=mapped.option_value or "",
+            ):
+                return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
             shown = _shown_value(locator)
             if not (
                 _value_verified(shown, expected)

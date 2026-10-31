@@ -8,6 +8,7 @@ from ``aria-controls`` / ``aria-owns``, or from the list inside that control.
 from __future__ import annotations
 
 import re
+import time
 
 from autofill.dom_ui import focus_field, type_char_delay
 from autofill.intents import match_option_exact
@@ -84,11 +85,18 @@ def match_country_option(desired: str, options: list[Option]) -> Option | None:
 
 
 _SCOPED_OPTIONS_JS = r"""
-(selector) => {
+(args) => {
+  const selector = args && args.selector ? args.selector : args;
+  const allowSingle = !!(args && args.allowSingle);
   const el = document.querySelector(selector);
   if (!el) return [];
   function textOf(node) {
     return (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+  function optionEnabled(option) {
+    if (!option) return false;
+    if (option.disabled) return false;
+    return option.getAttribute("aria-disabled") !== "true";
   }
   function claimedByOther(list) {
     if (!list.id) return false;
@@ -96,21 +104,43 @@ _SCOPED_OPTIONS_JS = r"""
     const owner = document.querySelector(query);
     return !!(owner && owner !== el);
   }
-  let list = null;
-  const owned = el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "";
-  if (owned) {
-    const node = document.getElementById(owned);
-    if (node && (node.getAttribute("role") || "") === "listbox" && !claimedByOther(node)) list = node;
+  function pageRoot(node) {
+    if (!node || !node.tagName) return true;
+    const tag = node.tagName.toLowerCase();
+    return tag === "body" || tag === "html" || tag === "form";
   }
-  let container = el.closest(".select, [class*='select__'], fieldset") || el.parentElement;
+  let list = null;
+  const owned = (el.getAttribute("aria-controls") || el.getAttribute("aria-owns") || "").trim();
+  if (owned) {
+    for (const id of owned.split(/\s+/)) {
+      const node = document.getElementById(id);
+      if (node && (node.getAttribute("role") || "") === "listbox" && !claimedByOther(node)) {
+        list = node;
+        break;
+      }
+    }
+  }
+  // A list inside this control counts. A list elsewhere on the page does not,
+  // even when it is the only visible listbox.
+  const widget = [
+    ".select",
+    "[class*='select__']",
+    "fieldset",
+    "[data-automation-id='multiSelectContainer']",
+    "[data-automation-id='multiselectInputContainer']",
+  ].join(", ");
+  let container = el.closest(widget) || el.parentElement;
   for (let depth = 0; container && depth < 4 && !list; depth += 1) {
+    if (pageRoot(container)) break;
     for (const candidate of container.querySelectorAll("[role='listbox']")) {
       if (!claimedByOther(candidate)) {
         list = candidate;
         break;
       }
     }
-    container = container.parentElement;
+    const parent = container.parentElement;
+    if (!parent || pageRoot(parent)) break;
+    container = parent;
   }
   function shown(node) {
     if (!node || node.hidden) return false;
@@ -119,14 +149,10 @@ _SCOPED_OPTIONS_JS = r"""
     const rect = node.getBoundingClientRect();
     return rect.width > 0 || rect.height > 0;
   }
-  if (!list) {
-    // A prompt menu often portals to the document instead of aria-controls.
-    const boxes = document.querySelectorAll("[role='listbox']");
-    for (const candidate of boxes) {
-      if (claimedByOther(candidate) || !shown(candidate)) continue;
-      list = candidate;
-      break;
-    }
+  function optionShown(option) {
+    if (!option || option.hidden) return false;
+    const style = window.getComputedStyle(option);
+    return style.display !== "none" && style.visibility !== "hidden";
   }
   const optionNodes = [];
   const optionSelector = [
@@ -136,12 +162,31 @@ _SCOPED_OPTIONS_JS = r"""
     "[data-automation-id='menuItem']",
   ].join(", ");
   if (list) {
-    for (const option of list.querySelectorAll(optionSelector)) optionNodes.push(option);
+    for (const option of list.querySelectorAll(optionSelector)) {
+      if (optionEnabled(option) && optionShown(option)) optionNodes.push(option);
+    }
   }
-  if (!optionNodes.length) {
+  const promptRoot = el.closest(
+    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  );
+  if (!optionNodes.length && promptRoot) {
+    // Workday draws the prompt menu on document.body. Only that widget may use it.
     const portalSelector = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode']";
     for (const option of document.querySelectorAll(portalSelector)) {
-      if (shown(option)) optionNodes.push(option);
+      if (optionEnabled(option) && shown(option)) optionNodes.push(option);
+    }
+  }
+  if (!optionNodes.length && allowSingle) {
+    // One unclaimed visible list. Two menus means we will not guess which one.
+    const boxes = [];
+    for (const candidate of document.querySelectorAll("[role='listbox']")) {
+      if (claimedByOther(candidate) || !shown(candidate)) continue;
+      boxes.push(candidate);
+    }
+    if (boxes.length === 1) {
+      for (const option of boxes[0].querySelectorAll(optionSelector)) {
+        if (optionEnabled(option) && optionShown(option)) optionNodes.push(option);
+      }
     }
   }
   if (!optionNodes.length) return [];
@@ -245,7 +290,14 @@ _COMMIT_JS = r"""
     tracksValue = true;
     if (matches(picked.textContent)) ariaOk = true;
   }
-  return { error, hiddenOk, shownOk, ariaOk, tracksValue };
+  let inputOk = false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") inputOk = fold(el.value) === wanted;
+  let buttonOk = false;
+  if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
+    buttonOk = fold(el.innerText || el.textContent) === wanted;
+  }
+  return { error, hiddenOk, shownOk, ariaOk, tracksValue, inputOk, buttonOk };
 }
 """
 
@@ -257,21 +309,29 @@ def _pause(page, millis: int) -> None:
     pause(millis)
 
 
-def _combobox_committed(page, selector: str, label: str) -> bool:
+def _combobox_committed(page, selector: str, label: str, *, accept_input: bool = False) -> bool:
+    """True only when the widget shows the choice. A click that changes nothing is not a commit.
+
+    The search input counts only when ``accept_input`` is set. Typing a filter
+    leaves that same text in the box before a choice exists.
+    """
     try:
         state = page.evaluate(_COMMIT_JS, {"selector": selector, "label": label}) or {}
     except Exception:
         return False
     if not isinstance(state, dict) or state.get("error"):
         return False
-    if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk"):
+    if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk") or state.get("buttonOk"):
         return True
-    return not bool(state.get("tracksValue"))
+    return bool(accept_input and state.get("inputOk"))
 
 
-def _read_options(page, selector: str) -> list[Option]:
+def _read_options(page, selector: str, *, allow_single: bool = False) -> list[Option]:
     try:
-        raw = page.evaluate(_SCOPED_OPTIONS_JS, selector) or []
+        raw = page.evaluate(
+            _SCOPED_OPTIONS_JS,
+            {"selector": selector, "allowSingle": allow_single},
+        ) or []
     except Exception:
         return []
     found: list[Option] = []
@@ -302,15 +362,71 @@ def _filter_terms(desired: str) -> list[str]:
     return [desired]
 
 
-def _poll_options(page, selector: str, attempts: int, delay_ms: int) -> list[Option]:
-    found: list[Option] = []
-    for _ in range(attempts):
+def _await_menu(page, selector: str, timeout_ms: int) -> list[Option]:
+    """Read the open menu until options appear or ``timeout_ms`` passes."""
+    found = _read_options(page, selector)
+    if found or timeout_ms <= 0 or getattr(page, "wait_for_timeout", None) is None:
+        return found
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        _pause(page, 50)
         found = _read_options(page, selector)
         if found:
             return found
-        if getattr(page, "wait_for_timeout", None) is None:
-            break
-        _pause(page, delay_ms)
+    return found
+
+
+_OPENER_JS = r"""
+(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return "";
+  const widget = [
+    "[data-automation-id='multiSelectContainer']",
+    "[data-automation-id='multiselectInputContainer']",
+    ".select",
+    ".select__control",
+  ].join(", ");
+  const root = el.closest(widget) || el.parentElement;
+  const icon = root && root.querySelector(
+    "[data-automation-id='promptIcon'], [data-automation-id='promptSearchButton']"
+  );
+  function mark(node) {
+    if (!node || node === el) return "";
+    if (node.id) return "#" + CSS.escape(node.id);
+    if (!node.getAttribute("data-autofill-open")) node.setAttribute("data-autofill-open", "prompt");
+    return "[data-autofill-open='prompt']";
+  }
+  if (icon) return mark(icon);
+  const control = el.closest(".select__control");
+  if (control && control !== el) return mark(control);
+  return "";
+}
+"""
+
+
+def _click_fallback_opener(page, selector: str) -> bool:
+    """Click the prompt icon or the closed control when the input click did not open a menu."""
+    try:
+        opener = str(page.evaluate(_OPENER_JS, selector) or "")
+    except Exception:
+        return False
+    if not opener or opener == selector:
+        return False
+    try:
+        open_combobox(page, opener)
+    except Exception:
+        return False
+    return True
+
+
+def _open_for_options(page, selector: str) -> list[Option]:
+    """Open the menu and wait. An async or portaled list is not read before it exists."""
+    open_combobox(page, selector)
+    found = _await_menu(page, selector, 400)
+    if found:
+        return found
+    if _click_fallback_opener(page, selector):
+        return _await_menu(page, selector, 1500)
     return found
 
 
@@ -340,7 +456,7 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
     focus_field(page, selector)
     try:
         open_combobox(page, selector)
-        found = _poll_options(page, selector, 6, 80)
+        found = _await_menu(page, selector, 480)
     except Exception:
         found = []
     labels: list[str] = []
@@ -358,8 +474,20 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
     return labels
 
 
-def _keyboard_commit(page, selector: str, desired: str) -> None:
-    """Type the option into the combobox input and confirm with Enter."""
+def _same_option(left: Option, right: Option) -> bool:
+    wanted = _fold(right.label) or _fold(right.value)
+    if not wanted:
+        return False
+    return wanted in {_fold(left.label), _fold(left.value)}
+
+
+def _keyboard_commit(page, selector: str, desired: str, match: Option | None = None) -> None:
+    """Type the option and confirm it.
+
+    ArrowDown is pressed only when the first visible row is that option.
+    Enter otherwise confirms a widget that commits the typed label, and does
+    not highlight a different first row.
+    """
     field = page.locator(selector)
     try:
         page.evaluate(_BLOCK_SUBMIT_JS)
@@ -369,6 +497,19 @@ def _keyboard_commit(page, selector: str, desired: str) -> None:
             target = inner.first
         target.fill("")
         target.press_sequentially(desired, delay=type_char_delay())
+        found = _await_menu(page, selector, 800)
+        if match is not None and found and _same_option(found[0], match):
+            target.press("ArrowDown")
+        # Enter confirms the row. It must not activate the form's submit button.
+        target.evaluate(
+            """(el) => {
+              if (el.dataset.autofillEnterHeld) return;
+              el.dataset.autofillEnterHeld = "1";
+              el.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") event.preventDefault();
+              }, true);
+            }"""
+        )
         target.press("Enter")
     except Exception:
         return
@@ -379,7 +520,10 @@ _BLOCK_SUBMIT_JS = """
 () => {
   if (window.__autofillBlockSubmit) return;
   window.__autofillBlockSubmit = true;
-  document.addEventListener("submit", (event) => event.preventDefault(), true);
+  document.addEventListener("submit", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
 }
 """
 
@@ -393,13 +537,17 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     if not selector or not desired.strip():
         return None
     focus_field(page, selector)
-    open_combobox(page, selector)
-    found = _poll_options(page, selector, 4, 50)
+    found = _open_for_options(page, selector)
+    if not found:
+        # A prompt list that is not wired with aria-controls, and is the only open menu.
+        found = _read_options(page, selector, allow_single=True)
+    typed = False
     match = _match_desired(desired, found)
     if match is None:
         for term in _filter_terms(desired):
             _type_filter(page, selector, term)
-            found = _poll_options(page, selector, 10, 80)
+            typed = True
+            found = _await_menu(page, selector, 1500)
             match = _match_desired(desired, found)
             if match is not None:
                 break
@@ -408,10 +556,10 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return None
     click_choice(page, match.selector, match.label)
     _pause(page, 50)
-    if _combobox_committed(page, selector, match.label):
+    if _combobox_committed(page, selector, match.label, accept_input=not typed):
         return match
-    _keyboard_commit(page, selector, desired)
-    if _combobox_committed(page, selector, match.label):
+    _keyboard_commit(page, selector, desired, match)
+    if _combobox_committed(page, selector, match.label, accept_input=True):
         return match
     dismiss_combobox(page)
     return None
