@@ -557,7 +557,9 @@ class LocalHelper:
         # The worker's job (fill or answer). The newest live job is ``_current``.
         self._active: str | None = None
         self._current: str | None = None
-        # True after any fill reached the window; the next job reloads first.
+        # True after any fill reached the window. The next job asks for a clean
+        # page. A later step of the same application is kept; see
+        # should_reload_application.
         self._window_used = False
         self._generation = 0
         self._peeking = False
@@ -1378,6 +1380,8 @@ class LocalHelper:
                 kwargs["cancel"] = job.gate
             if _accepts(fill, "fresh"):
                 # A different candidate reloads. A continue keeps the open page.
+                # The same candidate also keeps a later Workday step instead of
+                # reloading the job URL back to My Information.
                 kwargs["fresh"] = False if recover else self._window_used
             if job.resume is not None and _accepts(fill, "resume"):
                 kwargs["resume"] = job.resume

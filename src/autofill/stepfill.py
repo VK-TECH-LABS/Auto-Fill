@@ -2479,8 +2479,9 @@ _MATCH_VALUE_JS = r"""(hint) => {
       if (!value.trim() || placeholder(label) || placeholder(value)) return "";
       return value;
     }
-    const promptHost = el.closest && el.closest(
-      "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+    const promptHost = el.closest && (
+      el.closest("[data-automation-id='multiSelectContainer']") ||
+      el.closest("[data-automation-id='multiselectInputContainer']")
     );
     if (promptHost) {
       const pill = promptHost.querySelector(

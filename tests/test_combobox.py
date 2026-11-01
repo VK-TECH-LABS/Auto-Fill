@@ -38,3 +38,17 @@ def test_country_aliases_match_united_states_and_the_uk():
     assert match_country_option("Yes", options) is None
     assert country_aliases("USA")[0] == "united states of america"
     assert "united states" in country_aliases("U.S.A.")
+
+
+def test_parenthetical_calling_code_matches_the_united_states_not_india():
+    """Workday rows look like ``United States of America (+1)``. ``+1`` is not India."""
+    options = [
+        Option(value="91", label="India (+91)", selector="#in"),
+        Option(value="1", label="Canada (+1)", selector="#ca"),
+        Option(value="1", label="United States of America (+1)", selector="#us"),
+    ]
+    for word in ("+1", "US", "USA", "United States", "United States of America"):
+        match = match_country_option(word, options)
+        assert match is not None, word
+        assert match.label == "United States of America (+1)", word
+    assert match_country_option("India", options) is None

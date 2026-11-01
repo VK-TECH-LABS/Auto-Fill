@@ -232,6 +232,7 @@ _AUTOCOMPLETE = {
     "tel-national": "phone",
     "street-address": "address",
     "address-line1": "address",
+    "address-line2": "address_line2",
     "address-level2": "city",
     "address-level1": "state",
     "postal-code": "postal_code",
@@ -933,6 +934,13 @@ def _profile_text(
         return personal.phone
     if key == "address":
         return personal.address
+    if key == "address_line2":
+        line2 = personal.address_line2.strip()
+        line1 = personal.address.strip()
+        # Line 2 stays blank unless the profile has a different second line.
+        if not line2 or (line1 and line2.casefold() == line1.casefold()):
+            return ""
+        return line2
     if key == "city":
         return personal.city
     if key == "state":
@@ -1172,6 +1180,39 @@ def _is_phone_country_menu(control: Control) -> bool:
     return nearby in {"phone", "mobile", "telephone", "mobile phone"}
 
 
+_LINE2_RE = re.compile(
+    r"\b(?:address line 2|address line2|addressline2|line 2|line2|apartment|apt|suite|unit|flat)\b"
+)
+_EXTENSION_RE = re.compile(r"\b(?:extension|ext)\b")
+
+
+def _own_text(control: Control) -> str:
+    """Label text for this control. A sibling field's prompt is not included."""
+    return normalize(
+        " ".join(
+            part
+            for part in (
+                control.label,
+                control.aria_label,
+                control.placeholder,
+                control.name,
+                control.element_id,
+                control.autocomplete,
+            )
+            if part
+        )
+    )
+
+
+def _is_address_line2(control: Control) -> bool:
+    return bool(_LINE2_RE.search(_own_text(control)))
+
+
+def _is_phone_extension(control: Control) -> bool:
+    """A phone extension box. It is not the phone number."""
+    return bool(_EXTENSION_RE.search(_own_text(control)))
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     blob = haystack(control)
@@ -1181,6 +1222,12 @@ def _match_rule(control: Control) -> str | None:
         return "preferred_name"
     if _is_phone_country_menu(control):
         return "phone_country"
+    # Extension and line 2 are decided from this control's own label. The
+    # phone and street rules would otherwise copy line 1 and the full number.
+    if _is_phone_extension(control):
+        return None
+    if _is_address_line2(control):
+        return "address_line2"
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]

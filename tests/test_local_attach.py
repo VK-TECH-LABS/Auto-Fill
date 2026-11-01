@@ -40,6 +40,7 @@ from autofill.local_attach import (
     probe_branded_load_extension,
     probe_debug_port,
     probe_extension_debugger,
+    should_reload_application,
     stable_chrome_user_data_dir,
     start_fixture_server,
 )
@@ -1074,6 +1075,29 @@ def test_adopt_keeps_a_later_path_and_gotos_for_a_posting_or_other_host(monkeypa
     gotos.clear()
     adopt_employer_tab(type("Ctx", (), {"pages": [other]})(), apply)
     assert gotos == [apply]
+
+
+def test_same_candidate_keeps_a_later_workday_step(monkeypatch):
+    """Reloading the job URL restarts Workday at My Information. A later step stays.
+
+    A different candidate still reloads so the previous answers do not remain.
+    A posting is not a later step.
+    """
+    page = type(
+        "Page",
+        (),
+        {"url": "https://generalmotors.wd5.myworkdayjobs.com/en-US/Careers_GM/job/Role/apply"},
+    )()
+    job = "https://generalmotors.wd5.myworkdayjobs.com/en-US/Careers_GM/job/Role"
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+    monkeypatch.setattr("autofill.extract.extract_page", lambda _page: object())
+    monkeypatch.setattr("autofill.pagewait.classify_page", lambda *_args, **_kwargs: "APPLICATION_FORM")
+    assert should_reload_application(page, job, candidate_changed=False) is False
+    assert should_reload_application(page, job, candidate_changed=True) is True
+    monkeypatch.setattr("autofill.pagewait.classify_page", lambda *_args, **_kwargs: "REVIEW")
+    assert should_reload_application(page, job, candidate_changed=False) is False
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: True)
+    assert should_reload_application(page, job, candidate_changed=False) is True
 
 
 def test_load_extension_refusal_survives_a_long_log_prefix():

@@ -37,8 +37,9 @@ _CALLING_CODES: tuple[tuple[str, str], ...] = (
     ("+44", "United Kingdom"),
     ("+1", "United States"),
 )
-_DIAL_SUFFIX = re.compile(r"\s*\+\d{1,4}\s*$")
-_DIAL_PREFIX = re.compile(r"^\+\d{1,4}\s+")
+# Workday writes the code in parentheses: "United States of America (+1)".
+_DIAL_SUFFIX = re.compile(r"\s*(?:\(\s*)?\+\d{1,4}\s*\)?\s*$")
+_DIAL_PREFIX = re.compile(r"^(?:\(\s*)?\+\d{1,4}\s*\)?\s+")
 
 
 def _fold(value: str) -> str:
@@ -260,10 +261,17 @@ _SCOPED_OPTIONS_JS = r"""
     const itemSelector = option.id
       ? "#" + CSS.escape(option.id)
       : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
+    const auto = String(option.getAttribute("data-automation-id") || "").toLowerCase();
+    // A promptOption with no promptLeafNode is a category. Clicking it opens
+    // the nested choices. The value is the leaf, which may use the same name.
+    const leaf = auto === "promptleafnode"
+      || !!option.querySelector("[data-automation-id='promptLeafNode']")
+      || auto !== "promptoption";
     options.push({
       label: label,
       value: option.getAttribute("data-value") || label,
       selector: itemSelector,
+      leaf: leaf,
     });
   }
   return options;
@@ -291,9 +299,15 @@ _COMMIT_JS = r"""
     return text === wanted || text.indexOf(wanted) !== -1 || wanted.indexOf(text) !== -1;
   }
   const field = el.closest(".field, .select, fieldset") || el.parentElement;
-  const promptRoot = el.closest(
-    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
-  );
+  function promptValueRoot(node) {
+    // The search box lives in multiselectInputContainer. The selected pill is
+    // a sibling of that box, inside the outer multiSelectContainer.
+    if (!node || !node.closest) return null;
+    const outer = node.closest("[data-automation-id='multiSelectContainer']");
+    if (outer) return outer;
+    return node.closest("[data-automation-id='multiselectInputContainer']");
+  }
+  const promptRoot = promptValueRoot(el);
   const fieldRoot = el.closest("[data-automation-id^='formField']");
   let error = el.getAttribute("aria-invalid") === "true";
   if (field) {
@@ -326,6 +340,7 @@ _COMMIT_JS = r"""
     if (matches(input.value) || matches(selectedText)) hiddenOk = true;
   }
   let shownOk = false;
+  let pillOk = false;
   const single = root.querySelector(".select__single-value, [class*='singleValue']");
   if (single && matches(single.textContent)) shownOk = true;
   let ariaOk = false;
@@ -344,7 +359,10 @@ _COMMIT_JS = r"""
   if (pills.length) {
     tracksValue = true;
     for (const pill of pills) {
-      if (matches(pill.textContent)) shownOk = true;
+      if (matches(pill.textContent)) {
+        shownOk = true;
+        pillOk = true;
+      }
     }
   }
   const picked = root.querySelector("[role='option'][aria-selected='true']");
@@ -359,7 +377,7 @@ _COMMIT_JS = r"""
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
     buttonOk = fold(el.innerText || el.textContent) === wanted;
   }
-  return { error, hiddenOk, shownOk, ariaOk, tracksValue, inputOk, buttonOk };
+  return { error, hiddenOk, shownOk, pillOk, ariaOk, tracksValue, inputOk, buttonOk };
 }
 """
 
@@ -381,7 +399,14 @@ def _combobox_committed(page, selector: str, label: str, *, accept_input: bool =
         state = page.evaluate(_COMMIT_JS, {"selector": selector, "label": label}) or {}
     except Exception:
         return False
-    if not isinstance(state, dict) or state.get("error"):
+    if not isinstance(state, dict):
+        return False
+    # A Workday selected pill is the commit. The search box can stay
+    # aria-invalid after that pill is chosen. A painted menu label with a
+    # field error is not a commit; that widget is retried from the keyboard.
+    if state.get("pillOk"):
+        return True
+    if state.get("error"):
         return False
     if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk") or state.get("buttonOk"):
         return True
@@ -405,6 +430,7 @@ def _read_options(page, selector: str, *, allow_single: bool = False) -> list[Op
                 value=str(item.get("value") or ""),
                 label=str(item.get("label") or ""),
                 selector=str(item.get("selector") or ""),
+                leaf=bool(item.get("leaf", True)),
             )
         )
     return found
@@ -448,7 +474,9 @@ _OPENER_JS = r"""
     ".select",
     ".select__control",
   ].join(", ");
-  const root = el.closest(widget) || el.parentElement;
+  const root = el.closest("[data-automation-id='multiSelectContainer']")
+    || el.closest(widget)
+    || el.parentElement;
   const icon = root && root.querySelector(
     "[data-automation-id='promptIcon'], [data-automation-id='promptSearchButton']"
   );
@@ -594,27 +622,101 @@ _BLOCK_SUBMIT_JS = """
 """
 
 
+_PILL_TEXT_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  const root = (el.closest && el.closest("[data-automation-id='multiSelectContainer']"))
+    || (el.closest && el.closest("[data-automation-id='multiselectInputContainer']"))
+    || (el.closest && el.closest("[data-automation-id^='formField']"))
+    || el.parentElement;
+  if (!root || !root.querySelector) return "";
+  const pill = root.querySelector(
+    "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+  );
+  if (!pill || pill.hidden) return "";
+  const item = pill.closest && pill.closest("[data-automation-id='selectedItem']");
+  if (item && item.hidden) return "";
+  const style = window.getComputedStyle(pill);
+  if (style.display === "none" || style.visibility === "hidden") return "";
+  return String(pill.innerText || pill.textContent || "").replace(/\s+/g, " ").trim();
+}"""
+
+
+def _labels_match(desired: str, shown: str) -> bool:
+    """True when the pill is the requested choice, including a country alias."""
+    left, right = _fold(desired), _fold(shown)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if match_country_option(desired, [Option(value=shown, label=shown)]) is not None:
+        return True
+    return match_country_option(shown, [Option(value=desired, label=desired)]) is not None
+
+
+def _selected_text(page, selector: str) -> str:
+    try:
+        return str(page.evaluate(_PILL_TEXT_JS, selector) or "")
+    except Exception:
+        return ""
+
+
+def _prefer_leaf(desired: str, found: list[Option]) -> Option | None:
+    """A nested leaf wins over the category that has the same name."""
+    leaves = [option for option in found if option.leaf]
+    leaf = _match_desired(desired, leaves) if leaves else None
+    if leaf is not None:
+        return leaf
+    return _match_desired(desired, found)
+
+
+def _other_leaf(desired: str, current: Option, found: list[Option]) -> Option | None:
+    leaves = [
+        option
+        for option in found
+        if option.leaf and option.selector and option.selector != current.selector
+    ]
+    if not leaves:
+        return None
+    return _prefer_leaf(desired, leaves) or _prefer_leaf(current.label, leaves)
+
+
+def _committed_choice(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
+    if _combobox_committed(page, selector, match.label, accept_input=accept_input):
+        return True
+    if _combobox_committed(page, selector, desired, accept_input=accept_input):
+        return True
+    shown = _selected_text(page, selector)
+    return _labels_match(desired, shown) or _labels_match(match.label, shown)
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
+    A category row drills into the leaf of the same name. A pill that already
+    shows the choice is committed; the search box is not opened again.
     A click that paints the label but leaves the hidden input empty, or that
     shows a field error, is retried by typing the option and pressing Enter.
     """
     if not selector or not desired.strip():
         return None
     focus_field(page, selector)
+    shown = _selected_text(page, selector)
+    if _labels_match(desired, shown):
+        return Option(value=shown, label=shown, selector=selector)
     found = _open_for_options(page, selector)
     if not found:
         # A prompt list that is not wired with aria-controls, and is the only open menu.
         found = _read_options(page, selector, allow_single=True)
     typed = False
-    match = _match_desired(desired, found)
+    match = _prefer_leaf(desired, found)
     if match is None:
         for term in _filter_terms(desired):
             _type_filter(page, selector, term)
             typed = True
             found = _await_menu(page, selector, 1500)
-            match = _match_desired(desired, found)
+            match = _prefer_leaf(desired, found)
             if match is not None:
                 break
     if match is None or not match.selector:
@@ -622,10 +724,21 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return None
     click_choice(page, match.selector, match.label)
     _pause(page, 50)
-    if _combobox_committed(page, selector, match.label, accept_input=not typed):
+    if not match.leaf:
+        # The category click opens the nested menu. The leaf is the commit.
+        children = _read_options(page, selector)
+        leaf = _other_leaf(desired, match, children)
+        if leaf is None and not _committed_choice(page, selector, match, desired, accept_input=not typed):
+            children = _await_menu(page, selector, 500)
+            leaf = _other_leaf(desired, match, children)
+        if leaf is not None and leaf.selector:
+            click_choice(page, leaf.selector, leaf.label)
+            _pause(page, 50)
+            match = leaf
+    if _committed_choice(page, selector, match, desired, accept_input=not typed):
         return match
     _keyboard_commit(page, selector, desired, match)
-    if _combobox_committed(page, selector, match.label, accept_input=True):
+    if _committed_choice(page, selector, match, desired, accept_input=True):
         return match
     dismiss_combobox(page)
     return None
