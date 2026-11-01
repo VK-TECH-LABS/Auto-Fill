@@ -698,10 +698,10 @@ _COMMITTED_JS = r"""(selector) => {
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
       const typed = String(el.value || "").trim();
       if (typed && !placeholder(typed)) return true;
-      const root = el.closest(
-        "[data-automation-id='multiSelectContainer'], " +
-        "[data-automation-id='multiselectInputContainer'], .select__control"
-      ) || el.parentElement;
+      // The pill sits in the outer prompt, not in the search-box wrapper.
+      const root = (el.closest && el.closest("[data-automation-id='multiSelectContainer']"))
+        || (el.closest && el.closest("[data-automation-id='multiselectInputContainer'], .select__control"))
+        || el.parentElement;
       const choice = root
         ? root.querySelector(
             ".select__single-value, .select__multi-value, " +
@@ -739,8 +739,9 @@ _COMMITTED_JS = r"""(selector) => {
     }
     return selected(el);
   }
-  const promptHost = el.closest && el.closest(
-    "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+  const promptHost = el.closest && (
+    el.closest("[data-automation-id='multiSelectContainer']") ||
+    el.closest("[data-automation-id='multiselectInputContainer']")
   );
   if (promptHost) {
     const pill = promptHost.querySelector(

@@ -467,6 +467,85 @@ def test_phone_country_menu_uses_the_address_or_the_calling_code():
     assert unanswered.action == "unanswered"
 
 
+def test_phone_extension_and_address_line_2_are_not_copies():
+    """Extension is not the phone number. Line 2 stays blank unless it is distinct."""
+    person = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Casey Example",
+                "email": "casey.example@example.com",
+                "phone": "+1 (917) 555-0100",
+                "country": "US",
+            },
+            "address": {
+                "line1": "100 Broadway",
+                "city": "New York",
+                "state": "washington",
+                "postalCode": "10001",
+                "country": "US",
+            },
+        }
+    )
+    extension = map_field(control("Phone Extension"), person)
+    assert extension.key is None
+    assert extension.action == "unanswered"
+    assert extension.text == ""
+    assert map_field(control("Extension"), person).text == ""
+    phone = map_field(control("Phone Number", input_type="tel", national_phone=True), person)
+    assert phone.key == "phone"
+    assert phone.text == "9175550100"
+    assert not phone.text.startswith("0")
+    line1 = map_field(control("Address Line 1"), person)
+    assert line1.key == "address"
+    assert line1.text == "100 Broadway"
+    line2 = map_field(control("Address Line 2"), person)
+    assert line2.key == "address_line2"
+    assert line2.action == "unanswered"
+    assert line2.text == ""
+    copied = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Casey Example",
+                "email": "casey.example@example.com",
+                "phone": "+1 (917) 555-0100",
+            },
+            "address": {"line1": "100 Broadway", "line2": "100 Broadway"},
+        }
+    )
+    assert map_field(control("Address Line 2"), copied).text == ""
+    distinct = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Casey Example",
+                "email": "casey.example@example.com",
+                "phone": "+1 (917) 555-0100",
+            },
+            "address": {"line1": "100 Broadway", "line2": "Floor 4"},
+        }
+    )
+    second = map_field(control("Address Line 2"), distinct)
+    assert second.action == "fill"
+    assert second.text == "Floor 4"
+    state = map_field(
+        control(
+            "State",
+            kind="select",
+            options=[Option("NY", "New York"), Option("WA", "Washington")],
+        ),
+        person,
+    )
+    assert state.action == "select"
+    assert state.option_label == "Washington"
+    countries = [
+        Option("91", "India (+91)", selector="#in"),
+        Option("1", "Canada (+1)", selector="#ca"),
+        Option("1", "United States of America (+1)", selector="#us"),
+    ]
+    code = map_field(control("Country Phone Code", kind="combobox", options=countries), person)
+    assert code.key == "phone_country"
+    assert code.option_label == "United States of America (+1)"
+
+
 def test_unrecognized_control_is_left_alone():
     mapped = map_field(control("Pronouns"), profile())
     assert mapped.action == "unanswered"

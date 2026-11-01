@@ -56,6 +56,7 @@ class Personal:
     email: str
     phone: str = ""
     address: str = ""
+    address_line2: str = ""
     city: str = ""
     province_state: str = ""
     country: str = ""
@@ -274,6 +275,7 @@ class CandidateProfile:
                 email=email,
                 phone=_text(personal_raw, "phone"),
                 address=_text(personal_raw, "address"),
+                address_line2=_text(personal_raw, "address_line2"),
                 city=_text(personal_raw, "city"),
                 province_state=_text(personal_raw, "province_state"),
                 country=_text(personal_raw, "country"),
@@ -357,6 +359,10 @@ def _accept_extended_shape(data: dict) -> dict:
         alias = {
             "line1": "address",
             "street": "address",
+            "line2": "address_line2",
+            "line_2": "address_line2",
+            "street2": "address_line2",
+            "address2": "address_line2",
             "city": "city",
             "state": "province_state",
             "province": "province_state",

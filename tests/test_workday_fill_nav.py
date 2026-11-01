@@ -494,6 +494,244 @@ def test_hear_about_options_are_the_source_prompt_not_the_phone_code(browser, so
         page.close()
 
 
+_NESTED_HEAR = """
+<h1>My Information</h1>
+<div data-automation-id="formField-source">
+  <label for="source">How Did You Hear About Us?<abbr>*</abbr></label>
+  <div data-automation-id="multiSelectContainer">
+    <ul data-automation-id="selectedItemList">
+      <li id="source-picked" data-automation-id="selectedItem" hidden></li>
+    </ul>
+    <div data-automation-id="multiselectInputContainer">
+      <input id="source" data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+        aria-label="Search" placeholder="Search" aria-required="true" aria-invalid="true">
+    </div>
+    <button type="button" id="source-prompt" data-automation-id="promptIcon" aria-label="Search"
+      style="width:24px;height:24px"></button>
+  </div>
+</div>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__submitted = false;
+  window.__opens = [];
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  const input = document.getElementById("source");
+  document.getElementById("source-prompt").addEventListener("click", () => {
+    window.__opens.push("source-prompt");
+    input.setAttribute("aria-expanded", "true");
+    if (document.getElementById("source-menu")) return;
+    const menu = document.createElement("div");
+    menu.id = "source-menu";
+    const category = document.createElement("div");
+    category.id = "hear-category";
+    category.setAttribute("data-automation-id", "promptOption");
+    category.style.height = "24px";
+    category.textContent = "GM Careers Website";
+    category.addEventListener("click", () => {
+      category.remove();
+      const leaf = document.createElement("div");
+      leaf.id = "hear-leaf";
+      leaf.setAttribute("data-automation-id", "promptLeafNode");
+      leaf.style.height = "24px";
+      leaf.textContent = "GM Careers Website";
+      leaf.addEventListener("click", () => {
+        const picked = document.getElementById("source-picked");
+        picked.hidden = false;
+        picked.textContent = "GM Careers Website";
+        input.value = "";
+        input.setAttribute("aria-expanded", "false");
+        menu.remove();
+      });
+      menu.appendChild(leaf);
+    });
+    menu.appendChild(category);
+    document.body.appendChild(menu);
+  });
+</script>
+"""
+
+
+def test_hear_about_commits_the_nested_leaf_and_keeps_a_selected_pill(browser):
+    """The category and the leaf share a name. A pill already showing that name is committed."""
+    from autofill.dom_ui import commit_visible, control_committed
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_NESTED_HEAR)
+        target = {
+            "selector": "#source",
+            "value": "GM Careers Website",
+            "values": ["GM Careers Website"],
+            "answerType": "single_select",
+        }
+        filled = commit_visible(page, target)
+        assert filled["filled"] is True, filled
+        assert page.locator("#source-picked").inner_text().strip() == "GM Careers Website"
+        assert page.locator("#hear-leaf").count() == 0
+        assert control_committed(page, "#source") is True
+        assert page.evaluate("() => window.__submitted") is False
+        opens = page.evaluate("() => window.__opens.slice()")
+        again = commit_visible(page, target)
+        assert again["filled"] is True, again
+        assert page.evaluate("() => window.__opens.slice()") == opens
+        assert page.locator("#source-picked").inner_text().strip() == "GM Careers Website"
+    finally:
+        page.close()
+
+
+def test_selected_pill_outside_the_search_box_is_committed(browser):
+    """The pill is a sibling of the search wrapper. It still counts, even when aria-invalid."""
+    from autofill.dom_ui import commit_visible, control_committed
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_NESTED_HEAR)
+        page.evaluate(
+            """() => {
+              const picked = document.getElementById("source-picked");
+              picked.hidden = false;
+              picked.textContent = "GM Careers Website";
+            }"""
+        )
+        assert control_committed(page, "#source") is True
+        filled = commit_visible(
+            page,
+            {
+                "selector": "#source",
+                "value": "GM Careers Website",
+                "values": ["GM Careers Website"],
+                "answerType": "single_select",
+            },
+        )
+        assert filled["filled"] is True, filled
+        assert page.evaluate("() => window.__opens") == []
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
+_MY_INFO_CONTACT = """
+<h1>My Information</h1>
+<div id="phone-row">
+  <div data-automation-id="formField-countryPhoneCode">
+    <label for="code">Country Phone Code<abbr>*</abbr></label>
+    <div data-automation-id="multiSelectContainer">
+      <ul data-automation-id="selectedItemList">
+        <li id="phone-picked" data-automation-id="selectedItem">India (+91)</li>
+      </ul>
+      <div data-automation-id="multiselectInputContainer">
+        <input id="code" data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+          aria-label="Search" placeholder="Search" aria-required="true">
+      </div>
+      <button type="button" id="code-prompt" data-automation-id="promptIcon" aria-label="Search"
+        style="width:24px;height:24px"></button>
+    </div>
+  </div>
+  <label for="national">Phone Number<abbr>*</abbr></label>
+  <input id="national" type="tel" data-automation-id="phoneNumber" required>
+  <label for="ext">Phone Extension</label>
+  <input id="ext" type="text">
+</div>
+<label for="line1">Address Line 1<abbr>*</abbr></label>
+<input id="line1" required>
+<label for="line2">Address Line 2</label>
+<input id="line2">
+<label for="state">State<abbr>*</abbr></label>
+<select id="state" required>
+  <option value="">Select</option>
+  <option value="NY">New York</option>
+  <option value="WA">Washington</option>
+</select>
+<label for="postal">Postal Code<abbr>*</abbr></label>
+<input id="postal" required>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  const input = document.getElementById("code");
+  const rows = ["India (+91)", "Canada (+1)", "United States of America (+1)"];
+  document.getElementById("code-prompt").addEventListener("click", () => {
+    input.setAttribute("aria-expanded", "true");
+    if (document.getElementById("code-menu")) return;
+    const menu = document.createElement("div");
+    menu.id = "code-menu";
+    rows.forEach((label, index) => {
+      const item = document.createElement("div");
+      item.id = "country-" + index;
+      item.setAttribute("data-automation-id", "promptLeafNode");
+      item.style.height = "24px";
+      item.textContent = label;
+      item.addEventListener("click", () => {
+        const picked = document.getElementById("phone-picked");
+        picked.hidden = false;
+        picked.textContent = label;
+        input.value = "";
+        input.setAttribute("aria-expanded", "false");
+        menu.remove();
+      });
+      menu.appendChild(item);
+    });
+    document.body.appendChild(menu);
+  });
+</script>
+"""
+
+
+def test_phone_country_extension_and_address_line_2(browser):
+    """+1 / US replaces India. Extension and address line 2 stay empty.
+
+    Profile state "washington" selects Washington. Postal 10001 is left as
+    given; this engine does not invent New York from the ZIP.
+    """
+    from autofill.fill import fill_one_page
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    person = _person(
+        "+1 (917) 555-0100",
+        address={
+            "line1": "100 Broadway",
+            "city": "New York",
+            "state": "washington",
+            "postalCode": "10001",
+            "country": "US",
+        },
+    )
+    page = browser.new_page()
+    try:
+        page.set_content(_MY_INFO_CONTACT)
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#phone-picked").inner_text().strip() == "United States of America (+1)"
+        phone = page.locator("#national").input_value()
+        assert phone == "9175550100"
+        assert not phone.startswith("0")
+        assert page.locator("#ext").input_value() == ""
+        assert page.locator("#line1").input_value() == "100 Broadway"
+        assert page.locator("#line2").input_value() == ""
+        assert page.locator("#state").input_value() == "WA"
+        assert page.locator("#postal").input_value() == "10001"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
 _SMS_ERROR = (
     "Error-General Motors will need to contact you throughout the recruitment process, "
     "this may include SMS/text messaging from GM and/or GM's third party partners "
@@ -870,11 +1108,14 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
       window.__submitted = 0;
       window.__clears = 0;
       window.__legalClicks = 0;
+      window.__optionClicks = {{}};
       const mode = {mode!r};
       function syncDetail() {{
         const button = document.getElementById("legal");
         const detail = document.getElementById("legal-detail");
-        const yes = (button.textContent || "").trim() === "Yes";
+        const value = button.querySelector("[data-automation-id='promptSelectionLabel']");
+        const shown = value ? value.textContent : button.textContent;
+        const yes = String(shown || "").trim() === "Yes";
         detail.hidden = !yes;
         if (yes) detail.setAttribute("required", "true");
         else detail.removeAttribute("required");
@@ -900,12 +1141,35 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
             item.textContent = label;
             item.addEventListener("click", (optionEvent) => {{
               optionEvent.stopPropagation();
+              window.__optionClicks[id] = (window.__optionClicks[id] || 0) + 1;
               let shown = label;
               if (id === "legal") {{
                 window.__legalClicks += 1;
                 if (mode === "stuck" || (mode === "flaky" && window.__legalClicks === 1)) shown = "Yes";
               }}
-              button.textContent = shown;
+              // A decoy option row stays in the button so a raw innerText read
+              // starts with the clicked word. The committed label is the opposite
+              // on the first sponsorship/legal click, then the real word.
+              if (mode === "decoy" && (id === "sponsor" || id === "legal")) {{
+                const attempt = window.__optionClicks[id];
+                const committed = attempt === 1 ? (label === "Yes" ? "No" : "Yes") : label;
+                button.textContent = "";
+                const decoy = document.createElement("span");
+                decoy.setAttribute("data-autofill-decoy", "1");
+                decoy.style.display = "block";
+                decoy.textContent = label;
+                const value = document.createElement("span");
+                value.style.display = "block";
+                value.setAttribute("data-automation-id", "promptSelectionLabel");
+                value.id = id + "-value";
+                value.textContent = committed;
+                button.appendChild(decoy);
+                button.appendChild(value);
+                button.setAttribute("aria-label", committed + " Required");
+              }} else {{
+                button.textContent = shown;
+                button.removeAttribute("aria-label");
+              }}
               list.remove();
               if (id === "legal") syncDetail();
             }});
@@ -1035,6 +1299,45 @@ def test_wrong_legal_yes_is_overwritten_and_a_stuck_yes_is_cleared(browser):
         assert page.evaluate("() => window.__clears") >= 1
         assert page.locator("#sms").inner_text().strip() == "Yes"
         assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+
+
+def test_sponsorship_yes_and_legal_no_follow_the_committed_button(browser):
+    """A raw innerText read sees the clicked word. The committed label is the opposite.
+
+    Sponsorship must end as Yes and legal as No. Accepting the decoy leaves
+    sponsorship No and legal Yes, which is the live GM failure.
+    """
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="decoy"))
+        result = _fill_appq(page, "appq-decoy")
+        assert page.locator("#sponsor-value").inner_text().strip() == "Yes"
+        assert page.locator("#legal-value").inner_text().strip() == "No"
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        clicks = page.evaluate("() => window.__optionClicks")
+        assert clicks["sponsor"] >= 2
+        assert clicks["legal"] >= 2
+        sponsor = [
+            item for item in result.listbox_choices if item.get("selector") == "#sponsor"
+        ]
+        legal = _legal_choice(result)
+        assert sponsor[-1]["intended"] == "Yes"
+        assert sponsor[-1]["shown"] == "Yes"
+        assert legal["intended"] == "No"
+        assert legal["shown"] == "No"
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "describe the nature" not in prompts
+        assert page.evaluate("() => window.__submitted") == 0
+        assert result.stopped_before_submit is True
     finally:
         page.close()
 

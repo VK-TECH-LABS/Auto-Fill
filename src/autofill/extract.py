@@ -169,13 +169,27 @@ EXTRACT_JS = r"""
       return true;
     }
     const label = controlLabel(node);
-    return (
+    if (
       label === "country code" ||
       label === "phone country" ||
       label === "country phone code" ||
       label === "phone code" ||
       label === "calling code" ||
       label === "dial code"
+    ) {
+      return true;
+    }
+    // The search box aria-label is "Search". The question is the form-field label.
+    const field = node.closest && node.closest("[data-automation-id^='formField']");
+    const fieldLabelNode = field && field.querySelector ? field.querySelector("label") : null;
+    const fieldLabel = fieldLabelNode ? cleanPrompt(textOf(fieldLabelNode)).toLowerCase() : "";
+    return (
+      fieldLabel === "country code" ||
+      fieldLabel === "phone country" ||
+      fieldLabel === "country phone code" ||
+      fieldLabel === "phone code" ||
+      fieldLabel === "calling code" ||
+      fieldLabel === "dial code"
     );
   }
 
@@ -183,6 +197,13 @@ EXTRACT_JS = r"""
     const bits = [node.value || "", node.getAttribute("aria-label") || "", node.getAttribute("placeholder") || ""];
     if (node.options) {
       for (const option of Array.from(node.options).slice(0, 12)) bits.push(option.textContent || "");
+    }
+    const host = node.closest && node.closest("[data-automation-id='multiSelectContainer']");
+    if (host) {
+      const pill = host.querySelector(
+        "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+      );
+      if (pill) bits.push(pill.textContent || "");
     }
     return /\+\d{1,4}/.test(bits.join(" "));
   }

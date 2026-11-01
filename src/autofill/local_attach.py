@@ -1000,6 +1000,38 @@ def _tab_is_posting(page: Any) -> bool:
     return kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}
 
 
+def _application_in_progress(page: Any, application_url: str) -> bool:
+    """True when this tab is already inside the application, past the posting."""
+    try:
+        current = str(getattr(page, "url", "") or "")
+    except Exception:
+        return False
+    if not current or not same_site(current, application_url):
+        return False
+    if _tab_is_posting(page):
+        return False
+    try:
+        from autofill.extract import extract_page
+        from autofill.pagewait import classify_page
+
+        kind = classify_page(extract_page(page), url=current)
+    except Exception:
+        return False
+    return kind in {"APPLICATION_FORM", "REVIEW"}
+
+
+def should_reload_application(page: Any, application_url: str, *, candidate_changed: bool) -> bool:
+    """Whether a new fill should load the Apply URL again.
+
+    A different candidate reloads so the previous person's answers do not stay.
+    The same candidate keeps a later step. Reloading the job URL sends a
+    Workday wizard back to My Information.
+    """
+    if candidate_changed:
+        return True
+    return not _application_in_progress(page, application_url)
+
+
 def adopt_employer_tab(context: Any, application_url: str, *, bound: Any = None) -> Any:
     """Use the open application tab. Do not rewind a later step of the same site.
 
@@ -1448,11 +1480,13 @@ class DedicatedApplySession:
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
-        ``fresh`` reloads the employer URL first and forgets held selectors.
-        The helper sets it when a different candidate's Apply already wrote
-        into this window, so the previous candidate's values are not kept.
-        A continue after a crash does not reload. ``nav_block`` is a Next
-        this recovery already pressed. A reload clears it.
+        ``fresh`` forgets held selectors. It reloads the employer URL when the
+        candidate changed, or when the tab is still a posting. A later step of
+        the same application stays where it is: reloading the job URL sends
+        Workday back to My Information. The helper sets ``fresh`` when a
+        different candidate's Apply already wrote into this window. A continue
+        after a crash does not reload. ``nav_block`` is a Next this recovery
+        already pressed. A reload clears it.
         """
         if cancel is not None:
             cancel.check()
@@ -1483,7 +1517,9 @@ class DedicatedApplySession:
             self._held.clear()
             self._page_mark = None
             self._nav_block = None
-            tab.page.goto(application_url, wait_until="domcontentloaded", timeout=45000)
+            # A later Workday step stays put. goto of the job URL restarts My Information.
+            if should_reload_application(tab.page, application_url, candidate_changed=changed):
+                tab.page.goto(application_url, wait_until="domcontentloaded", timeout=45000)
             tab.page_url = str(tab.page.url or "")
             if cancel is not None:
                 cancel.check()
