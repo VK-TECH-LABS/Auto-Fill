@@ -1037,8 +1037,10 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
     """Open a Workday choice button and choose ``desired``. Does not type into the button.
 
     The button text afterwards must be the approved answer, not merely the row
-    that was clicked and not the first visible row. A mismatch is clicked again.
-    If it still disagrees, the wrong value is cleared and this returns None.
+    that was clicked and not the first visible row. The check reads the closed
+    button's committed label, not an open menu or a decoy Yes/No inside it.
+    A mismatch is clicked again. If it still disagrees, the wrong value is
+    cleared and this returns None.
     A button that already shows the approved answer is left as it is.
     """
     intended = str(desired or "").strip()
