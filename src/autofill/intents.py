@@ -39,6 +39,7 @@ PROTOCOL_INTENTS: tuple[str, ...] = (
     "VETERAN_STATUS",
     "DISABILITY_STATUS",
     "REFERRAL",
+    "RECRUITMENT_SMS_CONSENT",
 )
 
 # Demographic questions are never written by the engine.
@@ -131,13 +132,22 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("DRIVERS_LICENSE", "driver s license"),
     ("DRIVERS_LICENSE", "drivers license"),
     ("DRIVERS_LICENSE", "driver license"),
+    ("SALARY_EXPECTATION", "desired salary range"),
+    ("SALARY_EXPECTATION", "compensation range"),
     ("SALARY_EXPECTATION", "salary expectation"),
-    ("SALARY_EXPECTATION", "desired salary"),
     ("SALARY_EXPECTATION", "compensation expectation"),
+    ("SALARY_EXPECTATION", "wage expectation"),
+    ("SALARY_EXPECTATION", "annual compensation"),
     ("SALARY_EXPECTATION", "pay expectation"),
     ("SALARY_EXPECTATION", "expected salary"),
-    ("SALARY_EXPECTATION", "base salary"),
+    ("SALARY_EXPECTATION", "desired salary"),
+    ("SALARY_EXPECTATION", "salary range"),
+    ("SALARY_EXPECTATION", "target salary"),
     ("SALARY_EXPECTATION", "minimum salary"),
+    ("SALARY_EXPECTATION", "expected pay"),
+    ("SALARY_EXPECTATION", "base salary"),
+    ("SALARY_EXPECTATION", "base pay"),
+    ("SALARY_EXPECTATION", "pay range"),
     ("EMPLOYMENT_TYPE", "employment type"),
     ("EMPLOYMENT_TYPE", "type of employment"),
     ("EMPLOYMENT_TYPE", "full time or part time"),
@@ -151,6 +161,17 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("PREVIOUSLY_EMPLOYED", "worked here before"),
     ("PREVIOUSLY_EMPLOYED", "former employee"),
     ("PREVIOUSLY_EMPLOYED", "worked for this company"),
+    ("RECRUITMENT_SMS_CONSENT", "would you like to receive text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "would you like to receive text message"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text message updates"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "receive text message"),
+    ("RECRUITMENT_SMS_CONSENT", "sms text messages"),
+    ("RECRUITMENT_SMS_CONSENT", "sms text message"),
+    ("RECRUITMENT_SMS_CONSENT", "text message consent"),
+    ("RECRUITMENT_SMS_CONSENT", "sms consent"),
+    ("RECRUITMENT_SMS_CONSENT", "consent to receive sms"),
+    ("RECRUITMENT_SMS_CONSENT", "consent to receive text"),
     ("REFERRAL", "who referred you"),
     ("REFERRAL", "employee referral"),
     ("REFERRAL", "referred you"),
@@ -183,7 +204,7 @@ _PROTOTYPES: dict[str, str] = {
     "SECURITY_CLEARANCE": "security clearance secret top secret",
     "PE_LICENSE": "professional engineer pe license",
     "DRIVERS_LICENSE": "driver license driving valid",
-    "SALARY_EXPECTATION": "salary compensation pay expectation desired",
+    "SALARY_EXPECTATION": "salary compensation pay expectation desired range minimum wage",
     "EMPLOYMENT_TYPE": "employment type full time part time contract",
     "START_DATE": "start date available begin earliest",
     "PREVIOUSLY_EMPLOYED": "previously employed worked before former",
@@ -289,6 +310,99 @@ _WORK_AUTH_RE = re.compile(
     r"|\beligible\s+to\s+work\b"
     r"|\bwork\s+authorization\b"
 )
+
+
+# Intents whose answer depends on the country the question asks about.
+JURISDICTION_INTENTS = frozenset(
+    {
+        "US_WORK_AUTHORIZATION",
+        "AUTHORIZED_ANY_EMPLOYER",
+        "AUTHORIZED_WITHOUT_SPONSORSHIP",
+        "SPONSORSHIP_NOW",
+        "SPONSORSHIP_NOW_OR_FUTURE",
+        "SPONSORSHIP_FUTURE",
+    }
+)
+
+_COUNTRIES: tuple[tuple[str, str], ...] = (
+    ("united states", "US"),
+    ("america", "US"),
+    # Bare "US" after normalization. "U.S." is already folded to "united states".
+    ("us", "US"),
+    ("canada", "CA"),
+    ("canadian", "CA"),
+    ("united kingdom", "UK"),
+    ("uk", "UK"),
+    ("great britain", "UK"),
+    ("britain", "UK"),
+    ("england", "UK"),
+    ("european union", "EU"),
+    ("eu", "EU"),
+    ("european economic area", "EU"),
+    ("eea", "EU"),
+    ("australia", "AU"),
+    ("new zealand", "NZ"),
+    ("india", "IN"),
+    ("ireland", "IE"),
+    ("germany", "DE"),
+    ("france", "FR"),
+    ("netherlands", "NL"),
+    ("spain", "ES"),
+    ("poland", "PL"),
+    ("switzerland", "CH"),
+    ("sweden", "SE"),
+    ("mexico", "MX"),
+    ("brazil", "BR"),
+    ("singapore", "SG"),
+    ("japan", "JP"),
+    ("china", "CN"),
+    ("israel", "IL"),
+    ("philippines", "PH"),
+)
+
+def countries_named(text: str) -> frozenset[str]:
+    """Country codes written in the question. Empty when the text names none."""
+    folded = normalize_question(text)
+    return frozenset(
+        code
+        for phrase, code in _COUNTRIES
+        if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", folded)
+    )
+
+
+def jurisdiction(text: str) -> frozenset[str]:
+    """Countries named in a question. None named means the United States.
+
+    Callers that must not assume the United States use ``countries_named``
+    and ``classify_question(..., us_on_page=...)``.
+    """
+    return countries_named(text) or frozenset({"US"})
+
+
+def country_is_us(value: str) -> bool:
+    """True for a United States country label. A blank value is not the United States."""
+    token = normalize(value)
+    return token in {
+        "us",
+        "usa",
+        "u s",
+        "u s a",
+        "united states",
+        "united states of america",
+        "america",
+    }
+
+
+def _us_work_auth_applies(text: str, *, us_on_page: bool) -> bool:
+    """A work-authorization intent applies only to an explicit U.S. question.
+
+    A question that names no country is the United States only when this
+    page's address country is already the United States.
+    """
+    named = countries_named(text)
+    if not named:
+        return us_on_page
+    return named == frozenset({"US"})
 
 
 def normalize_question(text: str) -> str:
@@ -482,15 +596,30 @@ def classify_question(
     options: list[str] | None = None,
     *,
     hook: Level3Hook | None = None,
+    us_on_page: bool = False,
 ) -> IntentMatch:
-    """Classify one question. The hook is skipped unless the caller passes it."""
+    """Classify one question. The hook is skipped unless the caller passes it.
+
+    ``us_on_page`` is true when this application's address country is the
+    United States. A work-authorization question that names no country is
+    not treated as a U.S. question unless that flag is set.
+    """
     sanitized = sanitize_question(text)
     if not sanitized:
         return IntentMatch(None, "unknown", "none", "")
     level1 = _level1(sanitized)
+    if level1 in JURISDICTION_INTENTS and not _us_work_auth_applies(sanitized, us_on_page=us_on_page):
+        # "Authorized to work in Canada?" is not the U.S. question. No U.S. answer is reused for it.
+        return IntentMatch(None, "unknown", "jurisdiction", sanitized)
     if level1 is not None:
         return _planned(IntentMatch(level1, "HIGH", "level1", sanitized))
     semantic = _level2(sanitized)
+    if (
+        semantic is not None
+        and semantic.intent in JURISDICTION_INTENTS
+        and not _us_work_auth_applies(sanitized, us_on_page=us_on_page)
+    ):
+        semantic = None
     if semantic is not None and semantic.confidence == "HIGH":
         return IntentMatch(semantic.intent, semantic.confidence, semantic.source, sanitized)
     if hook is not None:
@@ -593,6 +722,25 @@ def _plain_number(value: str) -> str | None:
     return found.group(1).replace(",", "") if found else None
 
 
+# Closed labels that are the same fact. Two options in one group are a pause.
+_LISTED_EQUIVALENTS: tuple[frozenset[str], ...] = (
+    frozenset({"bachelors", "bachelor", "bachelor s", "bs", "b s", "bachelor of science"}),
+    frozenset({"bachelor of arts", "ba", "b a"}),
+    frozenset({"masters", "master", "master s", "ms", "m s", "master of science"}),
+    frozenset({"master of arts", "ma", "m a"}),
+    frozenset({"doctorate", "doctoral", "phd", "ph d", "doctor of philosophy"}),
+    frozenset({"full time", "fulltime", "permanent"}),
+    frozenset({"part time", "parttime"}),
+)
+
+
+def _same_listed_equivalent(left: str, right: str) -> bool:
+    for group in _LISTED_EQUIVALENTS:
+        if left in group and right in group:
+            return True
+    return False
+
+
 def options_equivalent(desired: str, option: str) -> bool:
     """True only for an exact label or a listed equivalent. No approximation."""
     left = normalize_question(desired)
@@ -607,6 +755,8 @@ def options_equivalent(desired: str, option: str) -> bool:
         return True
     left_number = _plain_number(desired)
     if left_number is not None and left_number == _plain_number(option):
+        return True
+    if _same_listed_equivalent(left, right):
         return True
     if left in _NO or right in _NO:
         return left in _NO and right in _NO
@@ -671,11 +821,27 @@ def pick_option(desired: str, options: list[Option]) -> tuple[str, Option | None
     """
     if not desired.strip() or not options:
         return "none", None
+    exact: list[Option] = []
+    equivalent: list[Option] = []
+    wanted_exact = normalize_question(desired)
     for option in options:
+        label = normalize_question(option.label)
+        value = normalize_question(option.value) if option.value else ""
+        if wanted_exact and (wanted_exact == label or wanted_exact == value):
+            exact.append(option)
+            continue
         if options_equivalent(desired, option.label) or (
             option.value and options_equivalent(desired, option.value)
         ):
-            return "match", option
+            equivalent.append(option)
+    if len(exact) == 1:
+        return "match", exact[0]
+    if len(exact) > 1:
+        return "ambiguous", None
+    if len(equivalent) == 1:
+        return "match", equivalent[0]
+    if len(equivalent) > 1:
+        return "ambiguous", None
     wanted = option_words(desired)
     if not wanted:
         return "none", None

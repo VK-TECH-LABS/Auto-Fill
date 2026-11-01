@@ -18,6 +18,7 @@ from autofill import (
 )
 from autofill.adapters import ADAPTERS, page_step
 from autofill.ats import detect_ats
+from autofill.credentials import credential_scope
 from autofill.dates import format_for_control
 from autofill.engine import autofill_application as engine_entry
 from autofill.mapping import map_field
@@ -78,8 +79,8 @@ def provider() -> MemoryCredentialProvider:
     store = MemoryCredentialProvider()
     store.put(
         "candidate-a",
-        DOMAIN,
-        Credentials(site=DOMAIN, email="avery.example@example.com", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="avery.example@example.com", password=PASSWORD),
     )
     return store
 
@@ -138,13 +139,17 @@ def test_dates_and_country_aliases_and_unknown_questions():
     assert low.action == "unanswered"
 
 
-def test_salary_and_work_auth_are_not_invented():
+def test_unknown_salary_defaults_and_work_auth_is_not_invented():
     empty = CandidateProfile.from_dict(
         {"personal": {"full_name": "Avery Example", "email": "avery.example@example.com"}}
     )
     salary = map_field(Control(kind="text", label="Desired salary"), empty)
-    assert salary.action == "unanswered"
-    assert salary.text == ""
+    assert salary.action == "fill"
+    assert salary.text == "90000"
+    ranged = map_field(Control(kind="text", label="Desired salary range"), empty)
+    assert ranged.action == "unanswered"
+    assert ranged.text == ""
+    assert ranged.text != "90000-90000"
     auth = map_field(
         Control(
             kind="select",
@@ -200,7 +205,10 @@ def test_credential_lookup_is_scoped():
     assert store.get_credentials(other, "candidate-a") is None
     wrong_person = SiteContext(url=URL, domain=DOMAIN, candidate_id="candidate-b")
     assert store.get_credentials(wrong_person, "candidate-b") is None
-    found = store.get_credentials(SiteContext(url=URL, domain=DOMAIN, candidate_id="candidate-a"), "candidate-a")
+    found = store.get_credentials(
+        SiteContext(url=URL, domain=credential_scope(URL), candidate_id="candidate-a"),
+        "candidate-a",
+    )
     assert found is not None
     assert "password" not in repr(found)
     assert PASSWORD not in repr(found)
@@ -375,8 +383,8 @@ def test_login_variants(browser):
     user_provider = MemoryCredentialProvider()
     user_provider.put(
         "candidate-a",
-        DOMAIN,
-        Credentials(site=DOMAIN, username="avery-example", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), username="avery-example", password=PASSWORD),
     )
     page = browser.new_page()
     try:
@@ -434,8 +442,8 @@ def test_login_variants(browser):
         bad = MemoryCredentialProvider()
         bad.put(
             "candidate-a",
-            DOMAIN,
-            Credentials(site=DOMAIN, email="avery.example@example.com", password="wrong-password"),
+            credential_scope(URL),
+            Credentials(site=credential_scope(URL), email="avery.example@example.com", password="wrong-password"),
         )
         result = autofill_application(
             URL, profile, bad, AutofillOptions(candidate_id="candidate-a", page=page, session_id="bad-login")

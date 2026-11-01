@@ -463,9 +463,12 @@ class FillRequest:
     on_paint: Any = None
     on_phase: Any = None
     on_navigation: Any = None
+    on_nav_block: Any = None
+    nav_block: tuple | None = None
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
+    verify_pending: bool = False
 
 
 class FillRunner(Protocol):
@@ -771,6 +774,20 @@ def _bind_page(slot):
     return bind
 
 
+def _stamp_page(page: Any, result: ApplicationResult) -> ApplicationResult:
+    """Remember the page signature for a question stop. Other statuses are unchanged."""
+    if page is None or result.status != Status.MANUAL_ANSWER_REQUIRED:
+        return result
+    try:
+        from autofill.extract import extract_page
+        from autofill.pagewait import navigation_signature
+
+        result.page_signature = navigation_signature(page, extract_page(page))
+    except Exception:
+        return result
+    return result
+
+
 class PlaywrightRunner:
     """Default runner. Manual-ATS and SSO decisions do not launch a browser."""
 
@@ -886,9 +903,12 @@ class PlaywrightRunner:
             on_paint=request.on_paint,
             on_page=_bind_page(slot),
             on_navigation=request.on_navigation,
+            on_nav_block=request.on_nav_block,
+            nav_block=request.nav_block,
             on_confirmed=request.on_confirmed,
             confirmed_values=request.confirmed_values,
             standard_terms_authorized=request.standard_terms_authorized,
+            verify_pending=request.verify_pending,
         )
 
     def _timings(self, request: FillRequest, slot: _SessionContext | None = None) -> dict[str, int]:
@@ -963,7 +983,7 @@ class PlaywrightRunner:
                 result = self._run_engine(request, slot.page, slot)
                 slot.last_ats = result.ats
                 self._remember_mark(slot)
-                return result
+                return _stamp_page(slot.page, result)
             except Exception as exc:
                 if is_ats_timeout(exc):
                     return self._retryable(request, category="ats_timeout")
@@ -1088,6 +1108,7 @@ class PlaywrightRunner:
                     confirm=str(payload.get("confirm") or ""),
                     ats=slot.last_ats,
                     standard_terms=bool(payload.get("standardTerms")),
+                    recruitment_sms_authorized=payload.get("recruitmentSmsAuthorized") is True,
                 )
             except Exception as exc:
                 if _page_navigating(exc):
@@ -1122,7 +1143,7 @@ class PlaywrightRunner:
                 if is_browser_crash(exc):
                     raise PageUnavailable(410) from None
                 if _page_navigating(exc):
-                    return "captcha"
+                    raise PageUnavailable(503) from None
                 raise
             if snapshot.captcha_present:
                 return "captcha"
@@ -1131,6 +1152,31 @@ class PlaywrightRunner:
             return "clear"
 
         return worker.submit(look)
+
+    def application_visible(self, session_id: str) -> bool:
+        """True when a job form is on screen. A password pane or real challenge is not."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return False
+
+        def look() -> bool:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return False
+            from autofill.extract import extract_page
+            from autofill.login import application_form_visible
+
+            try:
+                snapshot = extract_page(slot.page)
+            except Exception as exc:
+                if is_browser_crash(exc):
+                    raise PageUnavailable(410) from None
+                if _page_navigating(exc):
+                    raise PageUnavailable(503) from None
+                raise
+            return application_form_visible(snapshot)
+
+        return bool(worker.submit(look))
 
     def attach_resume_file(
         self,
@@ -1231,6 +1277,7 @@ class PlaywrightRunner:
             blocking=dict(follow.blocking) if follow.blocking else None,
             open_items=list(follow.open_items),
             manual_questions=list(follow.manual_questions),
+            account=dict(follow.account) if follow.account else None,
         )
         result.page_type = current_page_type()
         return result
@@ -1256,14 +1303,16 @@ class PlaywrightRunner:
                     cover_letter_text=request.cover_letter_text,
                     previous_stage=str((request.progress or {}).get("stage") or ""),
                 )
-                if follow.changed:
+                if follow.changed or (follow.status == Status.FILLED and not follow.open_items):
+                    # A new signature, or this step is filled: the engine presses
+                    # Next once. Review stays READY and does not enter here.
                     result = self._run_engine(request, slot.page, slot)
                     slot.last_ats = result.ats
                     self._remember_mark(slot)
-                    return result
+                    return _stamp_page(slot.page, result)
                 if follow.mark is not None:
                     slot.mark = follow.mark
-                return self._result_from_follow(request, follow, slot.last_ats)
+                return _stamp_page(slot.page, self._result_from_follow(request, follow, slot.last_ats))
             except Exception as exc:
                 if not is_browser_crash(exc):
                     raise
@@ -1359,6 +1408,29 @@ class PlaywrightRunner:
             return [str(option) for option in item.get("options") or []]
 
         return worker.submit(read)
+
+    def page_alive(self, session_id: str) -> bool:
+        """True when this session's page still answers. A dead page is not reused."""
+        worker = self._pinned_worker(session_id)
+        if worker is None:
+            return False
+
+        def check() -> bool:
+            slot = worker.sessions.get(session_id)
+            if slot is None or slot.page is None:
+                return False
+            try:
+                slot.page.evaluate("() => 1")
+            except Exception as exc:
+                if is_browser_crash(exc):
+                    return False
+                return True
+            return True
+
+        try:
+            return bool(worker.submit(check))
+        except Exception:
+            return False
 
     def discard(self, session_id: str) -> None:
         """Close this session's page and context, and the browser when it is idle.

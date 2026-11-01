@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Sign In</title></head>
+<body>
+  <section id="login">
+    <h1>Sign In</h1>
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="username">
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password">
+    <div id="error" role="alert"></div>
+    <button type="button" id="go">Sign In</button>
+  </section>
+  <section id="app" hidden>
+    <h1>My Information</h1>
+    <p>Check your email. We sent you a code so we can notify you about this application.</p>
+    <p>Just a moment while the form finishes.</p>
+    <label for="first">First Name</label>
+    <input id="first" name="firstName" autocomplete="given-name">
+    <button type="button" id="continue">Continue</button>
+    <button type="submit" id="submit">Submit application</button>
+  </section>
+  <script>
+    window.__continued = false;
+    window.__submitted = false;
+    window.__values = null;
+    window.__signedIn = 0;
+    document.getElementById("go").addEventListener("click", () => {
+      var password = document.getElementById("password").value;
+      if (password !== "Saved-Login-7!") {
+        document.getElementById("error").textContent = "Wrong email or password.";
+        return;
+      }
+      window.__signedIn += 1;
+      window.setTimeout(() => {
+        document.getElementById("login").hidden = true;
+        document.getElementById("app").hidden = false;
+      }, 400);
+    });
+    document.getElementById("continue").addEventListener("click", () => {
+      window.__continued = true;
+      window.__values = {first: document.getElementById("first").value};
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__submitted = true;
+    });
+  </script>
+</body>
+</html>

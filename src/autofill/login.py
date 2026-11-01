@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -18,7 +19,13 @@ from autofill.ats import WORKDAY_HOST_RE
 from autofill.credentials import Credentials
 from autofill.extract import extract_page
 from autofill.models import Control, PageSnapshot
-from autofill.safeguards import activate, activate_login
+from autofill.safeguards import (
+    activate,
+    activate_account_switch,
+    activate_login,
+    activate_login_at_point,
+    dismiss_cookie_banner,
+)
 
 logger = logging.getLogger("autofill.login")
 
@@ -89,6 +96,12 @@ def _login_button(snapshot: PageSnapshot):
         name = button.name.casefold()
         if "sign up" in name or "register" in name or "create account" in name:
             continue
+        # A header Sign In reopens the dialog, and "Sign in with Google" hands
+        # the candidate to an identity provider. Neither submits this form.
+        if getattr(button, "in_header", False) or getattr(button, "in_ad", False):
+            continue
+        if getattr(button, "disabled", False) or "sign in with" in name or "continue with" in name:
+            continue
         if "sign in" in name or "log in" in name or name == "login":
             return button
     return None
@@ -131,6 +144,7 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
     """
     steps: list[str] = []
     detector = LoginDetector()
+    clear_cookie_banner(page)
     snapshot = extract_page(page)
     if snapshot.captcha_present:
         return "CAPTCHA_REQUIRED", steps
@@ -154,9 +168,16 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
             return "LOGIN_FAILED", steps
         steps.append("LOGIN_CONTINUE")
         activate(page, button.selector, button.name, control_type=button.control_type)
-        snapshot = extract_page(page)
-        if snapshot.captcha_present:
+        revealed = _await_password_step(page)
+        if revealed == "CAPTCHA_REQUIRED":
             return "CAPTCHA_REQUIRED", steps
+        snapshot = revealed if isinstance(revealed, PageSnapshot) else extract_page(page)
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED", steps
+        if application_form_visible(snapshot) or verification_present(snapshot):
+            steps.append("AUTHENTICATED")
+            logger.info("login finished: authenticated")
+            return "AUTHENTICATED", steps
 
     password = _password_control(snapshot)
     identity = _email_control(snapshot)
@@ -168,20 +189,85 @@ def run_login(page, creds: Credentials) -> tuple[str, list[str]]:
     _type_secret(page, identity.selector, _identity(creds, identity))
     _type_secret(page, password.selector, creds.password)
     button = _login_button(snapshot)
+    covered = False
+    if button is None and "signInSubmitButton" in set(snapshot.automation_ids or []):
+        # Workday keeps the real Sign In button aria-hidden under a nameless overlay.
+        from autofill.models import ButtonControl
+
+        button = ButtonControl(
+            name="Sign In", selector="[data-automation-id='signInSubmitButton']", automation_id="signInSubmitButton"
+        )
+        covered = True
     if button is None:
         return "LOGIN_FAILED", steps
     steps.append("LOGIN_SUBMIT")
-    activate_login(page, button.selector, button.name, control_type=button.control_type)
+    if covered:
+        activate_login_at_point(page, button.selector, button.name)
+    else:
+        activate_login(page, button.selector, button.name, control_type=button.control_type)
     steps.append("WAIT_FOR_LOGIN")
-    snapshot = extract_page(page)
-    if snapshot.captcha_present:
+    outcome = _await_signed_in(page)
+    if outcome == "CAPTCHA_REQUIRED":
         return "CAPTCHA_REQUIRED", steps
-    if snapshot.password_present or _ERROR_RE.search(snapshot.banner or ""):
+    if outcome != "AUTHENTICATED":
         logger.info("login failed: form still asking for credentials")
         return "LOGIN_FAILED", steps
     steps.append("AUTHENTICATED")
     logger.info("login finished: authenticated")
     return "AUTHENTICATED", steps
+
+
+def _pause(page, millis: int) -> None:
+    pause = getattr(page, "wait_for_timeout", None)
+    try:
+        if pause is None:
+            time.sleep(millis / 1000)
+        else:
+            pause(millis)
+    except Exception:
+        return
+
+
+def _login_rejected(snapshot: PageSnapshot) -> bool:
+    """The password form is still up and the site showed a rejection."""
+    text = " ".join(part for part in (snapshot.banner, *snapshot.alerts) if part)
+    if _ERROR_RE.search(text):
+        return True
+    return bool(snapshot.password_present and (snapshot.banner or snapshot.alerts))
+
+
+def _await_signed_in(page) -> str:
+    """Wait for the application after Sign In. A rejection fails immediately.
+
+    A slow employer keeps the password box for a moment after a good password.
+    That wait is not a failed login, and it does not create an account.
+    """
+    deadline = time.monotonic() + _LOGIN_WAIT_SECONDS
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return "LOGIN_FAILED"
+    while True:
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED"
+        if application_form_visible(snapshot) or verification_present(snapshot):
+            return "AUTHENTICATED"
+        if _login_rejected(snapshot):
+            return "LOGIN_FAILED"
+        heading = (snapshot.heading or "").casefold()
+        still_login = snapshot.password_present or "sign in" in heading or "log in" in heading
+        if not still_login and (snapshot.controls or snapshot.buttons):
+            return "AUTHENTICATED"
+        if time.monotonic() >= deadline:
+            break
+        _pause(page, 150)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return "LOGIN_FAILED"
+    if snapshot.password_present or _login_rejected(snapshot):
+        return "LOGIN_FAILED"
+    return "AUTHENTICATED"
 
 
 def protocol_at_least(version: str, target: str = "0.7.0") -> bool:
@@ -211,7 +297,25 @@ _OTP_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _OTP_LABEL_RE = re.compile(r"\b(verification code|passcode|otp|code)\b", re.IGNORECASE)
-_EXISTS_RE = re.compile(r"already exists|account exists|already registered|email is taken", re.IGNORECASE)
+_OTP_PIN_RE = re.compile(r"\bpin\b", re.IGNORECASE)
+_DIAL_OR_POSTAL_RE = re.compile(
+    r"\b(?:country|area|postal|zip|dial|calling)\s*codes?\b",
+    re.IGNORECASE,
+)
+_NOT_OTP_CODE_RE = re.compile(
+    r"\b(?:referral|promo(?:tional)?|coupon|discount|employee|vendor|access|gift)\b",
+    re.IGNORECASE,
+)
+_LOGIN_WAIT_SECONDS = 3.0
+_CONTACT_NAME_RE = re.compile(
+    r"\b(?:first name|last name|full name|given name|family name|surname)\b",
+    re.IGNORECASE,
+)
+_CONTACT_REACH_RE = re.compile(r"\b(?:e-?mail|phone|mobile|telephone)\b", re.IGNORECASE)
+_EXISTS_RE = re.compile(
+    r"already exists|account exists|already registered|email is taken|already in use|already been used",
+    re.IGNORECASE,
+)
 _EMAIL_REDACT_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _DIGIT_RUN_RE = re.compile(r"\d{3,}")
 _WORKDAY_HOST_RE = WORKDAY_HOST_RE
@@ -278,6 +382,66 @@ def _control_blob(control: Control) -> str:
     )
 
 
+_CONFIRM_ID_RE = re.compile(r"verify|confirm|retype|re-?enter|repeat", re.IGNORECASE)
+_SIGNIN_ALTERNATE_IDS = frozenset({"signInLink", "signInButton"})
+
+
+def _create_account_ids(ids: set[str]) -> set[str]:
+    """Workday Create Account automation ids. ``createAccountLink`` sits on the Sign In pane."""
+    return {item for item in ids if item.startswith("createAccount") and item != "createAccountLink"} | (
+        {"verifyPassword"} & ids
+    )
+
+
+def confirm_password_control(snapshot: PageSnapshot) -> Control | None:
+    """A visible Verify / Confirm password box next to another password box. Sign In never has one."""
+    passwords = _passwords(snapshot)
+    if len(passwords) < 2:
+        return None
+    for control in passwords:
+        blob = " ".join(part for part in (_control_blob(control), control.automation_id, control.element_id) if part)
+        if _CONFIRM_RE.search(blob) or (
+            control.automation_id and _CONFIRM_ID_RE.search(control.automation_id)
+        ):
+            return control
+    return None
+
+
+def create_account_form(snapshot: PageSnapshot) -> bool:
+    """A Create Account form, scored before any Sign In rule.
+
+    Either a password box confirmed by a Verify / Confirm password box, or a
+    Workday Create Account id (``createAccountSubmitButton``,
+    ``createAccountCheckbox``, ``verifyPassword``) with a visible password box.
+    A Sign In link, tab, or header button on the same page does not change this.
+    An application form that mixes in a password is not an account page.
+    """
+    if snapshot.captcha_present:
+        return False
+    if LoginDetector()._looks_like_application(snapshot) and snapshot.password_present:
+        return False
+    if confirm_password_control(snapshot) is not None:
+        return True
+    ids = _automation_ids(snapshot)
+    if not (_passwords(snapshot) or snapshot.password_present):
+        return False
+    if "signInSubmitButton" in ids and not ({"createAccountSubmitButton", "verifyPassword"} & ids):
+        return False
+    return bool(_create_account_ids(ids))
+
+
+def _sign_in_alternate(snapshot: PageSnapshot) -> bool:
+    """A Sign In link, tab, or button the person can use instead of Create Account."""
+    if any(_LOGIN_RE.search(link.name) for link in snapshot.links):
+        return True
+    for button in snapshot.buttons:
+        if button.automation_id in _SIGNIN_ALTERNATE_IDS:
+            return True
+        if not button.in_header and not button.in_ad and _LOGIN_RE.search(button.name):
+            return True
+    return False
+
+
 def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     """Highest score wins. A tie is Sign In. A real application form is not an account page."""
     del url
@@ -307,7 +471,10 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     if _FORGOT_RE.search(link_names) or _FORGOT_RE.search(page_text):
         login += 2
     ids = _automation_ids(snapshot)
-    register_pane = "createAccountSubmitButton" in ids or "verifyPassword" in ids
+    create_form = create_account_form(snapshot)
+    register_pane = create_form or "createAccountSubmitButton" in ids or "verifyPassword" in ids
+    if create_form:
+        register += 4
     if "createAccountSubmitButton" in ids:
         register += 3
     if "verifyPassword" in ids:
@@ -332,8 +499,13 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
             register_score=register,
             login_score=login,
         )
-    if register > login and register > 0:
-        return AccountScore(mode="register", alternate=signin_link, register_score=register, login_score=login)
+    if create_form or (register > login and register > 0):
+        return AccountScore(
+            mode="register",
+            alternate=signin_link or _sign_in_alternate(snapshot),
+            register_score=register,
+            login_score=login,
+        )
     if login > 0 and login >= register:
         return AccountScore(
             mode="login",
@@ -344,21 +516,93 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
     return AccountScore(mode="none", alternate=False, register_score=register, login_score=login)
 
 
+def _otp_control(control: Control) -> bool:
+    """A real one-time-code box. A dial code, postal code, or referral code is not one."""
+    if control.hidden:
+        return False
+    if (control.autocomplete or "").casefold() == "one-time-code":
+        return True
+    blob = _control_blob(control)
+    if _DIAL_OR_POSTAL_RE.search(blob) or _NOT_OTP_CODE_RE.search(blob):
+        return False
+    if control.max_length is None or not 4 <= control.max_length <= 8:
+        return False
+    return bool(_OTP_LABEL_RE.search(blob) or _OTP_PIN_RE.search(blob))
+
+
+def _contact_application(snapshot: PageSnapshot) -> bool:
+    """Name plus email or phone. That page is an application, not an inbox check."""
+    blobs = [_control_blob(control) for control in snapshot.controls if not control.hidden]
+    blob = " ".join(blobs)
+    return bool(_CONTACT_NAME_RE.search(blob) and _CONTACT_REACH_RE.search(blob))
+
+
+def _job_application(snapshot: PageSnapshot) -> bool:
+    """Questions or contact fields. A lone email or password box is not one."""
+    if _contact_application(snapshot):
+        return True
+    for control in snapshot.controls:
+        if control.hidden or control.disabled:
+            continue
+        if control.kind == "password" or (control.input_type or "").casefold() == "password":
+            continue
+        if _otp_control(control):
+            continue
+        if control.kind in {"file", "textarea", "select", "radio", "combobox", "checkbox"}:
+            return True
+        if control.kind == "text" or (control.input_type or "").casefold() in {"tel", "number", "url"}:
+            blob = _control_blob(control)
+            if (control.input_type or "").casefold() == "email" or re.search(
+                r"\b(?:e-?mail|username|user name)\b", blob, re.IGNORECASE
+            ):
+                continue
+            return True
+    return False
+
+
 def verification_present(snapshot: PageSnapshot) -> bool:
-    """OTP or an email-verification notice. A password form is not this page."""
+    """OTP or an email-verification notice. A password form is not this page.
+
+    A country, area, postal, zip, or dial code is not an OTP. A referral,
+    promo, or access code is not one either. A contact form or question page
+    that mentions a code in page text is not one, unless a real one-time-code
+    control is on the page.
+    """
     if snapshot.password_present:
         return False
-    for control in snapshot.controls:
-        if control.hidden:
-            continue
-        if (control.autocomplete or "").casefold() == "one-time-code":
-            return True
-        if control.max_length is not None and 4 <= control.max_length <= 8 and _OTP_LABEL_RE.search(
-            _control_blob(control)
-        ):
-            return True
+    if any(_otp_control(control) for control in snapshot.controls):
+        return True
+    if _job_application(snapshot):
+        return False
     text = " ".join(part for part in (snapshot.page_text, snapshot.heading, snapshot.banner) if part)
     return bool(_OTP_TEXT_RE.search(text))
+
+
+def application_form_visible(snapshot: PageSnapshot) -> bool:
+    """A job form is on screen. Create Account, a real OTP, and a real captcha are not."""
+    if snapshot.captcha_present or snapshot.password_present:
+        return False
+    if verification_present(snapshot):
+        return False
+    return _job_application(snapshot)
+
+
+def _await_password_step(page) -> PageSnapshot | str:
+    """After email-first Continue, wait for the password box or the application."""
+    deadline = time.monotonic() + _LOGIN_WAIT_SECONDS
+    snapshot = extract_page(page)
+    while True:
+        if snapshot.captcha_present and not application_form_visible(snapshot):
+            return "CAPTCHA_REQUIRED"
+        if _password_control(snapshot) is not None or application_form_visible(snapshot):
+            return snapshot
+        if time.monotonic() >= deadline:
+            return snapshot
+        _pause(page, 150)
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return snapshot
 
 
 def tenant_identity(url: str, ats: str | None) -> dict:
@@ -421,6 +665,35 @@ def password_policy(snapshot: PageSnapshot) -> dict | None:
     return policy
 
 
+def password_meets_policy(password: str, policy: dict | None, email: str = "") -> str | None:
+    """``password_policy`` when ``password`` misses the on-page rules, else None.
+
+    The return value is a reason token. It never contains the secret.
+    ``policy`` None means the page published no rules, so the secret is not refused here.
+    """
+    if not policy:
+        return None
+    secret = password or ""
+    minimum = int(policy.get("minLength") or 0)
+    maximum = int(policy.get("maxLength") or 0)
+    if minimum and len(secret) < minimum:
+        return "password_policy"
+    if maximum and len(secret) > maximum:
+        return "password_policy"
+    if policy.get("requireUpper") and not any(char.isupper() for char in secret):
+        return "password_policy"
+    if policy.get("requireLower") and not any(char.islower() for char in secret):
+        return "password_policy"
+    if policy.get("requireDigit") and not any(char.isdigit() for char in secret):
+        return "password_policy"
+    if policy.get("requireSymbol") and not any(not char.isalnum() for char in secret):
+        return "password_policy"
+    folded_email = (email or "").strip().casefold()
+    if policy.get("disallowEmail") and folded_email and folded_email in secret.casefold():
+        return "password_policy"
+    return None
+
+
 def redact_site_error(text: str, secrets: list[str] | None = None) -> str:
     """Short site text with emails, digit runs, and submitted values removed."""
     cleaned = " ".join((text or "").split())
@@ -444,6 +717,7 @@ def account_view(
     """Public account description. It never includes a password or email value."""
     email = _email_control(snapshot)
     chosen = mode if mode in {"register", "login"} else "login"
+    fields = account_fields(snapshot)
     return {
         "mode": chosen,
         "alternateModeAvailable": bool(alternate),
@@ -451,7 +725,47 @@ def account_view(
         "passwordPolicy": password_policy(snapshot) if snapshot.password_present or chosen == "register" else None,
         "emailPrefillAllowed": not bool(email is not None and email.read_only),
         "siteErrors": [redact_site_error(item) for item in (site_errors or [])[:5]],
+        "fields": fields,
+        "requiredFields": [item["role"] for item in fields if item["required"]],
     }
+
+
+_FIELD_LABEL_MAX = 80
+
+
+def _field_label(control: Control) -> str:
+    """The page's own label for an account box. It is site text, never a value."""
+    text = " ".join((control.label or control.aria_label or control.placeholder or "").split())
+    return redact_site_error(text)[:_FIELD_LABEL_MAX]
+
+
+def account_fields(snapshot: PageSnapshot) -> list[dict]:
+    """Account boxes on this pane: email, password, confirmPassword, terms. No values.
+
+    Workday marks every Create Account box required. Other sites use
+    ``required`` / ``aria-required``. The account boxes themselves are always
+    needed, so email and passwords count as required.
+    """
+    out: list[dict] = []
+    email = _email_control(snapshot)
+    if email is not None:
+        out.append({"role": "email", "label": _field_label(email), "required": True})
+    confirm = confirm_password_control(snapshot)
+    for control in _passwords(snapshot):
+        role = "confirmPassword" if confirm is not None and control.selector == confirm.selector else "password"
+        if role == "password" and any(item["role"] == "password" for item in out):
+            role = "confirmPassword"
+        out.append({"role": role, "label": _field_label(control), "required": True})
+    for control in snapshot.controls:
+        if control.hidden or control.kind != "checkbox":
+            continue
+        blob = " ".join(part for part in (_control_blob(control), control.prompt, control.group) if part)
+        account_box = control.automation_id.startswith("createAccount") if control.automation_id else False
+        if account_box or _TERMS_RE.search(blob) or re.search(r"\bconsent\b", blob, re.IGNORECASE):
+            required = bool(control.required) or account_box
+            out.append({"role": "terms", "label": _field_label(control), "required": required})
+            break
+    return out[:6]
 
 
 def account_decision(snapshot: PageSnapshot, url: str, ats: str | None) -> AccountStop | None:
@@ -480,6 +794,164 @@ def login_account_view(snapshot: PageSnapshot, url: str, ats: str | None) -> dic
     return account_view(snapshot, url, ats, mode="login", alternate=scored.alternate)
 
 
+def stop_account(snapshot: PageSnapshot, url: str, ats: str | None, status: str) -> tuple[str, dict | None]:
+    """Status and account description for an account stop.
+
+    A page that scores as Create Account is never reported as Sign In: a
+    ``LOGIN_REQUIRED`` stop on such a page becomes ``ACCOUNT_CREATION_REQUIRED``
+    with ``mode=register``. A genuine Sign In page keeps ``LOGIN_REQUIRED`` and
+    its sign-in description. An application form gets no account.
+    """
+    scored = score_account(snapshot, url)
+    if scored.application:
+        return status, None
+    if status == "LOGIN_REQUIRED" and scored.mode == "register":
+        return "ACCOUNT_CREATION_REQUIRED", account_view(
+            snapshot, url, ats, mode="register", alternate=scored.alternate
+        )
+    if status == "ACCOUNT_CREATION_REQUIRED":
+        return status, account_view(snapshot, url, ats, mode="register", alternate=scored.alternate)
+    if status == "LOGIN_REQUIRED" and scored.mode == "login":
+        return status, account_view(snapshot, url, ats, mode="login", alternate=scored.alternate)
+    return status, None
+
+
 def account_exists_text(snapshot: PageSnapshot) -> bool:
     blob = " ".join(part for part in [snapshot.banner, snapshot.heading, snapshot.page_text, *snapshot.alerts] if part)
     return bool(_EXISTS_RE.search(blob))
+
+
+# "Sign in with email" beside Google / Apple / LinkedIn buttons. Workday tenants
+# hide the email and password boxes behind it. Identity-provider buttons are not
+# matched: Auto-Fill has no Google, Apple, or LinkedIn password for the candidate.
+_EMAIL_PATH_RE = re.compile(
+    r"^\s*(?:(?:sign\s*in|log\s*in|continue|sign\s*up|create account)\s+(?:with|using|via)\s+"
+    r"(?:your\s+|my\s+)?(?:e-?mail(?:\s+address)?|password)"
+    r"|use\s+(?:my\s+|your\s+)?e-?mail(?:\s+address)?(?:\s+instead)?)\s*$",
+    re.IGNORECASE,
+)
+_EMAIL_PATH_IDS = frozenset({"SignInWithEmailButton", "signInWithEmailButton", "signInWithEmail"})
+_EMAIL_PATH_WAIT_SECONDS = 4.0
+
+
+def email_sign_in_button(snapshot: PageSnapshot):
+    """The "Sign in with email" control on an SSO chooser, or None."""
+    if snapshot.password_present or _passwords(snapshot):
+        return None
+    for item in [*snapshot.buttons, *snapshot.links]:
+        if getattr(item, "in_header", False) or getattr(item, "in_ad", False) or getattr(item, "disabled", False):
+            continue
+        selector = str(getattr(item, "selector", "") or "")
+        if not selector:
+            continue
+        automation_id = getattr(item, "automation_id", "")
+        if automation_id in _EMAIL_PATH_IDS or _EMAIL_PATH_RE.search(str(getattr(item, "name", "") or "")):
+            return item
+    return None
+
+
+def open_email_sign_in(page, snapshot: PageSnapshot) -> PageSnapshot | None:
+    """Click "Sign in with email" and wait for the email or password box.
+
+    Returns the new snapshot, or None when there was nothing to click or the
+    form did not appear. One click; no identity-provider button is touched.
+    """
+    target = email_sign_in_button(snapshot)
+    if target is None:
+        return None
+    name = target.name or "Sign in with email"
+    if not _EMAIL_PATH_RE.search(name):
+        name = "Sign in with email"
+    try:
+        activate_account_switch(page, target.selector, name, control_type=getattr(target, "control_type", ""))
+    except Exception:
+        logger.info("email sign-in: click failed")
+        return None
+    deadline = time.monotonic() + _EMAIL_PATH_WAIT_SECONDS
+    while True:
+        try:
+            fresh = extract_page(page)
+        except Exception:
+            fresh = None
+        if fresh is not None and (fresh.password_present or _passwords(fresh) or fresh.captcha_present):
+            logger.info("email sign-in: form opened")
+            return fresh
+        if time.monotonic() >= deadline:
+            return fresh
+        _pause(page, 150)
+
+
+def clear_cookie_banner(page) -> bool:
+    """Close a cookie banner before typing into an account form. At most two tries."""
+    closed = False
+    for _ in range(2):
+        try:
+            if not dismiss_cookie_banner(page):
+                break
+        except Exception:
+            break
+        closed = True
+        _pause(page, 200)
+    return closed
+
+
+# Workday: "You may have entered the wrong email address or password or your
+# account might be locked." A new Workday account that is not verified yet gets
+# the same banner, and Workday locks an account after repeated tries.
+_WRONG_OR_LOCKED_RE = re.compile(
+    r"wrong (?:e-?mail|password|user)|incorrect (?:e-?mail|password|user)|invalid (?:e-?mail|password|user|credentials)"
+    r"|might be locked|(?:account|user) (?:is |has been |was )?locked"
+    r"|too many (?:failed )?(?:sign-?in |login )?attempts",
+    re.IGNORECASE,
+)
+_UNVERIFIED_RE = re.compile(
+    r"not (?:been |yet )?verified|verify your (?:e-?mail|account)|unverified|activate your account",
+    re.IGNORECASE,
+)
+
+LOGIN_FAILED_MESSAGES = {
+    "wrong_or_locked": (
+        "The employer site says the email or password is wrong or the account is locked. "
+        "Auto-Fill will not try again. If the account was just created, open the employer's verification "
+        "email first. Then sign in in the live preview, or use Forgot password, and press Continue."
+    ),
+    "unverified": (
+        "The employer account is not verified yet. Open the employer's verification email, "
+        "then press Continue."
+    ),
+    "rejected": (
+        "The employer site did not accept the sign-in. Auto-Fill will not try again. "
+        "Sign in in the live preview, then press Continue."
+    ),
+}
+
+
+def login_failure_reason(snapshot: PageSnapshot) -> str:
+    """``wrong_or_locked``, ``unverified``, or ``rejected`` from the site's own banner."""
+    text = " ".join(part for part in (snapshot.banner, *snapshot.alerts, snapshot.page_text) if part)
+    if _UNVERIFIED_RE.search(text):
+        return "unverified"
+    if _WRONG_OR_LOCKED_RE.search(text):
+        return "wrong_or_locked"
+    return "rejected"
+
+
+def sign_in_switch_target(snapshot: PageSnapshot):
+    """The "Sign In" link on a Create Account pane (Workday ``signInLink``), or None.
+
+    A header Sign In button is skipped: it opens the same dialog on some tenants
+    and leaves the Create Account form in place on others.
+    """
+    for item in [*snapshot.links, *snapshot.buttons]:
+        if getattr(item, "in_header", False) or getattr(item, "in_ad", False) or getattr(item, "disabled", False):
+            continue
+        selector = str(getattr(item, "selector", "") or "")
+        name = str(getattr(item, "name", "") or "")
+        if not selector or not name:
+            continue
+        automation_id = getattr(item, "automation_id", "")
+        if automation_id == "signInLink" or re.fullmatch(r"\s*(?:sign\s*in|log\s*in)\s*", name, re.IGNORECASE):
+            if automation_id in {"signInSubmitButton", "utilityButtonSignIn"}:
+                continue
+            return item
+    return None

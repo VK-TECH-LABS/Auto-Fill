@@ -15,14 +15,23 @@ from urllib.parse import urlparse
 from autofill.ats import WORKDAY_HOST_RE
 from autofill.extract import extract_page
 from autofill.login import _CONFIRM_RE as _VERIFY_RE
-from autofill.login import _LOGIN_RE, _REGISTER_RE
+from autofill.login import _LOGIN_RE, _REGISTER_RE, create_account_form
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import classify_control, is_entry_control, semantic_action
+from autofill.safeguards import (
+    classify_control,
+    dismiss_cookie_banner,
+    is_entry_control,
+    is_forward_navigation,
+    semantic_action,
+)
 
 logger = logging.getLogger("autofill.pagewait")
 
 _WORKDAY_HOST = WORKDAY_HOST_RE
-_DECISIVE_IDS = frozenset({"createAccountSubmitButton", "signInSubmitButton", "verifyPassword"})
+_DECISIVE_IDS = frozenset(
+    {"createAccountSubmitButton", "createAccountCheckbox", "signInSubmitButton", "verifyPassword"}
+)
+_WORKDAY_SHELL_BUDGET = 4.0
 
 
 def visible_fields(snapshot: PageSnapshot) -> list:
@@ -68,6 +77,112 @@ _SITE_ERROR_STRONG = re.compile(
     re.IGNORECASE,
 )
 _SITE_ERROR_SOFT = re.compile(r"\bplease try again\b", re.IGNORECASE)
+
+
+_JOB_CLOSED_RE = re.compile(
+    r"("
+    r"this job has expired"
+    r"|job has expired"
+    r"|sorry,?\s+this job has expired"
+    r"|no longer accepting applications"
+    r"|this (?:job|position|posting|requisition|opening) "
+    r"(?:has expired|is expired|has been closed|is closed|is no longer available)"
+    r"|the job you are trying to apply for has been filled"
+    r"|this (?:job|position|posting) has been filled"
+    r")",
+    re.IGNORECASE,
+)
+_IDENTITY_RE = re.compile(
+    r"\b(e-?mail|phone|mobile|resume|résumé|curriculum vitae|cv|first name|last name|full name|legal name)\b",
+    re.IGNORECASE,
+)
+_CHROME_CONTROL_RE = re.compile(r"\b(language|locale|lang)\b", re.IGNORECASE)
+_LANG_OPTION_RE = re.compile(
+    r"\b(english|español|spanish|français|french|deutsch|german|português|portuguese|"
+    r"chinese|japanese|italiano|italian|nederlands|dutch|korean|hindi|arabic)\b",
+    re.IGNORECASE,
+)
+
+
+def _control_blob(control) -> str:
+    return " ".join(
+        part
+        for part in (control.label, control.name, control.placeholder, control.aria_label, control.input_type)
+        if part
+    )
+
+
+_GENERIC_PROMPTS = frozenset(
+    {
+        "search",
+        "type to search",
+        "search options",
+        "select",
+        "please select",
+        "choose",
+        "choose one",
+        "select one",
+        "start typing",
+        "select an option",
+    }
+)
+
+
+def _folded(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").casefold()).strip(" .")
+
+
+def _prompt_search(control) -> bool:
+    """A named question whose box says Search. The site search box is not one.
+
+    Workday prompt widgets keep the placeholder ``Search`` on a required
+    question such as "How did you hear about us?". The label is the question.
+    """
+    label = _folded(control.label or "")
+    if not label or label in _GENERIC_PROMPTS or _SEARCH_RE.search(label):
+        return False
+    placeholder = _folded(control.placeholder or "")
+    aria = _folded(control.aria_label or "")
+    return placeholder in _GENERIC_PROMPTS or aria in _GENERIC_PROMPTS
+
+
+def _site_search(control) -> bool:
+    if _prompt_search(control):
+        return False
+    blob = _control_blob(control)
+    return control.input_type == "search" or bool(_SEARCH_RE.search(blob))
+
+
+def _chrome_control(control) -> bool:
+    """A language menu or cookie control is site chrome, not an application field."""
+    blob = _control_blob(control)
+    if _site_search(control):
+        return True
+    if _CHROME_CONTROL_RE.search(blob):
+        return True
+    if control.kind in {"select", "combobox"}:
+        options = " ".join(option.label for option in control.options if option.label)
+        if _LANG_OPTION_RE.search(options) or _LANG_OPTION_RE.search(blob):
+            return True
+    return False
+
+
+def _identity_fields(snapshot: PageSnapshot) -> bool:
+    """Email, phone, resume, or name fields mean the application form is already open."""
+    for control in snapshot.controls:
+        if control.hidden or control.kind == "hidden":
+            continue
+        if control.kind in {"file", "password"} or control.input_type in {"email", "tel", "password"}:
+            return True
+        if _IDENTITY_RE.search(_control_blob(control)):
+            return True
+    return False
+
+
+def is_job_closed(snapshot: PageSnapshot) -> bool:
+    """True when the employer says this posting is expired, filled, or closed."""
+    text = " ".join(part for part in (snapshot.heading, snapshot.banner, snapshot.page_text) if part)
+    return bool(_JOB_CLOSED_RE.search(text))
 
 
 _OUTAGE_RE = re.compile(
@@ -117,7 +232,7 @@ def application_controls(snapshot: PageSnapshot) -> list[Control]:
             for part in (control.label, control.name, control.placeholder, control.aria_label, control.input_type)
             if part
         )
-        if control.input_type == "search" or _SEARCH_RE.search(blob) or _CHAT_RE.search(blob):
+        if _site_search(control) or _CHAT_RE.search(blob):
             continue
         if control.kind in {"file", "textarea", "select", "radio", "checkbox", "combobox", "buttons"}:
             found.append(control)
@@ -144,6 +259,9 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     if snapshot.captcha_present:
         note_page_type("UNKNOWN")
         return "UNKNOWN"
+    if is_job_closed(snapshot):
+        note_page_type("JOB_CLOSED")
+        return "JOB_CLOSED"
     if is_site_error(snapshot):
         note_page_type("SITE_ERROR")
         return "SITE_ERROR"
@@ -157,7 +275,7 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     # A posting with an Apply control is a job page even when the header
     # offers Sign in. A page that already has application fields stays a form.
     entry = find_entry_control(snapshot)
-    fields = application_controls(snapshot)
+    fields = [control for control in application_controls(snapshot) if not _chrome_control(control)]
     formish = [
         control
         for control in fields
@@ -165,8 +283,21 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
         or control.input_type in {"email", "tel"}
     ]
     job_text = bool(_JOB_RE.search(text))
-    posting = entry is not None and not fields and not formish
-    if posting and not _password_controls(snapshot) and not snapshot.password_present and job_text:
+    # A language menu is not the application. Apply in the posting header, or a
+    # type=submit Apply on the description, still opens the form.
+    posting_entry = entry
+    if posting_entry is None and job_text and not fields and not _identity_fields(snapshot):
+        posting_entry = find_entry_control(snapshot, on_posting=True)
+    posting = (
+        posting_entry is not None
+        and not fields
+        and not formish
+        and not _identity_fields(snapshot)
+        and not _password_controls(snapshot)
+        and not snapshot.password_present
+        and job_text
+    )
+    if posting:
         note_page_type("JOB_DESCRIPTION")
         return "JOB_DESCRIPTION"
     if sign_in_pane(snapshot):
@@ -197,6 +328,32 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
         return "JOB_DESCRIPTION"
     note_page_type("UNKNOWN")
     return "UNKNOWN"
+
+
+_APPLICATION_SUBMIT_RE = re.compile(
+    r"\b(submit\s+application|send(?:\s+my)?\s+application|complete\s+application)\b",
+    re.IGNORECASE,
+)
+
+
+def has_application_submit(snapshot: PageSnapshot) -> bool:
+    """A visible Submit application control. A posting Apply is not one."""
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if _APPLICATION_SUBMIT_RE.search(" ".join((button.name or "").split())):
+            return True
+    return False
+
+
+def _has_forward_control(snapshot: PageSnapshot) -> bool:
+    """True when this page still has a Next / Continue the fill may press."""
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if is_forward_navigation(button.name, control_type=button.control_type or ""):
+            return True
+    return False
 
 
 def has_final_submit(snapshot: PageSnapshot, remembered: list[str] | None = None) -> bool:
@@ -235,6 +392,9 @@ def terminal_kind(
     if snapshot.captcha_present or blocked == "captcha":
         classify_page(snapshot, url=url)
         return "CAPTCHA"
+    if is_job_closed(snapshot):
+        note_page_type("JOB_CLOSED")
+        return "JOB_CLOSED"
     if is_site_error(snapshot):
         note_page_type("SITE_ERROR")
         return "SITE_ERROR"
@@ -269,6 +429,17 @@ def terminal_kind(
         return "READY"
     if kind in {"APPLICATION_FORM", "REVIEW"}:
         return "FILLED"
+    # The step after Next can be only "Submit application", with a heading that
+    # does not say Review and with no fields left. That is the human submit
+    # stop. A page that still has Next stays on the forward path.
+    if (
+        not gaps
+        and (blocked or "") not in {"account", "login", "captcha", "resume"}
+        and has_application_submit(snapshot)
+        and not _has_forward_control(snapshot)
+    ):
+        note_page_type("REVIEW")
+        return "READY"
     return "NO_FORM"
 
 
@@ -299,6 +470,10 @@ def register_pane(snapshot: PageSnapshot) -> bool:
     """
     if snapshot.captcha_present:
         return False
+    # Verify / Confirm password, or a Workday Create Account id, decides it before
+    # any Sign In rule. A Sign In link or header button does not make it a login.
+    if create_account_form(snapshot):
+        return True
     text = _pane_text(snapshot)
     passwords = _password_controls(snapshot)
     ids = {item for item in snapshot.automation_ids if item}
@@ -377,6 +552,8 @@ def ready_to_submit(
 
 def render_ready(snapshot: PageSnapshot) -> bool:
     """True when inspection would see a form, a wall, or an entry/login choice."""
+    if is_job_closed(snapshot):
+        return True
     if snapshot.captcha_present or visible_fields(snapshot):
         return True
     if register_pane(snapshot) or sign_in_pane(snapshot):
@@ -517,6 +694,17 @@ def content_frame_pending(page) -> bool:
         return "context was destroyed" in text or "navigat" in text
 
 
+def _dismiss_cookies(page, *, limit: list[int]) -> bool:
+    """Close one cookie dialog. ``limit`` is a one-item counter so a stuck banner is not clicked forever."""
+    if limit[0] >= 2:
+        return False
+    if not dismiss_cookie_banner(page):
+        return False
+    limit[0] += 1
+    _pause(page, 200)
+    return True
+
+
 def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     """Poll until a form or a known marker appears.
 
@@ -525,8 +713,15 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
     wait for network idle: an open Greenhouse page keeps connections up.
     The loop uses a small probe and runs the full DOM scan only when that
     probe sees controls, or once at the deadline. A dead browser or a
-    timeout while reading the page is raised.
+    timeout while reading the page is raised. A cookie dialog is dismissed
+    first so it cannot hide the posting.
     """
+    dismissals = [0]
+    try:
+        _dismiss_cookies(page, limit=dismissals)
+    except Exception as exc:
+        if _closed(exc) or _timeout(exc):
+            raise
     try:
         if not content_frame_pending(page) and render_ready(extract_page(page)):
             return
@@ -558,6 +753,7 @@ def wait_for_render(page, *, timeout_s: float = 12.0) -> None:
                 _settle_account_pane(page, snapshot)
                 _note_render_wait(started)
                 return
+            _dismiss_cookies(page, limit=dismissals)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if snapshot is None:
@@ -589,12 +785,14 @@ def _entry_name(name: str) -> str:
     return " ".join(name.split()).casefold().replace("\u2019", "'").replace("\u2018", "'")
 
 
-def _known_entry(control) -> bool:
+def _known_entry(control, *, on_posting: bool = False) -> bool:
     """An employer entry control. Submit application is never one.
 
-    A bare ``Apply`` whose type is submit stays on the final-submit path.
-    Greenhouse ``#apply_button``, a Lever apply posting button, and the
-    labeled entry phrases are entry controls. Header and ad controls are not.
+    A bare ``Apply`` whose type is submit stays on the final-submit path
+    unless ``on_posting`` says this is still the job description. Greenhouse
+    ``#apply_button``, a Lever apply posting button, and the labeled entry
+    phrases are entry controls. Header and ad controls are not, except an
+    Apply label in the posting header.
     """
     return is_entry_control(
         getattr(control, "name", "") or "",
@@ -608,10 +806,11 @@ def _known_entry(control) -> bool:
         in_header=bool(getattr(control, "in_header", False)),
         in_ad=bool(getattr(control, "in_ad", False)),
         in_main=bool(getattr(control, "in_main", True)),
+        on_posting=on_posting,
     )
 
 
-def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
+def find_entry_control(snapshot: PageSnapshot, *, on_posting: bool = False) -> ButtonControl | None:
     """The employer's Apply control, including on a posting that also has a search box.
 
     ``Apply Manually`` wins over a generic ``Apply``. Submit application is never chosen.
@@ -620,10 +819,10 @@ def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
         return None
     candidates: list[ButtonControl] = []
     for button in snapshot.buttons:
-        if _known_entry(button):
+        if _known_entry(button, on_posting=on_posting):
             candidates.append(button)
     for link in snapshot.links:
-        if link.selector and _known_entry(link):
+        if link.selector and _known_entry(link, on_posting=on_posting):
             candidates.append(
                 ButtonControl(
                     name=link.name,
@@ -642,6 +841,9 @@ def find_entry_control(snapshot: PageSnapshot) -> ButtonControl | None:
     manual = [button for button in candidates if _entry_name(button.name) == "apply manually"]
     if manual:
         return manual[0]
+    in_content = [button for button in candidates if button.in_main and not button.in_header]
+    if in_content:
+        return in_content[0]
     return candidates[0] if candidates else None
 
 
@@ -748,7 +950,8 @@ def _settle_account_pane(page, snapshot: PageSnapshot) -> None:
     if _account_decisive(snapshot) and (register_pane(snapshot) or sign_in_pane(snapshot)):
         return
     workday = bool(_WORKDAY_HOST.search(_host(page)))
-    budget = 2.0 if workday and not _account_decisive(snapshot) else 0.4
+    # A Workday Create Account step can paint its Sign In chrome seconds before the form.
+    budget = _WORKDAY_SHELL_BUDGET if workday and not _account_decisive(snapshot) else 0.4
     deadline = time.monotonic() + budget
     previous = _account_signature(snapshot)
     seen_decisive = _account_decisive(snapshot)
@@ -933,8 +1136,18 @@ def invalid_field_messages(page) -> list[str]:
     return [str(item) for item in found or [] if str(item).strip()]
 
 
-def wait_for_navigation(page, before: tuple, *, timeout_s: float = 1.5):
-    """Poll until the page moves or the budget ends. Returns ``(advanced, snapshot)``."""
+# Same cap as ``wait_for_render``. A step that moves inside this window is one
+# advance. An unchanged page is one stall at the deadline, not at 1.5 seconds.
+_NAVIGATION_BUDGET_S = 12.0
+
+
+def wait_for_navigation(page, before: tuple, *, timeout_s: float = _NAVIGATION_BUDGET_S):
+    """Poll until the page moves or the budget ends. Returns ``(advanced, snapshot)``.
+
+    A signature change returns immediately. The page can sit still and then
+    change its heading inside the budget, so two identical extracts do not
+    end the wait early. The caller clicks once. This function does not click.
+    """
     deadline = time.monotonic() + timeout_s
     snapshot = None
     while True:

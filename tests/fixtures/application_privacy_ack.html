@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Apply | Example Analyst</title></head>
+<body>
+<!-- Synthetic application step (Greenhouse / Lever / Ashby shape): a required privacy
+     acknowledgement whose input sits under a styled skin (a bare locator.check() is
+     intercepted), a required SMS consent box that must stay manual, and an optional
+     marketing box. The form keeps its own accepted state, as React does. No real data. -->
+<form id="application" onsubmit="return false" novalidate>
+  <div class="field">
+    <label for="first_name">First Name<span class="required">*</span></label>
+    <input id="first_name" name="first_name" value="Test" required>
+  </div>
+  <fieldset class="field">
+    <legend>Privacy acknowledgement<span class="required">*</span></legend>
+    <div style="position:relative;display:inline-block">
+      <input id="privacy_ack" name="privacy_ack" type="checkbox" required
+             style="opacity:0;position:absolute;left:0;top:0;width:18px;height:18px;margin:0">
+      <span class="skin" style="position:absolute;left:-2px;top:-2px;width:22px;height:22px;background:#fff;border:1px solid #333"></span>
+      <label for="privacy_ack" style="margin-left:28px">__TERMS__</label>
+    </div>
+  </fieldset>
+  <fieldset class="field">
+    <legend>Text messages<span class="required">*</span></legend>
+    <label><input id="sms_ack" name="sms_ack" type="checkbox" required> I consent to receive SMS text messages about my application.</label>
+  </fieldset>
+  <div class="field">
+    <label><input id="news" name="news" type="checkbox"> Send me product updates and marketing emails.</label>
+  </div>
+</form>
+<script>
+window.__privacy = false;
+var box = document.getElementById("privacy_ack");
+box.addEventListener("change", function () { window.__privacy = box.checked; });
+</script>
+</body>
+</html>

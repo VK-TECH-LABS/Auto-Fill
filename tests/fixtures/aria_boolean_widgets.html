@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Questions</h1>
+<form>
+  <div id="auth-q">Are you authorized to work in the United States?</div>
+  <div role="radiogroup" aria-labelledby="auth-q" aria-required="true" data-field-path="workAuth">
+    <div role="radio" id="aria-yes" aria-checked="false" tabindex="0">Yes</div>
+    <div role="radio" id="aria-no" aria-checked="false" tabindex="0">No</div>
+  </div>
+  <div role="checkbox" id="custom-box" aria-required="true" aria-checked="false">I agree to the Terms of Service</div>
+  <div role="switch" id="custom-switch" aria-checked="false">Enable job alerts</div>
+  <fieldset>
+    <legend>Preferred contact method</legend>
+    <label><input type="radio" value="Email"> Email</label>
+    <label><input type="radio" value="Phone" required> Phone</label>
+  </fieldset>
+</form>
+<script>
+document.querySelectorAll("[role='radio']").forEach(function (node) {
+  node.addEventListener("click", function () {
+    document.querySelectorAll("[role='radio']").forEach(function (peer) {
+      peer.setAttribute("aria-checked", peer === node ? "true" : "false");
+    });
+  });
+});
+</script>
+</body>
+</html>

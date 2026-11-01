@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from autofill.adapters import page_step
+from autofill.safeguards import PRESS_CHOICE_JS
 
 _JS_PATH = Path(__file__).with_name("dom_ui.js")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -48,6 +49,7 @@ STAGE_PERCENT = {
     "RESUME": 85,
     "REVIEW": 95,
     "READY": 100,
+    "CLOSED": 0,
 }
 STAGE_TITLES = {
     "OPENING": "Opening",
@@ -63,6 +65,7 @@ STAGE_TITLES = {
     "RESUME": "Resume",
     "REVIEW": "Review",
     "READY": "Ready",
+    "CLOSED": "Job closed",
 }
 
 _FOCUS_JS = """(selector) => {
@@ -104,7 +107,7 @@ _COMBOBOX_JS = r"""(selector) => {
   return !!(el.closest && el.closest("[class*='select__control']"));
 }"""
 
-_CHOOSE_JS = """({ selector, expected, multi }) => {
+_CHOOSE_JS = ("""({ selector, expected, multi }) => {
   const root = document.querySelector(selector);
   if (!root) return false;
   const wanted = multi && Array.isArray(expected) ? expected : [expected];
@@ -119,36 +122,37 @@ _CHOOSE_JS = """({ selector, expected, multi }) => {
   }
   if (root.tagName === "SELECT") {
     const match = Array.from(root.options).find((option) => {
+      if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
       const label = String(option.label || option.text || "").trim();
       return label === wanted[0] || String(option.value || "").trim() === wanted[0];
     });
     if (!match) return false;
-    root.value = match.value;
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+    if (desc && desc.set) desc.set.call(root, match.value);
+    else root.value = match.value;
     paint(root);
-    return true;
+    return String(root.value) === String(match.value);
   }
   const name = root.name || "";
   const kind = root.type === "checkbox" ? "checkbox" : "radio";
   const group = name
     ? Array.from(document.querySelectorAll("input")).filter((node) => node.type === kind && node.name === name)
     : [root];
+  const press = __PRESS__;
   if (root.type === "checkbox" && !multi) {
     const word = String(wanted[0] || "").trim();
     const on = word === "Yes" || word === "True" || word === "true";
-    root.checked = on;
-    paint(root);
-    return true;
+    return press(root, on);
   }
   let hits = 0;
   for (const word of wanted) {
     const match = group.find((node) => String(node.value || "").trim() === word || labelOf(node) === word);
     if (!match) return false;
-    match.checked = true;
-    paint(match);
+    if (!press(match, true)) return false;
     hits += 1;
   }
   return hits === wanted.length && hits > 0;
-}"""
+}""").replace("__PRESS__", PRESS_CHOICE_JS)
 
 _VERIFY_JS = """({ selector, expected, multi, fieldKey }) => {
   const root = document.querySelector(selector);
@@ -269,6 +273,7 @@ class RunState:
         self.token: contextvars.Token | None = None
         self.preview: Callable[[Any], None] | None = None
         self.preview_at = 0.0
+        self.listbox_choices: list[dict[str, str]] = []
 
 
 _RUN: contextvars.ContextVar[RunState | None] = contextvars.ContextVar("af_run", default=None)
@@ -360,6 +365,33 @@ def install(page: Any) -> None:
 
 def current_run() -> RunState | None:
     return _RUN.get()
+
+
+def note_listbox_choice(record: dict[str, str]) -> None:
+    """Remember one listbox commit for this fill. The values are Yes or No."""
+    state = _RUN.get()
+    if state is None or not isinstance(record, dict):
+        return
+    state.listbox_choices.append(
+        {
+            "selector": str(record.get("selector") or ""),
+            "label": str(record.get("label") or ""),
+            "intended": str(record.get("intended") or ""),
+            "clicked": str(record.get("clicked") or ""),
+            "shown": str(record.get("shown") or ""),
+        }
+    )
+
+
+def listbox_choice_for(selector: str) -> dict[str, str] | None:
+    """The latest listbox record for ``selector`` during this fill."""
+    state = _RUN.get()
+    if state is None or not selector:
+        return None
+    for record in reversed(state.listbox_choices):
+        if record.get("selector") == selector:
+            return record
+    return None
 
 
 def begin_run(
@@ -612,12 +644,17 @@ _COMMITTED_JS = r"""(selector) => {
   function placeholder(text) {
     const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (!folded) return true;
-    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+    if (/^(?:select one|choose one|please select one)\.{0,3}$/.test(folded)) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|start typing\.{0,3}|[-–—]+)$/.test(folded);
+  }
+  function rootOf(node) {
+    const root = node && typeof node.getRootNode === "function" ? node.getRootNode() : document;
+    return root && typeof root.querySelectorAll === "function" ? root : document;
   }
   if (type === "radio") {
     const name = el.getAttribute("name") || "";
     if (!name) return !!el.checked;
-    const nodes = document.querySelectorAll("input[type='radio']");
+    const nodes = rootOf(el).querySelectorAll("input[type='radio']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
     }
@@ -627,9 +664,20 @@ _COMMITTED_JS = r"""(selector) => {
     if (el.checked) return true;
     const name = el.getAttribute("name") || "";
     if (!name) return false;
-    const nodes = document.querySelectorAll("input[type='checkbox']");
+    const nodes = rootOf(el).querySelectorAll("input[type='checkbox']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
+    }
+    return false;
+  }
+  if (role === "radio" || role === "checkbox" || role === "switch") {
+    if (el.getAttribute("aria-checked") === "true" || el.checked === true) return true;
+    const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]");
+    if (role === "radio" && group) {
+      const peers = group.querySelectorAll("[role='radio']");
+      for (const peer of peers) {
+        if (peer.getAttribute("aria-checked") === "true") return true;
+      }
     }
     return false;
   }
@@ -643,17 +691,33 @@ _COMMITTED_JS = r"""(selector) => {
   if (type === "file") return !!(el.files && el.files.length);
   if (tag === "BUTTON" || role === "button" || role === "listbox" || role === "combobox") {
     const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
-    if (popup === "listbox" || role === "listbox") {
+    if ((popup === "listbox" || role === "listbox") && tag !== "INPUT" && tag !== "TEXTAREA") {
       const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
       return shown.length > 0 && !placeholder(shown);
     }
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
       const typed = String(el.value || "").trim();
       if (typed && !placeholder(typed)) return true;
-      const root = el.closest(".select__control") || el.parentElement;
-      const choice = root ? root.querySelector(".select__single-value, .select__multi-value") : null;
-      const shown = choice ? String(choice.textContent || "").replace(/\s+/g, " ").trim() : "";
-      return shown.length > 0 && !placeholder(shown);
+      // The pill sits in the outer prompt, not in the search-box wrapper.
+      const root = (el.closest && el.closest("[data-automation-id='multiSelectContainer']"))
+        || (el.closest && el.closest("[data-automation-id='multiselectInputContainer'], .select__control"))
+        || el.parentElement;
+      const choice = root
+        ? root.querySelector(
+            ".select__single-value, .select__multi-value, " +
+            "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+          )
+        : null;
+      if (choice && !choice.hidden) {
+        const item = choice.closest("[data-automation-id='selectedItem']");
+        const style = window.getComputedStyle(choice);
+        const hiddenItem = item && item.hidden;
+        if (!hiddenItem && style.display !== "none" && style.visibility !== "hidden") {
+          const shown = String(choice.innerText || choice.textContent || "").replace(/\s+/g, " ").trim();
+          if (shown.length > 0 && !placeholder(shown)) return true;
+        }
+      }
+      return false;
     }
     function selected(node) {
       if (!node) return false;
@@ -675,6 +739,23 @@ _COMMITTED_JS = r"""(selector) => {
     }
     return selected(el);
   }
+  const promptHost = el.closest && (
+    el.closest("[data-automation-id='multiSelectContainer']") ||
+    el.closest("[data-automation-id='multiselectInputContainer']")
+  );
+  if (promptHost) {
+    const pill = promptHost.querySelector(
+      "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+    );
+    if (pill && !pill.hidden) {
+      const item = pill.closest("[data-automation-id='selectedItem']");
+      const style = window.getComputedStyle(pill);
+      if (!(item && item.hidden) && style.display !== "none" && style.visibility !== "hidden") {
+        const pillText = String(pill.innerText || pill.textContent || "").replace(/\s+/g, " ").trim();
+        if (pillText && !placeholder(pillText)) return true;
+      }
+    }
+  }
   const value = "value" in el ? el.value : el.textContent;
   return String(value || "").trim().length > 0;
   }
@@ -687,7 +768,25 @@ _COMMITTED_JS = r"""(selector) => {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 || rect.height > 0;
   }
-  const nodes = Array.from(document.querySelectorAll(selector));
+  function collect(selector) {
+    const found = [];
+    function walk(node) {
+      if (!node || typeof node.querySelectorAll !== "function") return;
+      let matches;
+      try {
+        matches = node.querySelectorAll(selector);
+      } catch (error) {
+        return;
+      }
+      for (const match of matches) found.push(match);
+      for (const child of node.querySelectorAll("*")) {
+        if (child.shadowRoot) walk(child.shadowRoot);
+      }
+    }
+    walk(document);
+    return found;
+  }
+  const nodes = collect(selector);
   if (!nodes.length) return false;
   const visible = nodes.filter(shown);
   const pool = visible.length ? visible : nodes;
@@ -864,12 +963,50 @@ def canonical_blocker_kind(kind: object) -> str:
     return name
 
 
+_NOT_A_QUESTION = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
+
+
+def page_question_views(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """One public row per gap, in page order. Login and resume stops are not rows."""
+    views: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if canonical_blocker_kind(item.get("kind")) in _NOT_A_QUESTION:
+            continue
+        qid = str(
+            item.get("questionId") or item.get("questionHash") or item.get("fieldKey") or item.get("id") or ""
+        ).strip()
+        prompt = str(item.get("text") or item.get("prompt") or "").strip()
+        if not qid or not prompt or qid in seen:
+            continue
+        seen.add(qid)
+        options: list[str] = []
+        for option in item.get("options") or []:
+            if isinstance(option, dict):
+                label = str(option.get("label") or option.get("value") or "").strip()
+            else:
+                label = str(option).strip()
+            if label and label not in options:
+                options.append(label)
+        views.append(
+            {
+                "id": qid,
+                "prompt": prompt,
+                "type": str(item.get("answerType") or item.get("type") or "text"),
+                "options": options,
+            }
+        )
+    return views
+
+
 def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if item is None:
         return None
     question_id = item.get("questionId") or None
     question_hash = item.get("questionHash") or question_id
-    return {
+    published: dict[str, Any] = {
         "kind": canonical_blocker_kind(item.get("kind") or "QUESTION"),
         "questionId": question_id,
         "questionHash": question_hash,
@@ -879,6 +1016,21 @@ def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
         "options": [str(option) for option in item.get("options") or []],
         "required": bool(item.get("required")),
     }
+    challenge = str(item.get("challenge") or "")
+    if challenge:
+        # Confirm/complete hint. Salary amounts are not part of this object.
+        published["challenge"] = challenge
+        published["confidence"] = str(item.get("confidence") or "LOW")
+        related = [str(name) for name in item.get("relatedFields") or [] if str(name).strip()]
+        if related:
+            published["relatedFields"] = related
+        shape = str(item.get("salaryShape") or "")
+        if shape:
+            published["salaryShape"] = shape
+        reason = str(item.get("reason") or "")
+        if reason:
+            published["reason"] = reason
+    return published
 
 
 def _apply_status_stage(state: RunState, status: str) -> None:
@@ -1082,6 +1234,141 @@ def _choice(answer_type: str) -> bool:
     return answer_type in {"single_select", "multi_select", "boolean"}
 
 
+def _is_native_select(page: Any, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    try:
+        return bool(
+            evaluate(
+                """(selector) => {
+                  const el = document.querySelector(selector);
+                  return !!el && el.tagName === "SELECT";
+                }""",
+                selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+_SELECT_NATIVE_JS = r"""
+({ selector, label, value }) => {
+  const el = document.querySelector(selector);
+  if (!el || el.tagName !== "SELECT") return false;
+  function fold(item) {
+    return String(item || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  const wanted = [label, value].map(fold).filter(Boolean);
+  if (!wanted.length) return false;
+  const match = Array.from(el.options).find((option) => {
+    if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
+    const text = String(option.label || option.text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const stored = String(option.value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return wanted.indexOf(text) !== -1 || wanted.indexOf(stored) !== -1;
+  });
+  if (!match) return false;
+  const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+  if (desc && desc.set) desc.set.call(el, match.value);
+  else el.value = match.value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return String(el.value) === String(match.value);
+}
+"""
+
+
+def _selected_option(page: Any, selector: str) -> dict[str, str] | None:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        raw = evaluate(
+            """(selector) => {
+              const el = document.querySelector(selector);
+              if (!el || el.tagName !== "SELECT") return null;
+              const option = el.options[el.selectedIndex];
+              if (!option) return null;
+              if (option.disabled || option.getAttribute("aria-disabled") === "true") return null;
+              return {
+                value: String(option.value || ""),
+                label: String(option.label || option.text || "").replace(/\\s+/g, " ").trim()
+              };
+            }""",
+            selector,
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {"value": str(raw.get("value") or ""), "label": str(raw.get("label") or "")}
+
+
+def _selection_matches(chosen: dict[str, str], label: str, value: str) -> bool:
+    wanted = {item.strip().casefold() for item in (label, value) if item.strip()}
+    if not wanted:
+        return False
+    have = {chosen.get("label", "").strip().casefold(), chosen.get("value", "").strip().casefold()}
+    have.discard("")
+    return bool(wanted & have)
+
+
+def choose_native_select(page: Any, selector: str, *, label: str = "", value: str = "") -> bool:
+    """Choose one enabled ``<select>`` option. The answer path and the fill path both use this.
+
+    Playwright's ``select_option`` runs first. A controlled select that ignores
+    that write is set through ``HTMLSelectElement``'s value setter. A disabled
+    option is not chosen.
+    """
+    expected_label = str(label or "").strip()
+    expected_value = str(value or "").strip()
+    if not selector or not (expected_label or expected_value):
+        return False
+    attempts: list[dict[str, str]] = []
+    if expected_value:
+        attempts.append({"value": expected_value})
+    if expected_label:
+        attempts.append({"label": expected_label})
+    if expected_label and expected_label != expected_value:
+        attempts.append({"value": expected_label})
+    if expected_value and expected_value != expected_label:
+        attempts.append({"label": expected_value})
+    seen: set[tuple[str, str]] = set()
+    locator_factory = getattr(page, "locator", None)
+    if locator_factory is not None:
+        target = page.locator(selector)
+        for attempt in attempts:
+            key = next(iter(attempt.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                target.select_option(**attempt)
+            except Exception:
+                continue
+            chosen = _selected_option(page, selector)
+            if chosen and _selection_matches(chosen, expected_label, expected_value):
+                return True
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        applied = bool(
+            evaluate(
+                _SELECT_NATIVE_JS,
+                {"selector": selector, "label": expected_label, "value": expected_value},
+            )
+        )
+    except Exception:
+        return False
+    if not applied:
+        return False
+    chosen = _selected_option(page, selector)
+    if chosen is None:
+        return True
+    return _selection_matches(chosen, expected_label, expected_value)
+
+
 _BUTTON_CHOICE_JS = r"""({ selector, expected }) => {
   const root = document.querySelector(selector);
   if (!root) return "";
@@ -1181,15 +1468,26 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         clear_highlight(page, selector)
         return {"filled": True}
     if _choice(answer_type):
-        evaluate = getattr(page, "evaluate", None)
-        if evaluate is None:
-            return {"filled": False, "reason": "not_committed"}
-        try:
-            multi = answer_type == "multi_select"
-            expected: str | list[str] = values if multi else values[0]
-            chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
-        except Exception:
-            chosen = False
+        if _is_native_select(page, selector):
+            chosen = choose_native_select(page, selector, label=values[0], value=values[0])
+        else:
+            native = _commit_native_choices(
+                page, selector, values, multi=answer_type == "multi_select"
+            )
+            if native is not None:
+                chosen = native
+            elif _commit_aria_radio(page, selector, values[0]):
+                chosen = True
+            else:
+                evaluate = getattr(page, "evaluate", None)
+                if evaluate is None:
+                    return {"filled": False, "reason": "not_committed"}
+                try:
+                    multi = answer_type == "multi_select"
+                    expected: str | list[str] = values if multi else values[0]
+                    chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
+                except Exception:
+                    chosen = False
         if not chosen:
             return {"filled": False, "reason": "not_committed"}
     else:
@@ -1209,14 +1507,112 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     return {"filled": True}
 
 
-def _check_box(page: Any, selector: str) -> dict[str, Any]:
-    """Check one checkbox through the locator. This does not click a button."""
-    locator = getattr(page, "locator", None)
-    if locator is None:
-        return {"filled": False, "reason": "not_committed"}
+_NATIVE_CHOICE_SELECTORS_JS = r"""({ selector, labels, multi }) => {
+  let root = null;
+  try {
+    root = document.querySelector(selector);
+  } catch (error) {
+    return null;
+  }
+  if (!root || root.tagName !== "INPUT") return null;
+  const type = String(root.type || root.getAttribute("type") || "").toLowerCase();
+  if (type !== "checkbox" && type !== "radio") return null;
+  function labelOf(node) {
+    const wrap = node.closest("label");
+    const raw = wrap ? wrap.innerText : (node.getAttribute("aria-label") || node.value || "");
+    return String(raw || "").replace(/\s+/g, " ").trim();
+  }
+  function css(node) {
+    if (node.id) return "#" + CSS.escape(node.id);
+    const name = node.getAttribute("name") || "";
+    if (!name) return selector;
+    return "input[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(node.value || "") + "']";
+  }
+  const name = root.getAttribute("name") || "";
+  const group = name
+    ? Array.from(document.querySelectorAll("input")).filter((node) => (
+        node.type === type && node.getAttribute("name") === name
+      ))
+    : [root];
+  const wanted = (labels || []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (type === "checkbox" && !multi) {
+    const word = wanted[0] || "";
+    const off = /^(no|false|unchecked)$/i.test(word);
+    return [{ selector: css(root), on: !off }];
+  }
+  const found = [];
+  for (const word of wanted) {
+    const match = group.find((node) => labelOf(node) === word || String(node.value || "").trim() === word);
+    if (!match) return [];
+    found.push({ selector: css(match), on: true });
+  }
+  return found;
+}"""
+
+
+def _commit_native_choices(page: Any, selector: str, values: list[str], *, multi: bool) -> bool | None:
+    """Commit native checkbox or radio options. None when this control is not one."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
     try:
-        page.locator(selector).check()
+        found = evaluate(_NATIVE_CHOICE_SELECTORS_JS, {"selector": selector, "labels": values, "multi": multi})
     except Exception:
+        return None
+    if found is None:
+        return None
+    if not isinstance(found, list) or not found:
+        return False
+    from autofill.safeguards import commit_native_choice
+
+    for item in found:
+        if not isinstance(item, dict):
+            return False
+        target = str(item.get("selector") or "")
+        if not target or not commit_native_choice(page, target, on=bool(item.get("on", True))):
+            return False
+    return True
+
+
+def _commit_aria_radio(page: Any, selector: str, value: str) -> bool:
+    """Select one factual ``role=radio`` option. False when this is not that widget."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not value.strip():
+        return False
+    script = r"""({ selector, label }) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return ""; }
+      if (!el) return "";
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      if (!group) return "";
+      const radios = Array.from(group.querySelectorAll("[role='radio']"));
+      if (role !== "radio" && !radios.length) return "";
+      const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const match = radios.find((node) => {
+        const text = String(node.innerText || node.getAttribute("aria-label") || "");
+        return text.replace(/\s+/g, " ").trim().toLowerCase() === wanted;
+      });
+      if (!match) return "";
+      if (match.id) return "#" + CSS.escape(match.id);
+      return selector;
+    }"""
+    try:
+        target = str(evaluate(script, {"selector": selector, "label": value}) or "")
+    except Exception:
+        return False
+    if not target:
+        return False
+    from autofill.safeguards import press_aria_radio
+
+    return press_aria_radio(page, target)
+
+
+def _check_box(page: Any, selector: str) -> dict[str, Any]:
+    """Check one native checkbox and reread it. This does not click a button."""
+    from autofill.safeguards import commit_native_choice
+
+    if not commit_native_choice(page, selector, on=True):
         return {"filled": False, "reason": "not_committed"}
     if not control_committed(page, selector):
         return {"filled": False, "reason": "not_committed"}

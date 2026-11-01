@@ -19,11 +19,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from autofill.answers import match_answer
 from autofill.dates import format_for_control
 from autofill.models import Control, JobContext, MappedField, Option
 from autofill.profile import CandidateProfile
-from autofill.salary import resolve_salary
+from autofill.salary import SalaryAssessment, assess_salary, salary_shape, salary_value_covers
 
 _DECLINE_HINTS = ("decline", "prefer not", "do not wish", "not to say", "not to answer")
 _LEGAL_RE = re.compile(
@@ -38,6 +37,14 @@ _CONSENT_STRONG_RE = re.compile(
 _MARKETING_RE = re.compile(
     r"\b(newsletter|promotional|marketing|product updates|special offers|opt in|receive emails|receive updates)\b"
 )
+# Statements that stay manual even when they are not a fixed terms sentence.
+# Demographic words are classified separately so they stay DEMOGRAPHIC.
+_ATTESTATION_RE = re.compile(
+    r"\b(background check|e-?sign|electronic signature|arbitration|certify|attest|attestation"
+    r"|recording|text messages?|sms)\b"
+)
+_DEMOGRAPHIC_TEXT_RE = re.compile(r"\b(gender|race|ethnicity|veteran|disability)\b")
+_TERMS_KINDS = frozenset({"checkbox", "radio", "select", "combobox", "buttons"})
 _ALIAS_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"united states", "united states of america", "usa", "us"}),
     frozenset({"canada", "ca"}),
@@ -116,7 +123,14 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("work_permit_type", _compile((r"\bwork permit\b", r"\bvisa status\b"))),
     _Rule(
         "salary_range",
-        _compile((r"\bsalary range\b", r"\bcompensation range\b", r"\bpay range\b")),
+        _compile(
+            (
+                r"\bsalary range\b",
+                r"\bcompensation range\b",
+                r"\bpay range\b",
+                r"\bwage range\b",
+            )
+        ),
     ),
     _Rule(
         "salary",
@@ -126,8 +140,14 @@ _RULES: tuple[_Rule, ...] = (
                 r"\bcompensation\b",
                 r"\bdesired pay\b",
                 r"\bpay expectation\b",
+                r"\bexpected pay\b",
+                r"\bbase pay\b",
+                r"\btarget pay\b",
+                r"\bpay rate\b",
                 r"\bhourly rate\b",
                 r"\bper hour\b",
+                r"\bwage expectation\b",
+                r"\bremuneration\b",
             )
         ),
     ),
@@ -212,6 +232,7 @@ _AUTOCOMPLETE = {
     "tel-national": "phone",
     "street-address": "address",
     "address-line1": "address",
+    "address-line2": "address_line2",
     "address-level2": "city",
     "address-level1": "state",
     "postal-code": "postal_code",
@@ -226,6 +247,110 @@ _SKILL_RE = re.compile(
     r"(?:experience with|proficient in|knowledge of|familiar with|worked with|do you know)\s+(.+)$"
 )
 _SPECIFIC_EXPERIENCE_RE = re.compile(r"\b(with|using)\b")
+# True once this fill has committed a United States address country.
+_US_COMMITTED: contextvars.ContextVar[bool] = contextvars.ContextVar("autofill_us_committed", default=False)
+
+
+def bind_us_page() -> contextvars.Token[bool]:
+    """Start a fill with no committed address country. Reset the token when it ends."""
+    return _US_COMMITTED.set(False)
+
+
+def reset_us_page(token: contextvars.Token[bool]) -> None:
+    _US_COMMITTED.reset(token)
+
+
+def mark_us_committed() -> None:
+    """The page's address country is the United States for the rest of this fill."""
+    _US_COMMITTED.set(True)
+
+
+def wrote_us_country(field_key: str, value: str) -> bool:
+    """True when this write is an address country and the value is the United States."""
+    from autofill.intents import country_is_us
+
+    key = field_key.casefold()
+    if "phone" in key:
+        return False
+    if key != "country" and not key.endswith(".country"):
+        return False
+    return country_is_us(value)
+
+
+def note_page_country(page: object, snapshot: object) -> None:
+    """If a country control already shows the United States, remember that."""
+    from autofill.intents import country_is_us
+    from autofill.stepfill import live_field_value
+
+    if _US_COMMITTED.get() or page is None:
+        return
+    controls = getattr(snapshot, "controls", None) or []
+    for control in controls:
+        if getattr(control, "hidden", False) or match_field_key(control) != "country":
+            continue
+        shown = live_field_value(page, control) or ""
+        if country_is_us(str(shown)):
+            mark_us_committed()
+            return
+
+
+def us_context(profile: CandidateProfile | None = None) -> bool:
+    """True when this application already has a United States address country.
+
+    The profile country counts when it is the address we fill. A country
+    control that already shows the United States counts too. A question that
+    names no country is not assumed to be American without one of those.
+    """
+    from autofill.intents import country_is_us
+
+    if _US_COMMITTED.get():
+        return True
+    person = profile
+    if person is None:
+        from autofill.stepfill import current_location_profile
+
+        person = current_location_profile()
+    if person is None:
+        return False
+    return country_is_us(person.personal.country)
+
+
+def question_stem(control: Control) -> str:
+    """The question a person would read. Not the haystack and not a placeholder.
+
+    Order is group, prompt, label, then the accessible name. A section title
+    in all capitals is skipped. When one of those is the question (it contains
+    ``?``) it wins over a shorter option label such as ``Yes``.
+    """
+    options = {normalize(option.label) for option in control.options}
+    options.update(normalize(option.value) for option in control.options if option.value)
+    candidates: list[str] = []
+    for raw in (control.group, control.prompt, control.label, control.aria_label):
+        cleaned = (raw or "").strip()
+        if not cleaned:
+            continue
+        letters = [char for char in cleaned if char.isalpha()]
+        if "?" not in cleaned and len(letters) >= 3 and all(char.isupper() for char in letters):
+            continue
+        if len(options) > 1 and normalize(cleaned) in options:
+            continue
+        if cleaned not in candidates:
+            candidates.append(cleaned)
+    for text in candidates:
+        if "?" in text:
+            return text
+    return candidates[0] if candidates else ""
+
+
+def employer_keys_for(job: JobContext | None, url: str = "") -> tuple[str, ...]:
+    """This session's company and tenant scope, for employer-scoped answers."""
+    from autofill.answers import employer_keys
+
+    company = job.company if job is not None else ""
+    target = url or (job.url if job is not None else "")
+    return employer_keys(company=company, url=target)
+
+
 _SCREENING_KEYS = frozenset(
     {
         "age_18_or_older",
@@ -301,8 +426,8 @@ def option_stance(label: str) -> str:
 
 
 def is_consent_choice(control: Control) -> bool:
-    """A radio or select that offers both a consent option and a decline option."""
-    if control.kind not in {"radio", "select", "combobox"}:
+    """A choice control that offers both a consent option and a decline option."""
+    if control.kind not in {"radio", "select", "combobox", "buttons"}:
         return False
     stances = {option_stance(option.label or option.value) for option in control.options}
     return "agree" in stances and "decline" in stances
@@ -380,13 +505,45 @@ STANDARD_TERMS_DENY: tuple[str, ...] = (
     "salary",
 )
 # The whole statement, after normalize() drops a final period:
-# (I agree to|I accept|I have read and agree to) the
-# (Terms of Service|Terms and Conditions|Terms of Use|Privacy Policy|Privacy Notice)
-# (and [the] <same document>)*
-_TERMS_DOCUMENT = r"(?:terms of service|terms and conditions|terms of use|privacy policy|privacy notice)"
+# [yes] <verb> [the] <document> (and [the] <document>)* [for|of|at <owner>]
+# for example "I agree to the Terms of Service", "Yes, I have read the Applicant
+# Privacy Policy", "I acknowledge that I have read and understand the Privacy Notice".
+# A bare "terms" is accepted only without an owner tail ("I agree to the terms",
+# "I agree to the terms and privacy policy"); see ``_is_standard_terms``.
+_PRIVACY_OWNER = (
+    r"(?:candidate|applicant|job applicant|recruitment|recruiting|career|careers|global|data"
+    r"|personal data|data protection|employee|hr)"
+)
+_TERMS_DOCUMENT = (
+    r"(?:terms of service|terms and conditions|terms conditions|terms of use"
+    rf"|(?:{_PRIVACY_OWNER} ){{0,2}}privacy (?:policy|notice|statement)"
+    r"|data protection (?:policy|notice|statement)"
+    r"|terms)"
+)
+# Workday tenants word the Create Account box as, for example,
+# "Yes, I have read and consent to the terms and conditions" or
+# "I understand and acknowledge the terms of use for Example Company (EC)".
+# The optional tail names whose document it is, in at most eight plain words,
+# and never carries another verb or a second promise (checked in code).
+_READ_OBJECT = r"(?:agree to|agree with|accept|consent to|acknowledge|understand|understood)"
+_TERMS_VERB = (
+    rf"(?:i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    rf"|i have (?:read|reviewed) understood and {_READ_OBJECT}"
+    rf"|i have (?:read|reviewed) and understood and {_READ_OBJECT}"
+    rf"|i (?:acknowledge|confirm) that i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    r"|i acknowledge receipt of"
+    r"|i understand and (?:agree to|accept|acknowledge)"
+    r"|i agree to|i agree with|i accept|i consent to|i acknowledge)"
+)
 _STANDARD_TERMS_SENTENCE = re.compile(
-    rf"(?:i have read and agree to|i agree to|i accept) the {_TERMS_DOCUMENT}"
+    rf"(?:yes )?{_TERMS_VERB} (?:the )?{_TERMS_DOCUMENT}"
     rf"(?: and (?:the )?{_TERMS_DOCUMENT})*"
+    r"(?P<tail> (?:for|of|at) (?:[a-z0-9]+ ){0,7}[a-z0-9]+)?"
+)
+# "terms" not followed by one of the named documents.
+_BARE_TERMS = re.compile(r"\bterms\b(?! (?:of service|of use|and conditions|conditions)\b)")
+_TERMS_TAIL_STOP = frozenset(
+    {"and", "or", "to", "i", "me", "my", "that", "agree", "accept", "consent", "receive", "share", "allow", "use"}
 )
 # The whole statement, with no free-word gap:
 # I (consent|agree) to (submit|the submission of|the processing of)
@@ -397,7 +554,10 @@ _SUBMISSION_CONSENT = re.compile(
     r"my (?:personal )?(?:information|data)"
     r"(?: for this (?:job )?application| for the purposes of this (?:application|recruitment process))?"
 )
-AUTO_CONSENT_CATEGORIES = frozenset({"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT"})
+# Recruitment SMS is a separate Application Answer, not a standard-terms checkbox.
+AUTO_CONSENT_CATEGORIES = frozenset(
+    {"STANDARD_TERMS", "STANDARD_SUBMISSION_CONSENT", "RECRUITMENT_SMS_CONSENT"}
+)
 _logger = logging.getLogger("autofill.mapping")
 
 
@@ -430,7 +590,16 @@ def consume_auto_consents() -> list[dict]:
 def _is_standard_terms(statement: str) -> bool:
     """True only when the whole statement is a fixed terms or privacy sentence."""
     text = normalize(statement)
-    return bool(text) and _STANDARD_TERMS_SENTENCE.fullmatch(text) is not None
+    if not text:
+        return False
+    match = _STANDARD_TERMS_SENTENCE.fullmatch(text)
+    if match is None:
+        return False
+    tail = match.group("tail") or ""
+    if tail and _BARE_TERMS.search(text[: match.start("tail")]):
+        # "I agree to the terms of <anything>" names an unknown document.
+        return False
+    return not (set(tail.split()[1:]) & _TERMS_TAIL_STOP)
 
 
 def _is_submission_consent(statement: str) -> bool:
@@ -446,7 +615,7 @@ def terms_category(control: Control) -> str:
     ``STANDARD_TERMS``. Fixed data-submission wording, with no free-word gap,
     is ``STANDARD_SUBMISSION_CONSENT``. Anything else stays ``CONSENT``.
     """
-    if control.kind != "checkbox":
+    if control.kind not in _TERMS_KINDS:
         return "CONSENT"
     option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
     blob = normalize(f"{haystack(control)} {control.prompt} {control.group} {option_text}")
@@ -488,7 +657,7 @@ def acknowledgement_kind(control: Control) -> str:
     Marketing is checked first so "I agree to receive marketing emails" is an
     opt-in. Terms, privacy, attestation, and e-signature stay consent.
     """
-    if control.kind not in {"checkbox", "radio", "select"}:
+    if control.kind not in _TERMS_KINDS:
         return "factual"
     option_text = " ".join(
         part for option in control.options for part in (option.label, option.value) if part
@@ -501,6 +670,20 @@ def acknowledgement_kind(control: Control) -> str:
     if _CONSENT_RE.search(blob) or _LEGAL_RE.search(blob):
         return "consent"
     return "factual"
+
+
+def is_demographic_control(control: Control) -> bool:
+    """Gender, race, veteran, and disability questions stay demographic."""
+    return bool(_DEMOGRAPHIC_TEXT_RE.search(haystack(control)))
+
+
+def attestation_manual(control: Control) -> bool:
+    """Background-check, e-sign, arbitration, certification, SMS, and recording stay manual."""
+    if control.kind not in _TERMS_KINDS:
+        return False
+    option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
+    blob = normalize(f"{haystack(control)} {option_text}")
+    return bool(_ATTESTATION_RE.search(blob))
 
 
 def mark_required_acknowledgements(controls: list[Control]) -> None:
@@ -545,12 +728,13 @@ def match_option(desired: str, options: list[Option]) -> Option | None:
         for option in options:
             if yes_no(option.label) == answer or yes_no(option.value) == answer:
                 return option
-        for option in options:
-            label = normalize(option.label)
-            if answer == "yes" and label.startswith("yes"):
-                return option
-            if answer == "no" and label.startswith("no"):
-                return option
+        # "Yes, I am authorized" for Yes. Two such options ("Yes, ..." and
+        # "Yes, but ...") are a choice for the employee, not a guess.
+        leading = [option for option in options if normalize(option.label).split(" ")[:1] == [answer]]
+        if len(leading) == 1:
+            return leading[0]
+        if len(leading) > 1:
+            return None
     if any(hint in target for hint in _DECLINE_HINTS):
         for option in options:
             label = normalize(option.label)
@@ -573,7 +757,46 @@ def _alias_set(token: str) -> set[str]:
     return set().union(*matched)
 
 
+_CALLING_CODES = ("44", "1")
+_NANP_WITH_COUNTRY = re.compile(r"^1\d{10}$")
+
+
+def national_phone_digits(phone: str) -> str:
+    """Digits for a national box when the calling code is a separate control.
+
+    ``+1 (555) 010-0199`` and ``1-555-010-0199`` become ``5550100199``.
+    A number that is already national (``555-010-0199``) keeps those digits.
+    An explicit ``+`` / ``00`` prefix drops a known calling code. A punctuated
+    11-digit number that starts with 1 drops that leading 1. Other digit
+    strings are left intact so an unformatted non-NANP number is not truncated.
+    """
+    raw = str(phone or "").strip()
+    compact = re.sub(r"[^\d+]", "", raw)
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    digits = re.sub(r"\D", "", compact)
+    if not digits:
+        return ""
+    if compact.startswith("+"):
+        for code in _CALLING_CODES:
+            rest = digits[len(code) :]
+            if digits.startswith(code) and len(rest) >= 7:
+                return rest
+        return digits
+    if re.search(r"[()\-.]", raw) and _NANP_WITH_COUNTRY.fullmatch(digits):
+        return digits[1:]
+    return digits
+
+
 def _wants_national_digits(control: Control) -> bool:
+    """True when the box wants a national number, not the full profile phone.
+
+    ``tel-national``, a numeric keypad, or copy that says digits / country code
+    are the explicit cases. A phone input beside a separate calling-code menu
+    is the same rule: the country control already carries the prefix.
+    """
+    if control.national_phone:
+        return True
     if control.autocomplete == "tel-national" or control.input_mode == "numeric":
         return True
     blob = haystack(control)
@@ -587,6 +810,99 @@ def _row(items: list, cursor: MapCursor | None, kind: str):
     if index >= len(items):
         return None
     return items[index]
+
+
+def _salary_question_shape(control: Control, key: str) -> str:
+    """Range, minimum, maximum, or a single figure. The rule key breaks a tie.
+
+    The shape comes from the label. A selector such as ``#x`` is not part of
+    the question, so it cannot turn "Salary range minimum" into a full range.
+    """
+    label = " ".join(
+        part
+        for part in (control.label, control.aria_label, control.placeholder, control.prompt)
+        if part
+    )
+    shape = salary_shape(label or haystack(control))
+    if key == "salary_range" and shape == "single":
+        return "range"
+    return shape
+
+
+def _salary_decision(
+    control: Control,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    key: str,
+) -> SalaryAssessment:
+    blob = haystack(control)
+    return assess_salary(
+        profile.compensation,
+        shape=_salary_question_shape(control, key),
+        posted_min=job.posted_salary_min if job else None,
+        posted_max=job.posted_salary_max if job else None,
+        hourly="hourly" in blob or "per hour" in blob,
+    )
+
+
+def _explicit_salary(
+    control: Control,
+    profile: CandidateProfile,
+    shape: str,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
+    """An explicit answer for this question, when that answer covers the shape.
+
+    A saved minimum does not satisfy a range question through this path.
+    """
+    approved = _explicit_answer(control, profile, job=job)
+    if approved is None or approved.action == "unanswered":
+        return None
+    if not salary_value_covers(approved.text, shape):
+        return None
+    return approved
+
+
+def _map_salary(
+    control: Control,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    key: str,
+) -> MappedField:
+    """Fill a salary question, or ask a person to confirm an incomplete one."""
+    shape = _salary_question_shape(control, key)
+    try:
+        decision = _salary_decision(control, profile, job, key)
+    except ValueError as exc:
+        return MappedField(key=key, action="unanswered", reason=str(exc))
+    if decision.status == "answer":
+        mapped = _from_text(control, key, decision.value)
+        if mapped.action == "unanswered":
+            return mapped
+        mapped.field_class = "PROFILE_FIELD"
+        mapped.confidence = "high"
+        mapped.related_fields = decision.related_fields
+        return mapped
+    explicit = _explicit_salary(control, profile, shape, job=job)
+    if explicit is not None:
+        return explicit
+    if decision.status == "confirm":
+        return MappedField(
+            key=key,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            confidence="low",
+            reason=decision.reason,
+            related_fields=decision.related_fields,
+            challenge="confirm",
+        )
+    return MappedField(
+        key=key,
+        action="unanswered",
+        field_class="MANUAL_REVIEW_FIELD",
+        reason="Profile has no salary expectation.",
+    )
 
 
 def _profile_text(
@@ -614,10 +930,17 @@ def _profile_text(
         return personal.email
     if key == "phone":
         if _wants_national_digits(control):
-            return profile.phone_digits()
+            return national_phone_digits(personal.phone)
         return personal.phone
     if key == "address":
         return personal.address
+    if key == "address_line2":
+        line2 = personal.address_line2.strip()
+        line1 = personal.address.strip()
+        # Line 2 stays blank unless the profile has a different second line.
+        if not line2 or (line1 and line2.casefold() == line1.casefold()):
+            return ""
+        return line2
     if key == "city":
         return personal.city
     if key == "state":
@@ -654,16 +977,10 @@ def _profile_text(
     if key == "available_for_contract":
         return profile.availability.available_for_contract
     if key in {"salary", "salary_range"}:
-        posted_min = job.posted_salary_min if job else None
-        posted_max = job.posted_salary_max if job else None
-        blob = haystack(control)
-        return resolve_salary(
-            profile.compensation,
-            posted_min=posted_min,
-            posted_max=posted_max,
-            hourly="hourly" in blob or "per hour" in blob,
-            as_range=key == "salary_range" or "range" in blob,
-        )
+        decision = _salary_decision(control, profile, job, key)
+        if decision.status != "answer":
+            return ""
+        return decision.value
     if key == "years_of_experience_total":
         return profile.experience.years_of_experience_total
     if key == "education_level":
@@ -824,6 +1141,16 @@ def _is_referral_question(blob: str) -> bool:
 
 
 _DIAL_CODE = re.compile(r"\+\d{1,4}\b")
+_PHONE_COUNTRY_LABELS = frozenset(
+    {
+        "country code",
+        "phone country",
+        "country phone code",
+        "phone code",
+        "calling code",
+        "dial code",
+    }
+)
 
 
 def _is_phone_country_menu(control: Control) -> bool:
@@ -831,6 +1158,8 @@ def _is_phone_country_menu(control: Control) -> bool:
 
     Rows such as ``United States +1`` are the menu. A closed menu has no rows
     yet, so a Country combobox next to the phone input is the same field.
+    ``Country Phone Code`` is that menu even when it is closed. An address
+    ``Country / Territory`` menu is not.
     """
     hits = 0
     for option in control.options:
@@ -841,12 +1170,47 @@ def _is_phone_country_menu(control: Control) -> bool:
     if control.kind not in {"select", "combobox"}:
         return False
     label = normalize(control.label or control.aria_label)
+    if label in _PHONE_COUNTRY_LABELS:
+        return True
     if label not in {"country", "country code", "phone country"}:
         return False
     if control.phone_adjacent:
         return True
     nearby = normalize(control.nearby)
     return nearby in {"phone", "mobile", "telephone", "mobile phone"}
+
+
+_LINE2_RE = re.compile(
+    r"\b(?:address line 2|address line2|addressline2|line 2|line2|apartment|apt|suite|unit|flat)\b"
+)
+_EXTENSION_RE = re.compile(r"\b(?:extension|ext)\b")
+
+
+def _own_text(control: Control) -> str:
+    """Label text for this control. A sibling field's prompt is not included."""
+    return normalize(
+        " ".join(
+            part
+            for part in (
+                control.label,
+                control.aria_label,
+                control.placeholder,
+                control.name,
+                control.element_id,
+                control.autocomplete,
+            )
+            if part
+        )
+    )
+
+
+def _is_address_line2(control: Control) -> bool:
+    return bool(_LINE2_RE.search(_own_text(control)))
+
+
+def _is_phone_extension(control: Control) -> bool:
+    """A phone extension box. It is not the phone number."""
+    return bool(_EXTENSION_RE.search(_own_text(control)))
 
 
 def _match_rule(control: Control) -> str | None:
@@ -858,6 +1222,12 @@ def _match_rule(control: Control) -> str | None:
         return "preferred_name"
     if _is_phone_country_menu(control):
         return "phone_country"
+    # Extension and line 2 are decided from this control's own label. The
+    # phone and street rules would otherwise copy line 1 and the full number.
+    if _is_phone_extension(control):
+        return None
+    if _is_address_line2(control):
+        return "address_line2"
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]
@@ -868,6 +1238,9 @@ def _match_rule(control: Control) -> str | None:
                 return "phone"
             return mapped
     if "country code" in blob or "dial code" in blob or "calling code" in blob:
+        # A text dial-code box is not an address. Leave a prefilled +1 alone.
+        if control.kind not in {"select", "combobox"}:
+            return None
         return "country"
     label = normalize(control.label or control.aria_label or control.placeholder)
     if label in {"current location", "location", "your location"} and "relocat" not in label:
@@ -934,8 +1307,40 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason or "Country is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
-    if control.kind in {"select", "radio"} or (control.kind == "combobox" and control.options):
-        option = match_option(text, control.options)
+    # A closed search prompt has no rows until it is opened. Choose the saved
+    # source from that menu instead of leaving the placeholder in the box.
+    if key == "how_heard" and control.kind == "combobox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Source is chosen from the menu.",
+            field_class="PROFILE_FIELD",
+        )
+    # A Workday Application Questions dropdown is a button whose menu exists
+    # only after it is opened. Do not type the answer into the button.
+    if control.kind == "buttons" and control.role == "listbox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Choice is taken from the menu.",
+        )
+    if control.kind in {"select", "radio"} or (control.kind in {"combobox", "buttons"} and control.options):
+        from autofill.intents import pick_option
+
+        status, option = pick_option(text, control.options)
+        if status == "ambiguous":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Several options match this value.",
+            )
+        if option is None:
+            # Country and state aliases stay on the closed alias list.
+            option = match_option(text, control.options)
         if option is None:
             return MappedField(
                 key=key,
@@ -952,6 +1357,12 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason,
         )
     if control.kind == "checkbox":
+        if control.input_type in {"aria-checkbox", "switch"} or control.role == "switch":
+            return MappedField(
+                key=key,
+                action="unanswered",
+                reason="Custom checkbox left for a person.",
+            )
         answer = yes_no(text)
         if answer == "yes":
             return MappedField(key=key, action="check", text=text, reason=reason)
@@ -1017,6 +1428,35 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    from autofill.sms_consent import recruitment_sms_field
+
+    sms = recruitment_sms_field(control, profile)
+    if sms is not None:
+        return sms
+    if is_demographic_control(control):
+        key = _match_rule(
+            Control(
+                kind=control.kind,
+                label=control.label,
+                name=control.name,
+                aria_label=control.aria_label,
+                prompt=control.prompt,
+                group=control.group,
+            )
+        )
+        return MappedField(
+            key=key if key in {"gender", "race_ethnicity", "veteran_status", "disability_status"} else None,
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Demographic questions are left blank.",
+        )
+    if attestation_manual(control) and acknowledgement_kind(control) == "factual":
+        return MappedField(
+            key=None,
+            action="skip",
+            field_class="LEGAL_FIELD",
+            reason="This statement stays manual.",
+        )
     if is_consent_choice(control):
         return MappedField(
             key=None,
@@ -1024,9 +1464,9 @@ def map_field(
             field_class="LEGAL_FIELD",
             reason="Consent choice left for a person.",
         )
-    if control.kind == "checkbox" and acknowledgement_kind(control) == "marketing":
+    if control.kind in _TERMS_KINDS and acknowledgement_kind(control) == "marketing":
         return MappedField(key=None, action="skip", reason="Marketing opt-in left unchecked.")
-    if control.kind in {"checkbox", "radio", "select"} and (
+    if control.kind in _TERMS_KINDS and (
         acknowledgement_kind(control) == "consent" or _LEGAL_RE.search(haystack(control))
     ):
         return MappedField(
@@ -1063,7 +1503,7 @@ def map_field(
     if key is not None and control.kind == "file" and key not in {"resume", "cover_letter"}:
         return MappedField(key=key, action="unanswered", reason="File input did not match a resume or cover letter.")
     if key is None:
-        answered = _explicit_answer(control, profile)
+        answered = _explicit_answer(control, profile, job=job)
         if answered is not None:
             return answered
         skill = _skill_answer(control, profile)
@@ -1102,25 +1542,27 @@ def map_field(
             )
         return MappedField(key=key, action="upload", text=cover_letter_path, field_class="PROFILE_FIELD")
 
-    if key in {"salary", "salary_range"} and not profile.compensation.salary_expectation:
-        return MappedField(
-            key=key,
-            action="unanswered",
-            field_class="MANUAL_REVIEW_FIELD",
-            reason="Profile has no salary expectation.",
-        )
-    # An explicit approved answer beats a screening.* value for the same question.
-    # Other profile fields stay as mapped. A question with no approved answer is unchanged.
-    if key in _SCREENING_KEYS:
-        approved = _explicit_answer(control, profile)
-        if approved is not None and approved.action != "unanswered":
-            return approved
+    if key in {"salary", "salary_range"}:
+        return _map_salary(control, profile, job, key)
+    if key in {"legally_authorized_to_work", "require_sponsorship"}:
+        semantic = _map_work_authorization(control, profile, key, job=job)
+        if semantic is not None:
+            return semantic
     try:
         text = _profile_text(profile, key, control, job, cursor)
     except ValueError as exc:
         return MappedField(key=key, action="unanswered", reason=str(exc))
+    # Screening questions: the Application Profile first, then an approved answer
+    # for the same question. When both exist and disagree, the employee decides.
+    if key in _SCREENING_KEYS:
+        approved = _explicit_answer(control, profile, job=job)
+        if approved is not None and approved.action != "unanswered":
+            if text and not _same_answer(text, approved.text):
+                return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
+            if not text:
+                return approved
     if not text:
-        answered = _explicit_answer(control, profile)
+        answered = _explicit_answer(control, profile, job=job)
         if answered is not None and answered.action != "unanswered":
             return answered
     if key == "cover_letter" and cover_letter_text is not None:
@@ -1144,10 +1586,169 @@ def _retarget_date(key: str, cursor: MapCursor | None) -> str:
     return key
 
 
-def _explicit_answer(control: Control, profile: CandidateProfile) -> MappedField | None:
+def _question_texts(control: Control) -> list[str]:
+    """The question stem only. Placeholders and nearby text are not the question."""
+    stem = question_stem(control)
+    return [stem] if stem else []
+
+
+def _same_answer(left: str, right: str) -> bool:
+    left_flag, right_flag = yes_no(left), yes_no(right)
+    if left_flag or right_flag:
+        return left_flag == right_flag
+    return normalize(left) == normalize(right)
+
+
+def _ask_person(key: str | None, reason: str) -> MappedField:
+    """Leave the field for the employee. A required one becomes MANUAL_ANSWER_REQUIRED."""
+    return MappedField(
+        key=key,
+        action="unanswered",
+        field_class="MANUAL_REVIEW_FIELD",
+        confidence="low",
+        reason=reason,
+    )
+
+
+def _work_value(intent: str, text: str, authorized: str, sponsorship: str) -> str | None:
+    """The answer to one work-authorization intent from the two profile facts.
+
+    ``sponsorship`` is TileArc's "needs sponsorship (now or later)" fact. None
+    means the profile does not answer this exact question.
+    """
+    from autofill.intents import combine_authorized_without, compound_plan
+
+    auth_flag, sponsor_flag = yes_no(authorized), yes_no(sponsorship)
+    if intent == "US_WORK_AUTHORIZATION":
+        return authorized
+    if intent == "AUTHORIZED_ANY_EMPLOYER":
+        if auth_flag == "no":
+            return authorized
+        if sponsor_flag == "yes":
+            return None
+        return authorized
+    if intent in {"SPONSORSHIP_FUTURE", "SPONSORSHIP_NOW_OR_FUTURE"}:
+        return sponsorship
+    if intent == "SPONSORSHIP_NOW":
+        # Needing sponsorship later does not say whether it is needed today.
+        return None if sponsor_flag == "yes" else sponsorship
+    if intent == "AUTHORIZED_WITHOUT_SPONSORSHIP":
+        components, _ = compound_plan(text, intent)
+        if sponsor_flag == "yes" and "SPONSORSHIP_FUTURE" not in components:
+            return None
+        authorizations = [("HIGH", authorized)] if authorized else []
+        sponsorships = [("HIGH", sponsorship)] if sponsorship else []
+        return combine_authorized_without(authorizations, sponsorships)
+    return ""
+
+
+def _map_work_authorization(
+    control: Control,
+    profile: CandidateProfile,
+    key: str,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
+    """Answer the work-authorization question that is actually asked.
+
+    Returns None when the question has no known intent; the caller then maps the
+    profile field as before. A question that names no country does not use the
+    U.S. profile facts unless this page's address country is the United States.
+    """
+    from autofill.answers import _JURISDICTION_INTENTS, question_intent
+    from autofill.intents import countries_named
+
+    texts = _question_texts(control)
+    on_page = us_context(profile)
+    approved = _explicit_answer(control, profile, job=job)
+    if approved is not None and approved.action == "unanswered":
+        approved = None
+    named = countries_named(texts[0]) if texts else frozenset()
+    if named and named != frozenset({"US"}):
+        # The profile's work facts are for the United States only.
+        if approved is not None:
+            return approved
+        return _ask_person(key, "This question asks about a country other than the United States.")
+    if texts and not named and not on_page:
+        if approved is not None:
+            return approved
+        return _ask_person(key, "This question does not name the United States.")
+    intent, text = question_intent(texts, us_on_page=on_page)
+    if intent not in _JURISDICTION_INTENTS:
+        return None
+    authorized = profile.work_authorization.legally_authorized_to_work.strip()
+    sponsorship = profile.work_authorization.require_sponsorship.strip()
+    value = _work_value(intent, text, authorized, sponsorship)
+    if value is None:
+        if approved is not None:
+            return approved
+        return _ask_person(key, "The Application Profile does not answer this exact work-authorization question.")
+    # An empty work-authorization fact is not an answer. The saved Application
+    # Answer is used instead, including by the caller when this returns None.
+    if not value:
+        return approved
+    if approved is not None and not _same_answer(value, approved.text):
+        return _ask_person(key, "Application Profile and an approved answer disagree for this question.")
+    mapped = _from_text(control, key, value)
+    mapped.field_class = "PROFILE_FIELD" if mapped.action != "unanswered" else "MANUAL_REVIEW_FIELD"
+    return mapped
+
+
+def _fact_key(question: str) -> str:
+    """Catalogue key for a government-employment or legal-restriction question.
+
+    Empty when the question is not one of those facts. A missing row is not a No.
+    """
+    folded = normalize(question)
+    if "legal restriction" in folded:
+        return "legal_restrictions"
+    if "government" in folded and ("spouse" in folded or "partner" in folded):
+        return "spouse_gov"
+    if "government" in folded and any(word in folded for word in ("employee", "employed", "agency")):
+        return "current_former_gov"
+    return ""
+
+
+def _keyed_fact_answer(question: str, answers: list) -> str | None:
+    """The saved answer for this fact, only when the profile has that one row."""
+    key = _fact_key(question)
+    if not key:
+        return None
+    rows = [item for item in answers if getattr(item, "key", "") == key and str(item.answer or "").strip()]
+    if len(rows) != 1:
+        return None
+    return rows[0].answer
+
+
+def _explicit_answer(
+    control: Control,
+    profile: CandidateProfile,
+    *,
+    job: JobContext | None = None,
+) -> MappedField | None:
     if not profile.application_answers:
         return None
-    text = match_answer(haystack(control), profile.application_answers, normalize=normalize)
+    from autofill.answers import catalogue_match
+
+    texts = _question_texts(control)
+    if not texts:
+        return None
+    text, status = catalogue_match(
+        texts,
+        profile.application_answers,
+        normalize=normalize,
+        us_on_page=us_context(profile),
+        employers=employer_keys_for(job),
+    )
+    if status == "conflict":
+        return MappedField(
+            key="application_answer",
+            action="unanswered",
+            field_class="MANUAL_REVIEW_FIELD",
+            reason="Saved answers disagree for this question.",
+        )
+    if text is None:
+        text = _keyed_fact_answer(texts[0], profile.application_answers)
     if text is None:
         return None
     mapped = _from_text(control, "application_answer", text, reason="Explicit application answer.")

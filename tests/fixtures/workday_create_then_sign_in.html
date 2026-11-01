@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Analyst | Example Workday Careers</title></head>
+<body>
+<!--
+  Synthetic Workday-style account step for the 2026-10-26 staging smoke (Faith /
+  Hendrick / KLA). No real data.
+  * A cookie banner marked only by data-automation-id (hashed classes) sits over the page.
+  * Create Account shows a spinner, then returns to an EMPTY Sign In pane (Workday
+    sends a verification email first).
+  * localStorage "start" = "signin" opens on Sign In; "locked" = "1" makes Sign In
+    answer with Workday's wrong-email-or-locked banner.
+  * "spinnerMs" sets how long the Create Account spinner lasts (default 500; live
+    Workday tenants such as Ameren take 2-3 s). "after" = "app" makes Create Account
+    land on My Information instead of Sign In (tenants that sign in automatically).
+  * Aptiv 2026-10-27 (false 422 after a successful Create Account):
+    "stale" puts alert text on the Create Account pane before the press;
+    "flash" shows alert text for "holdMs" after the press while the form is still
+    mounted, then the spinner runs; "reject" shows a lasting error and creates nothing.
+  * BW Better World 2026-10-27 (verify before sign in): "blankMs" leaves an empty pane
+    (no form, no spinner) for that long after the spinner before Sign In opens;
+    "unverified" = "1" makes Sign In answer "Verify your account before you sign in".
+-->
+<div data-automation-id="legalNoticeBanner" class="css-7q1x9z"
+     style="position:fixed;top:0;left:0;right:0;height:140px;z-index:50;background:#fff;border-bottom:1px solid #999">
+  <p>This site uses cookies to give you a better experience.</p>
+  <button type="button" data-automation-id="legalNoticeDeclineButton" class="css-a1">Decline</button>
+  <button type="button" data-automation-id="legalNoticeAcceptButton" class="css-a2">Accept Cookies</button>
+</div>
+<main style="margin-top:160px">
+  <h2 data-automation-id="jobPostingHeader">Example Analyst</h2>
+  <ol data-automation-id="progressBar">
+    <li data-automation-id="progressBarActiveStep">Create Account/Sign In</li>
+    <li>My Information</li>
+    <li>Review</li>
+  </ol>
+  <div id="pane"></div>
+</main>
+<script>
+window.__created = 0;
+window.__signedIn = 0;
+window.__cookie = "";
+document.querySelectorAll("[data-automation-id^='legalNotice'] button").forEach(function (button) {
+  button.addEventListener("click", function () {
+    window.__cookie = button.textContent.trim();
+    document.querySelector("[data-automation-id='legalNoticeBanner']").remove();
+  });
+});
+var pane = document.getElementById("pane");
+function createPane() {
+  pane.innerHTML = '<div data-automation-id="createAccountPage">'
+    + '<h2 data-automation-id="headingText">Create Account</h2>'
+    + '<div id="cerr" role="alert" data-automation-id="errorMessage">' + (localStorage.getItem("stale") || "") + '</div>'
+    + '<form onsubmit="return false" novalidate>'
+    + '<label for="input-4">Email Address</label>'
+    + '<input id="input-4" type="text" data-automation-id="email" autocomplete="email">'
+    + '<label for="input-5">Password</label>'
+    + '<input id="input-5" type="password" data-automation-id="password">'
+    + '<label for="input-6">Verify New Password</label>'
+    + '<input id="input-6" type="password" data-automation-id="verifyPassword">'
+    + '<button type="button" data-automation-id="createAccountSubmitButton">Create Account</button>'
+    + '</form>'
+    + '<p>Already have an account? <button type="button" data-automation-id="signInLink">Sign In</button></p>'
+    + '</div>';
+  pane.querySelector("[data-automation-id='createAccountSubmitButton']").addEventListener("click", function () {
+    var cerr = document.getElementById("cerr");
+    if (localStorage.getItem("reject")) {
+      cerr.textContent = localStorage.getItem("reject");
+      return;
+    }
+    window.__created += 1;
+    function spin() {
+      pane.innerHTML = '<div data-automation-id="loadingSpinner" aria-busy="true">Loading</div>';
+      var spinnerMs = parseInt(localStorage.getItem("spinnerMs") || "500", 10);
+      var blankMs = parseInt(localStorage.getItem("blankMs") || "0", 10);
+      function blankThenSignIn() {
+        pane.innerHTML = '<div data-automation-id="createAccountSuccess"></div>';
+        setTimeout(signInPane, blankMs);
+      }
+      setTimeout(localStorage.getItem("after") === "app" ? myInfoPane : (blankMs > 0 ? blankThenSignIn : signInPane), spinnerMs);
+    }
+    var holdMs = parseInt(localStorage.getItem("holdMs") || "0", 10);
+    if (localStorage.getItem("flash")) { cerr.textContent = localStorage.getItem("flash"); }
+    if (holdMs > 0) { setTimeout(spin, holdMs); } else { spin(); }
+  });
+  pane.querySelector("[data-automation-id='signInLink']").addEventListener("click", signInPane);
+}
+function myInfoPane() {
+  pane.innerHTML = '<div data-automation-id="applyFlowMyInfoPage"><h2>My Information</h2>'
+    + '<label for="first">First Name</label><input id="first" type="text" data-automation-id="legalNameSection_firstName">'
+    + '<label for="last">Last Name</label><input id="last" type="text" data-automation-id="legalNameSection_lastName">'
+    + '<button type="button" data-automation-id="bottom-navigation-next-button">Save and Continue</button></div>';
+}
+function signInPane() {
+  pane.innerHTML = '<div data-automation-id="signInPage">'
+    + '<h2 data-automation-id="headingText">Sign In</h2>'
+    + '<div id="err" role="alert" data-automation-id="errorMessage"></div>'
+    + '<form onsubmit="return false" novalidate>'
+    + '<label for="input-14">Email Address</label>'
+    + '<input id="input-14" type="text" data-automation-id="email" autocomplete="username">'
+    + '<label for="input-15">Password</label>'
+    + '<input id="input-15" type="password" data-automation-id="password">'
+    + '<button type="button" data-automation-id="signInSubmitButton">Sign In</button>'
+    + '</form>'
+    + '<p>Don\'t have an account yet? <button type="button" data-automation-id="createAccountLink">Create Account</button></p>'
+    + '</div>';
+  pane.querySelector("[data-automation-id='signInSubmitButton']").addEventListener("click", function () {
+    window.__signedIn += 1;
+    if (localStorage.getItem("unverified") === "1") {
+      document.getElementById("err").textContent =
+        "Verify your account before you sign in or request a verification email.";
+      return;
+    }
+    if (localStorage.getItem("locked") === "1") {
+      document.getElementById("err").textContent =
+        "Error: You may have entered the wrong email address or password or your account might be locked.";
+      return;
+    }
+    myInfoPane();
+  });
+  pane.querySelector("[data-automation-id='createAccountLink']").addEventListener("click", createPane);
+}
+if (localStorage.getItem("start") === "signin") { signInPane(); } else { createPane(); }
+</script>
+</body>
+</html>

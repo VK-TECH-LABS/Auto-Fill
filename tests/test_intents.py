@@ -97,9 +97,18 @@ _MATRIX = [
 ]
 
 
+def test_country_less_work_authorization_is_not_the_united_states():
+    assert classify_question("Are you legally authorized to work?").intent is None
+    assert classify_question("Will you require sponsorship?").intent is None
+    assert classify_question("Are you legally authorized to work?", us_on_page=True).intent == "US_WORK_AUTHORIZATION"
+    assert classify_question("Are you authorized to work in Canada?", us_on_page=True).intent is None
+
+
 @pytest.mark.parametrize(("text", "intent", "phrasing"), _MATRIX)
 def test_level1_matrix(text: str, intent: str, phrasing: str):
-    match = classify_question(text)
+    # Country-less work-authorization phrases are U.S. questions only when the
+    # page address is the United States. The matrix checks the phrases themselves.
+    match = classify_question(text, us_on_page=True)
     assert match.intent == intent
     assert match.confidence == "HIGH"
     assert match.source == "level1"
@@ -207,17 +216,20 @@ def test_sanitize_drops_email_and_phone_and_bounds_length():
 
 
 def test_compound_sponsorship_does_not_collapse_to_now_or_work_auth():
-    compound = classify_question("Will you now or in the future require sponsorship for employment visa status?")
+    compound = classify_question(
+        "Will you now or in the future require sponsorship for employment visa status?",
+        us_on_page=True,
+    )
     assert compound.intent == "SPONSORSHIP_NOW_OR_FUTURE"
     assert compound.confidence == "HIGH"
     assert compound.fallback_intents == ("SPONSORSHIP_NOW", "SPONSORSHIP_FUTURE")
     assert compound.combine == "sponsorship_or"
-    future = classify_question("Will you require sponsorship in the future?")
+    future = classify_question("Will you require sponsorship in the future?", us_on_page=True)
     assert future.intent == "SPONSORSHIP_FUTURE"
     assert future.combine == ""
-    current = classify_question("Do you currently require visa sponsorship?")
+    current = classify_question("Do you currently require visa sponsorship?", us_on_page=True)
     assert current.intent == "SPONSORSHIP_NOW"
-    plain = classify_question("Will you require sponsorship?")
+    plain = classify_question("Will you require sponsorship?", us_on_page=True)
     assert plain.intent == "SPONSORSHIP_NOW"
     authorized = classify_question(
         "Are you legally authorized to work in the United States without the need for sponsorship now or in the future?"
@@ -227,9 +239,9 @@ def test_compound_sponsorship_does_not_collapse_to_now_or_work_auth():
     assert "US_WORK_AUTHORIZATION" in authorized.fallback_intents
     assert "SPONSORSHIP_NOW" in authorized.fallback_intents
     assert "SPONSORSHIP_FUTURE" in authorized.fallback_intents
-    any_employer = classify_question("Are you authorized to work for any employer?")
+    any_employer = classify_question("Are you authorized to work for any employer?", us_on_page=True)
     assert any_employer.intent == "AUTHORIZED_ANY_EMPLOYER"
-    without = classify_question("Are you authorized to work for any employer without sponsorship?")
+    without = classify_question("Are you authorized to work for any employer without sponsorship?", us_on_page=True)
     assert without.intent == "AUTHORIZED_WITHOUT_SPONSORSHIP"
     assert "AUTHORIZED_ANY_EMPLOYER" in without.fallback_intents
     assert "US_WORK_AUTHORIZATION" not in without.fallback_intents
@@ -328,6 +340,6 @@ def test_repeated_labels_keep_one_copy_and_drop_a_trailing_star():
     assert dedupe_label("What is your favorite prime number?") == "What is your favorite prime number?"
     citizen = classify_question("Are you a Singapore citizen?", ["Yes", "No"])
     assert citizen.intent is None
-    without = classify_question("Are you authorized to work without sponsorship?", ["Yes", "No"])
+    without = classify_question("Are you authorized to work without sponsorship?", ["Yes", "No"], us_on_page=True)
     assert without.intent == "AUTHORIZED_WITHOUT_SPONSORSHIP"
     assert without.confidence == "HIGH"

@@ -28,6 +28,7 @@ def main() -> None:
     try:
         app = create_app(
             token=token,
+            previous_token=os.environ.get("AUTOFILL_SERVICE_TOKEN_PREVIOUS") or None,
             run_browser=env_flag("AUTOFILL_RUN_BROWSER", True),
             max_sessions=int(os.environ.get("AUTOFILL_MAX_SESSIONS", "32")),
             browser_no_sandbox=env_flag("AUTOFILL_BROWSER_NO_SANDBOX", False),
