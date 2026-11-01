@@ -795,10 +795,35 @@ _LISTBOX_OPTIONS_JS = r"""() => {
 }"""
 
 
-_BUTTON_TEXT_JS = r"""(selector) => {
-  const el = document.querySelector(selector);
-  if (!el) return "";
-  return String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+# The committed value, not an open menu. A Yes/No row inside the button is not
+# the value Workday shows after the menu closes. ``promptSelectionLabel`` is
+# that value. The accessible name is returned separately.
+_COMMITTED_BUTTON_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return { text: "", aria: "" }; }
+  if (!el) return { text: "", aria: "" };
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
+  let labelled = "";
+  const scope = field && field.querySelectorAll ? field : el;
+  const nodes = scope.querySelectorAll(
+    "[data-automation-id='promptSelectionLabel'], [data-automation-id='selectedItemText']"
+  );
+  for (const node of nodes) {
+    if (node.closest("[role='option'], [role='listbox']")) continue;
+    const text = clean(node.innerText || node.textContent);
+    if (text) labelled = text;
+  }
+  const clone = el.cloneNode(true);
+  clone.querySelectorAll("[role='option'], [role='listbox'], [data-autofill-menu]").forEach((node) => {
+    node.remove();
+  });
+  return {
+    text: labelled || clean(clone.textContent),
+    aria: clean(el.getAttribute("aria-label") || ""),
+  };
 }"""
 
 
@@ -907,26 +932,59 @@ def attach_listbox_options(page, control) -> None:
         control.options = found
 
 
+def _listbox_token(shown: str) -> str | None:
+    """The committed Yes or No, or None when the text is a menu of both.
+
+    ``Yes Required`` is Yes. A string that contains both Yes and No is an open
+    menu or a decoy row, not the value Workday committed.
+    """
+    from autofill.mapping import normalize, yes_no
+
+    text = re.sub(r"\brequired\b", "", normalize(shown)).strip()
+    if not text:
+        return None
+    if re.search(r"\byes\b", text) and re.search(r"\bno\b", text):
+        return None
+    exact = yes_no(text)
+    if exact:
+        return exact
+    first = text.split(" ")[:1]
+    if first == ["yes"] or first == ["no"]:
+        return first[0]
+    return None
+
+
 def _button_text(page, selector: str) -> str:
+    """Committed label of one closed listbox button.
+
+    An open menu's Yes/No rows are not this value. The accessible name is used
+    when the visible text still mixes both words.
+    """
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return ""
     try:
-        return str(evaluate(_BUTTON_TEXT_JS, selector) or "")
+        raw = evaluate(_COMMITTED_BUTTON_JS, selector)
     except Exception:
         return ""
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, dict):
+        return ""
+    text = str(raw.get("text") or "").strip()
+    aria = str(raw.get("aria") or "").strip()
+    if _listbox_token(text) is None and _listbox_token(aria) is not None:
+        return aria
+    return text or aria
 
 
 def _answer_matches(shown: str, intended: str) -> bool:
-    """True when the button text is the approved answer. Yes is not No."""
+    """True when the committed button text is the approved answer. Yes is not No."""
     from autofill.mapping import normalize, yes_no
 
     wanted = yes_no(intended)
     if wanted:
-        if yes_no(shown) == wanted:
-            return True
-        first = normalize(shown).split(" ")[:1]
-        return first == [wanted]
+        return _listbox_token(shown) == wanted
     folded = normalize(shown)
     target = normalize(intended)
     return bool(target) and folded == target
@@ -1024,10 +1082,11 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
         if not chose:
             _close_listbox(page)
             continue
+        # The menu's own Yes/No is not the commit. Close it, then read the
+        # button Workday actually shows.
+        _close_listbox(page)
+        _pause(page, 50)
         shown = _wait_for_answer(page, selector, intended)
-        if _read_open_listbox(page):
-            _close_listbox(page)
-            shown = _wait_for_answer(page, selector, intended)
         if _answer_matches(shown, intended):
             _note_listbox(selector, question, intended, clicked, shown)
             return Option(value=intended, label=shown or clicked, selector=match.selector)

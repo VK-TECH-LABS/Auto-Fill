@@ -1108,11 +1108,14 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
       window.__submitted = 0;
       window.__clears = 0;
       window.__legalClicks = 0;
+      window.__optionClicks = {{}};
       const mode = {mode!r};
       function syncDetail() {{
         const button = document.getElementById("legal");
         const detail = document.getElementById("legal-detail");
-        const yes = (button.textContent || "").trim() === "Yes";
+        const value = button.querySelector("[data-automation-id='promptSelectionLabel']");
+        const shown = value ? value.textContent : button.textContent;
+        const yes = String(shown || "").trim() === "Yes";
         detail.hidden = !yes;
         if (yes) detail.setAttribute("required", "true");
         else detail.removeAttribute("required");
@@ -1138,12 +1141,35 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
             item.textContent = label;
             item.addEventListener("click", (optionEvent) => {{
               optionEvent.stopPropagation();
+              window.__optionClicks[id] = (window.__optionClicks[id] || 0) + 1;
               let shown = label;
               if (id === "legal") {{
                 window.__legalClicks += 1;
                 if (mode === "stuck" || (mode === "flaky" && window.__legalClicks === 1)) shown = "Yes";
               }}
-              button.textContent = shown;
+              // A decoy option row stays in the button so a raw innerText read
+              // starts with the clicked word. The committed label is the opposite
+              // on the first sponsorship/legal click, then the real word.
+              if (mode === "decoy" && (id === "sponsor" || id === "legal")) {{
+                const attempt = window.__optionClicks[id];
+                const committed = attempt === 1 ? (label === "Yes" ? "No" : "Yes") : label;
+                button.textContent = "";
+                const decoy = document.createElement("span");
+                decoy.setAttribute("data-autofill-decoy", "1");
+                decoy.style.display = "block";
+                decoy.textContent = label;
+                const value = document.createElement("span");
+                value.style.display = "block";
+                value.setAttribute("data-automation-id", "promptSelectionLabel");
+                value.id = id + "-value";
+                value.textContent = committed;
+                button.appendChild(decoy);
+                button.appendChild(value);
+                button.setAttribute("aria-label", committed + " Required");
+              }} else {{
+                button.textContent = shown;
+                button.removeAttribute("aria-label");
+              }}
               list.remove();
               if (id === "legal") syncDetail();
             }});
@@ -1273,6 +1299,45 @@ def test_wrong_legal_yes_is_overwritten_and_a_stuck_yes_is_cleared(browser):
         assert page.evaluate("() => window.__clears") >= 1
         assert page.locator("#sms").inner_text().strip() == "Yes"
         assert page.evaluate("() => window.__submitted") == 0
+    finally:
+        page.close()
+
+
+def test_sponsorship_yes_and_legal_no_follow_the_committed_button(browser):
+    """A raw innerText read sees the clicked word. The committed label is the opposite.
+
+    Sponsorship must end as Yes and legal as No. Accepting the decoy leaves
+    sponsorship No and legal Yes, which is the live GM failure.
+    """
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="decoy"))
+        result = _fill_appq(page, "appq-decoy")
+        assert page.locator("#sponsor-value").inner_text().strip() == "Yes"
+        assert page.locator("#legal-value").inner_text().strip() == "No"
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        clicks = page.evaluate("() => window.__optionClicks")
+        assert clicks["sponsor"] >= 2
+        assert clicks["legal"] >= 2
+        sponsor = [
+            item for item in result.listbox_choices if item.get("selector") == "#sponsor"
+        ]
+        legal = _legal_choice(result)
+        assert sponsor[-1]["intended"] == "Yes"
+        assert sponsor[-1]["shown"] == "Yes"
+        assert legal["intended"] == "No"
+        assert legal["shown"] == "No"
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "describe the nature" not in prompts
+        assert page.evaluate("() => window.__submitted") == 0
+        assert result.stopped_before_submit is True
     finally:
         page.close()
 
