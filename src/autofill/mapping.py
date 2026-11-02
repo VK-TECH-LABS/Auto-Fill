@@ -1558,8 +1558,7 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is disabled.")
     if control.read_only and control.kind in {"text", "textarea"}:
         return MappedField(key=None, action="skip", reason="Control is read-only.")
-    if control.hidden and not (control.kind == "file" and _match_rule(control) == "resume"):
-        # A Workday resume input is display:none. It is still the upload.
+    if control.hidden:
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")

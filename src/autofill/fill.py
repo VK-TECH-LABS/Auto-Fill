@@ -617,6 +617,36 @@ def _address_pending(page, snapshot: PageSnapshot) -> bool:
     return country_set and pending
 
 
+def _css_hidden_on_this_page(page, selector: str) -> bool:
+    """True when the control's own style hides it and no ancestor step is hidden.
+
+    Workday's resume input is ``display: none`` on the current My Experience
+    page. A file inside a later ``hidden`` section is not that input.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display !== "none" && style.visibility !== "hidden") return false;
+      let node = el.parentElement;
+      while (node) {
+        if (node.hidden) return false;
+        const parentStyle = window.getComputedStyle(node);
+        if (parentStyle.display === "none" || parentStyle.visibility === "hidden") return false;
+        node = node.parentElement;
+      }
+      return true;
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
 def _click_add(page, button) -> bool:
     """Open one repeatable section. A bad selector must not fail the page."""
     try:
@@ -754,8 +784,28 @@ def fill_one_page(
             for control in snapshot.controls:
                 if control.kind != "file" or not control.hidden:
                     continue
+                if not _css_hidden_on_this_page(page, control.selector):
+                    continue
+                shown = Control(
+                    kind=control.kind,
+                    name=control.name,
+                    element_id=control.element_id,
+                    label=control.label,
+                    placeholder=control.placeholder,
+                    aria_label=control.aria_label,
+                    autocomplete=control.autocomplete,
+                    required=control.required,
+                    options=control.options,
+                    selector=control.selector,
+                    input_type=control.input_type,
+                    role=control.role,
+                    nearby=control.nearby,
+                    group=control.group,
+                    prompt=control.prompt,
+                    automation_id=control.automation_id,
+                )
                 mapped = map_field(
-                    control,
+                    shown,
                     profile,
                     cover_letter_path=cover_letter_path,
                     cover_letter_text=cover_letter_text,
