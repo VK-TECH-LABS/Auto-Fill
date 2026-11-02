@@ -672,6 +672,9 @@ def fill_one_page(
             activate(page, add.selector, add.name, control_type=add.control_type)
             continue
         break
+    from autofill.combobox import resettle_listboxes
+
+    resettle_listboxes(page)
     return fields, snapshot, resume_blocked, manual
 
 

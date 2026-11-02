@@ -394,6 +394,23 @@ def listbox_choice_for(selector: str) -> dict[str, str] | None:
     return None
 
 
+def latest_listbox_choices() -> list[dict[str, str]]:
+    """One record per listbox, the latest write for that button."""
+    state = _RUN.get()
+    if state is None:
+        return []
+    found: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for record in state.listbox_choices:
+        selector = str(record.get("selector") or "")
+        if not selector:
+            continue
+        if selector not in found:
+            order.append(selector)
+        found[selector] = record
+    return [found[selector] for selector in order]
+
+
 def begin_run(
     *,
     page: Any = None,
@@ -635,7 +652,99 @@ def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False, op
     return "text"
 
 
-_COMMITTED_JS = r"""(selector) => {
+# Text of the pill Workday already committed on a prompt. The search box
+# stays empty and aria-invalid. The pill may sit outside multiSelectContainer,
+# as a selectedItemList with no selectedItem id. An open promptOption menu
+# is not this value.
+_PILL_FN_JS = r"""
+  function autofillPillText(el) {
+    if (!el || !el.closest) return "";
+    function clean(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function junk(text) {
+      const folded = clean(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+      if (!folded) return true;
+      if (folded === "search" || folded === "remove" || folded === "clear") return true;
+      if (/^(?:select one|choose one|please select one)$/.test(folded)) return true;
+      return /^(select|choose|please select|please choose|start typing)$/.test(folded);
+    }
+    function hiddenNode(node) {
+      if (!node || node.hidden) return true;
+      const style = window.getComputedStyle(node);
+      return style.display === "none" || style.visibility === "hidden";
+    }
+    function itemText(node) {
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll(
+        "button, input, textarea, [data-automation-id='DELETE_charm'], " +
+        "[data-automation-id='promptIcon'], [data-automation-id='clearButton']"
+      ).forEach((child) => child.remove());
+      return clean(clone.textContent);
+    }
+    const root = el.closest("[data-automation-id^='formField']")
+      || el.closest("[data-automation-id='multiSelectContainer']")
+      || el.closest("[data-automation-id='multiselectInputContainer']")
+      || el.parentElement;
+    if (!root || !root.querySelectorAll) return "";
+    const found = [];
+    function add(text) {
+      if (junk(text) || found.indexOf(text) !== -1) return;
+      found.push(text);
+    }
+    root.querySelectorAll("[data-automation-id='selectedItemList']").forEach((list) => {
+      if (hiddenNode(list)) return;
+      const items = list.querySelectorAll(
+        "[data-automation-id='selectedItem'], li, [role='option']"
+      );
+      const nodes = items.length ? Array.from(items) : [list];
+      nodes.forEach((node) => {
+        if (hiddenNode(node)) return;
+        add(itemText(node));
+      });
+    });
+    if (!found.length) {
+      root.querySelectorAll(
+        "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel'], " +
+        "[data-automation-id='selectedItemText']"
+      ).forEach((node) => {
+        if (hiddenNode(node)) return;
+        if (node.closest("[role='option'], [data-automation-id='promptOption']")) return;
+        add(itemText(node));
+      });
+    }
+    return found.join(", ");
+  }
+"""
+
+
+_PILL_TEXT_EVAL_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  return autofillPillText(el);
+}
+"""
+
+
+def prompt_pill_text(page: Any, selector: str) -> str:
+    """The committed prompt pill for ``selector``, or empty when none is showing.
+
+    A search box value is not the pill. A menu row that is still open is not
+    the pill. The text is whatever Workday painted, not the answer we wanted.
+    """
+    if not selector:
+        return ""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return ""
+    try:
+        return str(evaluate(_PILL_TEXT_EVAL_JS, selector) or "").strip()
+    except Exception:
+        return ""
+
+
+_COMMITTED_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
   function committed(el) {
   if (!el) return false;
   const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
@@ -698,25 +807,10 @@ _COMMITTED_JS = r"""(selector) => {
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
       const typed = String(el.value || "").trim();
       if (typed && !placeholder(typed)) return true;
-      // The pill sits in the outer prompt, not in the search-box wrapper.
-      const root = (el.closest && el.closest("[data-automation-id='multiSelectContainer']"))
-        || (el.closest && el.closest("[data-automation-id='multiselectInputContainer'], .select__control"))
-        || el.parentElement;
-      const choice = root
-        ? root.querySelector(
-            ".select__single-value, .select__multi-value, " +
-            "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
-          )
-        : null;
-      if (choice && !choice.hidden) {
-        const item = choice.closest("[data-automation-id='selectedItem']");
-        const style = window.getComputedStyle(choice);
-        const hiddenItem = item && item.hidden;
-        if (!hiddenItem && style.display !== "none" && style.visibility !== "hidden") {
-          const shown = String(choice.innerText || choice.textContent || "").replace(/\s+/g, " ").trim();
-          if (shown.length > 0 && !placeholder(shown)) return true;
-        }
-      }
+      // The pill can sit outside the search wrapper, including a selectedItemList
+      // that is a sibling of multiSelectContainer. aria-invalid does not clear it.
+      const pill = autofillPillText(el);
+      if (pill && !placeholder(pill)) return true;
       return false;
     }
     function selected(node) {
@@ -739,23 +833,8 @@ _COMMITTED_JS = r"""(selector) => {
     }
     return selected(el);
   }
-  const promptHost = el.closest && (
-    el.closest("[data-automation-id='multiSelectContainer']") ||
-    el.closest("[data-automation-id='multiselectInputContainer']")
-  );
-  if (promptHost) {
-    const pill = promptHost.querySelector(
-      "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
-    );
-    if (pill && !pill.hidden) {
-      const item = pill.closest("[data-automation-id='selectedItem']");
-      const style = window.getComputedStyle(pill);
-      if (!(item && item.hidden) && style.display !== "none" && style.visibility !== "hidden") {
-        const pillText = String(pill.innerText || pill.textContent || "").replace(/\s+/g, " ").trim();
-        if (pillText && !placeholder(pillText)) return true;
-      }
-    }
-  }
+  const pill = autofillPillText(el);
+  if (pill && !placeholder(pill)) return true;
   const value = "value" in el ? el.value : el.textContent;
   return String(value || "").trim().length > 0;
   }
