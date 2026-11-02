@@ -617,6 +617,147 @@ def test_selected_pill_outside_the_search_box_is_committed(browser):
         page.close()
 
 
+_FILLED_PROMPTS = """
+<h1>My Information</h1>
+<div data-automation-id="formField-countryPhoneCode">
+  <label for="code">Country Phone Code<abbr>*</abbr></label>
+  <div data-automation-id="multiSelectContainer">
+    <div data-automation-id="multiselectInputContainer">
+      <input id="code" data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+        aria-label="Search" placeholder="Search" aria-required="true" aria-invalid="true">
+    </div>
+    <button type="button" id="code-prompt" data-automation-id="promptIcon" aria-label="Search"
+      style="width:24px;height:24px"></button>
+  </div>
+  <ul data-automation-id="selectedItemList">
+    <li>
+      <span id="phone-picked">United States of America (+1)</span>
+      <button type="button" data-automation-id="DELETE_charm" aria-label="Remove">Remove</button>
+    </li>
+  </ul>
+</div>
+<div data-automation-id="formField-source">
+  <label for="source">How Did You Hear About Us?<abbr>*</abbr></label>
+  <div data-automation-id="multiSelectContainer">
+    <div data-automation-id="multiselectInputContainer">
+      <input id="source" data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+        aria-label="Search" placeholder="Search" aria-required="true" aria-invalid="true">
+    </div>
+    <button type="button" id="source-prompt" data-automation-id="promptIcon" aria-label="Search"
+      style="width:24px;height:24px"></button>
+  </div>
+  <ul data-automation-id="selectedItemList">
+    <li>
+      <span id="source-picked">GM Careers Website</span>
+      <button type="button" data-automation-id="DELETE_charm" aria-label="Remove">Remove</button>
+    </li>
+  </ul>
+</div>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__submitted = false;
+  window.__opens = [];
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  document.getElementById("code-prompt").addEventListener("click", () => window.__opens.push("phone"));
+  document.getElementById("source-prompt").addEventListener("click", () => window.__opens.push("source"));
+  document.getElementById("code").addEventListener("click", () => window.__opens.push("phone-input"));
+  document.getElementById("source").addEventListener("click", () => window.__opens.push("source-input"));
+</script>
+"""
+
+
+def test_filled_hear_about_and_phone_pills_are_not_unanswered(browser, monkeypatch):
+    """Pills outside the search box already match the profile. They are not gaps.
+
+    A stale saved answer (Internet Job Board, +91) must not replace them, and
+    /answer for the live value commits without opening the menu.
+    """
+    from autofill.extract import extract_page
+    from autofill.local_attach import ENV_FLAG, apply_visible_answer
+    from autofill.resolver import ResolverAnswer, ResolverResponse
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+    from autofill.stepfill import fill_resolved_page, required_gaps
+
+    assert HUMAN_SUBMIT_ONLY is True
+    monkeypatch.setenv(ENV_FLAG, "1")
+
+    def fake_resolve(binding, *, session_id, step, fields, questions):
+        del binding, session_id, step, fields
+        answers = []
+        for question in questions:
+            text = str(question.get("text") or "")
+            if "how did you hear" in text.casefold():
+                answers.append(
+                    ResolverAnswer(
+                        intent=None,
+                        value="Internet Job Board / Job Search",
+                        confidence="HIGH",
+                        source="saved_answer",
+                        text=text,
+                    )
+                )
+        return ResolverResponse(
+            fields={"phone": "+1 (917) 555-0100", "address.country": "United States"},
+            answers=answers,
+        )
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    try:
+        page.set_content(_FILLED_PROMPTS)
+        gaps = required_gaps(page, extract_page(page), None)
+        prompts = [str(item.get("text") or "").casefold() for item in gaps]
+        assert not any("how did you hear" in prompt for prompt in prompts)
+        assert not any("phone code" in prompt for prompt in prompts)
+        assert page.evaluate("() => window.__opens.slice()") == []
+        outcome = fill_resolved_page(
+            page,
+            _binding(),
+            session_id="filled-pills",
+            ats_name="workday",
+            step="my information",
+        )
+        texts = " ".join(str(item.get("text") or "") for item in outcome.manual_questions).casefold()
+        assert "how did you hear" not in texts
+        assert "phone code" not in texts
+        assert page.locator("#source-picked").inner_text().strip() == "GM Careers Website"
+        assert page.locator("#phone-picked").inner_text().strip() == "United States of America (+1)"
+        assert page.evaluate("() => window.__opens.slice()") == []
+        heard = apply_visible_answer(
+            page,
+            {
+                "selector": "#source",
+                "value": "GM Careers Website",
+                "values": ["GM Careers Website"],
+                "answerType": "single_select",
+                "text": "How Did You Hear About Us?",
+            },
+        )
+        assert heard["verified"] is True, heard
+        assert heard["filled"] is True
+        phone = apply_visible_answer(
+            page,
+            {
+                "selector": "#code",
+                "value": "United States",
+                "values": ["United States"],
+                "answerType": "single_select",
+                "text": "Country Phone Code",
+                "fieldKey": "phone.country",
+            },
+        )
+        assert phone["verified"] is True, phone
+        assert page.locator("#source-picked").inner_text().strip() == "GM Careers Website"
+        assert page.locator("#phone-picked").inner_text().strip() == "United States of America (+1)"
+        assert page.evaluate("() => window.__opens.slice()") == []
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
 _MY_INFO_CONTACT = """
 <h1>My Information</h1>
 <div id="phone-row">
@@ -1044,6 +1185,8 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
     ``flaky`` commits Yes on the first legal option click and the real label after that.
     ``stuck`` always commits Yes for legal. A clear control puts Select One back.
     ``errors`` paints Workday's required-field banners, including the SMS sentence.
+    ``settle`` paints the clicked word first, then commits the opposite on the
+    closed button. Legal flips to Yes again after a successful No.
     """
     questions = list(_APP_QUESTIONS) + [
         (
@@ -1147,10 +1290,43 @@ def _live_app_questions(*, mode: str = "ok", errors: bool = False, legal_value: 
                 window.__legalClicks += 1;
                 if (mode === "stuck" || (mode === "flaky" && window.__legalClicks === 1)) shown = "Yes";
               }}
-              // A decoy option row stays in the button so a raw innerText read
-              // starts with the clicked word. The committed label is the opposite
-              // on the first sponsorship/legal click, then the real word.
-              if (mode === "decoy" && (id === "sponsor" || id === "legal")) {{
+              // The clicked word is painted on the button and on a field-level
+              // promptSelectionLabel immediately. After a short delay the closed
+              // button commits the opposite word on the first try. Legal's
+              // successful commit then flips to Yes, which is the live GM settle.
+              if (mode === "settle" && (id === "sponsor" || id === "legal")) {{
+                const attempt = window.__optionClicks[id];
+                const committed = attempt === 1 ? (label === "Yes" ? "No" : "Yes") : label;
+                let clicked = document.getElementById(id + "-clicked");
+                if (!clicked) {{
+                  clicked = document.createElement("span");
+                  clicked.id = id + "-clicked";
+                  clicked.setAttribute("data-automation-id", "promptSelectionLabel");
+                  button.parentElement.appendChild(clicked);
+                }}
+                clicked.textContent = label;
+                button.textContent = label;
+                button.setAttribute("aria-label", label + " Required");
+                window.setTimeout(() => {{
+                  const prior = document.getElementById(id + "-value");
+                  if (prior) prior.remove();
+                  button.textContent = "";
+                  const value = document.createElement("span");
+                  value.id = id + "-value";
+                  value.setAttribute("data-automation-id", "promptSelectionLabel");
+                  value.textContent = committed;
+                  button.appendChild(value);
+                  button.setAttribute("aria-label", committed + " Required");
+                  if (id === "legal") syncDetail();
+                  if (id === "legal" && attempt === 2) {{
+                    window.setTimeout(() => {{
+                      value.textContent = "Yes";
+                      button.setAttribute("aria-label", "Yes Required");
+                      syncDetail();
+                    }}, 300);
+                  }}
+                }}, 40);
+              }} else if (mode === "decoy" && (id === "sponsor" || id === "legal")) {{
                 const attempt = window.__optionClicks[id];
                 const committed = attempt === 1 ? (label === "Yes" ? "No" : "Yes") : label;
                 button.textContent = "";
@@ -1334,6 +1510,48 @@ def test_sponsorship_yes_and_legal_no_follow_the_committed_button(browser):
         assert sponsor[-1]["shown"] == "Yes"
         assert legal["intended"] == "No"
         assert legal["shown"] == "No"
+        prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
+        assert "describe the nature" not in prompts
+        assert page.evaluate("() => window.__submitted") == 0
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
+def test_listbox_settle_does_not_accept_the_clicked_word(browser):
+    """The closed button flips after the click. shown is that later label.
+
+    Sponsorship must end Yes and legal No. Accepting the clicked word, or a
+    field-level promptSelectionLabel, leaves sponsorship No and legal Yes.
+    A flip after the successful legal commit is corrected before the
+    restriction box is treated as the question.
+    """
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_live_app_questions(mode="settle"))
+        result = _fill_appq(page, "appq-settle")
+        assert page.locator("#sponsor-value").inner_text().strip() == "Yes"
+        assert page.locator("#legal-value").inner_text().strip() == "No"
+        assert page.locator("#eligible").inner_text().strip() == "Yes"
+        assert page.locator("#spouse").inner_text().strip() == "No"
+        assert page.locator("#former").inner_text().strip() == "No"
+        assert page.locator("#sms").inner_text().strip() == "Yes"
+        assert page.locator("#legal-detail").is_hidden()
+        clicks = page.evaluate("() => window.__optionClicks")
+        assert clicks["sponsor"] >= 2
+        assert clicks["legal"] >= 3
+        sponsor = [item for item in result.listbox_choices if item.get("selector") == "#sponsor"]
+        legal = _legal_choice(result)
+        assert sponsor[-1]["intended"] == "Yes"
+        assert sponsor[-1]["clicked"] == "Yes"
+        assert sponsor[-1]["shown"] == "Yes"
+        assert sponsor[-1]["shown"] == page.locator("#sponsor-value").inner_text().strip()
+        assert legal["intended"] == "No"
+        assert legal["shown"] == "No"
+        assert legal["shown"] == page.locator("#legal-value").inner_text().strip()
         prompts = " ".join(str(item.get("text") or "") for item in result.manual_questions).casefold()
         assert "describe the nature" not in prompts
         assert page.evaluate("() => window.__submitted") == 0

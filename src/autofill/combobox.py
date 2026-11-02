@@ -13,7 +13,7 @@ import logging
 import re
 import time
 
-from autofill.dom_ui import focus_field, note_listbox_choice, type_char_delay
+from autofill.dom_ui import focus_field, latest_listbox_choices, note_listbox_choice, prompt_pill_text, type_char_delay
 from autofill.intents import match_option_exact
 from autofill.models import Option
 from autofill.safeguards import (
@@ -622,27 +622,6 @@ _BLOCK_SUBMIT_JS = """
 """
 
 
-_PILL_TEXT_JS = r"""(selector) => {
-  let el = null;
-  try { el = document.querySelector(selector); } catch (error) { return ""; }
-  if (!el) return "";
-  const root = (el.closest && el.closest("[data-automation-id='multiSelectContainer']"))
-    || (el.closest && el.closest("[data-automation-id='multiselectInputContainer']"))
-    || (el.closest && el.closest("[data-automation-id^='formField']"))
-    || el.parentElement;
-  if (!root || !root.querySelector) return "";
-  const pill = root.querySelector(
-    "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
-  );
-  if (!pill || pill.hidden) return "";
-  const item = pill.closest && pill.closest("[data-automation-id='selectedItem']");
-  if (item && item.hidden) return "";
-  const style = window.getComputedStyle(pill);
-  if (style.display === "none" || style.visibility === "hidden") return "";
-  return String(pill.innerText || pill.textContent || "").replace(/\s+/g, " ").trim();
-}"""
-
-
 def _labels_match(desired: str, shown: str) -> bool:
     """True when the pill is the requested choice, including a country alias."""
     left, right = _fold(desired), _fold(shown)
@@ -655,11 +634,13 @@ def _labels_match(desired: str, shown: str) -> bool:
     return match_country_option(shown, [Option(value=desired, label=desired)]) is not None
 
 
+def selected_pill_text(page, selector: str) -> str:
+    """The prompt pill Workday is showing. Empty when the prompt is still blank."""
+    return prompt_pill_text(page, selector)
+
+
 def _selected_text(page, selector: str) -> str:
-    try:
-        return str(page.evaluate(_PILL_TEXT_JS, selector) or "")
-    except Exception:
-        return ""
+    return selected_pill_text(page, selector)
 
 
 def _prefer_leaf(desired: str, found: list[Option]) -> Option | None:
@@ -795,33 +776,49 @@ _LISTBOX_OPTIONS_JS = r"""() => {
 }"""
 
 
-# The committed value, not an open menu. A Yes/No row inside the button is not
-# the value Workday shows after the menu closes. ``promptSelectionLabel`` is
-# that value. The accessible name is returned separately.
+# Workday paints the clicked row first. The closed button can then commit the
+# opposite word, or flip again after a short settle. These waits are the
+# settle; a match during the first paint is not a commit.
+_LISTBOX_SETTLE_MS = 160
+_LISTBOX_SETTLE_AGAIN_MS = 100
+_LISTBOX_RECHECK_MS = 120
+
+# The committed value is the closed button itself. A promptSelectionLabel
+# elsewhere in the field is the clicked row, not this button. A decoy span
+# inside the button is not the value either. ``promptSelectionLabel`` on the
+# button is that value. The accessible name is returned separately.
 _COMMITTED_BUTTON_JS = r"""(selector) => {
   let el = null;
-  try { el = document.querySelector(selector); } catch (error) { return { text: "", aria: "" }; }
-  if (!el) return { text: "", aria: "" };
+  try { el = document.querySelector(selector); } catch (error) { return { missing: true }; }
+  if (!el) return { missing: true };
   function clean(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
   }
-  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
+  const expanded = el.getAttribute("aria-expanded") === "true";
+  const menu = el.querySelector("[role='listbox'], [data-autofill-menu]");
+  let menuOpen = false;
+  if (menu) {
+    const style = window.getComputedStyle(menu);
+    menuOpen = style.display !== "none" && style.visibility !== "hidden" && !menu.hidden;
+  }
   let labelled = "";
-  const scope = field && field.querySelectorAll ? field : el;
-  const nodes = scope.querySelectorAll(
+  const nodes = el.querySelectorAll(
     "[data-automation-id='promptSelectionLabel'], [data-automation-id='selectedItemText']"
   );
   for (const node of nodes) {
-    if (node.closest("[role='option'], [role='listbox']")) continue;
+    if (node.closest("[role='option'], [role='listbox'], [data-autofill-menu], [data-autofill-decoy]")) continue;
     const text = clean(node.innerText || node.textContent);
     if (text) labelled = text;
   }
   const clone = el.cloneNode(true);
-  clone.querySelectorAll("[role='option'], [role='listbox'], [data-autofill-menu]").forEach((node) => {
-    node.remove();
-  });
+  clone.querySelectorAll(
+    "[role='option'], [role='listbox'], [data-autofill-menu], [data-autofill-decoy]"
+  ).forEach((node) => node.remove());
   return {
-    text: labelled || clean(clone.textContent),
+    missing: false,
+    open: expanded || menuOpen,
+    labelled: labelled,
+    visible: clean(clone.textContent),
     aria: clean(el.getAttribute("aria-label") || ""),
   };
 }"""
@@ -954,28 +951,55 @@ def _listbox_token(shown: str) -> str | None:
     return None
 
 
-def _button_text(page, selector: str) -> str:
-    """Committed label of one closed listbox button.
-
-    An open menu's Yes/No rows are not this value. The accessible name is used
-    when the visible text still mixes both words.
-    """
+def _read_closed_button(page, selector: str) -> dict:
+    """Parts of one listbox button. ``missing`` when the button is gone."""
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
-        return ""
+        return {"missing": True}
     try:
         raw = evaluate(_COMMITTED_BUTTON_JS, selector)
     except Exception:
-        return ""
+        return {"missing": True}
     if isinstance(raw, str):
-        return raw
+        return {"missing": False, "open": False, "labelled": raw, "visible": raw, "aria": ""}
     if not isinstance(raw, dict):
+        return {"missing": True}
+    return raw
+
+
+def _agree_label(labelled: str, visible: str, aria: str) -> str:
+    """The closed button's Yes or No when its own reads agree.
+
+    A clicked-row label and the button text are not a commit when they
+    disagree. The word comes from those reads. It is not copied from the
+    answer we intended.
+    """
+    tokens: list[str] = []
+    for part in (labelled, visible, aria):
+        token = _listbox_token(part)
+        if token:
+            tokens.append(token)
+    if not tokens:
+        return (labelled or visible or aria or "").strip()
+    if len(set(tokens)) != 1:
         return ""
-    text = str(raw.get("text") or "").strip()
-    aria = str(raw.get("aria") or "").strip()
-    if _listbox_token(text) is None and _listbox_token(aria) is not None:
-        return aria
-    return text or aria
+    return "Yes" if tokens[0] == "yes" else "No"
+
+
+def _button_text(page, selector: str) -> str:
+    """Committed label of one closed listbox button.
+
+    An open menu, a clicked row outside the button, and a decoy inside it are
+    not this value. Disagreeing reads are not a commit.
+    """
+    raw = _read_closed_button(page, selector)
+    if raw.get("missing") or raw.get("open"):
+        return ""
+    return _agree_label(
+        str(raw.get("labelled") or ""),
+        str(raw.get("visible") or ""),
+        str(raw.get("aria") or ""),
+    )
 
 
 def _answer_matches(shown: str, intended: str) -> bool:
@@ -990,17 +1014,18 @@ def _answer_matches(shown: str, intended: str) -> bool:
     return bool(target) and folded == target
 
 
-def _wait_for_answer(page, selector: str, intended: str) -> str:
-    """Poll until the button shows ``intended`` or the short wait ends."""
-    shown = _button_text(page, selector)
-    if _answer_matches(shown, intended) or getattr(page, "wait_for_timeout", None) is None:
-        return shown
-    for _ in range(8):
-        _pause(page, 40)
-        shown = _button_text(page, selector)
-        if _answer_matches(shown, intended):
-            return shown
-    return shown
+def _settled_button_label(page, selector: str) -> str:
+    """Closed-button label after the menu is gone and a short settle.
+
+    The first paint is often the clicked row. This wait does not return when
+    that paint matches the intended answer. The string is the later read.
+    """
+    _close_listbox(page)
+    _pause(page, _LISTBOX_SETTLE_MS)
+    _close_listbox(page)
+    _pause(page, _LISTBOX_SETTLE_AGAIN_MS)
+    _close_listbox(page)
+    return _button_text(page, selector)
 
 
 def _revert_listbox(page, selector: str) -> None:
@@ -1084,14 +1109,14 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
         if not chose:
             _close_listbox(page)
             continue
-        # The menu's own Yes/No is not the commit. Close it, then read the
-        # button Workday actually shows.
+        # The menu's own Yes/No is not the commit. Close it, wait out the
+        # paint of the clicked row, then read the closed button. ``shown`` is
+        # that read. It is not the intended word and not the row we clicked.
         _close_listbox(page)
-        _pause(page, 50)
-        shown = _wait_for_answer(page, selector, intended)
+        shown = _settled_button_label(page, selector)
         if _answer_matches(shown, intended):
             _note_listbox(selector, question, intended, clicked, shown)
-            return Option(value=intended, label=shown or clicked, selector=match.selector)
+            return Option(value=intended, label=shown, selector=match.selector)
         _close_listbox(page)
     shown = _button_text(page, selector)
     if shown and not _answer_matches(shown, intended):
@@ -1102,3 +1127,36 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
     if _answer_matches(shown, intended):
         return Option(value=intended, label=shown, selector=selector)
     return None
+
+
+def resettle_listboxes(page) -> None:
+    """Re-read listboxes after the page has had a moment to flip a value.
+
+    A button that no longer shows the approved answer is cleared and chosen
+    again. A button that left the page is left alone. ``shown`` stays the
+    read label.
+    """
+    choices = latest_listbox_choices()
+    if not choices:
+        return
+    _pause(page, _LISTBOX_RECHECK_MS)
+    for choice in choices:
+        selector = str(choice.get("selector") or "")
+        intended = str(choice.get("intended") or "")
+        if not selector or not intended:
+            continue
+        raw = _read_closed_button(page, selector)
+        if raw.get("missing"):
+            continue
+        shown = _button_text(page, selector)
+        if _answer_matches(shown, intended):
+            if shown and shown != str(choice.get("shown") or ""):
+                _note_listbox(
+                    selector,
+                    str(choice.get("label") or ""),
+                    intended,
+                    str(choice.get("clicked") or ""),
+                    shown,
+                )
+            continue
+        select_listbox_button(page, selector, intended, question=str(choice.get("label") or ""))

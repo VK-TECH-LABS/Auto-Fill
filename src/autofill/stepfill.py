@@ -1451,6 +1451,8 @@ def _phone_country_value(fields: dict) -> str:
 def _apply_phone_country(page, control: Control, fields: dict, outcome: ResolvedPage) -> None:
     """Choose the calling-code row. This is not an address country field."""
     text = _phone_country_value(fields)
+    if text and _keep_matching_pill(page, control, text, outcome, key="phone.country"):
+        return
     if not text:
         _manual(
             outcome,
@@ -3311,6 +3313,71 @@ def _question_blocks(controls: list[Control], answer: ResolverAnswer | None) -> 
     return any(item.required for item in controls)
 
 
+def _keep_matching_pill(page, control: Control, desired: str, outcome: ResolvedPage, *, key: str) -> bool:
+    """True when the prompt already shows ``desired``. The menu stays closed."""
+    if control.kind != "combobox" or not control.selector or not str(desired or "").strip():
+        return False
+    from autofill.combobox import _labels_match, selected_pill_text
+
+    pill = selected_pill_text(page, control.selector)
+    if not pill or not _labels_match(desired, pill):
+        return False
+    remember_confirmed(control, pill, field_key=key or "")
+    outcome.fields.append(
+        FieldOutcome(
+            selector=control.selector,
+            label=control.label,
+            key=key or None,
+            action="select",
+            detail=pill,
+            field_class="PROFILE_FIELD",
+        )
+    )
+    return True
+
+
+def _keep_live_pill(
+    page,
+    control: Control,
+    answer: ResolverAnswer | None,
+    outcome: ResolvedPage,
+    match: IntentMatch,
+) -> bool:
+    """Keep a pill Workday already shows. A stale saved answer does not replace it.
+
+    A blank prompt is not kept. An answer that is not a saved answer and names
+    a different choice is still written.
+    """
+    if control.kind != "combobox" or not control.selector:
+        return False
+    from autofill.combobox import _labels_match, selected_pill_text
+
+    pill = selected_pill_text(page, control.selector)
+    if not pill:
+        return False
+    desired = ""
+    source = ""
+    if answer is not None:
+        desired = str(answer.value or (answer.values[0] if answer.values else "") or "").strip()
+        source = str(getattr(answer, "source", "") or "")
+    matches = bool(desired) and _labels_match(desired, pill)
+    if not matches and desired and source != "saved_answer":
+        return False
+    key = match.intent or ""
+    remember_confirmed(control, pill, field_key=key)
+    outcome.fields.append(
+        FieldOutcome(
+            selector=control.selector,
+            label=control.label,
+            key=key or None,
+            action="select",
+            detail=pill,
+            field_class="APPROVED_QUESTION",
+        )
+    )
+    return True
+
+
 def _apply_question(
     page,
     ask: _Ask,
@@ -3340,6 +3407,8 @@ def _apply_question(
             answer_confidence="LOW",
             challenge_reason="salary_range_incomplete" if shape == "range" else "salary_needs_confirm",
         )
+        return
+    if ask.controls and _keep_live_pill(page, ask.controls[0], answer, outcome, match):
         return
     if answer is None or not (
         may_fill(local=match, resolver_confidence=answer.confidence) or _saved_unknown(match, answer)
@@ -3857,8 +3926,13 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
     """Every required visible control that is still empty is a manual question.
 
     Options of a checkbox group stay on that one question. A section heading
-    is not a question.
+    is not a question. A listbox that flipped after it was chosen is put back
+    before that scan, so a conditional textarea is not asked in its place.
     """
+    if page is not None:
+        from autofill.combobox import resettle_listboxes
+
+        resettle_listboxes(page)
     snapshot = _live_snapshot(page, outcome.snapshot) if outcome.snapshot is not None else None
     if snapshot is None:
         if page is not None:
