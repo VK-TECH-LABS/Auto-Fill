@@ -1509,6 +1509,27 @@ def _button_choice_selector(page: Any, selector: str, value: str) -> str:
     return str(found or "")
 
 
+def _is_listbox_button(page: Any, selector: str) -> bool:
+    """A Workday choice button, such as Phone Device Type. Not a search input."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const tag = String(el.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return false;
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+      return popup === "listbox" || role === "listbox";
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
 def _looks_like_combobox(page: Any, selector: str) -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
@@ -1552,6 +1573,20 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
 
         try:
             picked = select_combobox(page, selector, values[0])
+        except Exception:
+            picked = None
+        if picked is None:
+            return {"filled": False, "reason": "not_committed"}
+        if not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
+    if _is_listbox_button(page, selector):
+        from autofill.combobox import select_listbox_button
+
+        question = str(target.get("text") or target.get("label") or "")
+        try:
+            picked = select_listbox_button(page, selector, values[0], question=question)
         except Exception:
             picked = None
         if picked is None:

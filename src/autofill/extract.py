@@ -331,7 +331,9 @@ EXTRACT_JS = r"""
   }
 
   function radioContainer(el) {
-    return el.closest("[role='radiogroup'], fieldset, [data-field-path]") || null;
+    return el.closest(
+      "[role='radiogroup'], fieldset, [data-field-path], [data-automation-id^='formField']"
+    ) || null;
   }
 
   function containerKey(box, el) {
@@ -407,6 +409,15 @@ EXTRACT_JS = r"""
     })).filter((option) => option.selector && option.label);
     if (!options.length) return;
     const native = (first.tagName || "").toLowerCase() === "input";
+    const field = first.closest("[data-automation-id^='formField']");
+    const fieldAuto = field ? (field.getAttribute("data-automation-id") || "") : "";
+    for (const radio of visible) {
+      const radioTag = (radio.tagName || "").toLowerCase();
+      if (radioTag === "button" || (radio.getAttribute("role") || "").toLowerCase() === "radio") {
+        const radioSelector = selectorFor(radio);
+        if (radioSelector) takenRadios.add(radioSelector);
+      }
+    }
     controls.push({
       kind: "radio",
       name: first.getAttribute("name") || "",
@@ -432,6 +443,7 @@ EXTRACT_JS = r"""
       nearby: "",
       group: textOf(legend) || question,
       prompt: question,
+      automationId: first.getAttribute("data-automation-id") || fieldAuto || "",
     });
   }
 
@@ -676,6 +688,7 @@ EXTRACT_JS = r"""
 
   const controls = [];
   const seenRadios = new Set();
+  const takenRadios = new Set();
   const buttons = [];
   const seenButtons = new Set();
 
@@ -824,10 +837,13 @@ EXTRACT_JS = r"""
       if (isHidden(el)) continue;
       const tag = el.tagName ? el.tagName.toLowerCase() : "";
       const type = (el.getAttribute("type") || "").toLowerCase();
-      if (tag === "input" || tag === "button" || tag === "a" || type === "submit" || type === "button") continue;
+      if (tag === "input" || tag === "a" || type === "submit") continue;
+      if (tag === "button" || type === "button") {
+        if ((el.getAttribute("role") || "").toLowerCase() !== "radio") continue;
+      }
       if ((el.getAttribute("role") || "").toLowerCase() === "button") continue;
       if (el.querySelector("input[type='radio']")) continue;
-      const box = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      const box = radioContainer(el) || el.parentElement;
       const key = rootKey + "::aria::" + containerKey(box, el);
       if (seenAriaRadios.has(key)) continue;
       seenAriaRadios.add(key);
@@ -835,10 +851,11 @@ EXTRACT_JS = r"""
       const group = Array.from(scope.querySelectorAll("[role='radio']")).filter((radio) => {
         if (isHidden(radio)) return false;
         const radioTag = radio.tagName ? radio.tagName.toLowerCase() : "";
-        if (radioTag === "input" || radioTag === "button" || radioTag === "a") return false;
+        const radioRole = (radio.getAttribute("role") || "").toLowerCase();
+        if (radioTag === "input" || radioTag === "a") return false;
+        if ((radioTag === "button" || radioRole === "button") && radioRole !== "radio") return false;
         if (radio.querySelector("input[type='radio']")) return false;
-        return radio.closest("[role='radiogroup'], fieldset, [data-field-path]") === box
-          || radio.parentElement === box;
+        return radioContainer(radio) === box || radio.parentElement === box;
       });
       pushRadioControl(group.length ? group : [el]);
     }
@@ -878,6 +895,10 @@ EXTRACT_JS = r"""
       });
     }
   });
+
+  for (let index = buttons.length - 1; index >= 0; index -= 1) {
+    if (takenRadios.has(buttons[index].selector)) buttons.splice(index, 1);
+  }
 
   // A closed react-select keeps the real <input> or <select> aria-hidden and
   // shows .select__control. The question is the label beside that control.
@@ -1101,7 +1122,10 @@ EXTRACT_JS = r"""
       folded === "choose" ||
       folded === "choose one" ||
       folded === "select one" ||
-      folded === "start typing"
+      folded === "start typing" ||
+      folded === "no items" ||
+      folded === "no matches" ||
+      folded === "no results"
     ) return true;
     return folded.indexOf("click here") !== -1 && (
       folded.indexOf("issue") !== -1 || folded.indexOf("browser") !== -1 || folded.indexOf("cache") !== -1
@@ -1138,6 +1162,7 @@ EXTRACT_JS = r"""
         if (seenGroups.has(container)) break;
         const kids = visibleButtons(container);
         if (kids.length !== 2) continue;
+        if (kids.every((node) => (node.getAttribute("role") || "").toLowerCase() === "radio")) continue;
         const names = kids.map((node) => buttonText(node).toLowerCase());
         if (names.indexOf("yes") === -1 || names.indexOf("no") === -1) continue;
         seenGroups.add(container);

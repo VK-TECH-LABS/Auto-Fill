@@ -1027,8 +1027,15 @@ def _profile_text(
         return profile.screening.willing_background_check
     if key == "felony_conviction":
         return profile.screening.felony_conviction
+    if key == "middle_name":
+        return personal.middle_name.strip()
     if key == "previously_employed_here":
-        return profile.screening.previously_employed_here
+        companies = [item.company for item in profile.employment]
+        companies.extend(item.company for item in profile.internships)
+        question = " ".join(
+            part for part in (control.label, control.group, control.prompt, control.aria_label) if part
+        )
+        return previous_worker_value(question, companies, profile.screening.previously_employed_here)
     if key == "how_heard":
         return profile.screening.how_heard
     if key == "cover_letter":
@@ -1213,6 +1220,103 @@ def _is_phone_extension(control: Control) -> bool:
     return bool(_EXTENSION_RE.search(_own_text(control)))
 
 
+def _identity_blob(control: Control) -> str:
+    """This control's own id and label. A parent section title is not included."""
+    return " ".join(
+        part
+        for part in (
+            control.label,
+            control.aria_label,
+            control.placeholder,
+            control.element_id,
+            control.name,
+            control.automation_id,
+        )
+        if part
+    )
+
+
+def _compact_id(control: Control) -> str:
+    return re.sub(r"[\s_\-]+", "", _identity_blob(control).casefold())
+
+
+def _is_middle_name(control: Control) -> bool:
+    """A middle-name box. It is not the legal full name."""
+    compact = _compact_id(control)
+    if "middlename" in compact or "middleinitial" in compact:
+        return True
+    own = normalize(f"{control.label} {control.aria_label} {control.placeholder}")
+    return bool(re.search(r"\bmiddle name\b|\bmiddle initial\b|\badditional name\b", own))
+
+
+def _is_county(control: Control) -> bool:
+    """County / regionSubdivision1. The street line does not belong here."""
+    if "regionsubdivision1" in _compact_id(control):
+        return True
+    label = normalize(control.label or control.aria_label or "")
+    return bool(re.search(r"\bcounty\b", label))
+
+
+def _is_phone_device(control: Control) -> bool:
+    """Phone Device Type. It is a listbox, not the phone number."""
+    compact = _compact_id(control)
+    if "phonetype" in compact or "phonedevicetype" in compact:
+        return True
+    own = normalize(f"{control.label} {control.aria_label}")
+    return "device type" in own or "phone device" in own
+
+
+_EMPLOYER_IN_QUESTION = re.compile(
+    r"\b(?:by|for|at|with)\s+([A-Za-z0-9][A-Za-z0-9&.'’-]{1,60})",
+    re.IGNORECASE,
+)
+
+
+def company_named_in_question(question: str) -> str:
+    """The employer a previous-worker question names, such as AAON."""
+    match = _EMPLOYER_IN_QUESTION.search(question or "")
+    if match is None:
+        return ""
+    token = match.group(1).strip(" .,-")
+    if normalize(token) in {"us", "this", "the", "our", "company", "employer", "organization"}:
+        return ""
+    return token
+
+
+def previous_worker_value(question: str, companies: list[str], explicit: str = "") -> str:
+    """Yes or No for a previous-employer radio. Empty when a person must answer.
+
+    An explicit screening value wins. Otherwise No when the question names an
+    employer that is not in employment history, including when that history is
+    empty. A question that does not name the employer is left for a person.
+    """
+    saved = yes_no(explicit)
+    if saved == "yes":
+        return "Yes"
+    if saved == "no":
+        return "No"
+    named = normalize(company_named_in_question(question))
+    if not named:
+        return ""
+    folded = [normalize(company) for company in companies if normalize(company)]
+    if any(named == company or named in company or company in named for company in folded):
+        return "Yes"
+    return "No"
+
+
+def is_previous_worker(control: Control) -> bool:
+    """The Workday previous-worker radio, including candidateIsPreviousWorker."""
+    if "candidateispreviousworker" in _compact_id(control):
+        return True
+    blob = normalize(f"{control.label} {control.group} {control.prompt} {control.aria_label}")
+    return bool(
+        re.search(
+            r"\b(?:previously employed|previously worked|former employee|worked here before|worked for us)\b",
+            blob,
+        )
+    )
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     blob = haystack(control)
@@ -1225,6 +1329,12 @@ def _match_rule(control: Control) -> str | None:
     # Extension and line 2 are decided from this control's own label. The
     # phone and street rules would otherwise copy line 1 and the full number.
     if _is_phone_extension(control):
+        return None
+    if _is_middle_name(control):
+        return "middle_name"
+    if _is_county(control):
+        return None
+    if _is_phone_device(control):
         return None
     if _is_address_line2(control):
         return "address_line2"
@@ -1428,6 +1538,32 @@ def map_field(
         return MappedField(key=None, action="skip", reason="Control is hidden.")
     if is_honeypot(control):
         return MappedField(key=None, action="skip", reason="Honeypot or hidden text field left blank.")
+    if _is_county(control):
+        return MappedField(
+            key="county",
+            action="skip",
+            reason="County is left blank. The street address is not a county.",
+        )
+    if _is_middle_name(control):
+        middle = profile.personal.middle_name.strip()
+        if not middle:
+            return MappedField(
+                key="middle_name",
+                action="skip",
+                reason="No middle name on the profile. The full name is not a middle name.",
+            )
+        return _from_text(control, "middle_name", middle, reason="Middle name from the profile.")
+    if is_previous_worker(control):
+        companies = [item.company for item in profile.employment]
+        companies.extend(item.company for item in profile.internships)
+        question = " ".join(
+            part for part in (control.label, control.group, control.prompt, control.aria_label) if part
+        )
+        answer = previous_worker_value(question, companies, profile.screening.previously_employed_here)
+        if answer:
+            # A named employer missing from history is No. An unnamed question
+            # falls through so a saved answer for this job's company can still match.
+            return _from_text(control, "previously_employed_here", answer, reason="Employment history.")
     from autofill.sms_consent import recruitment_sms_field
 
     sms = recruitment_sms_field(control, profile)
