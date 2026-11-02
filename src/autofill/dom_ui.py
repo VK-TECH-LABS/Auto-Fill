@@ -1646,9 +1646,41 @@ _NATIVE_CHOICE_SELECTORS_JS = r"""({ selector, labels, multi }) => {
   const type = String(root.type || root.getAttribute("type") || "").toLowerCase();
   if (type !== "checkbox" && type !== "radio") return null;
   function labelOf(node) {
+    function clean(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function short(value) {
+      const text = clean(value);
+      if (!text || text.length > 40) return "";
+      if (text.toLowerCase().indexOf("current employees:") === 0) return "";
+      return text;
+    }
+    if (node.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+      if (explicit && !explicit.querySelector("input, select, textarea, [role='radio']")) {
+        const text = short(explicit.innerText || explicit.textContent);
+        if (text) return text;
+      }
+    }
+    const next = node.nextElementSibling;
+    if (next && String(next.tagName || "").toUpperCase() === "LABEL") {
+      const text = short(next.innerText || next.textContent);
+      if (text) return text;
+    }
+    const role = String(node.getAttribute("role") || "").toLowerCase();
+    if (role === "radio") {
+      const own = short(node.getAttribute("aria-label") || node.innerText || node.textContent);
+      if (own) return own;
+    }
     const wrap = node.closest("label");
-    const raw = wrap ? wrap.innerText : (node.getAttribute("aria-label") || node.value || "");
-    return String(raw || "").replace(/\s+/g, " ").trim();
+    if (wrap) {
+      const nested = wrap.querySelectorAll("input[type='radio'], [role='radio']");
+      if (nested.length <= 1) {
+        const text = short(wrap.innerText || wrap.textContent);
+        if (text) return text;
+      }
+    }
+    return clean(node.getAttribute("aria-label") || node.value || "");
   }
   function css(node) {
     if (node.id) return "#" + CSS.escape(node.id);
@@ -1717,9 +1749,21 @@ def _commit_aria_radio(page: Any, selector: str, value: str) -> bool:
       const radios = Array.from(group.querySelectorAll("[role='radio']"));
       if (role !== "radio" && !radios.length) return "";
       const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+      function short(value) {
+        const text = String(value || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length > 40) return "";
+        return text.toLowerCase();
+      }
       const match = radios.find((node) => {
-        const text = String(node.innerText || node.getAttribute("aria-label") || "");
-        return text.replace(/\s+/g, " ").trim().toLowerCase() === wanted;
+        const own = short(node.getAttribute("aria-label") || node.innerText || node.textContent);
+        if (own === wanted) return true;
+        if (node.id) {
+          const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+          if (explicit && short(explicit.innerText || explicit.textContent) === wanted) return true;
+        }
+        const next = node.nextElementSibling;
+        if (next && short(next.innerText || next.textContent) === wanted) return true;
+        return false;
       });
       if (!match) return "";
       if (match.id) return "#" + CSS.escape(match.id);

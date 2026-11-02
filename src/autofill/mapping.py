@@ -202,9 +202,10 @@ _RULES: tuple[_Rule, ...] = (
         "previously_employed_here",
         _compile(
             (
+                r"\bpreviously(?:\s+\w+){0,3}\s+employed\b",
                 r"\bpreviously worked\b",
-                r"\bpreviously employed\b",
                 r"\bformer employee\b",
+                r"\bprevious worker\b",
                 r"\bworked here before\b",
                 r"\bworked for us\b",
             )
@@ -1032,9 +1033,7 @@ def _profile_text(
     if key == "previously_employed_here":
         companies = [item.company for item in profile.employment]
         companies.extend(item.company for item in profile.internships)
-        question = " ".join(
-            part for part in (control.label, control.group, control.prompt, control.aria_label) if part
-        )
+        question = _previous_worker_text(control)
         return previous_worker_value(question, companies, profile.screening.previously_employed_here)
     if key == "how_heard":
         return profile.screening.how_heard
@@ -1304,17 +1303,33 @@ def previous_worker_value(question: str, companies: list[str], explicit: str = "
     return "No"
 
 
-def is_previous_worker(control: Control) -> bool:
-    """The Workday previous-worker radio, including candidateIsPreviousWorker."""
-    if "candidateispreviousworker" in _compact_id(control):
-        return True
-    blob = normalize(f"{control.label} {control.group} {control.prompt} {control.aria_label}")
-    return bool(
-        re.search(
-            r"\b(?:previously employed|previously worked|former employee|worked here before|worked for us)\b",
-            blob,
-        )
+_PREVIOUS_WORKER_RE = re.compile(
+    r"\b(?:previously(?:\s+\w+){0,3}\s+employed|previously worked|former employee|previous worker|"
+    r"worked here before|worked for us)\b",
+    re.IGNORECASE,
+)
+_EMPLOYEE_NOTE_RE = re.compile(r"\bcurrent employees:.*", re.IGNORECASE | re.DOTALL)
+
+
+def _previous_worker_text(control: Control) -> str:
+    """The legend, without Workday's internal-account note."""
+    raw = " ".join(
+        part for part in (control.label, control.group, control.prompt, control.aria_label, control.nearby) if part
     )
+    return _EMPLOYEE_NOTE_RE.sub("", raw)
+
+
+def is_previous_worker(control: Control) -> bool:
+    """The Workday previous-worker radio, including candidateIsPreviousWorker.
+
+    The legend may add a second line telling current employees to use the
+    internal account. That line is not the question. ``previously been
+    employed`` still matches.
+    """
+    compact = _compact_id(control)
+    if "previousworker" in compact:
+        return True
+    return bool(_PREVIOUS_WORKER_RE.search(normalize(_previous_worker_text(control))))
 
 
 def _match_rule(control: Control) -> str | None:
@@ -1426,6 +1441,15 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             text=text,
             option_label=text,
             reason=reason or "Source is chosen from the menu.",
+            field_class="PROFILE_FIELD",
+        )
+    if key == "school" and control.kind == "combobox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "School is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
     # A Workday Application Questions dropdown is a button whose menu exists
@@ -1553,13 +1577,20 @@ def map_field(
                 reason="No middle name on the profile. The full name is not a middle name.",
             )
         return _from_text(control, "middle_name", middle, reason="Middle name from the profile.")
+    if _is_phone_device(control):
+        return _from_text(control, "phone_device", "Mobile", reason="Phone device type is Mobile.")
     if is_previous_worker(control):
         companies = [item.company for item in profile.employment]
         companies.extend(item.company for item in profile.internships)
-        question = " ".join(
-            part for part in (control.label, control.group, control.prompt, control.aria_label) if part
-        )
+        question = _previous_worker_text(control)
         answer = previous_worker_value(question, companies, profile.screening.previously_employed_here)
+        if not answer and "previousworker" in _compact_id(control):
+            # The Workday radio did not name the employer in the legend we could
+            # read. Employment history still decides Yes; otherwise this is No.
+            named = [normalize(company) for company in companies if normalize(company)]
+            folded = normalize(question)
+            if not any(company and company in folded for company in named):
+                answer = "No"
         if answer:
             # A named employer missing from history is No. An unnamed question
             # falls through so a saved answer for this job's company can still match.
@@ -1628,6 +1659,10 @@ def map_field(
         or normalize(control.nearby) in {"phone", "mobile", "telephone", "mobile phone"},
     )
     key = _match_rule(own)
+    if key is None and is_current_company_label(control):
+        # Workday's work-history box is labeled Company. The longer
+        # "company name" rule does not cover that short label.
+        key = "current_company"
     if key is None and _nearby_key(control):
         return MappedField(
             key=None,

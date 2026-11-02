@@ -55,6 +55,17 @@ EXTRACT_JS = r"""
     return (text || "").replace(/[✱*＊]+$/, "").replace(/\s+/g, " ").trim();
   }
 
+  function isEmployeeNote(text) {
+    // Workday appends this under the previous-worker legend. It is not the question.
+    return cleanPrompt(text).toLowerCase().indexOf("current employees:") === 0;
+  }
+
+  function questionPrompt(text) {
+    const cleaned = cleanPrompt(text);
+    if (!cleaned || isEmployeeNote(cleaned)) return "";
+    return cleaned.replace(/\bcurrent employees:[\s\S]*$/i, "").trim() || cleaned;
+  }
+
   function lettersOf(text) {
     return (text || "").replace(/[^A-Za-z]/g, "");
   }
@@ -275,8 +286,8 @@ EXTRACT_JS = r"""
     // aria-labelledby. An option label such as "Yes" is not the question.
     // A section heading is not the question either.
     const legendNode = el.closest("fieldset") ? el.closest("fieldset").querySelector("legend") : null;
-    const legend = legendText(el);
-    if (legend && !isSectionHeading(legendNode, legend)) return cleanPrompt(legend);
+    const legend = questionPrompt(legendText(el));
+    if (legend && !isSectionHeading(legendNode, legend)) return legend;
     const option = optionText(el);
     const stop = el.closest("form") || document.body;
     let node = el;
@@ -287,11 +298,11 @@ EXTRACT_JS = r"""
         for (const id of labelled.split(/\s+/)) {
           const target = document.getElementById(id);
           if (!target || target.contains(el) || isSectionHeading(target, textOf(target))) continue;
-          const text = textOf(target);
+          const text = questionPrompt(textOf(target));
           if (text) bits.push(text);
         }
         const joined = cleanPrompt(bits.join(" "));
-        if (joined && joined !== option) return joined;
+        if (joined && joined !== option && !isEmployeeNote(joined)) return joined;
       }
       if (node === stop) break;
     }
@@ -300,7 +311,7 @@ EXTRACT_JS = r"""
       for (const child of Array.from(node.children)) {
         if (child.contains(el)) break;
         if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
-        const text = cleanPrompt(textOf(child));
+        const text = questionPrompt(textOf(child));
         if (!text || text.length > 600 || text === option || isSectionHeading(child, text)) continue;
         return text;
       }
@@ -316,15 +327,15 @@ EXTRACT_JS = r"""
     if (labelled) {
       const node = document.getElementById(labelled.split(/\s+/)[0]);
       if (node && !node.contains(el)) {
-        const text = cleanPrompt(textOf(node));
+        const text = questionPrompt(textOf(node));
         if (text && text !== option && !isSectionHeading(node, text)) return text;
       }
     }
     const labels = field.querySelectorAll("label, legend");
     for (const label of labels) {
       if (!label || label.contains(el)) continue;
-      const text = cleanPrompt(textOf(label));
-      if (!text || text === option || text.length > 200 || isSectionHeading(label, text)) continue;
+      const text = questionPrompt(textOf(label));
+      if (!text || text === option || text.length > 500 || isSectionHeading(label, text)) continue;
       return text;
     }
     return "";
@@ -380,18 +391,40 @@ EXTRACT_JS = r"""
   }
 
   function radioOptionLabel(radio) {
-    const wrapping = radio.closest("label");
-    if (wrapping) return cleanPrompt(textOf(wrapping));
+    // The option is Yes or No. A legend that wraps the group is the question,
+    // and a value of "false" is not the word the person picked.
+    function short(text) {
+      const cleaned = cleanPrompt(text);
+      if (!cleaned || cleaned.length > 40 || isEmployeeNote(cleaned)) return "";
+      return cleaned;
+    }
     if (radio.id) {
       const explicit = document.querySelector("label[for='" + CSS.escape(radio.id) + "']");
-      if (explicit) return cleanPrompt(textOf(explicit));
+      if (explicit && !explicit.querySelector("input, select, textarea, [role='radio']")) {
+        const text = short(textOf(explicit));
+        if (text) return text;
+      }
     }
     const next = radio.nextElementSibling;
     if (next && next.tagName && next.tagName.toLowerCase() === "label") {
-      if (!next.querySelector("input, select, textarea")) return cleanPrompt(textOf(next));
+      if (!next.querySelector("input, select, textarea")) {
+        const text = short(textOf(next));
+        if (text) return text;
+      }
     }
     const role = (radio.getAttribute("role") || "").toLowerCase();
-    if (role === "radio") return cleanPrompt(radio.getAttribute("aria-label") || textOf(radio));
+    if (role === "radio") {
+      const own = short(radio.getAttribute("aria-label") || textOf(radio));
+      if (own) return own;
+    }
+    const wrapping = radio.closest("label");
+    if (wrapping && !wrapping.querySelector("[role='radiogroup']")) {
+      const radios = wrapping.querySelectorAll("input[type='radio'], [role='radio']");
+      if (radios.length <= 1) {
+        const text = short(textOf(wrapping));
+        if (text) return text;
+      }
+    }
     return radio.value || "";
   }
 
@@ -584,6 +617,22 @@ EXTRACT_JS = r"""
     return dedupeBits(bits);
   }
 
+  function sectionHeading(el) {
+    // My Experience sections are role=group labelled by "Work Experience",
+    // "Education", and "Languages". The Add button itself only says Add.
+    const group = el.closest && el.closest("[role='group'][aria-labelledby]");
+    if (!group) return "";
+    const labelled = group.getAttribute("aria-labelledby") || "";
+    const bits = [];
+    for (const id of labelled.split(/\s+/)) {
+      if (!id) continue;
+      const node = document.getElementById(id);
+      const text = node ? textOf(node) : "";
+      if (text) bits.push(text);
+    }
+    return cleanPrompt(bits.join(" "));
+  }
+
   function selectorFor(el) {
     if (el.id) return "#" + CSS.escape(el.id);
     const name = el.getAttribute("name");
@@ -608,11 +657,14 @@ EXTRACT_JS = r"""
     const automation = el.getAttribute("data-automation-id");
     if (automation) {
       const bare = "[data-automation-id='" + CSS.escape(automation) + "']";
-      // Workday repeats searchBox and promptIcon on every prompt. The first
-      // Country Phone Code box must not be the selector for How Did You Hear.
+      // Workday repeats searchBox, promptIcon, and add-button. The first
+      // Country Phone Code box must not be the selector for How Did You Hear,
+      // and Work Experience's Add must not be Education's or Languages'.
       const field = el.closest && el.closest("[data-automation-id^='formField']");
       const fieldAuto = field && field !== el ? (field.getAttribute("data-automation-id") || "") : "";
-      if (fieldAuto) {
+      const group = el.closest && el.closest("[role='group'][aria-labelledby]");
+      const labelled = group && group !== el ? (group.getAttribute("aria-labelledby") || "") : "";
+      if (fieldAuto || labelled) {
         const root = el.getRootNode && el.getRootNode();
         const scope = root && typeof root.querySelectorAll === "function" ? root : document;
         let count = 1;
@@ -622,7 +674,8 @@ EXTRACT_JS = r"""
           count = 1;
         }
         if (count > 1) {
-          return "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare;
+          if (fieldAuto) return "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare;
+          return "[role='group'][aria-labelledby='" + CSS.escape(labelled) + "'] " + bare;
         }
       }
       return bare;
@@ -812,12 +865,13 @@ EXTRACT_JS = r"""
       if (!name || !selector || seenButtons.has(selector)) continue;
       seenButtons.add(selector);
       const place = placementOf(el);
+      const section = sectionHeading(el);
       buttons.push({
         name,
         selector,
         controlType: (el.getAttribute("type") || "").toLowerCase(),
         automationId: el.getAttribute("data-automation-id") || "",
-        ariaLabel: el.getAttribute("aria-label") || "",
+        ariaLabel: el.getAttribute("aria-label") || section,
         role: controlRole(el),
         href,
         inHeader: place.inHeader,

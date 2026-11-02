@@ -9,6 +9,7 @@ any field is written. Resume file inputs are reported and never selected.
 
 from __future__ import annotations
 
+import logging
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from autofill.models import Control, FieldOutcome, FillResult, JobContext, Mappe
 from autofill.pagewait import navigation_signature, validation_message, wait_for_navigation
 from autofill.profile import CandidateProfile
 from autofill.safeguards import HumanSubmissionRequired, _bound_target, activate, classify_control, is_add_row
+
+logger = logging.getLogger("autofill.fill")
 
 _HUMAN_MESSAGE = (
     "Filled what it could and stopped. A person must review the form and click Submit or Apply."
@@ -401,6 +404,12 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 refresh_preview(page)
                 return _outcome(control, mapped, detail=mapped.option_label or "selected")
             expected = mapped.option_label or mapped.option_value or mapped.text or ""
+            shown = _shown_value(locator)
+            if _value_verified(shown, expected) or _value_verified(shown, mapped.option_label or "") or _value_verified(
+                shown, mapped.option_value or ""
+            ):
+                remember_confirmed(control, shown.strip(), field_key=mapped.key or "")
+                return _outcome(control, mapped, detail="already set")
             focus_field(target, control.selector)
             if not choose_native_select(
                 target,
@@ -552,6 +561,116 @@ def _fill_checkbox_group(
     return outcomes
 
 
+_ADDRESS_RESCAN_KEYS = frozenset({"address", "city", "state", "postal_code", "phone"})
+
+
+def _section_add_button(snapshot: PageSnapshot, token: str):
+    """The Add control for one My Experience section, such as Education."""
+    wanted = token.casefold()
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if not is_add_row(button.name):
+            continue
+        blob = " ".join(
+            part
+            for part in (button.name, button.aria_label, button.automation_id, button.selector)
+            if part
+        ).casefold()
+        if wanted in blob:
+            return button
+    return None
+
+
+def _address_pending(page, snapshot: PageSnapshot) -> bool:
+    """Country is committed and a street, city, region, postal, or phone box is still empty.
+
+    Workday clears or reveals those inputs when the country is chosen. County
+    and phone device type are not part of that block.
+    """
+    from autofill.mapping import (
+        _is_county,
+        _is_middle_name,
+        _is_phone_device,
+        _is_phone_extension,
+        match_field_key,
+    )
+
+    country_set = False
+    pending = False
+    for control in snapshot.controls:
+        if control.hidden:
+            continue
+        if _is_county(control) or _is_middle_name(control) or _is_phone_device(control) or _is_phone_extension(control):
+            continue
+        key = match_field_key(control)
+        if key == "country":
+            if control.disabled:
+                continue
+            if not control.selector or control_committed(page, control.selector):
+                country_set = True
+            continue
+        if key not in _ADDRESS_RESCAN_KEYS:
+            continue
+        if control.disabled or not control.selector or not control_committed(page, control.selector):
+            pending = True
+    return country_set and pending
+
+
+def _css_hidden_on_this_page(page, selector: str) -> bool:
+    """True when the control's own style hides it and no ancestor step is hidden.
+
+    Workday's resume input is ``display: none`` on the current My Experience
+    page. A file inside a later ``hidden`` section is not that input.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display !== "none" && style.visibility !== "hidden") return false;
+      let node = el.parentElement;
+      while (node) {
+        if (node.hidden) return false;
+        const parentStyle = window.getComputedStyle(node);
+        if (parentStyle.display === "none" || parentStyle.visibility === "hidden") return false;
+        node = node.parentElement;
+      }
+      return true;
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
+def _click_add(page, button) -> bool:
+    """Open one repeatable section. A bad selector must not fail the page."""
+    try:
+        activate(page, button.selector, button.name, control_type=button.control_type)
+    except Exception as exc:
+        logger.info("add_row result=error error_type=%s", type(exc).__name__)
+        return False
+    return True
+
+
+def _education_needed(profile: CandidateProfile, snapshot: PageSnapshot) -> bool:
+    rows = [item for item in profile.education_history if item.school or item.degree or item.field_of_study]
+    if not rows:
+        return False
+    visible = 0
+    for control in snapshot.controls:
+        if control.hidden:
+            continue
+        blob = f"{control.label} {control.aria_label} {control.element_id} {control.automation_id}".casefold()
+        if "school" in blob or "university" in blob or "college" in blob:
+            visible += 1
+    return visible < len(rows)
+
+
 def fill_one_page(
     page,
     profile: CandidateProfile,
@@ -572,7 +691,8 @@ def fill_one_page(
     from autofill.mapping import note_page_country
     from autofill.sms_consent import SMS_INTENT, accept_recruitment_sms, apply_stored_sms_no, begin_sms_pass
 
-    for _ in range(4):
+    rescans = 0
+    for _ in range(6):
         fields = []
         manual = []
         resume_blocked = False
@@ -660,17 +780,84 @@ def fill_one_page(
                 resume_blocked = True
             _note_manual(control, mapped, manual)
             fields.append(_apply_mapped(page, control, mapped))
+        if not resume_blocked:
+            for control in snapshot.controls:
+                if control.kind != "file" or not control.hidden:
+                    continue
+                if not _css_hidden_on_this_page(page, control.selector):
+                    continue
+                shown = Control(
+                    kind=control.kind,
+                    name=control.name,
+                    element_id=control.element_id,
+                    label=control.label,
+                    placeholder=control.placeholder,
+                    aria_label=control.aria_label,
+                    autocomplete=control.autocomplete,
+                    required=control.required,
+                    options=control.options,
+                    selector=control.selector,
+                    input_type=control.input_type,
+                    role=control.role,
+                    nearby=control.nearby,
+                    group=control.group,
+                    prompt=control.prompt,
+                    automation_id=control.automation_id,
+                )
+                mapped = map_field(
+                    shown,
+                    profile,
+                    cover_letter_path=cover_letter_path,
+                    cover_letter_text=cover_letter_text,
+                    job=job,
+                    cursor=cursor,
+                )
+                if mapped.action != "resume_required":
+                    continue
+                if resume_uploaded:
+                    fields.append(
+                        _outcome(
+                            control,
+                            mapped,
+                            action="skip",
+                            detail="Resume left for the person who uploaded it.",
+                        )
+                    )
+                else:
+                    resume_blocked = True
+                    _note_manual(control, mapped, manual)
+                    fields.append(_apply_mapped(page, control, mapped))
+                break
+        from autofill.mapping import is_current_company_label
+        from autofill.stepfill import _experience_add_button
+
+        employer_slots = [
+            control for control in snapshot.controls if not control.hidden and is_current_company_label(control)
+        ]
+        work_add = _experience_add_button(snapshot)
+        if work_add and len(profile.employment) > len(employer_slots):
+            if _click_add(page, work_add):
+                continue
+        education_add = _section_add_button(snapshot, "education")
+        if education_add and _education_needed(profile, snapshot):
+            if _click_add(page, education_add):
+                continue
         if resume_blocked:
             break
-        employer_slots = [
-            control
-            for control in snapshot.controls
-            if not control.hidden and control.kind in {"text", "combobox"} and "employ" in control.label.casefold()
-        ]
-        add = next((button for button in snapshot.buttons if is_add_row(button.name)), None)
-        if add and len(profile.employment) > len(employer_slots):
-            activate(page, add.selector, add.name, control_type=add.control_type)
-            continue
+        if rescans < 2:
+            try:
+                fresh = extract_page(page)
+            except Exception:
+                fresh = snapshot
+            if _address_pending(page, fresh):
+                rescans += 1
+                pause = getattr(page, "wait_for_timeout", None)
+                if pause is not None:
+                    try:
+                        pause(80)
+                    except Exception:
+                        pass
+                continue
         break
     from autofill.combobox import resettle_listboxes
 
