@@ -68,6 +68,7 @@ def test_phone_beside_a_calling_code_menu_is_national_and_a_single_box_is_not():
     assert national.key == "phone"
     assert national.action == "fill"
     assert national.text == NATIONAL
+    assert "+1" not in national.text
     full = map_field(_control("Phone", autocomplete="tel", input_type="tel"), person)
     assert full.text == EXAMPLE_PHONE
     explicit = map_field(

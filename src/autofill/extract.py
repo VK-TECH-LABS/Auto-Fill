@@ -546,6 +546,12 @@ EXTRACT_JS = r"""
       const option = optionText(el);
       if (option) bits.push(option);
     }
+    // The form field's own label wins over a neighboring Postal Code. A phone
+    // country prompt whose box says Search must not be labeled as that neighbor.
+    if (!bits.length) {
+      const question = fieldQuestionNode(el);
+      if (question) bits.push(textOf(question));
+    }
     if (!bits.length) {
       const fieldset = el.closest("fieldset");
       if (fieldset) {
@@ -557,9 +563,11 @@ EXTRACT_JS = r"""
     if (!bits.length) {
       let node = el;
       const stop = el.closest ? el.closest("form") : null;
+      const fieldRoot = el.closest ? el.closest("[data-automation-id^='formField']") : null;
       let found = "";
       for (let depth = 0; node && depth < 8 && !found; depth += 1, node = node.parentElement) {
         if (stop && node === stop) break;
+        if (fieldRoot && !fieldRoot.contains(node)) break;
         let prev = node.previousElementSibling;
         while (prev && !found) {
           if (isHidden(prev)) {

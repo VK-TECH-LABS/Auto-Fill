@@ -166,6 +166,8 @@ class Employment:
     start_date: str = ""
     end_date: str = ""
     current: bool = False
+    # Only a location stored on this row. The home address is not a job site.
+    location: str = ""
 
 
 @dataclass
@@ -441,6 +443,7 @@ def _employment_list(raw: object) -> list[Employment]:
             start_date=_text(entry, "startDate") or _text(entry, "start_date"),
             end_date=_text(entry, "endDate") or _text(entry, "end_date"),
             current=bool(entry.get("current", False)),
+            location=_text(entry, "location"),
         )
         for entry in _objects(raw, "employment")
     ]

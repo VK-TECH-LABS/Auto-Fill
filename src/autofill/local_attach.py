@@ -974,6 +974,32 @@ def same_document(current: str, wanted: str) -> bool:
     return left.path.rstrip("/") == right.path.rstrip("/")
 
 
+_LOCALE_PREFIX = re.compile(r"^/[a-z]{2}-[a-z]{2}(?=/)", re.IGNORECASE)
+
+
+def _workday_apply_path(url: str) -> str:
+    path = urlparse(url).path or ""
+    path = _LOCALE_PREFIX.sub("", path)
+    return path.rstrip("/").casefold()
+
+
+def same_workday_apply(current: str, wanted: str) -> bool:
+    """True when both URLs are the same Workday apply document.
+
+    Workday inserts ``/en-US/`` (and other locales) without changing the step.
+    Loading the Apply URL without that prefix reopens Start Your Application.
+    """
+    from autofill.ats import WORKDAY_HOST_RE
+
+    host = urlparse(current).hostname or ""
+    if not WORKDAY_HOST_RE.search(host):
+        return False
+    if not same_site(current, wanted):
+        return False
+    left, right = _workday_apply_path(current), _workday_apply_path(wanted)
+    return bool(left) and left == right
+
+
 def same_site(current: str, wanted: str) -> bool:
     """True when both URLs are the same scheme, host, and port."""
     return _same_site(urlparse(current), urlparse(wanted))
@@ -1025,10 +1051,17 @@ def should_reload_application(page: Any, application_url: str, *, candidate_chan
 
     A different candidate reloads so the previous person's answers do not stay.
     The same candidate keeps a later step. Reloading the job URL sends a
-    Workday wizard back to My Information.
+    Workday wizard back to My Information. A Workday error page on the apply
+    document stays there; recovery reloads that document in place.
     """
     if candidate_changed:
         return True
+    try:
+        current = str(getattr(page, "url", "") or "")
+    except Exception:
+        current = ""
+    if current and same_workday_apply(current, application_url) and not _tab_is_posting(page):
+        return False
     return not _application_in_progress(page, application_url)
 
 
@@ -1056,7 +1089,7 @@ def adopt_employer_tab(context: Any, application_url: str, *, bound: Any = None)
             if page is bound:
                 return page
     for page, current in readable:
-        if same_document(current, application_url):
+        if same_document(current, application_url) or same_workday_apply(current, application_url):
             return page
     advanced = [
         (page, current)
@@ -1090,9 +1123,12 @@ def apply_visible_answer(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     """
     require_feature()
     from autofill.dom_ui import commit_visible, control_committed
+    from autofill.split_dates import commit_split_date_answer, is_split_date_answer
     from autofill.stepfill import commit_location_answer, is_location_answer
 
-    if is_location_answer(page, target):
+    if is_split_date_answer(target):
+        report = commit_split_date_answer(page, target)
+    elif is_location_answer(page, target):
         report = commit_location_answer(page, target)
     else:
         report = commit_visible(page, target)
@@ -1777,6 +1813,7 @@ class DedicatedApplySession:
         force: bool = False,
         locked: bool = False,
         restored: dict[str, list[str]] | None = None,
+        note: str = "",
     ) -> bool:
         """Save & Continue card on the employer tab. Not shown after a detach."""
         page = self._popup_page()
@@ -1796,6 +1833,7 @@ class DedicatedApplySession:
             force=force,
             locked=locked,
             restored=restored,
+            note=note,
         )
 
     def read_question_popup(self, nonce: str) -> dict[str, Any]:

@@ -1052,6 +1052,107 @@ def search_school(page, selector: str, desired: str) -> Option | None:
     return match
 
 
+_STUDY_FIELD_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const field = el.closest("[data-automation-id^='formField']");
+  const ident = [
+    el.id || "",
+    el.getAttribute("name") || "",
+    field ? (field.getAttribute("data-automation-id") || "") : "",
+  ].join(" ").toLowerCase();
+  if (ident.indexOf("fieldofstudy") !== -1 || ident.indexOf("field-of-study") !== -1) return true;
+  let label = "";
+  if (el.id) {
+    const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+    if (lab) label = lab.innerText || lab.textContent || "";
+  }
+  if (!label && field) {
+    const lab = field.querySelector("label, legend");
+    if (lab && !lab.contains(el)) label = lab.innerText || lab.textContent || "";
+  }
+  return String(label || "").toLowerCase().indexOf("field of study") !== -1;
+}"""
+
+
+def _is_study_field(page, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_STUDY_FIELD_JS, selector))
+    except Exception:
+        return False
+
+
+def _best_study_match(query: str, found: list[Option]) -> Option | None:
+    """Prefer the field-of-study row that names the profile value.
+
+    ``engineer`` matches ``Engineering``. A menu with no such row matches nothing.
+    """
+    folded = (query or "").strip().casefold()
+    if not folded:
+        return None
+    pool = [
+        option
+        for option in found
+        if option.selector and not option.folder and not _menu_junk(option.label or option.value)
+    ]
+    if not pool:
+        pool = [option for option in found if option.selector and not _menu_junk(option.label or option.value)]
+
+    def label_of(option: Option) -> str:
+        return (option.label or option.value or "").strip().casefold()
+
+    exact = [option for option in pool if label_of(option) == folded]
+    if exact:
+        return exact[0]
+    starts = [option for option in pool if label_of(option).startswith(folded)]
+    if starts:
+        return starts[0]
+    contains = [option for option in pool if folded in label_of(option)]
+    if len(contains) == 1:
+        return contains[0]
+    return None
+
+
+def search_field_of_study(page, selector: str, desired: str) -> Option | None:
+    """Type a field of study the way a school search types, and pick that row.
+
+    There is no School Not Found fallback. No matching prompt row stays blank.
+    """
+    query = (desired or "").strip()
+    if not selector or not query:
+        return None
+    focus_field(page, selector)
+    shown = _selected_text(page, selector)
+    if _labels_match(query, shown) or (shown and query.casefold() in shown.casefold()):
+        return Option(value=shown, label=shown, selector=selector)
+    _type_filter(page, selector, query, school=True)
+    _press_enter(page, selector)
+    found = _await_menu(page, selector, 2500)
+    match = _best_study_match(query, found)
+    if match is None or not match.selector:
+        try:
+            dismiss_combobox(page)
+        except Exception:
+            return None
+        return None
+    try:
+        click_choice(page, match.selector, match.label)
+    except Exception:
+        return None
+    _pause(page, 50)
+    if _committed_choice(page, selector, match, query, accept_input=False) or _labels_match(
+        match.label, _selected_text(page, selector)
+    ):
+        return match
+    pill = _selected_text(page, selector)
+    if pill and query.casefold() in pill.casefold():
+        return match
+    return match
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
@@ -1071,6 +1172,8 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         return Option(value=shown, label=shown, selector=selector)
     if _is_school_field(page, selector):
         return search_school(page, selector, desired)
+    if _is_study_field(page, selector):
+        return search_field_of_study(page, selector, desired)
     found = _open_for_options(page, selector)
     if not found:
         # A prompt list that is not wired with aria-controls, and is the only open menu.

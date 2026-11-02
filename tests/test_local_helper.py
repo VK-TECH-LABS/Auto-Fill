@@ -1659,8 +1659,10 @@ def test_same_binding_after_a_crash_does_not_reload(monkeypatch):
             "profile": _profile("Avery Alpha", "avery@example.com"),
             "binding": _binding("sess-a", "101"),
         })
-        assert code == 202 and again["sessionId"] == created["sessionId"]
-        ready = _wait_job(port, created["sessionId"])
+        assert code == 202 and again["sessionId"] != created["sessionId"]
+        old = _request(port, "GET", f"/v1/sessions/{created['sessionId']}")[1]
+        assert old["status"] == "FAILED"
+        ready = _wait_job(port, again["sessionId"])
         assert ready["status"] == "READY_FOR_HUMAN_SUBMIT"
         assert ready["stopped_before_submit"] is True
         assert ready["submitted"] is not True
@@ -1672,8 +1674,7 @@ def test_same_binding_after_a_crash_does_not_reload(monkeypatch):
         })
         assert code == 202 and other["sessionId"] != created["sessionId"]
         _wait_job(port, other["sessionId"])
-        assert fake.fresh == [False, False, True]
-        assert fake.nav_blocks[1] == ("#next", "Next", ("page-1",))
+        assert fake.fresh == [False, True, True]
     finally:
         server.shutdown()
         helper.close()

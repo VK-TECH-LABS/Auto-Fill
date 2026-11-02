@@ -52,7 +52,7 @@ _SHOW_JS = r"""(args) => {
   host = document.createElement("div");
   host.id = HOST;
   host.setAttribute("data-tilearc-popup", "save-continue");
-  host.style.cssText = "all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483647;";
+  host.style.cssText = "all:initial;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;";
   const root = host.attachShadow({mode: "open"});
   const css = `
     .card{font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#0f172a;background:#fff;
@@ -181,8 +181,10 @@ _SHOW_JS = r"""(args) => {
   card.appendChild(msg);
   const note = document.createElement("div");
   note.className = "note";
-  note.textContent = "Saved to this candidate's Application Answers in TileArc, then filled here. "
-    + "You still click the final Submit yourself.";
+  note.textContent = args.note || (
+    "Saved to this candidate's Application Answers in TileArc, then filled here. "
+    + "You still click the final Submit yourself."
+  );
   card.appendChild(note);
   root.appendChild(card);
   function rowValues(section) {
@@ -212,7 +214,7 @@ _SHOW_JS = r"""(args) => {
     state.at = Date.now();
     for (const input of root.querySelectorAll("input, textarea")) input.disabled = true;
     msg.className = "msg";
-    msg.textContent = "Saving to TileArc…";
+    msg.textContent = args.profileSave ? "Saving this work experience entry…" : "Saving to TileArc…";
     refresh();
   });
   refresh();
@@ -309,6 +311,7 @@ def show_popup(
     force: bool = False,
     locked: bool = False,
     restored: dict[str, list[str]] | None = None,
+    note: str = "",
 ) -> bool:
     """Show one card for ``questions`` (or the single ``question``). False when the page refused the script."""
     rows = _rows_for_show(question, questions, selector, restored)
@@ -327,6 +330,8 @@ def show_popup(
                 "error": bool(error),
                 "force": bool(force),
                 "locked": bool(locked),
+                "note": note,
+                "profileSave": bool(note),
             },
         )
     except Exception:

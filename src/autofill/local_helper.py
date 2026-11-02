@@ -232,6 +232,22 @@ def _binding_matches(job: LocalJob, claimed: Any) -> bool:
     )
 
 
+def _create_keeps_failed(job: LocalJob) -> bool:
+    """True when POST /v1/sessions must not return this session.
+
+    A crashed or ``FAILED`` / ``FAILED_RETRYABLE`` session stays until
+    ``/cancel``. ``/continue`` is what retries it. A new create gets a new id.
+    """
+    if job.superseded:
+        return False
+    if job.state == "error":
+        return True
+    if job.state != "done" or job.result is None:
+        return False
+    status = str(job.result.get("status") or "")
+    return status in {Status.FAILED, Status.FAILED_RETRYABLE, Status.FAILED_FINAL}
+
+
 def _can_continue(job: LocalJob) -> bool:
     """True after a crash, a stall, or a retryable employer failure. A reported submit is not.
 
@@ -509,6 +525,8 @@ class LocalJob:
                 "type": self.question["type"],
                 "options": list(self.question["options"]),
             }
+            if self.question.get("fieldKey"):
+                body["question"]["fieldKey"] = self.question["fieldKey"]
             popup = _popup_view(self)
             if popup is not None:
                 body["question"]["popup"] = popup
@@ -585,11 +603,12 @@ class LocalHelper:
         fill starts.
 
         Same binding and URL as the live job: that job is returned (a double
-        click does not start a second fill). The same binding after ``error``
-        or ``FAILED_RETRYABLE`` continues on the open page and does not reload.
-        Different binding: the previous job is cancelled at its next field or
-        page, marked ``replaced``, and its profile is dropped. An unbound
-        create keeps the old rule and is refused while a live fill runs.
+        click does not start a second fill). A failed session is not returned.
+        ``/continue`` retries it in place. A new create gets a new session id
+        and leaves the failed one until ``/cancel``. Different binding: the
+        previous job is cancelled at its next field or page, marked
+        ``replaced``, and its profile is dropped. An unbound create keeps the
+        old rule and is refused while a live fill runs.
         """
         url = validate_application_url(application_url)
         if resume_ref is not None and binding is None:
@@ -604,7 +623,7 @@ class LocalHelper:
                 if standard_terms_authorized:
                     current.standard_terms_authorized = True
                 return current
-            if same and current is not None and _can_continue(current):
+            if same and current is not None and _can_continue(current) and not _create_keeps_failed(current):
                 active = self._jobs.get(self._active) if self._active else None
                 if active is not None and not active.superseded and active.session_id != current.session_id:
                     raise LocalAttachError("A fill is already running on this dedicated profile.")
@@ -625,7 +644,7 @@ class LocalHelper:
                 self._active = current.session_id
                 job = current
                 recover = True
-            elif same and current is not None:
+            elif same and current is not None and not _create_keeps_failed(current):
                 if resume_ref is not None:
                     # A double click restaged the same file. The live job keeps its copy.
                     self._staged.pop(resume_ref, None)
@@ -638,7 +657,10 @@ class LocalHelper:
                 if active is not None and not active.superseded and binding is None:
                     raise LocalAttachError("A fill is already running on this dedicated profile.")
                 incoming = (binding or {}).get("candidateId") or ""
+                preserve = current if (same and current is not None and _create_keeps_failed(current)) else None
                 for old in {job.session_id: job for job in (current, active) if job is not None}.values():
+                    if old is preserve:
+                        continue
                     if not old.superseded:
                         previous = (old.binding or {}).get("candidateId") or ""
                         if incoming and previous and incoming != previous:
@@ -1616,18 +1638,20 @@ class LocalHelper:
         job.card_ids = list(ids)
         restored = _restored_map(popup) if error or popup.get("values") else None
         try:
-            shown = show(
-                rows[0],
-                nonce=popup["nonce"],
-                questions=rows,
-                selector=str(rows[0].get("selector") or ""),
-                candidate=_candidate_label(job),
-                message=message,
-                error=error,
-                force=True,
-                locked=locked,
-                restored=restored,
-            )
+            kwargs = {
+                "nonce": popup["nonce"],
+                "questions": rows,
+                "selector": str(rows[0].get("selector") or ""),
+                "candidate": _candidate_label(job),
+                "message": message,
+                "error": error,
+                "force": True,
+                "locked": locked,
+                "restored": restored,
+            }
+            if _accepts(show, "note"):
+                kwargs["note"] = _profile_popup_note(rows)
+            shown = show(rows[0], **kwargs)
         except TypeError:
             try:
                 shown = show(
@@ -2202,6 +2226,12 @@ def _open_question_rows(job: LocalJob) -> list[dict[str, Any]]:
             continue
         row = dict(view)
         row["selector"] = str(item.get("selector") or "")
+        key = str(item.get("fieldKey") or "").strip()
+        if key:
+            row["fieldKey"] = key
+        kind = str(item.get("kind") or "").strip()
+        if kind:
+            row["kind"] = kind
         rows.append(row)
     return rows
 
@@ -2212,10 +2242,13 @@ def _rows_for_ids(job: LocalJob, ids: list[str]) -> list[dict[str, Any]]:
 
 
 def _status_questions(job: LocalJob) -> list[dict[str, Any]]:
-    return [
-        {"id": row["id"], "prompt": row["prompt"], "type": row["type"], "options": list(row["options"])}
-        for row in _open_question_rows(job)
-    ]
+    listed: list[dict[str, Any]] = []
+    for row in _open_question_rows(job):
+        public = {"id": row["id"], "prompt": row["prompt"], "type": row["type"], "options": list(row["options"])}
+        if row.get("fieldKey"):
+            public["fieldKey"] = row["fieldKey"]
+        listed.append(public)
+    return listed
 
 
 def _restored_map(popup: dict[str, Any]) -> dict[str, list[str]]:
@@ -2294,6 +2327,14 @@ def pending_question(
                 break
     if view is None:
         return None
+    source = blocking if isinstance(blocking, dict) else None
+    if source is None:
+        for item in open_items:
+            if str(item.get("questionId") or item.get("questionHash") or "") == view["id"]:
+                source = item
+                break
+    if source is not None and source.get("fieldKey"):
+        view["fieldKey"] = str(source.get("fieldKey") or "")
     if not view["options"]:
         for item in open_items:
             richer = question_view(item)
@@ -2355,6 +2396,71 @@ def _learned_sms(job: LocalJob) -> list[dict]:
     return learned_application_answers(job.profile, _job_candidate(job))
 
 
+def _is_hear_item(item: dict[str, Any]) -> bool:
+    key = str(item.get("fieldKey") or "")
+    text = str(item.get("text") or item.get("prompt") or "").casefold()
+    return key == "how_heard" or "how did you hear" in text or "where did you hear" in text
+
+
+def _remember_hear_answer(
+    job: LocalJob,
+    profile: CandidateProfile,
+    item: dict[str, Any],
+    target: dict[str, Any],
+) -> None:
+    """How Did You Hear is an Application Answer, then it is filled on the page."""
+    values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+    if len(values) != 1:
+        return
+    profile.screening.how_heard = values[0]
+    from autofill.answers import employer_keys, note_session_answer
+
+    note_session_answer(
+        profile,
+        stem=str(item.get("text") or "How Did You Hear About Us?"),
+        value=values[0],
+        field_key="",
+        intent=str(item.get("intent") or ""),
+        kind="QUESTION",
+        employers=employer_keys(url=job.application_url),
+    )
+
+
+def _keep_profile_row(profile: CandidateProfile, item: dict[str, Any], target: dict[str, Any]) -> None:
+    """Write a work-entry date onto that employment row. Not an Application Answer."""
+    key = str(item.get("fieldKey") or "")
+    match = re.fullmatch(r"employment\.(\d+)\.(startDate|endDate)", key)
+    if match is None:
+        return
+    values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+    if len(values) != 1:
+        value = str(target.get("value") or "").strip()
+        if not value:
+            return
+        values = [value]
+    index = int(match.group(1))
+    if index < 0 or index >= len(profile.employment):
+        return
+    row = profile.employment[index]
+    if match.group(2) == "startDate":
+        row.start_date = values[0]
+    else:
+        row.end_date = values[0]
+
+
+def _profile_popup_note(rows: list[dict[str, Any]]) -> str:
+    """Work-entry prompts are not saved as Application Answers."""
+    if not rows:
+        return ""
+    keys = [str(row.get("fieldKey") or "") for row in rows]
+    if not keys or not all(key.startswith("employment.") or key.startswith("education.") for key in keys):
+        return ""
+    return (
+        "Saved on this work experience entry, not as an Application Answer. "
+        "You still click the final Submit yourself."
+    )
+
+
 def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]) -> None:
     """A verified answer is offered to later pages of this same fill.
 
@@ -2367,6 +2473,10 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
     """
     profile = job.profile
     if profile is None:
+        return
+    _keep_profile_row(profile, item, target)
+    if _is_hear_item(item):
+        _remember_hear_answer(job, profile, item, target)
         return
     kind = canonical_blocker_kind(item.get("kind"))
     question = str(item.get("text") or "").strip()

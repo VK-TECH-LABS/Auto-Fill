@@ -931,7 +931,7 @@ def _profile_text(
         return personal.email
     if key == "phone":
         if _wants_national_digits(control):
-            return national_phone_digits(personal.phone)
+            return workday_phone_text(personal.phone, country=personal.country, national=True)
         return personal.phone
     if key == "address":
         return personal.address
@@ -998,17 +998,17 @@ def _profile_text(
     if key == "current_job_title":
         row = _row(profile.employment, cursor, "title")
         if row is not None:
-            titled = row.title.strip()
-            if titled:
-                return titled
-            # A past row with no title stays blank. The current role may use
-            # the profile's current title when that row did not name one.
-            if row.current:
-                return profile.experience.current_job_title.strip()
-            return ""
+            # This row's title only. A blank title stays blank. current_job_title
+            # and another row's title are not copied in.
+            return row.title.strip()
         if profile.employment:
             return ""
         return profile.experience.current_job_title
+    if key == "employment_location":
+        row = _row(profile.employment, cursor, "location")
+        if row is None:
+            return ""
+        return row.location.strip()
     if key == "current_company":
         row = _row(profile.employment, cursor, "employer")
         if profile.employment:
@@ -1168,6 +1168,19 @@ _PHONE_COUNTRY_LABELS = frozenset(
 )
 
 
+def workday_phone_text(phone: str, *, country: str = "", national: bool = False) -> str:
+    """National digits for a phone box that already has a calling-code control.
+
+    ``+1475-441-1744`` beside United States (+1) becomes ``4754411744``.
+    ``country`` names that control for callers; the digits come from the number.
+    """
+    if country and not national:
+        return phone
+    if national:
+        return national_phone_digits(phone)
+    return phone
+
+
 def _is_phone_country_menu(control: Control) -> bool:
     """A calling-code menu, or a Country select sitting on the phone input.
 
@@ -1176,6 +1189,13 @@ def _is_phone_country_menu(control: Control) -> bool:
     ``Country Phone Code`` is that menu even when it is closed. An address
     ``Country / Territory`` menu is not.
     """
+    ident = re.sub(
+        r"[^a-z0-9]",
+        "",
+        normalize(f"{control.element_id} {control.name} {control.automation_id} {control.selector}"),
+    )
+    if any(token in ident for token in ("countryphonecode", "phonecountry", "callingcode", "dialcode")):
+        return True
     hits = 0
     for option in control.options:
         if _DIAL_CODE.search(f"{option.label} {option.value}"):
@@ -1341,6 +1361,35 @@ def is_previous_worker(control: Control) -> bool:
     return bool(_PREVIOUS_WORKER_RE.search(normalize(_previous_worker_text(control))))
 
 
+def _is_work_experience_location(control: Control) -> bool:
+    """A Work Experience row's Location box. It is not the home address.
+
+    ``workExperience-16--location`` is one. ``Current location`` on My
+    Information is not, and neither is a relocation question.
+    """
+    blob = normalize(
+        " ".join(
+            part
+            for part in (
+                control.element_id,
+                control.name,
+                control.automation_id,
+                control.selector,
+                control.label,
+                control.nearby,
+                control.group,
+            )
+            if part
+        )
+    )
+    compact = re.sub(r"[^a-z0-9]", "", blob)
+    if "workexperience" not in compact:
+        return False
+    if "relocat" in blob:
+        return False
+    return "location" in compact or normalize(control.label or "") == "location"
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     blob = haystack(control)
@@ -1377,6 +1426,8 @@ def _match_rule(control: Control) -> str | None:
             return None
         return "country"
     label = normalize(control.label or control.aria_label or control.placeholder)
+    if _is_work_experience_location(control):
+        return "employment_location"
     if label in {"current location", "location", "your location"} and "relocat" not in label:
         return "location"
     if (
