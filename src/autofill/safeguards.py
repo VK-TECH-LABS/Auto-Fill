@@ -47,7 +47,7 @@ _FORBIDDEN_RE = re.compile(
 )
 _FORWARD = frozenset({"next", "continue", "save_and_continue", "review"})
 _ADD_RE = re.compile(
-    r"\badd (another|experience|employment|education|position|job)\b",
+    r"\badd (another|experience|employment|education|position|job)\b|^(?:add|add another)$",
     re.IGNORECASE,
 )
 _SIGNUP_RE = re.compile(r"\b(sign\s*up|create\s+account|register)\b", re.IGNORECASE)
@@ -1183,13 +1183,15 @@ _ARIA_RADIO_JS = r"""(selector) => {
     return false;
   }
   if (!el) return false;
-  const tag = String(el.tagName || "").toLowerCase();
   const type = String(el.getAttribute("type") || "").toLowerCase();
   const role = String(el.getAttribute("role") || "").toLowerCase();
-  if (tag === "button" || tag === "a" || type === "submit" || type === "button") return false;
-  if (role === "button" || role === "link") return false;
-  if (el.closest("button, a[href], [role='button'], [role='link'], input[type='submit']")) return false;
+  if (type === "submit" || role === "button" || role === "link") return false;
   if (role !== "radio") return false;
+  // A button whose role is radio is the Yes/No choice. A radio nested inside
+  // another button, a link, or a submit control is not.
+  if (el.closest("a[href], [role='link'], input[type='submit']")) return false;
+  const host = el.closest("button, [role='button']");
+  if (host && host !== el) return false;
   if (el.getAttribute("aria-checked") === "true") return true;
   el.click();
   return el.getAttribute("aria-checked") === "true";
@@ -1197,9 +1199,9 @@ _ARIA_RADIO_JS = r"""(selector) => {
 
 
 def press_aria_radio(page, selector: str) -> bool:
-    """Click one ``role=radio`` node that is not a button, link, or submit.
+    """Click one ``role=radio`` node. A button that is itself the radio is allowed.
 
-    Success is ``aria-checked=true`` after the click.
+    A radio inside a link or submit control is not. Success is ``aria-checked=true``.
     """
     if not selector:
         return False

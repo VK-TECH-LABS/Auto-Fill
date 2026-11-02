@@ -254,6 +254,12 @@ def is_site_error(snapshot: PageSnapshot) -> bool:
     return bool(_SITE_ERROR_SOFT.search(text) and not application_controls(snapshot))
 
 
+def _experience_step(snapshot: PageSnapshot) -> bool:
+    """Workday's My Experience wizard step, not a section inside a posting."""
+    heading = " ".join((snapshot.heading or "").split()).casefold()
+    return heading == "my experience" or heading.startswith("my experience ")
+
+
 def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
     """One of the public page types. A posting is not an application form."""
     if snapshot.captcha_present:
@@ -323,6 +329,11 @@ def classify_page(snapshot: PageSnapshot, *, url: str = "") -> str:
         kind = "ACCOUNT" if "create account" in text.casefold() else "LOGIN"
         note_page_type(kind)
         return kind
+    if _experience_step(snapshot) and _has_forward_control(snapshot):
+        # Resume already uploaded, or the step has no empty inputs. Save and
+        # Continue still advances. This is not NO_FORM.
+        note_page_type("APPLICATION_FORM")
+        return "APPLICATION_FORM"
     if _JOB_RE.search(text):
         note_page_type("JOB_DESCRIPTION")
         return "JOB_DESCRIPTION"

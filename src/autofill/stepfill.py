@@ -50,6 +50,8 @@ from autofill.intents import (
 )
 from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
+    _is_county,
+    _is_middle_name,
     _wants_national_digits,
     acknowledgement_kind,
     attestation_manual,
@@ -57,11 +59,13 @@ from autofill.mapping import (
     is_consent_choice,
     is_demographic_control,
     is_honeypot,
+    is_previous_worker,
     map_field,
     match_field_key,
     mentions_work_history,
     national_phone_digits,
     normalize,
+    previous_worker_value,
     record_auto_consent,
     standard_terms_enabled,
     terms_category,
@@ -271,6 +275,9 @@ def fill_resolved_page(
             preserve_filled=resume_uploaded,
         )
         _fill_region_after_country(page, response, outcome)
+        _refill_after_country(page, response, active, outcome, snapshot.heading, snapshot)
+        _write_profile_middle_name(page, outcome)
+        _open_missing_experience(page, response, active, outcome, step or snapshot.heading)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -394,6 +401,10 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         return None
     if is_honeypot(control):
         return None
+    if _is_county(control) or _is_middle_name(control):
+        # County is not the street line. Middle name stays blank unless the
+        # profile has one, and that write does not ask the resolver for fullName.
+        return None
     blob = haystack(control)
     role = acknowledgement_kind(control)
     if not is_demographic_control(control):
@@ -414,9 +425,18 @@ def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | 
         match = classify_question(text, options, hook=hook, us_on_page=_us_on_page())
         return _Ask(controls=controls, match=match, include_question=True)
     if control.kind == "file" or any(item.kind == "file" for item in controls):
-        if _is_application_resume(control):
+        if _is_application_resume(control, heading):
             return _Ask(controls=controls, field_key="resume.file")
         return None
+    if is_previous_worker(control):
+        text = sanitize_question(_question_text(controls) or control.label or "Previously employed")
+        if "employ" not in text.casefold() and "work" not in text.casefold():
+            text = "Previously employed"
+        return _Ask(
+            controls=controls,
+            match=IntentMatch("PREVIOUSLY_EMPLOYED", "HIGH", "level1", text),
+            include_question=True,
+        )
     if kind != "multi" and _is_location_typeahead(control):
         return _Ask(controls=controls, field_key="location", compose_location=True)
     text = _question_text(controls if kind == "multi" else [control])
@@ -520,12 +540,25 @@ def _subfield(control: Control, heading: str) -> str:
     return ""
 
 
-def _is_application_resume(control: Control) -> bool:
-    """The application Resume/CV input. The Autofill-from-resume widget is not it."""
+def _is_application_resume(control: Control, heading: str = "") -> bool:
+    """The application Resume/CV input. The Autofill-from-resume widget is not it.
+
+    On My Experience a file input is the resume even when its label is only
+    the upload control. A cover letter on that step is not.
+    """
     blob = haystack(control)
     if "autofill" in blob:
         return False
-    return bool(re.search(r"\b(?:resume|cv|curriculum vitae)\b", blob))
+    if re.search(r"\b(?:resume|cv|curriculum vitae)\b", blob):
+        return True
+    if control.kind != "file":
+        return False
+    head = normalize(heading)
+    if "experience" not in head and "resume" not in head:
+        return False
+    if "cover" in normalize(control.label):
+        return False
+    return True
 
 
 def _is_location_typeahead(control: Control) -> bool:
@@ -807,6 +840,245 @@ def _fill_region_after_country(page, response: ResolverResponse, outcome: Resolv
     outcome.fields.append(written)
     if written.action == "select":
         _drop_manual_selector(outcome, control.selector)
+
+
+_ADDRESS_AFTER_COUNTRY = (
+    "address.line1",
+    "address.city",
+    "address.postalCode",
+    "address.region",
+    "address.state",
+    "phone",
+)
+
+
+def _refill_after_country(
+    page,
+    response,
+    flags: FillFlags,
+    outcome: ResolvedPage,
+    heading: str,
+    original: PageSnapshot,
+) -> None:
+    """Write address and phone again after a country change clears the block.
+
+    Workday replaces those inputs when the country is chosen. Only controls
+    that were already on the page are rewritten. A short poll stays under the
+    delay another site uses to reveal the rest of the form, so that reveal
+    is still filled on the next pass instead of being asked as manual.
+    """
+    if page is None or not _country_was_set(outcome):
+        return
+    known = {control.selector for control in original.controls if control.selector and not control.hidden}
+    pause = getattr(page, "wait_for_timeout", None)
+    snapshot = original
+    for _ in range(4):
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return
+        cleared = False
+        for control in snapshot.controls:
+            if control.hidden or control.selector not in known:
+                continue
+            if not any(
+                item.selector == control.selector and item.action in {"fill", "select"} for item in outcome.fields
+            ):
+                continue
+            if control.selector and not control_committed(page, control.selector):
+                cleared = True
+                break
+        if cleared or pause is None:
+            break
+        try:
+            pause(40)
+        except Exception:
+            break
+    for kind, controls in _clusters(snapshot):
+        ask = _describe(kind, controls, snapshot.heading or heading, None)
+        if ask is None or ask.field_key not in _ADDRESS_AFTER_COUNTRY:
+            continue
+        control = controls[0]
+        if control.selector not in known:
+            continue
+        if control.selector and control_committed(page, control.selector):
+            _drop_manual_selector(outcome, control.selector)
+            continue
+        raw = response.fields.get(ask.field_key, "")
+        text = "" if raw is None else str(raw).strip()
+        if not text:
+            text = _profile_address_value(ask.field_key)
+        if ask.field_key == "phone" and text and (_wants_national_digits(control) or flags.digits_phone):
+            text = national_phone_digits(text)
+        if not text:
+            continue
+        _write_control(page, control, text, outcome, key=ask.field_key, flags=flags)
+        if control.selector and control_committed(page, control.selector):
+            _drop_manual_selector(outcome, control.selector)
+
+
+def _profile_address_value(key: str) -> str:
+    """Profile address and phone, used when a country change reveals empty inputs."""
+    from autofill.answers import current_catalogue
+
+    bound = current_catalogue()
+    if bound is None:
+        return ""
+    personal = bound[0].personal
+    values = {
+        "address.line1": personal.address,
+        "address.city": personal.city,
+        "address.postalCode": personal.postal_code,
+        "address.region": personal.province_state,
+        "address.state": personal.province_state,
+        "phone": personal.phone,
+    }
+    return str(values.get(key) or "").strip()
+
+
+def _write_profile_middle_name(page, outcome: ResolvedPage) -> None:
+    """Write an explicit middle name. Never copy the full name into that box."""
+    from autofill.answers import current_catalogue
+    from autofill.mapping import _is_middle_name
+
+    if page is None:
+        return
+    bound = current_catalogue()
+    if bound is None:
+        return
+    text = bound[0].personal.middle_name.strip()
+    if not text:
+        return
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or not _is_middle_name(control):
+            continue
+        if control.selector and control_committed(page, control.selector):
+            continue
+        _write_text(page, control, text, outcome, key="middle_name")
+
+
+def _experience_add_button(snapshot: PageSnapshot):
+    from autofill.safeguards import is_add_row
+
+    candidates = []
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad or button.in_header or not button.in_main:
+            continue
+        if not is_add_row(button.name):
+            continue
+        blob = " ".join(
+            part for part in (button.name, button.aria_label, button.automation_id) if part
+        ).casefold()
+        if "education" in blob or "school" in blob:
+            continue
+        candidates.append((button, blob))
+    for button, blob in candidates:
+        if "work" in blob or "experience" in blob or "employment" in blob:
+            return button
+    if candidates:
+        return candidates[0][0]
+    return None
+
+
+def _employment_rows_for(response) -> list[dict[str, str]]:
+    rows = _rows(response.fields.get("employment[]"))
+    if rows:
+        return rows
+    from autofill.answers import current_catalogue
+
+    bound = current_catalogue()
+    if bound is None:
+        return []
+    found: list[dict[str, str]] = []
+    for item in bound[0].employment:
+        if not (item.company or item.title):
+            continue
+        found.append(
+            {
+                "company": item.company,
+                "title": item.title,
+                "startDate": item.start_date,
+                "endDate": item.end_date,
+            }
+        )
+    return found
+
+
+def _open_missing_experience(page, response, flags: FillFlags, outcome: ResolvedPage, heading: str) -> None:
+    """Add a work-experience row before a school search can stop the page.
+
+    The resume on this step is handled with the other fields. One unresolved
+    school prompt does not skip the Add click or the rows it reveals.
+    """
+    current = ""
+    if outcome.snapshot is not None:
+        current = outcome.snapshot.heading or ""
+    if "experience" not in normalize(f"{heading} {current}"):
+        return
+    rows = _employment_rows_for(response)
+    if not rows or page is None:
+        return
+    from autofill.safeguards import activate
+
+    for _ in range(3):
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return
+        companies = [
+            control
+            for control in snapshot.controls
+            if not control.hidden and mentions_work_history(control)
+        ]
+        if len(companies) >= len(rows):
+            break
+        button = _experience_add_button(snapshot)
+        if button is None:
+            break
+        try:
+            activate(page, button.selector, button.name, control_type=button.control_type)
+        except Exception:
+            return
+        pause = getattr(page, "wait_for_timeout", None)
+        if pause is not None:
+            try:
+                pause(250)
+            except Exception:
+                pass
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    asks: list[_Ask] = []
+    for kind, controls in _clusters(snapshot):
+        ask = _describe(kind, controls, snapshot.heading or heading, None)
+        if ask is None or ask.field_key != "employment[]":
+            continue
+        control = controls[0]
+        if control.selector and control_committed(page, control.selector):
+            continue
+        asks.append(ask)
+    if not asks:
+        return
+    by_intent, unnamed, by_key = _index_answers(response)
+    shared = (
+        by_intent,
+        unnamed,
+        by_key,
+        0,
+        {
+            "employment": rows,
+            "education": _rows(response.fields.get("education[]")),
+            "projects": _rows(response.fields.get("projects[]")),
+        },
+        [-1],
+    )
+    for ask in asks:
+        _apply_ask(page, ask, response, flags, outcome, heading, shared)
 
 
 _LOCATION_OPTIONS_JS = r"""
@@ -3393,6 +3665,32 @@ def _apply_question(
             controls=ask.controls,
         )
         return
+    if match.intent == "PREVIOUSLY_EMPLOYED" and (answer is None or not str(answer.value or "").strip()):
+        from autofill.answers import current_catalogue
+        from autofill.resolver import ResolverAnswer
+
+        question = match.text or _question_text(ask.controls)
+        bound = current_catalogue()
+        if bound is None:
+            from autofill.mapping import company_named_in_question
+
+            inferred = "No" if company_named_in_question(question) else ""
+        else:
+            profile = bound[0]
+            companies = [item.company for item in profile.employment]
+            companies.extend(item.company for item in profile.internships)
+            inferred = previous_worker_value(question, companies, profile.screening.previously_employed_here)
+        if inferred:
+            answer = ResolverAnswer(
+                intent="PREVIOUSLY_EMPLOYED",
+                value=inferred,
+                confidence="HIGH",
+                source="profile",
+                text=question,
+            )
+        else:
+            _manual(outcome, match, blocking=True, controls=ask.controls)
+            return
     if match.intent == "SALARY_EXPECTATION" and not _salary_answer_ok(match, answer):
         # A minimum, or a HIGH single number, is not a range. Ask the person.
         shape = salary_shape(match.text)
@@ -3620,6 +3918,15 @@ def _apply_row_field(
     _write_control(page, control, text, outcome, key=subfield or None, flags=flags)
 
 
+def _closed_search(control: Control) -> bool:
+    """A prompt whose menu is closed, or whose only row is ``No Items.``"""
+    from autofill.combobox import _menu_junk
+
+    labels = [(option.label or option.value).strip() for option in control.options]
+    usable = [label for label in labels if label and not _menu_junk(label)]
+    return not usable
+
+
 def _write_control(
     page,
     control: Control,
@@ -3632,7 +3939,7 @@ def _write_control(
     if not text:
         _skip(control, outcome, key, "No value for this control.", page=page)
         return
-    if control.kind == "combobox" and not control.options:
+    if control.kind == "combobox" and _closed_search(control):
         picked = select_combobox(page, control.selector, text)
         if picked is None:
             _skip(control, outcome, key, "No option matched this value.")
@@ -4364,7 +4671,7 @@ def ensure_blocker_options(page, items: list[dict[str, Any]]) -> None:
 
 _JUNK_OPTION = re.compile(r"click here\b.{0,80}\b(?:issue|browser|cache|cookies)\b", re.IGNORECASE)
 _PLACEHOLDER_OPTION = re.compile(
-    r"^(?:select|choose|please select|choose one|select one|start typing)\.{0,3}$",
+    r"^(?:select|choose|please select|choose one|select one|start typing|no items|no matches|no results)\.{0,3}$",
     re.IGNORECASE,
 )
 

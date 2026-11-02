@@ -253,6 +253,8 @@ _SCOPED_OPTIONS_JS = r"""
   for (const option of optionNodes) {
     const label = textOf(option);
     if (!label) continue;
+    const foldedLabel = label.toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (foldedLabel === "no items" || foldedLabel === "no matches" || foldedLabel === "no results") continue;
     const nested = option.querySelector(
       "[role='option'], [data-automation-id='promptOption'], [data-automation-id='promptLeafNode']"
     );
@@ -267,11 +269,24 @@ _SCOPED_OPTIONS_JS = r"""
     const leaf = auto === "promptleafnode"
       || !!option.querySelector("[data-automation-id='promptLeafNode']")
       || auto !== "promptoption";
+    let folder = !leaf && option.getAttribute("data-autofill-folder") === "true";
+    if (!leaf && !folder) {
+      const marks = option.querySelectorAll("[data-automation-id], [class]");
+      for (const mark of marks) {
+        const auto = String(mark.getAttribute("data-automation-id") || "").toLowerCase();
+        const cls = String(mark.getAttribute("class") || "").toLowerCase();
+        if (auto.indexOf("chevron") !== -1 || cls.indexOf("chevron") !== -1) {
+          folder = true;
+          break;
+        }
+      }
+    }
     options.push({
       label: label,
       value: option.getAttribute("data-value") || label,
       selector: itemSelector,
-      leaf: leaf,
+      leaf: leaf && !folder,
+      folder: folder,
     });
   }
   return options;
@@ -431,6 +446,7 @@ def _read_options(page, selector: str, *, allow_single: bool = False) -> list[Op
                 label=str(item.get("label") or ""),
                 selector=str(item.get("selector") or ""),
                 leaf=bool(item.get("leaf", True)),
+                folder=bool(item.get("folder", False)),
             )
         )
     return found
@@ -520,8 +536,12 @@ def _open_for_options(page, selector: str) -> list[Option]:
     return found
 
 
-def _type_filter(page, selector: str, text: str) -> None:
-    """Type into the combobox so an async menu can filter."""
+def _type_filter(page, selector: str, text: str, *, school: bool = False) -> None:
+    """Type into the combobox so an async menu can filter.
+
+    A school search ignores a value assignment. The query is real key events,
+    and the menu is given time to replace ``No Items.``
+    """
     try:
         page.evaluate(_BLOCK_SUBMIT_JS)
     except Exception:
@@ -532,11 +552,36 @@ def _type_filter(page, selector: str, text: str) -> None:
         inner = field.locator("input:not([type='hidden']), textarea")
         if inner.count():
             target = inner.first
-        target.fill("")
+        if school:
+            target.focus()
+            target.press("Control+A")
+            target.press("Backspace")
+        else:
+            target.fill("")
         target.press_sequentially(text, delay=type_char_delay())
     except Exception:
         return
-    _pause(page, 40)
+    _pause(page, 200 if school else 40)
+
+
+def _menu_junk(label: str) -> bool:
+    folded = re.sub(r"[.…]+$", "", (label or "").strip().casefold()).strip()
+    return folded in {"no items", "no matches", "no results", "select one", "select", "choose"}
+
+
+def _remember_label(labels: list[str], label: str, limit: int) -> None:
+    text = (label or "").strip()
+    if not text or text in labels or _menu_junk(text) or len(labels) >= limit:
+        return
+    labels.append(text[:200])
+
+
+def _path_parts(desired: str) -> list[str]:
+    """``Career Websites > Corporate Website`` and the same path with / or →."""
+    parts = [part.strip() for part in re.split(r"\s*(?:>|→|/)\s*", desired or "") if part.strip()]
+    if len(parts) < 2:
+        return []
+    return parts
 
 
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
@@ -544,7 +589,8 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
 
     The prompt icon is clicked when the input click does not reveal options.
     Workday search prompts open from that icon, and the menu is ``promptOption``
-    rows, not another field's selected pills.
+    rows, not another field's selected pills. A chevron category is opened so
+    the leaf and the ``Category > Leaf`` path are both choices.
     """
     if not selector:
         return []
@@ -554,13 +600,37 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
     except Exception:
         found = []
     labels: list[str] = []
+    folders = [option for option in found if option.folder and option.selector]
     for option in found:
-        label = (option.label or option.value).strip()
-        if not label or label in labels:
-            continue
-        labels.append(label[:200])
+        _remember_label(labels, option.label or option.value, limit)
+    for folder in folders:
         if len(labels) >= limit:
             break
+        try:
+            opened = _open_for_options(page, selector)
+        except Exception:
+            opened = []
+        current = _match_desired(folder.label, opened) or folder
+        if not current.selector:
+            continue
+        try:
+            click_choice(page, current.selector, current.label)
+        except Exception:
+            continue
+        _pause(page, 50)
+        children = _await_menu(page, selector, 800)
+        parent = (current.label or folder.label).strip()
+        for child in children:
+            if not child.leaf:
+                continue
+            child_label = (child.label or child.value).strip()
+            _remember_label(labels, child_label, limit)
+            if parent and child_label:
+                _remember_label(labels, f"{parent} > {child_label}", limit)
+        try:
+            dismiss_combobox(page)
+        except Exception:
+            return labels
     try:
         dismiss_combobox(page)
     except Exception:
@@ -645,11 +715,12 @@ def _selected_text(page, selector: str) -> str:
 
 def _prefer_leaf(desired: str, found: list[Option]) -> Option | None:
     """A nested leaf wins over the category that has the same name."""
-    leaves = [option for option in found if option.leaf]
+    usable = [option for option in found if not _menu_junk(option.label or option.value)]
+    leaves = [option for option in usable if option.leaf]
     leaf = _match_desired(desired, leaves) if leaves else None
     if leaf is not None:
         return leaf
-    return _match_desired(desired, found)
+    return _match_desired(desired, usable)
 
 
 def _other_leaf(desired: str, current: Option, found: list[Option]) -> Option | None:
@@ -672,39 +743,192 @@ def _committed_choice(page, selector: str, match: Option, desired: str, *, accep
     return _labels_match(desired, shown) or _labels_match(match.label, shown)
 
 
+_SCHOOL_FIELD_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const field = el.closest("[data-automation-id^='formField']");
+  const ident = [
+    el.id || "",
+    el.getAttribute("name") || "",
+    field ? (field.getAttribute("data-automation-id") || "") : "",
+  ].join(" ").toLowerCase();
+  if (ident.indexOf("school") !== -1 || ident.indexOf("university") !== -1) return true;
+  let label = "";
+  if (el.id) {
+    const lab = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+    if (lab) label = lab.innerText || lab.textContent || "";
+  }
+  if (!label && field) {
+    const lab = field.querySelector("label, legend");
+    if (lab && !lab.contains(el)) label = lab.innerText || lab.textContent || "";
+  }
+  const folded = String(label || "").toLowerCase();
+  return folded.indexOf("school") !== -1 || folded.indexOf("university") !== -1 || folded.indexOf("college") !== -1;
+}"""
+
+
+_SCHOOL_HINT_JS = r"""() => {
+  const text = ((document.body && document.body.innerText) || "").slice(0, 8000).toLowerCase();
+  return text.indexOf("school not found") !== -1;
+}"""
+
+
+def _is_school_field(page, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_SCHOOL_FIELD_JS, selector))
+    except Exception:
+        return False
+
+
+def _real_leaves(found: list[Option]) -> list[Option]:
+    return [
+        option
+        for option in found
+        if option.leaf and option.selector and not _menu_junk(option.label or option.value)
+    ]
+
+
+def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> Option | None:
+    """Open a chevron category and choose the leaf, or the only leaf it contains.
+
+    ``Career Websites > Corporate Website`` follows that path. A leaf name
+    searches each category. A category with one leaf selects that leaf.
+    """
+    parts = _path_parts(desired)
+    folders = [option for option in found if option.folder and option.selector]
+    if not folders and parts:
+        folders = [option for option in found if not option.leaf and option.selector]
+    if not folders:
+        return None
+    category_name = parts[0] if parts else ""
+    leaf_name = parts[-1] if parts else desired
+    ordered = folders
+    if category_name:
+        named = [option for option in folders if _labels_match(category_name, option.label)]
+        if named:
+            ordered = named
+    for folder in ordered:
+        try:
+            opened = _open_for_options(page, selector)
+        except Exception:
+            opened = []
+        current = _match_desired(folder.label, opened) or folder
+        if not current.selector:
+            continue
+        try:
+            click_choice(page, current.selector, current.label)
+        except Exception:
+            continue
+        _pause(page, 50)
+        children = _await_menu(page, selector, 800)
+        leaves = _real_leaves(children)
+        leaf = _prefer_leaf(leaf_name, leaves)
+        if leaf is None and not parts and len(leaves) == 1 and _labels_match(desired, current.label):
+            leaf = leaves[0]
+        if leaf is None or not leaf.selector:
+            try:
+                dismiss_combobox(page)
+            except Exception:
+                return None
+            continue
+        try:
+            click_choice(page, leaf.selector, leaf.label)
+        except Exception:
+            continue
+        _pause(page, 50)
+        return leaf
+    return None
+
+
+def _school_not_found(page, selector: str) -> Option | None:
+    """Choose School Not Found when the page tells the candidate to."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        instructed = bool(evaluate(_SCHOOL_HINT_JS))
+    except Exception:
+        return None
+    if not instructed:
+        return None
+    found = _read_options(page, selector)
+    if not any(_labels_match("School Not Found", option.label) for option in found):
+        try:
+            found = _open_for_options(page, selector)
+        except Exception:
+            found = []
+    match = _match_desired("School Not Found", found)
+    if match is None or not match.selector:
+        return None
+    try:
+        click_choice(page, match.selector, match.label)
+    except Exception:
+        return None
+    _pause(page, 50)
+    return match
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
-    A category row drills into the leaf of the same name. A pill that already
-    shows the choice is committed; the search box is not opened again.
-    A click that paints the label but leaves the hidden input empty, or that
-    shows a field error, is retried by typing the option and pressing Enter.
+    A category row drills into the leaf of the same name. A chevron category
+    drills into a differently named leaf, and a ``Category > Leaf`` path is
+    followed. A pill that already shows the choice is committed; the search
+    box is not opened again. A click that paints the label but leaves the
+    hidden input empty, or that shows a field error, is retried by typing
+    the option and pressing Enter. A school search types with real keys and
+    may fall back to School Not Found when the page says to.
     """
     if not selector or not desired.strip():
         return None
     focus_field(page, selector)
     shown = _selected_text(page, selector)
-    if _labels_match(desired, shown):
+    if _labels_match(desired, shown) or any(_labels_match(part, shown) for part in _path_parts(desired)[-1:]):
         return Option(value=shown, label=shown, selector=selector)
     found = _open_for_options(page, selector)
     if not found:
         # A prompt list that is not wired with aria-controls, and is the only open menu.
         found = _read_options(page, selector, allow_single=True)
     typed = False
+    clicked_leaf = False
+    school = _is_school_field(page, selector)
+    top_level = list(found)
     match = _prefer_leaf(desired, found)
-    if match is None:
+    folder_hit = match if match is not None and match.folder else None
+    if match is not None and match.folder:
+        match = None
+    if match is None and folder_hit is None and not _path_parts(desired):
         for term in _filter_terms(desired):
-            _type_filter(page, selector, term)
+            _type_filter(page, selector, term, school=school)
             typed = True
-            found = _await_menu(page, selector, 1500)
+            wait_ms = 2500 if school else 1500
+            found = _await_menu(page, selector, wait_ms)
             match = _prefer_leaf(desired, found)
+            if match is not None and match.folder:
+                folder_hit = match
+                match = None
             if match is not None:
                 break
+    hierarchical = bool(_path_parts(desired) or any(option.folder for option in top_level) or folder_hit is not None)
+    if hierarchical and match is None:
+        drilled = _drill_for_leaf(page, selector, desired, top_level)
+        if drilled is not None:
+            match = drilled
+            clicked_leaf = True
+    if school and match is None:
+        fallback = _school_not_found(page, selector)
+        if fallback is not None:
+            match = fallback
+            clicked_leaf = True
     if match is None or not match.selector:
         dismiss_combobox(page)
         return None
-    click_choice(page, match.selector, match.label)
-    _pause(page, 50)
+    if not clicked_leaf:
+        click_choice(page, match.selector, match.label)
+        _pause(page, 50)
     if not match.leaf:
         # The category click opens the nested menu. The leaf is the commit.
         children = _read_options(page, selector)
@@ -712,6 +936,15 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         if leaf is None and not _committed_choice(page, selector, match, desired, accept_input=not typed):
             children = _await_menu(page, selector, 500)
             leaf = _other_leaf(desired, match, children)
+        if leaf is None and match.folder and not _committed_choice(
+            page, selector, match, desired, accept_input=not typed
+        ):
+            leaves = _real_leaves(children)
+            parts = _path_parts(desired)
+            if parts:
+                leaf = _prefer_leaf(parts[-1], leaves)
+            elif len(leaves) == 1:
+                leaf = leaves[0]
         if leaf is not None and leaf.selector:
             click_choice(page, leaf.selector, leaf.label)
             _pause(page, 50)

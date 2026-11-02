@@ -62,6 +62,7 @@ class Personal:
     country: str = ""
     postal_code: str = ""
     preferred_name: str = ""
+    middle_name: str = ""
     linkedin_url: str = ""
     github_url: str = ""
     portfolio_url: str = ""
@@ -281,6 +282,7 @@ class CandidateProfile:
                 country=_text(personal_raw, "country"),
                 postal_code=_text(personal_raw, "postal_code"),
                 preferred_name=_text(personal_raw, "preferred_name"),
+                middle_name=_text(personal_raw, "middle_name") or _text(personal_raw, "middleName"),
                 linkedin_url=_text(personal_raw, "linkedin_url"),
                 github_url=_text(personal_raw, "github_url"),
                 portfolio_url=_text(personal_raw, "portfolio_url"),
