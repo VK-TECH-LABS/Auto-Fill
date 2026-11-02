@@ -905,6 +905,153 @@ def _school_not_found(page, selector: str) -> Option | None:
     return match
 
 
+def _best_school_match(query: str, found: list[Option]) -> Option | None:
+    """The one school row ``query`` names. ``harvard`` matches Harvard University."""
+    usable = [
+        option
+        for option in found
+        if option.selector
+        and not _menu_junk(option.label or option.value)
+        and not _school_fallback_label(option.label or option.value)
+    ]
+    wanted = _fold(query)
+    if not wanted or not usable:
+        return None
+    exact = [option for option in usable if _fold(option.label) == wanted or _fold(option.value) == wanted]
+    if len(exact) == 1:
+        return exact[0]
+    first = [option for option in usable if (_fold(option.label).split(" ")[:1] == [wanted])]
+    if len(first) == 1:
+        return first[0]
+    prefix = [option for option in usable if _fold(option.label).startswith(wanted)]
+    if len(prefix) == 1:
+        return prefix[0]
+    contains = [option for option in usable if wanted in _fold(option.label)]
+    if len(contains) == 1:
+        return contains[0]
+    return None
+
+
+def _school_fallback_label(label: str) -> bool:
+    text = _fold(label)
+    return text in {"school not found", "other", "school not listed", "not listed"} or "school not found" in text
+
+
+def _school_fallback(found: list[Option]) -> Option | None:
+    """School Not Found, then Other, when the search has no school."""
+    ranked = ("school not found", "other", "school not listed", "not listed")
+    usable = [option for option in found if option.selector and not _menu_junk(option.label or option.value)]
+    for name in ranked:
+        for option in usable:
+            if name in _fold(option.label) or name in _fold(option.value):
+                return option
+    return None
+
+
+def _press_enter(page, selector: str) -> None:
+    """Confirm a school query. Enter must not submit the application."""
+    try:
+        page.evaluate(_BLOCK_SUBMIT_JS)
+    except Exception:
+        pass
+    field = page.locator(selector)
+    try:
+        target = field
+        inner = field.locator("input:not([type='hidden']), textarea")
+        if inner.count():
+            target = inner.first
+        target.evaluate(
+            """(el) => {
+              if (el.dataset.autofillEnterHeld) return;
+              el.dataset.autofillEnterHeld = "1";
+              el.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") event.preventDefault();
+              }, true);
+            }"""
+        )
+        target.press("Enter")
+    except Exception:
+        return
+    _pause(page, 50)
+
+
+def is_school_target(page, selector: str, target: dict | None = None) -> bool:
+    """True for a school prompt, including one reported as an empty single select."""
+    info = target or {}
+    key = str(info.get("fieldKey") or "").casefold()
+    if key in {"school", "education.school"} or key.endswith(".school"):
+        return True
+    if _is_school_field(page, selector):
+        return True
+    answer_type = str(info.get("answerType") or "").casefold()
+    text = str(info.get("text") or info.get("label") or "").casefold()
+    if answer_type == "single_select" and any(word in text for word in ("school", "university", "college")):
+        if "high school" not in text and "diploma" not in text and "degree" not in text:
+            return True
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const field = el.closest("[data-automation-id^='formField']");
+      const ident = [
+        el.id || "",
+        el.getAttribute("name") || "",
+        el.getAttribute("aria-label") || "",
+        field ? (field.getAttribute("data-automation-id") || "") : "",
+      ].join(" ").toLowerCase();
+      return ident.indexOf("school") !== -1 || ident.indexOf("university") !== -1;
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
+def search_school(page, selector: str, desired: str) -> Option | None:
+    """Type the school, press Enter, and choose the prompt row.
+
+    ``harvard`` selects Harvard University. No match selects School Not Found
+    or Other when that row is offered.
+    """
+    query = (desired or "").strip()
+    if not selector or not query:
+        return None
+    focus_field(page, selector)
+    shown = _selected_text(page, selector)
+    if _labels_match(query, shown):
+        return Option(value=shown, label=shown, selector=selector)
+    _type_filter(page, selector, query, school=True)
+    _press_enter(page, selector)
+    found = _await_menu(page, selector, 2500)
+    match = _best_school_match(query, found)
+    if match is None:
+        match = _school_fallback(found)
+        if match is None:
+            opened = _open_for_options(page, selector)
+            match = _school_fallback(opened)
+    if match is None or not match.selector:
+        try:
+            dismiss_combobox(page)
+        except Exception:
+            return None
+        return None
+    try:
+        click_choice(page, match.selector, match.label)
+    except Exception:
+        return None
+    _pause(page, 50)
+    if _committed_choice(page, selector, match, query, accept_input=False) or _labels_match(
+        match.label, _selected_text(page, selector)
+    ):
+        return match
+    if _committed_choice(page, selector, match, match.label, accept_input=True):
+        return match
+    return match
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
@@ -922,6 +1069,8 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     shown = _selected_text(page, selector)
     if _labels_match(desired, shown) or any(_labels_match(part, shown) for part in _path_parts(desired)[-1:]):
         return Option(value=shown, label=shown, selector=selector)
+    if _is_school_field(page, selector):
+        return search_school(page, selector, desired)
     found = _open_for_options(page, selector)
     if not found:
         # A prompt list that is not wired with aria-controls, and is the only open menu.

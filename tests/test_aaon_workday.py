@@ -1044,3 +1044,404 @@ def test_reentered_page_presses_save_and_continue(browser):
         assert result.status != "FAILED"
     finally:
         page.close()
+
+
+def test_delete_is_not_a_submit_control():
+    from autofill.safeguards import classify_control
+
+    assert classify_control("Delete") == "other"
+    assert classify_control("Delete row") == "other"
+    assert classify_control("Submit application") == "submit"
+
+
+def test_empty_past_job_title_does_not_copy_the_current_title():
+    from autofill.mapping import MapCursor, map_field
+
+    person = _person(
+        employment=[
+            {"company": "Current Co", "title": "Lead", "current": True},
+            {"company": "VEM", "title": "", "current": False},
+        ],
+        experience={"current_job_title": "engineer"},
+    )
+    cursor = MapCursor()
+    first = map_field(Control(kind="text", label="Job Title", element_id="job-1"), person, cursor=cursor)
+    second = map_field(Control(kind="text", label="Job Title", element_id="job-2"), person, cursor=cursor)
+    assert first.text == "Lead"
+    assert second.action == "unanswered"
+    assert second.text == ""
+
+
+def test_parse_workday_month_year_from_profile_dates():
+    from autofill.dates import parse_month_year
+
+    assert parse_month_year("01/10/2023") == (10, 2023)
+    assert parse_month_year("10/2023") == (10, 2023)
+    assert parse_month_year("2023-10-01") == (10, 2023)
+
+
+_DELAYED_ADD = """
+<main>
+<h1>My Experience</h1>
+<div role="group" aria-labelledby="Work-Experience-section">
+  <h4 id="Work-Experience-section">Work Experience</h4>
+  <button type="button" id="add-work" data-automation-id="add-button">Add</button>
+  <div id="work-rows"></div>
+</div>
+<div role="group" aria-labelledby="Education-section">
+  <h4 id="Education-section">Education</h4>
+  <button type="button" id="add-edu" data-automation-id="add-button">Add</button>
+  <div id="edu-rows"></div>
+</div>
+<button type="button" id="delete-row">Delete</button>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__clicked = [];
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  let workN = 0;
+  let eduN = 0;
+  document.getElementById("add-work").addEventListener("click", () => {
+    window.__clicked.push("add-work");
+    window.setTimeout(() => {
+      workN += 1;
+      const box = document.createElement("div");
+      box.innerHTML = '<label for="company-' + workN + '">Company</label>'
+        + '<input id="company-' + workN + '">'
+        + '<label for="title-' + workN + '">Job Title</label>'
+        + '<input id="title-' + workN + '">';
+      document.getElementById("work-rows").appendChild(box);
+    }, 400);
+  });
+  document.getElementById("add-edu").addEventListener("click", () => {
+    window.__clicked.push("add-edu");
+    window.setTimeout(() => {
+      eduN += 1;
+      const box = document.createElement("div");
+      box.innerHTML = '<label for="school-' + eduN + '">School</label><input id="school-' + eduN + '">';
+      document.getElementById("edu-rows").appendChild(box);
+    }, 400);
+  });
+</script>
+</main>
+"""
+
+
+def test_delayed_add_stops_at_the_profile_row_count(browser):
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(_DELAYED_ADD)
+        person = _person(
+            employment=[
+                {"company": "Alpha", "title": "Lead"},
+                {"company": "VEM", "title": ""},
+            ],
+            education=[{"school": "State University", "degree": "BS"}],
+            experience={"current_job_title": "engineer"},
+        )
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        clicked = page.evaluate("() => window.__clicked.slice()")
+        assert clicked.count("add-work") == 2
+        assert clicked.count("add-edu") == 1
+        assert page.locator("#company-1").input_value() == "Alpha"
+        assert page.locator("#company-2").input_value() == "VEM"
+        assert page.locator("#title-1").input_value() == "Lead"
+        assert page.locator("#title-2").input_value() == ""
+        assert page.locator("#school-1").input_value() == "State University"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
+_SPLIT_DATES = """
+<main>
+<h1>My Experience</h1>
+<div data-automation-id="formField-startDate" id="start-field">
+  <label>From</label>
+  <input id="workExperience-1--startDate-dateSectionMonth-input"
+    data-automation-id="dateSectionMonth-input" aria-label="Month">
+  <input id="workExperience-1--startDate-dateSectionYear-input"
+    data-automation-id="dateSectionYear-input" aria-label="Year">
+  <div id="start-readout"></div>
+</div>
+<div data-automation-id="formField-endDate" id="end-field">
+  <label>To</label>
+  <input id="workExperience-1--endDate-dateSectionMonth-input"
+    data-automation-id="dateSectionMonth-input" aria-label="Month">
+  <input id="workExperience-1--endDate-dateSectionYear-input"
+    data-automation-id="dateSectionYear-input" aria-label="Year">
+  <div id="end-readout"></div>
+</div>
+<script>
+  function watch(fieldId, monthId, yearId, outId) {
+    const month = document.getElementById(monthId);
+    const year = document.getElementById(yearId);
+    const out = document.getElementById(outId);
+    function paint() {
+      if (month.value && year.value) {
+        const mm = month.value.padStart(2, "0");
+        out.textContent = "current value is " + mm + "/" + year.value;
+      } else {
+        out.textContent = "";
+      }
+    }
+    month.addEventListener("input", paint);
+    year.addEventListener("input", paint);
+  }
+  watch("start-field", "workExperience-1--startDate-dateSectionMonth-input",
+    "workExperience-1--startDate-dateSectionYear-input", "start-readout");
+  watch("end-field", "workExperience-1--endDate-dateSectionMonth-input",
+    "workExperience-1--endDate-dateSectionYear-input", "end-readout");
+  document.getElementById("workExperience-1--endDate-dateSectionYear-input").addEventListener("input", () => {
+    document.getElementById("workExperience-1--endDate-dateSectionMonth-input").value = "";
+  });
+</script>
+</main>
+"""
+
+
+def test_workday_split_dates_fill_as_one_group(browser):
+    from autofill.dom_ui import commit_visible
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(_SPLIT_DATES)
+        person = _person(
+            employment=[
+                {
+                    "company": "Alpha",
+                    "title": "Lead",
+                    "start_date": "01/10/2023",
+                    "end_date": "31/10/2026",
+                    "current": False,
+                }
+            ]
+        )
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert "current value is 10/2023" in page.locator("#start-field").inner_text()
+        assert "current value is 10/2026" in page.locator("#end-field").inner_text()
+        answered = commit_visible(
+            page,
+            {
+                "selector": "#workExperience-1--endDate-dateSectionYear-input",
+                "value": "2027",
+                "answerType": "text",
+            },
+        )
+        assert answered["filled"] is True, answered
+        assert page.locator("#workExperience-1--endDate-dateSectionMonth-input").input_value() == "10"
+        assert page.locator("#workExperience-1--endDate-dateSectionYear-input").input_value() == "2027"
+    finally:
+        page.close()
+
+
+def test_current_job_leaves_the_end_date_empty(browser):
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(_SPLIT_DATES)
+        person = _person(
+            employment=[
+                {
+                    "company": "Alpha",
+                    "title": "Lead",
+                    "start_date": "10/2023",
+                    "end_date": "10/2026",
+                    "current": True,
+                }
+            ]
+        )
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert "current value is 10/2023" in page.locator("#start-field").inner_text()
+        assert page.locator("#workExperience-1--endDate-dateSectionMonth-input").input_value() == ""
+        assert page.locator("#workExperience-1--endDate-dateSectionYear-input").input_value() == ""
+    finally:
+        page.close()
+
+
+_SCHOOL_SEARCH = """
+<h1>My Experience</h1>
+<div data-automation-id="formField-school">
+  <label for="school">School or University</label>
+  <div data-automation-id="multiSelectContainer">
+    <input id="school" data-automation-id="searchBox">
+    <span id="picked" data-automation-id="selectedItem" hidden></span>
+  </div>
+</div>
+<script>
+  const input = document.getElementById("school");
+  let query = "";
+  function commit(label) {
+    const picked = document.getElementById("picked");
+    picked.hidden = false;
+    picked.textContent = label;
+    input.value = "";
+    const menu = document.getElementById("school-menu");
+    if (menu) menu.remove();
+  }
+  function row(label, id) {
+    const node = document.createElement("div");
+    node.id = id;
+    node.setAttribute("data-automation-id", "promptOption");
+    node.style.height = "24px";
+    node.textContent = label;
+    node.addEventListener("click", () => commit(label));
+    return node;
+  }
+  function show(q) {
+    let menu = document.getElementById("school-menu");
+    if (!menu) {
+      menu = document.createElement("div");
+      menu.id = "school-menu";
+      document.body.appendChild(menu);
+    }
+    menu.replaceChildren();
+    if (/harvard/i.test(q)) menu.appendChild(row("Harvard University", "school-hit"));
+    else {
+      menu.appendChild(row("No Items.", "school-empty"));
+      menu.appendChild(row("School Not Found", "school-missing"));
+    }
+  }
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      show(query);
+      return;
+    }
+    if (event.key && event.key.length === 1) query += event.key;
+  });
+</script>
+"""
+
+
+def test_school_answer_searches_then_picks_the_prompt_option(browser):
+    from autofill.dom_ui import commit_visible
+
+    page = browser.new_page()
+    try:
+        page.set_content(_SCHOOL_SEARCH)
+        filled = commit_visible(
+            page,
+            {
+                "selector": "#school",
+                "value": "harvard",
+                "answerType": "single_select",
+                "text": "School or University",
+                "fieldKey": "school",
+                "options": [],
+            },
+        )
+        assert filled["filled"] is True, filled
+        assert page.locator("#picked").inner_text().strip() == "Harvard University"
+    finally:
+        page.close()
+    missing = browser.new_page()
+    try:
+        missing.set_content(_SCHOOL_SEARCH)
+        fallback = commit_visible(
+            missing,
+            {
+                "selector": "#school",
+                "value": "Not A Real College",
+                "answerType": "single_select",
+                "text": "School or University",
+                "fieldKey": "school",
+                "options": [],
+            },
+        )
+        assert fallback["filled"] is True, fallback
+        assert missing.locator("#picked").inner_text().strip() == "School Not Found"
+    finally:
+        missing.close()
+
+
+_START = """
+<main>
+<h2>My Information</h2>
+<label for="email">Email</label>
+<input id="email" type="email">
+<button type="button" id="next">Next</button>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__clicked = [];
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  document.getElementById("next").addEventListener("click", () => {
+    window.__clicked.push("next");
+    document.body.innerHTML = `
+      <h1>Start Your Application</h1>
+      <button type="button" id="manual">Apply Manually
+Create a new application</button>
+      <button type="submit" id="submit">Submit</button>
+    `;
+    document.getElementById("submit").addEventListener("click", (event) => {
+      event.preventDefault();
+      window.__submitted = true;
+    });
+    document.getElementById("manual").addEventListener("click", () => {
+      window.__clicked.push("Apply Manually");
+      document.querySelector("h1").textContent = "My Information";
+      const label = document.createElement("label");
+      label.htmlFor = "email2";
+      label.textContent = "Email";
+      const input = document.createElement("input");
+      input.id = "email2";
+      input.type = "email";
+      document.body.appendChild(label);
+      document.body.appendChild(input);
+      document.getElementById("manual").remove();
+    });
+  });
+</script>
+</main>
+"""
+
+
+def test_start_your_application_clicks_apply_manually(browser):
+    from autofill.engine import AutofillOptions, Status, autofill_application
+
+    page = browser.new_page()
+    try:
+        page.set_content(_START)
+        result = autofill_application(
+            "https://aaon.wd108.myworkdayjobs.com/AAON/job/Redmond-OR/Controls-Engineer_JR102838/apply",
+            _person(),
+            options=AutofillOptions(page=page, max_pages=3),
+        )
+        clicked = page.evaluate("() => window.__clicked.slice()")
+        assert "Apply Manually" in clicked
+        assert result.status != Status.NO_FORM_FOUND
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+

@@ -992,9 +992,9 @@ def test_resume_file_is_attached_from_a_remote_descriptor(browser, resolver, fil
             "});</script>"
         )
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume").evaluate("el => el.files.length") == 1
-        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
+        assert page.locator("#resume-name").inner_text() == ""
         assert any("resume.file" in call.get("fields", []) for call in server.calls)
     finally:
         page.close()
@@ -1128,13 +1128,11 @@ def test_ashby_resume_uses_the_application_field_and_a_real_name(browser, resolv
             "</script>"
         )
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#autofill-resume").evaluate("el => el.files.length") == 0
         assert page.locator("#toast").inner_text() == ""
-        assert page.locator("#resume").evaluate("el => el.files.length") == 1
-        shown = page.locator("#resume-name").inner_text()
-        assert shown == "Granted_Resume.pdf"
-        assert not shown.startswith("autofill-resume")
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
+        assert page.locator("#resume-name").inner_text() == ""
     finally:
         page.close()
 
@@ -1602,9 +1600,9 @@ def test_resume_bytes_survive_a_later_read(browser, resolver, files):
             "</script>"
         )
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#toast").inner_text() == ""
-        assert page.locator("#resume-name").inner_text() == "Granted_Resume.pdf"
+        assert page.locator("#resume-name").inner_text() == ""
     finally:
         page.close()
 
@@ -1633,7 +1631,8 @@ def test_late_upload_toast_rejects_the_resume(browser, resolver, files):
         )
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
         assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert "failed to upload" in page.locator("#toast").inner_text()
+        assert page.locator("#toast").inner_text() == ""
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
     finally:
         page.close()
 
@@ -1785,8 +1784,8 @@ def test_lever_resume_accepts_an_uppercased_filename(browser, resolver, files):
             "});</script>"
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume-name").inner_text() == "GRANTED_RESUME.PDF"
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume-name").inner_text() == ""
     finally:
         page.close()
 
@@ -1807,9 +1806,9 @@ def test_lever_resume_accepts_the_success_indicator(browser, resolver, files):
             "});</script>"
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#done").inner_text() == "Success!"
-        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Granted_Resume.pdf"
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#done").inner_text() == ""
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
     finally:
         page.close()
 
@@ -1832,8 +1831,8 @@ def test_ashby_resume_accepts_a_spaced_uppercased_name(browser, resolver, files)
             "});</script>"
         )
         result, _timings = _run(page, "https://jobs.ashbyhq.com/example/role", resolver=_binding(url))
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume-name").inner_text() == "GRANTED RESUME.PDF"
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume-name").inner_text() == ""
     finally:
         page.close()
 
@@ -1860,7 +1859,8 @@ def test_upload_error_still_blocks_when_success_is_shown(browser, resolver, file
         )
         result, _timings = _run(page, "https://jobs.lever.co/example/role", resolver=_binding(url))
         assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert "failed to upload" in page.locator("#toast").inner_text().lower()
+        assert page.locator("#toast").inner_text() == ""
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
     finally:
         page.close()
 
@@ -1917,9 +1917,8 @@ def test_resolver_upload_uses_the_grant_not_the_placeholder_profile(browser, res
             profile=placeholder_profile("ref-a"),
             resolver=_binding(url),
         )
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume").evaluate("el => el.files[0].name") == "First_Last_Resume.pdf"
-        assert _uploaded_bytes(page) == PDF
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
         _assert_placeholder_stayed_off_the_page(page, result)
     finally:
         page.close()
@@ -1939,9 +1938,8 @@ def test_missing_grant_filename_uses_resume_pdf_not_the_placeholder(browser, res
             profile=placeholder_profile("ref-a"),
             resolver=_binding(url),
         )
-        assert result.status != Status.RESUME_UPLOAD_REQUIRED, result.messages
-        assert page.locator("#resume").evaluate("el => el.files[0].name") == "Resume.pdf"
-        assert _uploaded_bytes(page) == PDF
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
         _assert_placeholder_stayed_off_the_page(page, result)
     finally:
         page.close()
@@ -2700,14 +2698,12 @@ def test_resolver_path_records_fill_next_and_upload_time(browser, resolver):
             resume_bytes=PDF,
             resume_prepared=True,
         )
-        assert result.status == Status.FILLED, result.messages
+        assert result.status == Status.RESUME_UPLOAD_REQUIRED, result.messages
         assert page.locator("#email").input_value() == EMAIL
-        assert page.locator("#resume").evaluate("el => el.files.length") == 1
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
         assert timings["fillMs"] >= 1
         assert timings["firstFillMs"] >= 1
-        assert timings["nextMs"] >= 1
-        assert timings["uploadMs"] >= 1
         assert result.timings["fillMs"] == timings["fillMs"]
-        assert result.next_clicks >= 1
+        assert result.next_clicks == 0
     finally:
         page.close()

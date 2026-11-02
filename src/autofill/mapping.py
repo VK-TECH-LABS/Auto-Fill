@@ -997,8 +997,17 @@ def _profile_text(
         return row.field_of_study if row else ""
     if key == "current_job_title":
         row = _row(profile.employment, cursor, "title")
+        if row is not None:
+            titled = row.title.strip()
+            if titled:
+                return titled
+            # A past row with no title stays blank. The current role may use
+            # the profile's current title when that row did not name one.
+            if row.current:
+                return profile.experience.current_job_title.strip()
+            return ""
         if profile.employment:
-            return row.title if row else ""
+            return ""
         return profile.experience.current_job_title
     if key == "current_company":
         row = _row(profile.employment, cursor, "employer")

@@ -249,6 +249,62 @@ def _match_resume(controls: list[Control], hint: str) -> Control | None:
     return None
 
 
+_FILE_ATTACHED_JS = r"""() => {
+  function shown(node) {
+    if (!node || node.nodeType !== 1 || node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+  function blob(input) {
+    let label = "";
+    if (input.id) {
+      const lab = document.querySelector("label[for='" + CSS.escape(input.id) + "']");
+      if (lab) label = lab.innerText || lab.textContent || "";
+    }
+    return (
+      (input.id || "") + " " + (input.name || "") + " " +
+      (input.getAttribute("aria-label") || "") + " " + label
+    ).toLowerCase();
+  }
+  function isResume(text) {
+    return /\b(resume|cv|curriculum vitae)\b/.test(text);
+  }
+  for (const input of document.querySelectorAll("input[type='file']")) {
+    if (!isResume(blob(input))) continue;
+    if (input.files && input.files.length) return true;
+    const host = (input.closest && input.closest(
+      "[data-automation-id^='formField'], section, div"
+    )) || input.parentElement;
+    if (!host || !host.querySelector) continue;
+    const item = host.querySelector("[data-automation-id='file-upload-item']");
+    if (item && shown(item)) return true;
+  }
+  for (const item of document.querySelectorAll("[data-automation-id='file-upload-item']")) {
+    if (!shown(item)) continue;
+    const around = String(item.innerText || item.textContent || "").toLowerCase();
+    const host = item.closest("[data-automation-id^='formField'], section") || item.parentElement;
+    const hostText = host ? String(host.innerText || "").toLowerCase() : "";
+    if (isResume(around + " " + hostText) || isResume(hostText)) return true;
+  }
+  return false;
+}"""
+
+
+def resume_file_attached(page) -> bool:
+    """True when the employee has a resume file on this page.
+
+    A held ``resumeRef`` is not a file. The check is the input's file list or
+    a visible Workday ``file-upload-item``.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_FILE_ATTACHED_JS))
+    except Exception:
+        return False
+
+
 def resume_control(snapshot: PageSnapshot, hint: str = "") -> Control | None:
     """The resume file input, including one the ATS hid after the first attach."""
     files = [control for control in snapshot.controls if control.kind == "file"]

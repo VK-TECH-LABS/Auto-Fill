@@ -31,7 +31,7 @@ from autofill.dom_ui import (
     type_visible,
 )
 from autofill.extract import extract_page
-from autofill.fill import apply_mapped, attach_resume, remember_confirmed
+from autofill.fill import apply_mapped, remember_confirmed
 from autofill.intents import (
     DEMOGRAPHIC_INTENTS,
     UNFILLED_INTENTS,
@@ -73,7 +73,6 @@ from autofill.mapping import (
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverAnswer, ResolverBinding, ResolverResponse, resolve_step
-from autofill.resume_fetch import ResumeFetchError, fetch_resume_payload
 from autofill.safeguards import click_choice, dismiss_combobox
 from autofill.salary import SALARY_RELATED_FIELDS, salary_fill_allowed, salary_shape
 
@@ -1023,9 +1022,11 @@ def _open_missing_experience(page, response, flags: FillFlags, outcome: Resolved
     rows = _employment_rows_for(response)
     if not rows or page is None:
         return
-    from autofill.safeguards import activate
+    from autofill.fill import click_add_and_wait
 
-    for _ in range(3):
+    clicks = 0
+    cap = None
+    while True:
         try:
             snapshot = extract_page(page)
         except Exception:
@@ -1035,21 +1036,24 @@ def _open_missing_experience(page, response, flags: FillFlags, outcome: Resolved
             for control in snapshot.controls
             if not control.hidden and mentions_work_history(control)
         ]
-        if len(companies) >= len(rows):
+        visible = len(companies)
+        if visible >= len(rows):
+            break
+        if cap is None:
+            cap = max(0, len(rows) - visible)
+        if clicks >= cap:
             break
         button = _experience_add_button(snapshot)
         if button is None:
             break
-        try:
-            activate(page, button.selector, button.name, control_type=button.control_type)
-        except Exception:
-            return
-        pause = getattr(page, "wait_for_timeout", None)
-        if pause is not None:
-            try:
-                pause(250)
-            except Exception:
-                pass
+
+        def _count(current, _rows=rows):
+            del _rows
+            return sum(1 for control in current.controls if not control.hidden and mentions_work_history(control))
+
+        if not click_add_and_wait(page, button, _count):
+            break
+        clicks += 1
     try:
         snapshot = extract_page(page)
     except Exception:
@@ -1120,26 +1124,28 @@ def _open_missing_education(page, response, flags: FillFlags, outcome: ResolvedP
     rows = _education_rows_for(response)
     if not rows or page is None:
         return
-    from autofill.fill import _click_add, _section_add_button
+    from autofill.fill import _count_education_rows, _section_add_button, click_add_and_wait
 
-    for _ in range(2):
+    clicks = 0
+    cap = None
+    while True:
         try:
             snapshot = extract_page(page)
         except Exception:
             return
-        if len(_school_controls(snapshot)) >= len(rows):
+        visible = len(_school_controls(snapshot))
+        if visible >= len(rows):
+            break
+        if cap is None:
+            cap = max(0, len(rows) - visible)
+        if clicks >= cap:
             break
         button = _section_add_button(snapshot, "education")
         if button is None:
             break
-        if not _click_add(page, button):
-            return
-        pause = getattr(page, "wait_for_timeout", None)
-        if pause is not None:
-            try:
-                pause(250)
-            except Exception:
-                pass
+        if not click_add_and_wait(page, button, _count_education_rows):
+            break
+        clicks += 1
     try:
         snapshot = extract_page(page)
     except Exception:
@@ -2522,13 +2528,16 @@ def _apply_ask(
             employment_index[0] += 1
         index = employment_index[0]
         row = employment_rows[index] if 0 <= index < len(employment_rows) else None
-        if row is None and employment_rows:
-            row = employment_rows[0]
         _apply_row_field(page, ask.controls[0], row, sub, flags, outcome)
         return
     if ask.field_key == "education[]":
-        row = rows["education"][0] if rows["education"] else None
         subfield = ask.subfield or _subfield(ask.controls[0], heading)
+        education_rows = rows["education"]
+        cursor = rows.setdefault("_edu_index", [-1])
+        if subfield == "education.school":
+            cursor[0] += 1
+        index = cursor[0] if cursor[0] >= 0 else 0
+        row = education_rows[index] if 0 <= index < len(education_rows) else None
         _apply_row_field(page, ask.controls[0], row, subfield, flags, outcome)
         return
     if ask.field_key == "projects[]":
@@ -3660,28 +3669,29 @@ def _apply_resume(
     response: ResolverResponse,
     outcome: ResolvedPage,
 ) -> None:
-    """Attach the resume grant, or leave the input when none was granted."""
+    """Leave the resume for the employee. A file already on the page is kept.
+
+    The engine does not fetch a grant or push held resume bytes onto the
+    employer's file input. The employee attaches the file on the portal.
+    """
+    del response
     control = ask.controls[0]
-    descriptor = response.fields.get("resume.file")
-    if not isinstance(descriptor, dict):
-        outcome.resume_blocked = True
-        _skip(control, outcome, "resume.file", "Resolver did not return a resume file.")
-        return
-    try:
-        payload = fetch_resume_payload(descriptor)
-        result = attach_resume(
-            page,
-            control,
-            name=payload.name,
-            mime_type=payload.mime_type,
-            data=payload.data,
+    from autofill.resume_manual import resume_file_attached
+
+    if resume_file_attached(page):
+        outcome.fields.append(
+            FieldOutcome(
+                selector=control.selector,
+                label=control.label,
+                key="resume.file",
+                action="skip",
+                detail="Resume already attached by the employee.",
+                field_class="RESUME_FIELD",
+            )
         )
-        outcome.fields.append(result)
-        if result.action == "error" or not _resume_accepted(page, control.selector, payload.name):
-            outcome.resume_blocked = True
-    except ResumeFetchError:
-        outcome.resume_blocked = True
-        _skip(control, outcome, "resume.file", "Resume file was not attached.")
+        return
+    outcome.resume_blocked = True
+    _skip(control, outcome, "resume.file", "A person attaches the resume on the employer page.")
 
 
 def _salary_answer_ok(match: IntentMatch, answer: ResolverAnswer | None) -> bool:
