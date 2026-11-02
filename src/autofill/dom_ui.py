@@ -1540,6 +1540,77 @@ def _looks_like_combobox(page: Any, selector: str) -> bool:
         return False
 
 
+_DATE_PART_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  const auto = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+  const id = String(el.id || "").toLowerCase();
+  const blob = auto + " " + id;
+  if (blob.indexOf("datesectionmonth") !== -1) return "month";
+  if (blob.indexOf("datesectionyear") !== -1) return "year";
+  return "";
+}"""
+
+
+_COMMIT_DATE_PART_JS = r"""({ selector, value }) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return { ok: false }; }
+  if (!el) return { ok: false };
+  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
+  function kind(node) {
+    if (!node) return "";
+    const blob = (
+      String(node.getAttribute("data-automation-id") || "") + " " + String(node.id || "")
+    ).toLowerCase();
+    if (blob.indexOf("datesectionmonth") !== -1) return "month";
+    if (blob.indexOf("datesectionyear") !== -1) return "year";
+    return "";
+  }
+  const inputs = field ? Array.from(field.querySelectorAll("input")) : [];
+  const sibling = inputs.find((node) => node !== el && kind(node));
+  const kept = sibling ? String(sibling.value || "") : "";
+  function write(node, next, notify) {
+    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    if (proto && proto.set) proto.set.call(node, next);
+    else node.value = next;
+    if (!notify) return;
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  write(el, value, true);
+  if (sibling && kept && String(sibling.value || "") !== kept) write(sibling, kept, false);
+  return {
+    ok: String(el.value || "") === String(value),
+    sibling: sibling ? String(sibling.value || "") : kept,
+  };
+}"""
+
+
+def _date_part_kind(page: Any, selector: str) -> str:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return ""
+    try:
+        return str(evaluate(_DATE_PART_JS, selector) or "")
+    except Exception:
+        return ""
+
+
+def _commit_date_part(page: Any, selector: str, value: str) -> dict[str, Any]:
+    """Write one month or year box and put back the other part if the widget clears it."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return {"filled": False, "reason": "not_committed"}
+    try:
+        report = evaluate(_COMMIT_DATE_PART_JS, {"selector": selector, "value": value}) or {}
+    except Exception:
+        return {"filled": False, "reason": "not_committed"}
+    if not report.get("ok"):
+        return {"filled": False, "reason": "not_committed"}
+    return {"filled": True}
+
+
 def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     """Fill one field visibly, verify the commit, and clear the outline."""
     selector = str(target.get("selector") or "")
@@ -1554,6 +1625,19 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         return {"filled": False, "reason": "empty"}
     if target.get("check"):
         return _check_box(page, selector)
+    if _date_part_kind(page, selector):
+        return _commit_date_part(page, selector, values[0])
+    from autofill.combobox import is_school_target, search_school
+
+    if is_school_target(page, selector, target):
+        try:
+            picked = search_school(page, selector, values[0])
+        except Exception:
+            picked = None
+        if picked is None or not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
     install(page)
     focus_field(page, selector)
     button = _button_choice_selector(page, selector, values[0])

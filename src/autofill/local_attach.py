@@ -1615,15 +1615,15 @@ class DedicatedApplySession:
         *,
         cancel: CancelGate | None = None,
     ) -> dict[str, Any]:
-        """Retry the held resume, or re-verify one the employee attached by hand.
+        """Re-check a resume the employee attached on the employer page.
 
-        ``retry`` attaches the held bytes again through ``attach_and_confirm``.
-        ``confirm_manual`` only reads the page with ``confirm_current``: a click
-        on "I uploaded it" alone never passes. When the verifier accepts the
-        file, the same fill continues from this page. Final Submit stays refused.
+        ``retry`` and ``confirm_manual`` only read the page. Neither pushes a
+        held resumeRef onto the file input. A click on "I uploaded it" alone
+        never passes. When the verifier accepts the file, the same fill
+        continues from this page. Final Submit stays refused.
         """
         from autofill.engine import resume_failure_view
-        from autofill.resume_manual import attach_and_confirm, confirm_current
+        from autofill.resume_manual import confirm_current
         from autofill.stepfill import post_upload_refill
 
         require_feature()
@@ -1634,9 +1634,14 @@ class DedicatedApplySession:
 
         close_popup(page)
         if mode == "retry":
-            if not resume.held:
-                return {"verified": False, "reason": "not_held", "siteErrors": []}
-            report = attach_and_confirm(page, name=resume.name, data=resume.data)
+            # The employee attaches the file on the employer page. Retry only
+            # checks that a file is there. Held bytes are not uploaded.
+            from autofill.resume_manual import resume_file_attached
+
+            if resume_file_attached(page):
+                report = confirm_current(page)
+            else:
+                report = {"verified": False, "reason": "not_confirmed", "siteErrors": []}
         else:
             report = confirm_current(page)
         if _optional_submitted(page) is True:

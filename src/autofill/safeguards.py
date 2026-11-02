@@ -92,6 +92,9 @@ def classify_control(name: str, *, control_type: str = "") -> str:
     not a submit control, even when it contains the word "apply".
     """
     label = " ".join(name.split())
+    # A repeatable-row Delete is not the application's Submit control.
+    if re.fullmatch(r"delete(?:\s+(?:row|experience|education|entry|this))?", label, flags=re.IGNORECASE):
+        return "other"
     if _VALIDATION_LABEL_RE.search(label):
         if _CONTINUE_RE.search(label):
             return "continue"
@@ -214,7 +217,7 @@ def is_entry_label(name: str) -> bool:
         return False
     if re.search(r"\b(submit|send(\s+my)?\s+application|complete\s+application)\b", label):
         return False
-    if label in _ENTRY_LABELS:
+    if label in _ENTRY_LABELS or "apply manually" in label:
         return True
     return any(label.startswith(prefix) for prefix in _ENTRY_PREFIXES)
 

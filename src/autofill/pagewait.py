@@ -821,6 +821,80 @@ def _known_entry(control, *, on_posting: bool = False) -> bool:
     )
 
 
+def _names_manual_apply(control) -> bool:
+    blob = " ".join(
+        part
+        for part in (
+            getattr(control, "name", "") or "",
+            getattr(control, "aria_label", "") or "",
+        )
+        if part
+    ).casefold()
+    auto = (getattr(control, "automation_id", "") or "").casefold().replace("-", "").replace("_", "")
+    return "apply manually" in blob or "applymanually" in auto
+
+
+def manual_apply_button(snapshot: PageSnapshot) -> ButtonControl | None:
+    """Apply Manually on Workday's Start Your Application page.
+
+    The page is an entry, even when the button's accessible name is longer
+    than the exact label. A page that already has application fields is left
+    alone.
+    """
+    blob = f"{snapshot.heading} {snapshot.page_text}".casefold()
+    if "start your application" not in blob:
+        return None
+    if _application_fields(snapshot):
+        return None
+    found: ButtonControl | None = None
+    for button in snapshot.buttons:
+        if button.disabled or button.in_ad:
+            continue
+        if _names_manual_apply(button):
+            found = button
+            break
+    if found is None:
+        for link in snapshot.links:
+            if link.disabled or link.in_ad or not link.selector:
+                continue
+            if not _names_manual_apply(link):
+                continue
+            found = ButtonControl(
+                name=link.name,
+                selector=link.selector,
+                automation_id=link.automation_id,
+                aria_label=link.aria_label,
+                role=link.role or "link",
+                href=link.href,
+                in_header=False,
+                in_ad=False,
+                in_main=True,
+                disabled=link.disabled,
+                frame_url=link.frame_url,
+            )
+            break
+    if found is None:
+        found = find_entry_control(snapshot, on_posting=True)
+    if found is None:
+        return None
+    # The guard accepts an entry in the main content. This page's Apply
+    # Manually is that entry even when the shell did not mark a <main>.
+    return ButtonControl(
+        name=found.name or "Apply Manually",
+        selector=found.selector,
+        control_type=found.control_type,
+        automation_id=found.automation_id,
+        aria_label=found.aria_label,
+        role=found.role,
+        href=found.href,
+        in_header=False,
+        in_ad=False,
+        in_main=True,
+        disabled=False,
+        frame_url=found.frame_url,
+    )
+
+
 def find_entry_control(snapshot: PageSnapshot, *, on_posting: bool = False) -> ButtonControl | None:
     """The employer's Apply control, including on a posting that also has a search box.
 

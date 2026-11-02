@@ -12,7 +12,6 @@ from playwright.sync_api import sync_playwright
 from autofill.extract import extract_page
 from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
 from autofill.resolver import ResolverBinding, ResolverResponse
-from autofill.resume_fetch import ResumePayload
 from autofill.resume_manual import reattach_verified
 from autofill.stepfill import (
     _resume_accepted,
@@ -60,10 +59,6 @@ def test_ashby_parse_refills_cleared_values_and_keeps_a_typed_one(browser, monke
             }
         ),
     )
-    monkeypatch.setattr(
-        "autofill.stepfill.fetch_resume_payload",
-        lambda descriptor: ResumePayload(name="notes.pdf", mime_type="application/pdf", data=PDF),
-    )
     page = browser.new_page()
     try:
         page.goto((FIXTURES / "ashby_resume_rewrite.html").as_uri())
@@ -74,10 +69,11 @@ def test_ashby_parse_refills_cleared_values_and_keeps_a_typed_one(browser, monke
             ats_name="ashby",
             step="application",
         )
-        assert outcome.resume_blocked is False
+        assert outcome.resume_blocked is True
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
         assert page.locator("#name").input_value() == "River Example"
         assert page.locator("#phone").input_value() == "5550100199"
-        assert page.locator("#email").input_value() == "parsed@example.com"
+        assert page.locator("#email").input_value() == "river.example@example.com"
         assert page.locator("#referral").input_value() == "FRIEND"
     finally:
         page.close()

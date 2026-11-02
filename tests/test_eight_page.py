@@ -306,6 +306,13 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
         assert {"intent": None, "text": "What is your favorite prime number?"} in second.manual_questions
         assert page.locator("#prime").input_value() == ""
         assert page.locator("#resume").input_value() == ""
+        page.locator("#resume").set_input_files(
+            {
+                "name": "notes.pdf",
+                "mimeType": "application/pdf",
+                "buffer": b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n",
+            }
+        )
         third = autofill_application(
             URL,
             _profile(),

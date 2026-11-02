@@ -759,19 +759,52 @@ def _cancel_point(opts: AutofillOptions) -> None:
 
 
 def _maybe_reattach(page, opts: AutofillOptions) -> None:
-    if opts.resume_prepared and not opts.resume_uploaded:
-        return
-    if not opts.resume_bytes or not opts.resume_name:
-        return
-    from autofill.resume_manual import reattach_verified
+    """Held resume bytes are not written back onto a later page.
 
-    reattach_verified(
-        page,
-        opts.resume_name,
-        opts.resume_mime,
-        opts.resume_bytes,
-        session_id=opts.session_id,
-    )
+    The employee attaches the file on the employer portal. Auto-Fill does not
+    push a staged resumeRef or a previous upload onto the file input.
+    """
+    del page, opts
+
+
+def _resume_still_empty(page, snapshot) -> bool:
+    """A resume control on this step has no file. Later hidden steps do not count."""
+    from autofill.fill import _css_hidden_on_this_page
+    from autofill.resume_manual import resume_file_attached
+    from autofill.stepfill import _is_application_resume
+
+    found = False
+    for control in snapshot.controls:
+        if control.kind != "file" or not control.selector:
+            continue
+        if not _is_application_resume(control, snapshot.heading or ""):
+            continue
+        if control.hidden and not _css_hidden_on_this_page(page, control.selector):
+            continue
+        found = True
+        break
+    if not found:
+        return False
+    return not resume_file_attached(page)
+
+
+def _note_employee_resume(page, opts: AutofillOptions) -> bool:
+    """True when the page already shows a resume file the employee attached."""
+    from autofill.resume_manual import resume_file_attached
+
+    if not resume_file_attached(page):
+        return False
+    opts.resume_uploaded = True
+    opts.resume_verified_now = True
+    opts.resume_prepared = False
+    opts.resume_failure = None
+    return True
+
+
+_RESUME_WAIT = (
+    "Attach the resume on this page. Auto-Fill does not upload it. "
+    "Continue after the file is on the form."
+)
 
 
 RESUME_FAILURE_REASONS = ("no_upload_control", "ats_rejected", "not_confirmed")
@@ -788,31 +821,13 @@ def resume_failure_view(report: dict | None) -> dict[str, Any]:
 
 
 def _attach_prepared(page, opts: AutofillOptions) -> str:
-    """Attach a file held before the control appeared.
+    """Never push held resume bytes onto the employer page.
 
-    ``attached`` means the same verifier accepted it. ``failed`` keeps the
-    bytes and records site errors. ``absent`` means nothing was prepared.
+    A staged resumeRef stays in memory. The employee attaches the file.
+    ``absent`` tells the caller to wait.
     """
-    if page is None or opts.resume_uploaded or not opts.resume_prepared:
-        return "absent"
-    if not opts.resume_bytes or not opts.resume_name:
-        return "absent"
-    from autofill.resume_manual import attach_and_confirm
-    from autofill.stepfill import post_upload_refill
-
-    upload_started = time.perf_counter()
-    report = attach_and_confirm(page, name=opts.resume_name, data=opts.resume_bytes)
-    _add_ms(opts, "uploadMs", upload_started)
-    if report.get("verified"):
-        opts.resume_uploaded = True
-        opts.resume_verified_now = True
-        opts.resume_prepared = False
-        opts.resume_failure = None
-        post_upload_refill(page, session_id=opts.session_id)
-        return "attached"
-    opts.resume_site_errors = [str(item) for item in report.get("siteErrors") or []]
-    opts.resume_failure = resume_failure_view(report)
-    return "failed"
+    del page, opts
+    return "absent"
 
 
 def _counts(fields) -> tuple[int, int, int]:
@@ -1253,20 +1268,19 @@ def autofill_application(
                         submit_controls.append(button.name)
 
             if resume_blocked and not opts.resume_uploaded:
-                prepared = _attach_prepared(page, opts)
-                if prepared == "attached":
+                if _note_employee_resume(page, opts):
                     refilled, snapshot, resume_blocked, refill_manual = fill_one_page(
                         page,
                         candidate_profile,
                         cover_letter_path=opts.cover_letter_path,
                         cover_letter_text=opts.cover_letter_text,
                         job=opts.job,
-                        resume_uploaded=opts.resume_uploaded,
+                        resume_uploaded=True,
                     )
                     fields.extend(refilled)
                     manual.extend(refill_manual)
                     _note_fill(refilled, opts, run_started, inspect_state)
-                elif prepared != "attached":
+                else:
                     session.mark("RESUME_UPLOAD_REQUIRED")
                     detected, filled, skipped = _counts(fields)
                     return _result(
@@ -1278,9 +1292,7 @@ def autofill_application(
                         fields_filled=filled,
                         fields_skipped=skipped,
                         manual_actions=manual,
-                        messages=[
-                            "Upload the resume that was already downloaded, then call again with resume_uploaded."
-                        ],
+                        messages=[_RESUME_WAIT],
                         submit_controls=submit_controls,
                     )
             if opts.resume_uploaded and any(item.field_class == "RESUME_FIELD" for item in page_fields):
@@ -1322,6 +1334,21 @@ def autofill_application(
             current_sig = navigation_signature(page, snapshot)
             if _release_block(nav_block, current_sig):
                 nav_block = None
+            if _resume_still_empty(page, snapshot):
+                session.mark(Status.RESUME_UPLOAD_REQUIRED)
+                detected, filled, skipped = _counts(fields)
+                return _result(
+                    session,
+                    status=Status.RESUME_UPLOAD_REQUIRED,
+                    ats=ats_name,
+                    login_status=login_status,
+                    fields_detected=detected,
+                    fields_filled=filled,
+                    fields_skipped=skipped,
+                    manual_actions=manual,
+                    messages=[_RESUME_WAIT],
+                    submit_controls=submit_controls,
+                )
             nxt = _next_button(snapshot, nav_block)
             if nxt is None:
                 snapshot = _refresh_forward(page, snapshot)
@@ -1809,6 +1836,51 @@ def _confirm_move(page, before, opts: AutofillOptions, started: float, state: di
     return True, fresh
 
 
+_DOM_MANUAL_APPLY_JS = r"""() => {
+  const text = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").toLowerCase();
+  if (text.indexOf("start your application") === -1) return null;
+  const nodes = document.querySelectorAll("button, a, [role='button'], [role='link']");
+  for (const el of nodes) {
+    if (!el || el.hidden) continue;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") continue;
+    const auto = String(el.getAttribute("data-automation-id") || "");
+    const name = String(el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    const compact = auto.toLowerCase().replace(/[-_]/g, "");
+    const blob = (name + " " + auto).toLowerCase();
+    if (blob.indexOf("apply manually") === -1 && compact.indexOf("applymanually") === -1) continue;
+    if (!el.id) el.setAttribute("data-autofill-entry", "apply-manually");
+    const selector = el.id ? "#" + CSS.escape(el.id) : "[data-autofill-entry='apply-manually']";
+    return { selector: selector, name: name || "Apply Manually", automationId: auto };
+  }
+  return null;
+}"""
+
+
+def _dom_manual_apply(page, snapshot):
+    """Apply Manually when the snapshot did not list the button."""
+    blob = f"{getattr(snapshot, 'heading', '')} {getattr(snapshot, 'page_text', '')}".casefold()
+    if "start your application" not in blob:
+        return None
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        found = evaluate(_DOM_MANUAL_APPLY_JS)
+    except Exception:
+        return None
+    if not isinstance(found, dict) or not found.get("selector"):
+        return None
+    from autofill.models import ButtonControl
+
+    return ButtonControl(
+        name=str(found.get("name") or "Apply Manually"),
+        selector=str(found.get("selector") or ""),
+        automation_id=str(found.get("automationId") or ""),
+        in_main=True,
+    )
+
+
 def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float, state: dict):
     """Click at most two entry controls while the page is still a posting.
 
@@ -1822,9 +1894,13 @@ def _follow_entry(page, snapshot, session, opts: AutofillOptions, started: float
             note_page_type("JOB_CLOSED")
             return page, snapshot
         kind = _observe_page(page, snapshot)
-        if kind not in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
-            return page, snapshot
-        button = find_entry_control(snapshot, on_posting=True)
+        from autofill.pagewait import manual_apply_button
+
+        button = None
+        if kind in {"JOB_DESCRIPTION", "APPLY_ENTRY"}:
+            button = find_entry_control(snapshot, on_posting=True)
+        if button is None:
+            button = manual_apply_button(snapshot) or _dom_manual_apply(page, snapshot)
         if button is None:
             return page, snapshot
         before = navigation_signature(page, snapshot)
@@ -2143,13 +2219,12 @@ def _run_resolver_pages(
                 # conditional section). Fill what appeared before deciding.
                 continue
             if outcome.resume_blocked and not opts.resume_uploaded:
-                prepared = _attach_prepared(page, opts)
-                if prepared != "attached":
+                if not _note_employee_resume(page, opts):
                     # The resume stop is reported with every question this step already
                     # asked. HIGH answers were written above; unanswered ones stay listed.
                     pending = blocking if opts.answers_updated else list(outcome.manual_questions)
                     carried.extend(optional)
-                    messages = ["Upload the resume that was already downloaded, then continue with resumeUploaded."]
+                    messages = [_RESUME_WAIT]
                     if pending:
                         messages.append("A saved answer is required. Nothing below HIGH confidence was written.")
                     session.mark(Status.RESUME_UPLOAD_REQUIRED)
@@ -2214,6 +2289,9 @@ def _run_resolver_pages(
             current_sig = navigation_signature(page, snapshot)
             if _release_block(nav_block, current_sig):
                 nav_block = None
+            if _resume_still_empty(page, snapshot):
+                session.mark(Status.RESUME_UPLOAD_REQUIRED)
+                return finish(Status.RESUME_UPLOAD_REQUIRED, [_RESUME_WAIT])
             nxt = _next_button(snapshot, nav_block)
             if nxt is None:
                 snapshot = _refresh_forward(page, snapshot)
@@ -2244,14 +2322,14 @@ def _run_resolver_pages(
             if validation_message(snapshot) and not moved:
                 named = invalid_field_messages(page)
                 if not opts.resume_uploaded and any(_RESUME_NAMED.search(item) for item in named):
-                    # The employer flagged the resume, which this step hid behind
-                    # its own picker. Attach the prepared file and try the step again.
-                    if _attach_prepared(page, opts) == "attached":
+                    # The employer flagged the resume. Wait until the employee
+                    # attaches a file. Held bytes are not uploaded.
+                    if _note_employee_resume(page, opts):
                         continue
                     session.mark(Status.RESUME_UPLOAD_REQUIRED)
                     return finish(
                         Status.RESUME_UPLOAD_REQUIRED,
-                        ["Upload the resume that was already downloaded, then continue with resumeUploaded.", *named],
+                        [_RESUME_WAIT, *named],
                     )
                 if attempt == REVEAL_ATTEMPTS - 1:
                     session.mark(Status.MANUAL_ANSWER_REQUIRED)

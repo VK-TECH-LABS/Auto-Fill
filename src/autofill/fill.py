@@ -10,6 +10,7 @@ any field is written. Resume file inputs are reported and never selected.
 from __future__ import annotations
 
 import logging
+import time
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -657,6 +658,106 @@ def _click_add(page, button) -> bool:
     return True
 
 
+def click_add_and_wait(page, button, count_rows) -> bool:
+    """Click Add once. True only when that section's row count increases.
+
+    Workday paints the new row after the click. The wait is about three
+    seconds. A click that adds nothing stops the caller from clicking again.
+    """
+    try:
+        before = int(count_rows(extract_page(page)))
+    except Exception:
+        before = 0
+    if not _click_add(page, button):
+        return False
+    deadline = time.monotonic() + 3.0
+    while True:
+        try:
+            fresh = extract_page(page)
+            current = int(count_rows(fresh))
+        except Exception:
+            return False
+        if current > before:
+            return True
+        pause = getattr(page, "wait_for_timeout", None)
+        if pause is None or time.monotonic() >= deadline:
+            return False
+        try:
+            pause(int(min(100, max(1, (deadline - time.monotonic()) * 1000))))
+        except Exception:
+            return False
+
+
+def _count_work_rows(snapshot: PageSnapshot) -> int:
+    from autofill.mapping import is_current_company_label
+
+    return sum(1 for control in snapshot.controls if not control.hidden and is_current_company_label(control))
+
+
+def _count_education_rows(snapshot: PageSnapshot) -> int:
+    return len(_school_controls(snapshot))
+
+
+def _school_controls(snapshot: PageSnapshot):
+    found = []
+    for control in snapshot.controls:
+        if control.hidden:
+            continue
+        blob = f"{control.label} {control.aria_label} {control.element_id} {control.automation_id}".casefold()
+        if "school" in blob or "university" in blob or "college" in blob:
+            found.append(control)
+    return found
+
+
+def _profile_work_rows(profile: CandidateProfile) -> int:
+    return sum(
+        1
+        for item in profile.employment
+        if item.company or item.title or item.start_date or item.end_date
+    )
+
+
+def _profile_education_rows(profile: CandidateProfile) -> int:
+    return sum(
+        1
+        for item in profile.education_history
+        if item.school or item.degree or item.field_of_study or item.start_date or item.end_date
+    )
+
+
+def _offer_add(page, snapshot, state, kind, needed, count_rows, button_fn) -> bool:
+    """Click Add at most (profile rows − visible rows) times for this section.
+
+    The cap is fixed from the first look at the page. A click that does not
+    increase the row count stops the section. True when a row was added.
+    """
+    slot = state[kind]
+    if slot["stopped"]:
+        return False
+    try:
+        visible = int(count_rows(snapshot))
+    except Exception:
+        slot["stopped"] = True
+        return False
+    if visible >= needed:
+        slot["stopped"] = True
+        return False
+    if slot["cap"] is None:
+        slot["cap"] = max(0, needed - visible)
+    if slot["clicks"] >= slot["cap"]:
+        slot["stopped"] = True
+        return False
+    button = button_fn(snapshot)
+    if button is None:
+        slot["stopped"] = True
+        return False
+    if not click_add_and_wait(page, button, count_rows):
+        slot["stopped"] = True
+        return False
+    slot["clicks"] += 1
+    return True
+
+
 def _education_needed(profile: CandidateProfile, snapshot: PageSnapshot) -> bool:
     rows = [item for item in profile.education_history if item.school or item.degree or item.field_of_study]
     if not rows:
@@ -692,12 +793,40 @@ def fill_one_page(
     from autofill.sms_consent import SMS_INTENT, accept_recruitment_sms, apply_stored_sms_no, begin_sms_pass
 
     rescans = 0
-    for _ in range(6):
+    add_state = {
+        "work": {"clicks": 0, "cap": None, "stopped": False},
+        "education": {"clicks": 0, "cap": None, "stopped": False},
+    }
+    passes = max(8, _profile_work_rows(profile) + _profile_education_rows(profile) + 4)
+    for _ in range(passes):
         fields = []
         manual = []
         resume_blocked = False
         snapshot = extract_page(page)
         note_page_country(page, snapshot)
+        from autofill.stepfill import _experience_add_button
+
+        grew = _offer_add(
+            page, snapshot, add_state, "work", _profile_work_rows(profile), _count_work_rows, _experience_add_button
+        )
+        snapshot = extract_page(page)
+        grew = (
+            _offer_add(
+                page,
+                snapshot,
+                add_state,
+                "education",
+                _profile_education_rows(profile),
+                _count_education_rows,
+                lambda current: _section_add_button(current, "education"),
+            )
+            or grew
+        )
+        snapshot = extract_page(page)
+        note_page_country(page, snapshot)
+        from autofill.split_dates import fill_split_dates
+
+        handled_dates = fill_split_dates(page, profile, snapshot)
         cursor = MapCursor(page_heading=snapshot.heading)
         from autofill.stepfill import _clusters
 
@@ -718,11 +847,22 @@ def fill_one_page(
                 )
                 continue
             control = group[0]
+            if control.selector and control.selector in handled_dates:
+                continue
             # A listbox that already shows the wrong Yes/No is selected again.
-            # Other held controls stay as the person left them.
+            # Other held controls stay as the person left them. The repeater
+            # cursor still advances so the next row does not reuse this one.
             if control.role != "listbox" and selector_held(control.selector) and (
                 not refill_cleared() or control_committed(page, control.selector)
             ):
+                map_field(
+                    control,
+                    profile,
+                    cover_letter_path=cover_letter_path,
+                    cover_letter_text=cover_letter_text,
+                    job=job,
+                    cursor=cursor,
+                )
                 continue
             from autofill.combobox import attach_listbox_options
 
@@ -828,20 +968,8 @@ def fill_one_page(
                     _note_manual(control, mapped, manual)
                     fields.append(_apply_mapped(page, control, mapped))
                 break
-        from autofill.mapping import is_current_company_label
-        from autofill.stepfill import _experience_add_button
-
-        employer_slots = [
-            control for control in snapshot.controls if not control.hidden and is_current_company_label(control)
-        ]
-        work_add = _experience_add_button(snapshot)
-        if work_add and len(profile.employment) > len(employer_slots):
-            if _click_add(page, work_add):
-                continue
-        education_add = _section_add_button(snapshot, "education")
-        if education_add and _education_needed(profile, snapshot):
-            if _click_add(page, education_add):
-                continue
+        if grew:
+            continue
         if resume_blocked:
             break
         if rescans < 2:
