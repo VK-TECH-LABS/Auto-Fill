@@ -811,6 +811,20 @@ _COMMITTED_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
       // that is a sibling of multiSelectContainer. aria-invalid does not clear it.
       const pill = autofillPillText(el);
       if (pill && !placeholder(pill)) return true;
+      // Greenhouse react-select keeps the input empty and shows the choice
+      // in .select__single-value inside .select__control. A hidden or menu
+      // row is not that choice. Workday pills stay on autofillPillText.
+      const scope = el.closest(".select__control") || el.closest(".select");
+      if (scope) {
+        const values = scope.querySelectorAll(".select__single-value, .select__multi-value");
+        for (const node of values) {
+          if (node.hidden || node.closest("[role='listbox'], [role='option']")) continue;
+          const style = window.getComputedStyle(node);
+          if (style.display === "none" || style.visibility === "hidden") continue;
+          const text = String(node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+          if (text && !placeholder(text)) return true;
+        }
+      }
       return false;
     }
     function selected(node) {
