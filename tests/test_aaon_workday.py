@@ -1445,3 +1445,308 @@ def test_start_your_application_clicks_apply_manually(browser):
     finally:
         page.close()
 
+
+def test_my_information_without_fields_waits_and_error_page_stays_put(monkeypatch):
+    from autofill.local_attach import adopt_employer_tab, should_reload_application
+    from autofill.models import ButtonControl
+    from autofill.pagewait import render_ready
+
+    waiting = PageSnapshot(
+        controls=[],
+        buttons=[ButtonControl(name="Sign In", in_header=False, in_main=True)],
+        heading="My Information",
+    )
+    assert render_ready(waiting) is False
+    ready = PageSnapshot(
+        controls=[Control(kind="text", label="Email", selector="#email", input_type="email")],
+        buttons=[],
+        heading="My Information",
+    )
+    assert render_ready(ready) is True
+
+    live_url = "https://aaon.wd108.myworkdayjobs.com/en-US/AAON/job/Role/apply"
+    apply = "https://aaon.wd108.myworkdayjobs.com/AAON/job/Role/apply"
+    monkeypatch.setattr("autofill.local_attach._tab_is_posting", lambda _page: False)
+
+    class _Page:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.gotos: list[str] = []
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            self.gotos.append(url)
+            self.url = url
+
+    page = _Page(live_url)
+    assert should_reload_application(page, apply, candidate_changed=False) is False
+    adopted = adopt_employer_tab(type("Ctx", (), {"pages": [page]})(), apply)
+    assert adopted is page
+    assert page.gotos == []
+
+
+
+def test_error_page_refreshes_in_place(monkeypatch):
+    from autofill.engine import _ERROR_RELOADS, _refresh_error_page
+
+    _ERROR_RELOADS.set(0)
+    error = PageSnapshot(
+        controls=[],
+        buttons=[],
+        heading="Something went wrong",
+        page_text="Please refresh the page and then try again.",
+    )
+    form = PageSnapshot(
+        controls=[Control(kind="radio", label="Gender", selector="#g", required=True)],
+        buttons=[],
+        heading="Voluntary Disclosures",
+    )
+
+    class _Page:
+        def __init__(self) -> None:
+            self.snapshot = error
+            self.calls: list[str] = []
+
+        def reload(self, **_kwargs: object) -> None:
+            self.calls.append("reload")
+            self.snapshot = form
+
+        def goto(self, url: str, **_kwargs: object) -> None:
+            self.calls.append("goto:" + url)
+
+    page = _Page()
+    monkeypatch.setattr("autofill.engine.extract_page", lambda current: current.snapshot)
+    monkeypatch.setattr("autofill.engine.wait_for_render", lambda _page: None)
+    monkeypatch.setattr("autofill.engine.note_snapshot", lambda _snap: None)
+    fresh = _refresh_error_page(page, error)
+    assert fresh is form
+    assert page.calls == ["reload"]
+    assert _refresh_error_page(page, error) is None
+
+
+def test_empty_job_title_and_location_are_not_copied(browser):
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <h1>My Experience</h1>
+            <label for="title-1">Job Title</label><input id="title-1" value="engineer">
+            <label for="company-1">Company</label><input id="company-1">
+            <label for="loc-1">Location</label>
+            <input id="loc-1" name="workExperience-1--location" value="New York, New York, US">
+            <label for="title-2">Job Title</label><input id="title-2" value="engineer">
+            <label for="company-2">Company</label><input id="company-2">
+            <label for="loc-2">Location</label>
+            <input id="loc-2" name="workExperience-2--location" value="New York, New York, US">
+            """
+        )
+        person = _person(
+            personal={"city": "New York", "province_state": "New York", "country": "US"},
+            employment=[
+                {"company": "Standard electric company, inc.", "title": "engineer", "current": False},
+                {"company": "VEM Technologies pvt ltd", "title": "", "current": False},
+            ],
+            experience={"current_job_title": "engineer"},
+        )
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#title-1").input_value() == "engineer"
+        assert page.locator("#company-2").input_value() == "VEM Technologies pvt ltd"
+        assert page.locator("#title-2").input_value() == ""
+        assert page.locator("#loc-1").input_value() == ""
+        assert page.locator("#loc-2").input_value() == ""
+    finally:
+        page.close()
+
+
+def test_empty_work_dates_are_labeled_and_filled_rows_are_kept(browser):
+    from autofill.extract import extract_page
+    from autofill.split_dates import commit_split_date_answer
+    from autofill.stepfill import inspect_required
+
+    html = """
+    <h1>My Experience</h1>
+    <div data-automation-id="formField-startDate" id="start-1">
+      <label>From*</label>
+      <input id="workExperience-1--startDate-dateSectionMonth-input" required value="10">
+      <input id="workExperience-1--startDate-dateSectionYear-input" required value="2023">
+      <div>current value is 10/2023</div>
+    </div>
+    <div data-automation-id="formField-endDate" id="end-1">
+      <label>To*</label>
+      <input id="workExperience-1--endDate-dateSectionMonth-input" required value="10">
+      <input id="workExperience-1--endDate-dateSectionYear-input" required value="2026">
+      <div>current value is 10/2026</div>
+    </div>
+    <div data-automation-id="formField-startDate" id="start-2">
+      <label>From*</label>
+      <input id="workExperience-2--startDate-dateSectionMonth-input" required value="">
+      <input id="workExperience-2--startDate-dateSectionYear-input" required value="">
+    </div>
+    <div data-automation-id="formField-endDate" id="end-2">
+      <label>To*</label>
+      <input id="workExperience-2--endDate-dateSectionMonth-input" required value="">
+      <input id="workExperience-2--endDate-dateSectionYear-input" required value="">
+    </div>
+    """
+    page = browser.new_page()
+    try:
+        page.set_content(html)
+        person = _person(
+            employment=[
+                {
+                    "company": "Standard electric company, inc.",
+                    "title": "engineer",
+                    "start_date": "01/10/2023",
+                    "end_date": "31/10/2026",
+                },
+                {"company": "VEM Technologies pvt ltd", "title": ""},
+            ]
+        )
+        gaps, _total, _done = inspect_required(page, extract_page(page), person)
+        prompts = [str(item.get("text") or "") for item in gaps]
+        assert len(prompts) == 2, prompts
+        assert any("Work Experience 2" in text and "VEM" in text and text.endswith("From") for text in prompts)
+        assert any("Work Experience 2" in text and text.endswith("To") for text in prompts)
+        assert all("Standard electric" not in text for text in prompts)
+        assert all(item.get("kind") == "MISSING_PROFILE_VALUE" for item in gaps)
+        assert all(str(item.get("fieldKey") or "").startswith("employment.1.") for item in gaps)
+        before = page.locator("#workExperience-1--startDate-dateSectionYear-input").input_value()
+        target = next(item for item in gaps if str(item.get("fieldKey")).endswith("startDate"))
+        report = commit_split_date_answer(
+            page,
+            {"selector": target["selector"], "fieldKey": target["fieldKey"], "value": "01/2021"},
+        )
+        assert report["verified"] is True
+        assert page.locator("#workExperience-1--startDate-dateSectionYear-input").input_value() == before
+        assert page.locator("#workExperience-2--startDate-dateSectionMonth-input").input_value() == "01"
+        assert page.locator("#workExperience-2--startDate-dateSectionYear-input").input_value() == "2021"
+    finally:
+        page.close()
+
+
+def test_field_of_study_search_and_unmatched_flag(browser):
+    from autofill.combobox import select_combobox
+    from autofill.extract import extract_page
+    from autofill.stepfill import unmatched_study_gaps
+
+    html = """
+    <h1>My Experience</h1>
+    <div data-automation-id="formField-fieldOfStudy">
+      <label for="study">Field of Study</label>
+      <div data-automation-id="multiSelectContainer">
+        <input id="study" data-automation-id="searchBox" role="combobox" aria-label="Search">
+        <span id="picked" data-automation-id="selectedItem" hidden></span>
+      </div>
+    </div>
+    <script>
+      const input = document.getElementById("study");
+      let query = "";
+      input.addEventListener("keydown", (event) => {
+        if (event.key && event.key.length === 1) query += event.key;
+        input.setAttribute("aria-expanded", "true");
+        let menu = document.getElementById("menu");
+        if (!menu) {
+          menu = document.createElement("div");
+          menu.id = "menu";
+          document.body.appendChild(menu);
+        }
+        menu.replaceChildren();
+        if (/engineer/i.test(query)) {
+          const row = document.createElement("div");
+          row.id = "eng";
+          row.setAttribute("data-automation-id", "promptLeafNode");
+          row.textContent = "Engineering";
+          row.style.height = "24px";
+          row.addEventListener("click", () => {
+            const picked = document.getElementById("picked");
+            picked.hidden = false;
+            picked.textContent = "Engineering";
+            menu.remove();
+          });
+          menu.appendChild(row);
+        }
+      });
+    </script>
+    """
+    page = browser.new_page()
+    try:
+        page.set_content(html)
+        picked = select_combobox(page, "#study", "engineer")
+        assert picked is not None
+        assert page.locator("#picked").inner_text().strip() == "Engineering"
+        person = _person(education=[{"school": "Harvard", "degree": "MS", "field_of_study": "dance"}])
+        page.set_content(html.replace("/engineer/i", "/nomatch/"))
+        gaps = unmatched_study_gaps(page, extract_page(page), person)
+        assert gaps and gaps[0]["kind"] == "MISSING_PROFILE_VALUE"
+        assert gaps[0]["fieldKey"] == "field_of_study"
+    finally:
+        page.close()
+
+
+def test_phone_country_prompt_is_not_postal_code(browser):
+    from autofill.extract import extract_page
+    from autofill.mapping import map_field, workday_phone_text
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <label for="postal">Postal Code</label>
+            <input id="postal" value="">
+            <div data-automation-id="formField-countryPhoneCode">
+              <span data-automation-id="formLabel">Country Phone Code</span>
+              <input id="code" data-automation-id="searchBox" role="combobox" aria-label="Search">
+            </div>
+            <label for="phone">Phone Number</label>
+            <input id="phone" type="tel">
+            """
+        )
+        found = {control.element_id: control for control in extract_page(page).controls}
+        assert "postal" not in found["code"].label.casefold()
+        assert "country" in found["code"].label.casefold()
+        mapped = map_field(found["code"], _person())
+        assert mapped.key == "phone_country"
+    finally:
+        page.close()
+    formatted = workday_phone_text("+1475-441-1744", country="United States", national=True)
+    assert formatted == "4754411744"
+    assert not formatted.startswith("+")
+
+
+def test_hear_about_answer_is_an_application_answer_not_a_work_date():
+    from autofill.local_helper import _keep_profile_row, _remember_hear_answer
+
+    person = _person(
+        employment=[
+            {"company": "Alpha", "title": "Lead"},
+            {"company": "VEM Technologies pvt ltd", "title": ""},
+        ]
+    )
+    job = type(
+        "Job",
+        (),
+        {"application_url": "https://aaon.wd108.myworkdayjobs.com/AAON/job/x/apply", "profile": person},
+    )()
+    _remember_hear_answer(
+        job,
+        person,
+        {"text": "How Did You Hear About Us?", "fieldKey": "how_heard", "kind": "MISSING_PROFILE_VALUE"},
+        {"values": ["Social Media"]},
+    )
+    assert person.screening.how_heard == "Social Media"
+    assert any(item.answer == "Social Media" for item in person.application_answers)
+    _keep_profile_row(
+        person,
+        {"fieldKey": "employment.1.startDate", "kind": "MISSING_PROFILE_VALUE", "text": "From"},
+        {"values": ["01/2021"]},
+    )
+    assert person.employment[1].start_date == "01/2021"
+    assert all(item.answer != "01/2021" for item in person.application_answers)

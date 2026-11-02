@@ -55,6 +55,7 @@ from autofill.pagewait import (
     invalid_field_messages,
     is_job_closed,
     is_login_wall,
+    is_refreshable_site_error,
     is_review,
     is_site_error,
     navigation_changed,
@@ -378,6 +379,56 @@ def _this_page_counts(extra: dict, snapshot) -> None:
     state.progress["requiredDone"] = 0
 
 
+_ERROR_RELOADS: contextvars.ContextVar[int] = contextvars.ContextVar("autofill_error_reloads", default=0)
+
+
+def _refresh_error_page(page, snapshot):
+    """Reload a field-less Workday error page once. Never navigates to the Apply URL.
+
+    Returns the snapshot after a reload that left the error, or None when the
+    page should still stop as ``FAILED_RETRYABLE``.
+    """
+    if page is None or not is_refreshable_site_error(snapshot):
+        return None
+    if _ERROR_RELOADS.get() >= 1:
+        return None
+    reload = getattr(page, "reload", None)
+    if reload is None:
+        return None
+    _ERROR_RELOADS.set(_ERROR_RELOADS.get() + 1)
+    try:
+        reload(wait_until="domcontentloaded", timeout=45000)
+    except TypeError:
+        try:
+            reload()
+        except Exception:
+            return None
+    except Exception:
+        return None
+    try:
+        wait_for_render(page)
+        fresh = extract_page(page)
+    except Exception:
+        return None
+    note_snapshot(fresh)
+    if is_site_error(fresh):
+        return None
+    return fresh
+
+
+def _with_study_gaps(page, snapshot, profile, gaps: list) -> list:
+    from autofill.stepfill import unmatched_study_gaps
+
+    extra = unmatched_study_gaps(page, snapshot, profile)
+    seen = {str(item.get("selector") or "") for item in gaps}
+    for item in extra:
+        selector = str(item.get("selector") or "")
+        if selector and selector in seen:
+            continue
+        gaps.append(item)
+    return gaps
+
+
 def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | None, **extra):
     """Score account, sign-in, job, and empty pages before a zero-field NO_FORM.
 
@@ -415,16 +466,20 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             **extra,
         )
     if is_site_error(snapshot):
-        note_page_type("SITE_ERROR")
-        session.mark(Status.FAILED_RETRYABLE)
-        return snapshot, _result(
-            session,
-            status=Status.FAILED_RETRYABLE,
-            ats=ats_name,
-            login_status=login_status,
-            messages=site_error_messages(snapshot),
-            **extra,
-        )
+        refreshed = _refresh_error_page(page, snapshot)
+        if refreshed is not None:
+            snapshot = refreshed
+        else:
+            note_page_type("SITE_ERROR")
+            session.mark(Status.FAILED_RETRYABLE)
+            return snapshot, _result(
+                session,
+                status=Status.FAILED_RETRYABLE,
+                ats=ats_name,
+                login_status=login_status,
+                messages=site_error_messages(snapshot),
+                **extra,
+            )
     kind = classify_page(snapshot, url=url)
     # A Create Account form is checked before any Sign In rule, and Continue
     # (``human_resolved``) does not skip it: the form is still in front of us.
@@ -856,6 +911,7 @@ def autofill_application(
     if opts.max_pages < 1:
         raise ValueError("max_pages must be at least 1.")
     _ACTIVE_OPTIONS.set(opts)
+    _ERROR_RELOADS.set(0)
     _reset_navigation()
     run_started = time.perf_counter()
     inspect_state = {"seen": False}
@@ -956,15 +1012,18 @@ def autofill_application(
         guard_page = page
         snapshot = _timed_extract(page, opts, run_started, inspect_state)
         if is_site_error(snapshot):
-            note_page_type("SITE_ERROR")
-            session.mark(Status.FAILED_RETRYABLE)
-            return _result(
-                session,
-                status=Status.FAILED_RETRYABLE,
-                ats=ats_name,
-                login_status="NOT_REQUIRED",
-                messages=site_error_messages(snapshot),
-            )
+            refreshed = _refresh_error_page(page, snapshot)
+            if refreshed is None:
+                note_page_type("SITE_ERROR")
+                session.mark(Status.FAILED_RETRYABLE)
+                return _result(
+                    session,
+                    status=Status.FAILED_RETRYABLE,
+                    ats=ats_name,
+                    login_status="NOT_REQUIRED",
+                    messages=site_error_messages(snapshot),
+                )
+            snapshot = refreshed
         if snapshot.captcha_present:
             session.mark("FAILED")
             return _result(
@@ -1215,6 +1274,7 @@ def autofill_application(
                 _note_fill(page_fields, opts, run_started, inspect_state)
                 fresh = extract_page(page)
                 gaps, total, _done = inspect_required(page, fresh, candidate_profile)
+                gaps = _with_study_gaps(page, fresh, candidate_profile, gaps)
                 if gaps:
                     return _manual_for_gaps(
                         session,
@@ -1299,7 +1359,7 @@ def autofill_application(
                 resume_seen = True
                 session.mark("CONTINUE_AFTER_RESUME")
 
-            gaps = required_gaps(page, snapshot, candidate_profile)
+            gaps = _with_study_gaps(page, snapshot, candidate_profile, required_gaps(page, snapshot, candidate_profile))
             if gaps:
                 return _manual_for_gaps(
                     session,
@@ -1406,6 +1466,7 @@ def autofill_application(
         if on_review:
             session.mark("REVIEW_PAGE")
         gaps, total, _done = inspect_required(page, snapshot, candidate_profile)
+        gaps = _with_study_gaps(page, snapshot, candidate_profile, gaps)
         if gaps:
             return _manual_for_gaps(
                 session,

@@ -561,10 +561,46 @@ def ready_to_submit(
     return bool(has_submit)
 
 
+def is_refreshable_site_error(snapshot: PageSnapshot) -> bool:
+    """A Workday ``Something went wrong`` page with no fields.
+
+    Recovery reloads this document. It does not open the Apply URL, which
+    sends the wizard back to Start Your Application. An outage page and a
+    form that already has fields are left alone.
+    """
+    if not is_site_error(snapshot) or application_controls(snapshot):
+        return False
+    text = f"{snapshot.heading} {snapshot.page_text} {snapshot.banner}"
+    return not bool(_OUTAGE_RE.search(text))
+
+
+_WORKDAY_STEP_RE = re.compile(
+    r"\b(my information|my experience|application questions|voluntary disclosures|self identify|review)\b",
+    re.IGNORECASE,
+)
+
+
+def workday_step_pending(snapshot: PageSnapshot) -> bool:
+    """A Workday step heading is on screen and the form fields are not yet.
+
+    Sign In in the header is not those fields. Inspecting now reports 0/0.
+    """
+    if is_site_error(snapshot) or is_job_closed(snapshot) or snapshot.captcha_present:
+        return False
+    if application_controls(snapshot):
+        return False
+    text = f"{snapshot.heading} {snapshot.page_text}"
+    return bool(_WORKDAY_STEP_RE.search(text))
+
+
 def render_ready(snapshot: PageSnapshot) -> bool:
     """True when inspection would see a form, a wall, or an entry/login choice."""
     if is_job_closed(snapshot):
         return True
+    if is_site_error(snapshot):
+        return True
+    if workday_step_pending(snapshot):
+        return False
     if snapshot.captcha_present or visible_fields(snapshot):
         return True
     if register_pane(snapshot) or sign_in_pane(snapshot):

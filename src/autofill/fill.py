@@ -772,6 +772,43 @@ def _education_needed(profile: CandidateProfile, snapshot: PageSnapshot) -> bool
     return visible < len(rows)
 
 
+_CLEAR_ROW_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  const current = "value" in el ? String(el.value || "") : "";
+  if (!current.trim()) return false;
+  const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  if (proto && proto.set) proto.set.call(el, "");
+  else el.value = "";
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}"""
+
+
+def _clear_blank_profile_row(page, control: Control, mapped: MappedField) -> bool:
+    """Clear a work-row title or location the profile does not have.
+
+    Workday copies the previous row when Add is clicked. An empty title must
+    not keep ``current_job_title``, and an empty job location must not keep
+    the home address.
+    """
+    if mapped.action != "unanswered" or mapped.key not in {"current_job_title", "employment_location"}:
+        return False
+    if "no value" not in (mapped.reason or "").casefold():
+        return False
+    if not control.selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_CLEAR_ROW_JS, control.selector))
+    except Exception:
+        return False
+
+
 def fill_one_page(
     page,
     profile: CandidateProfile,
@@ -906,6 +943,16 @@ def fill_one_page(
                 job=job,
                 cursor=cursor,
             )
+            if _clear_blank_profile_row(page, control, mapped):
+                fields.append(
+                    _outcome(
+                        control,
+                        mapped,
+                        action="skip",
+                        detail="Cleared a value that is not on this profile row.",
+                    )
+                )
+                continue
             if mapped.action == "resume_required" and resume_uploaded:
                 fields.append(
                     _outcome(

@@ -63,7 +63,6 @@ from autofill.mapping import (
     map_field,
     match_field_key,
     mentions_work_history,
-    national_phone_digits,
     normalize,
     previous_worker_value,
     record_auto_consent,
@@ -907,7 +906,9 @@ def _refill_after_country(
         if not text:
             text = _profile_address_value(ask.field_key)
         if ask.field_key == "phone" and text and (_wants_national_digits(control) or flags.digits_phone):
-            text = national_phone_digits(text)
+            from autofill.mapping import workday_phone_text
+
+            text = workday_phone_text(text, national=True)
         if not text:
             continue
         _write_control(page, control, text, outcome, key=ask.field_key, flags=flags)
@@ -2559,7 +2560,9 @@ def _apply_ask(
     # on a later pass uses the same rule, so the leading country digit is not
     # typed again as if it were part of the subscriber number.
     if ask.field_key == "phone" and (_wants_national_digits(ask.controls[0]) or flags.digits_phone):
-        text = national_phone_digits(text)
+        from autofill.mapping import workday_phone_text
+
+        text = workday_phone_text(text, national=True)
     if flags.us_dates and _looks_iso(text):
         text = _force_us_date(text)
     _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
@@ -5274,6 +5277,126 @@ def _live_snapshot(page, snapshot: PageSnapshot) -> PageSnapshot:
     return fresh if fresh is not None else snapshot
 
 
+def _split_date_gaps(
+    page,
+    snapshot: PageSnapshot,
+    profile: CandidateProfile | None,
+) -> tuple[list[dict[str, Any]], set[str], int]:
+    """One labeled gap per empty work or education date. Filled pairs are not asked.
+
+    The prompt names the entry (``Work Experience 2 — VEM — From``). The field
+    key is that employment or education row, so the answer is not an
+    Application Answer. Selectors for every part are returned so the generic
+    required scan does not ask ``From*`` again, including a row already filled.
+    """
+    from autofill.split_dates import date_field_key, date_groups, date_prompt, split_pair_committed
+
+    gaps: list[dict[str, Any]] = []
+    skip: set[str] = set()
+    done = 0
+    for group in date_groups(snapshot):
+        selectors = [str(item) for item in group["selectors"] if item]
+        skip.update(selectors)
+        anchor = group["anchor"]
+        controls = [item for item in group.get("controls") or [] if isinstance(item, Control)]
+        if not isinstance(anchor, Control) or not anchor.selector:
+            continue
+        if not any(counts_required(item) for item in controls):
+            continue
+        if page is not None and split_pair_committed(page, anchor.selector):
+            done += 1
+            continue
+        bucket = str(group["bucket"])
+        index = int(group["index"])
+        which = str(group["which"])
+        text = date_prompt(profile, bucket, index, which)
+        field_key = date_field_key(bucket, index, which)
+        digest = _question_digest(text, anchor) or None
+        gaps.append(
+            {
+                "intent": None,
+                "text": text,
+                "blocking": True,
+                "questionId": digest,
+                "questionHash": digest,
+                "fieldKey": field_key,
+                "answerType": "text",
+                "options": [],
+                "required": True,
+                "selector": anchor.selector,
+                "kind": "MISSING_PROFILE_VALUE",
+            }
+        )
+    return gaps, skip, done
+
+
+def unmatched_study_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile | None) -> list[dict[str, Any]]:
+    """A Field of Study the profile names and the prompt did not commit.
+
+    Workday leaves the box blank when the search does not pick a row. That is
+    a missing profile value, including when the label is not marked required.
+    """
+    if profile is None or page is None:
+        return []
+    if getattr(page, "evaluate", None) is not None:
+        try:
+            fresh = extract_page(page)
+        except Exception:
+            fresh = None
+        if fresh is not None:
+            snapshot = fresh
+    wanted = ""
+    for row in profile.education_history:
+        if row.field_of_study.strip():
+            wanted = row.field_of_study.strip()
+            break
+    if not wanted:
+        return []
+    from autofill.combobox import _labels_match, selected_pill_text
+
+    gaps: list[dict[str, Any]] = []
+    for control in snapshot.controls:
+        if control.hidden or not control.selector or not _is_study_control(control):
+            continue
+        pill = selected_pill_text(page, control.selector)
+        if pill and (_labels_match(wanted, pill) or wanted.casefold() in pill.casefold()):
+            continue
+        if control_committed(page, control.selector) and not _is_prompt_search(control):
+            shown = _visible_control_text(page, control)
+            if shown and (wanted.casefold() in shown.casefold()):
+                continue
+        text = "Field of Study"
+        digest = _question_digest(text, control) or None
+        gaps.append(
+            {
+                "intent": None,
+                "text": text,
+                "blocking": True,
+                "questionId": digest,
+                "questionHash": digest,
+                "fieldKey": "field_of_study",
+                "answerType": "single_select" if control.kind == "combobox" else "text",
+                "options": [],
+                "required": True,
+                "selector": control.selector,
+                "kind": "MISSING_PROFILE_VALUE",
+            }
+        )
+        break
+    return gaps
+
+
+def _is_study_control(control: Control) -> bool:
+    blob = normalize(f"{control.label} {control.element_id} {control.name} {control.automation_id}")
+    compact = re.sub(r"[^a-z0-9]", "", blob)
+    return "fieldofstudy" in compact or "field of study" in blob
+
+
+def _is_prompt_search(control: Control) -> bool:
+    blob = normalize(f"{control.automation_id} {control.element_id} {control.placeholder}")
+    return "search" in blob or control.kind == "combobox"
+
+
 def inspect_required(
     page,
     snapshot: PageSnapshot,
@@ -5293,13 +5416,16 @@ def inspect_required(
 
     begin_sms_pass()
     snapshot = _live_snapshot(page, snapshot)
+    date_gaps, date_skip, date_done = _split_date_gaps(page, snapshot, profile)
     clusters = _gap_clusters(snapshot)
     committed: set[str] = set()
     open_keys: set[str] = set()
-    gaps: list[dict[str, Any]] = []
-    committed_clusters = 0
+    gaps: list[dict[str, Any]] = list(date_gaps)
+    committed_clusters = date_done
     reads = 0
     for cluster in clusters:
+        if any(item.selector in date_skip for item in cluster):
+            continue
         keys = [key for key in (_required_key(item) for item in cluster) if key]
         if _cluster_committed(page, cluster):
             committed.update(keys)
