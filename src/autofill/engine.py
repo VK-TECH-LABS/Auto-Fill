@@ -1323,6 +1323,12 @@ def autofill_application(
             if _release_block(nav_block, current_sig):
                 nav_block = None
             nxt = _next_button(snapshot, nav_block)
+            if nxt is None:
+                snapshot = _refresh_forward(page, snapshot)
+                current_sig = navigation_signature(page, snapshot)
+                if _release_block(nav_block, current_sig):
+                    nav_block = None
+                nxt = _next_button(snapshot, nav_block)
             if nxt is None or index + 1 >= opts.max_pages:
                 break
             session.mark("NEXT_PAGE")
@@ -1748,6 +1754,22 @@ def _log_move(session_id: str, action: str, result: str) -> None:
         )
     except Exception:
         return
+
+
+def _refresh_forward(page, snapshot):
+    """Re-read Next after a fill. A disabled Save and Continue can enable once values land."""
+    if _next_button(snapshot) is not None:
+        return snapshot
+    pause = getattr(page, "wait_for_timeout", None)
+    if pause is not None:
+        try:
+            pause(80)
+        except Exception:
+            pass
+    try:
+        return extract_page(page)
+    except Exception:
+        return snapshot
 
 
 def _next_button(snapshot, block: tuple | None = None):
@@ -2193,6 +2215,12 @@ def _run_resolver_pages(
             if _release_block(nav_block, current_sig):
                 nav_block = None
             nxt = _next_button(snapshot, nav_block)
+            if nxt is None:
+                snapshot = _refresh_forward(page, snapshot)
+                current_sig = navigation_signature(page, snapshot)
+                if _release_block(nav_block, current_sig):
+                    nav_block = None
+                nxt = _next_button(snapshot, nav_block)
             if nxt is None or index + 1 >= opts.max_pages:
                 leave_pages = True
                 break

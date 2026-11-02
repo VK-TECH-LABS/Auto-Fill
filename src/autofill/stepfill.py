@@ -277,7 +277,9 @@ def fill_resolved_page(
         _fill_region_after_country(page, response, outcome)
         _refill_after_country(page, response, active, outcome, snapshot.heading, snapshot)
         _write_profile_middle_name(page, outcome)
+        _write_phone_device(page, outcome)
         _open_missing_experience(page, response, active, outcome, step or snapshot.heading)
+        _open_missing_education(page, response, active, outcome, step or snapshot.heading)
         _note_unfilled_required(outcome, page)
         adapter = adapter_for(ats_name)
         resume_code = "none"
@@ -862,10 +864,9 @@ def _refill_after_country(
 ) -> None:
     """Write address and phone again after a country change clears the block.
 
-    Workday replaces those inputs when the country is chosen. Only controls
-    that were already on the page are rewritten. A short poll stays under the
-    delay another site uses to reveal the rest of the form, so that reveal
-    is still filled on the next pass instead of being asked as manual.
+    Workday replaces those inputs when the country is chosen. The replacement
+    nodes are filled too. A short poll stays under the delay another site uses
+    to reveal the rest of the form.
     """
     if page is None or not _country_was_set(outcome):
         return
@@ -899,8 +900,6 @@ def _refill_after_country(
         if ask is None or ask.field_key not in _ADDRESS_AFTER_COUNTRY:
             continue
         control = controls[0]
-        if control.selector not in known:
-            continue
         if control.selector and control_committed(page, control.selector):
             _drop_manual_selector(outcome, control.selector)
             continue
@@ -971,7 +970,9 @@ def _experience_add_button(snapshot: PageSnapshot):
         if not is_add_row(button.name):
             continue
         blob = " ".join(
-            part for part in (button.name, button.aria_label, button.automation_id) if part
+            part
+            for part in (button.name, button.aria_label, button.automation_id, button.selector)
+            if part
         ).casefold()
         if "education" in blob or "school" in blob:
             continue
@@ -1079,6 +1080,126 @@ def _open_missing_experience(page, response, flags: FillFlags, outcome: Resolved
     )
     for ask in asks:
         _apply_ask(page, ask, response, flags, outcome, heading, shared)
+
+
+def _education_rows_for(response) -> list[dict[str, str]]:
+    rows = _rows(response.fields.get("education[]"))
+    if rows:
+        return rows
+    from autofill.answers import current_catalogue
+
+    bound = current_catalogue()
+    if bound is None:
+        return []
+    found: list[dict[str, str]] = []
+    for item in bound[0].education_history:
+        if not (item.school or item.degree or item.field_of_study):
+            continue
+        found.append({"school": item.school, "degree": item.degree, "field": item.field_of_study})
+    return found
+
+
+def _school_controls(snapshot: PageSnapshot) -> list[Control]:
+    found = []
+    for control in snapshot.controls:
+        if control.hidden:
+            continue
+        blob = f"{control.label} {control.aria_label} {control.element_id} {control.automation_id}".casefold()
+        if "school" in blob or "university" in blob or "college" in blob:
+            found.append(control)
+    return found
+
+
+def _open_missing_education(page, response, flags: FillFlags, outcome: ResolvedPage, heading: str) -> None:
+    """Open the Education section after Work Experience, then fill the school row."""
+    current = ""
+    if outcome.snapshot is not None:
+        current = outcome.snapshot.heading or ""
+    if "experience" not in normalize(f"{heading} {current}"):
+        return
+    rows = _education_rows_for(response)
+    if not rows or page is None:
+        return
+    from autofill.fill import _click_add, _section_add_button
+
+    for _ in range(2):
+        try:
+            snapshot = extract_page(page)
+        except Exception:
+            return
+        if len(_school_controls(snapshot)) >= len(rows):
+            break
+        button = _section_add_button(snapshot, "education")
+        if button is None:
+            break
+        if not _click_add(page, button):
+            return
+        pause = getattr(page, "wait_for_timeout", None)
+        if pause is not None:
+            try:
+                pause(250)
+            except Exception:
+                pass
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    asks: list[_Ask] = []
+    for kind, controls in _clusters(snapshot):
+        ask = _describe(kind, controls, snapshot.heading or heading, None)
+        if ask is None or ask.field_key != "education[]":
+            continue
+        control = controls[0]
+        if control.selector and control_committed(page, control.selector):
+            continue
+        asks.append(ask)
+    if not asks:
+        return
+    by_intent, unnamed, by_key = _index_answers(response)
+    shared = (
+        by_intent,
+        unnamed,
+        by_key,
+        0,
+        {
+            "employment": _rows(response.fields.get("employment[]")),
+            "education": rows,
+            "projects": _rows(response.fields.get("projects[]")),
+        },
+        [-1],
+    )
+    for ask in asks:
+        _apply_ask(page, ask, response, flags, outcome, heading, shared)
+
+
+def _write_phone_device(page, outcome: ResolvedPage) -> None:
+    """Phone Device Type is Mobile unless the page already shows a choice."""
+    from autofill.mapping import _is_phone_device
+
+    if page is None:
+        return
+    try:
+        snapshot = extract_page(page)
+    except Exception:
+        return
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or not _is_phone_device(control):
+            continue
+        if control.selector and control_committed(page, control.selector):
+            _drop_manual_selector(outcome, control.selector)
+            continue
+        mapped = MappedField(
+            key="phone_device",
+            action="select",
+            text="Mobile",
+            option_label="Mobile",
+            field_class="PROFILE_FIELD",
+            confidence="high",
+        )
+        written = apply_mapped(page, control, mapped)
+        outcome.fields.append(written)
+        if control.selector and control_committed(page, control.selector):
+            _drop_manual_selector(outcome, control.selector)
 
 
 _LOCATION_OPTIONS_JS = r"""

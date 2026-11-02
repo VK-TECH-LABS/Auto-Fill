@@ -641,3 +641,406 @@ def test_experience_and_resume_are_not_blocked_by_the_school_search(browser, mon
         assert page.evaluate("() => window.__submitted") is False
     finally:
         page.close()
+
+
+_LIVE_HIERARCHY = """
+<h1>My Information</h1>
+<div data-automation-id="formField-source">
+  <label for="source">How Did You Hear About Us?</label>
+  <div data-automation-id="multiSelectContainer">
+    <input id="source" data-automation-id="searchBox" role="combobox" aria-haspopup="listbox"
+      aria-label="Search" placeholder="Search">
+    <button type="button" id="source-prompt" data-automation-id="promptIcon" aria-label="Search"
+      style="width:24px;height:24px"></button>
+    <span id="picked" data-automation-id="selectedItem" hidden></span>
+  </div>
+</div>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  const input = document.getElementById("source");
+  function closeMenu() {
+    const menu = document.getElementById("source-menu");
+    if (menu) menu.remove();
+    input.setAttribute("aria-expanded", "false");
+  }
+  function commit(label) {
+    const picked = document.getElementById("picked");
+    picked.hidden = false;
+    picked.textContent = label;
+    input.value = "";
+    closeMenu();
+  }
+  function leaf(label) {
+    const row = document.createElement("div");
+    row.id = "hear-leaf";
+    row.setAttribute("data-automation-id", "promptLeafNode");
+    row.style.height = "24px";
+    row.textContent = label;
+    row.addEventListener("click", () => commit(label));
+    return row;
+  }
+  function openTop() {
+    closeMenu();
+    input.setAttribute("aria-expanded", "true");
+    const menu = document.createElement("div");
+    menu.id = "source-menu";
+    const stale = document.createElement("div");
+    stale.id = "stale-phone";
+    stale.setAttribute("data-automation-id", "promptLeafNode");
+    stale.style.height = "24px";
+    stale.textContent = "United States of America (+1)";
+    menu.appendChild(stale);
+    const category = document.createElement("div");
+    category.id = "hear-category";
+    category.setAttribute("data-automation-id", "promptLeafNode");
+    category.setAttribute("data-uxi-multiselectlistitem-type", "2");
+    category.setAttribute("data-uxi-hassidecharm", "true");
+    category.style.height = "24px";
+    category.appendChild(document.createTextNode("Career Websites"));
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("class", "wd-icon-chevron-right-small");
+    category.appendChild(icon);
+    category.addEventListener("click", () => {
+      category.remove();
+      stale.remove();
+      menu.appendChild(leaf("Corporate Website"));
+    });
+    menu.appendChild(category);
+    document.body.appendChild(menu);
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeMenu();
+  });
+  document.getElementById("source-prompt").addEventListener("click", openTop);
+  input.addEventListener("click", openTop);
+</script>
+"""
+
+
+def test_hear_about_drills_a_type_2_category_and_ignores_the_phone_pill(browser):
+    from autofill.combobox import list_combobox_options, select_combobox
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_LIVE_HIERARCHY)
+        labels = list_combobox_options(page, "#source")
+        assert "United States of America (+1)" not in labels
+        assert "Corporate Website" in labels
+        assert "Career Websites > Corporate Website" in labels
+        picked = select_combobox(page, "#source", "Corporate Website")
+        assert picked is not None
+        assert page.locator("#picked").inner_text().strip() == "Corporate Website"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+    path_page = browser.new_page()
+    try:
+        path_page.set_content(_LIVE_HIERARCHY)
+        picked = select_combobox(path_page, "#source", "Career Websites > Corporate Website")
+        assert picked is not None
+        assert path_page.locator("#picked").inner_text().strip() == "Corporate Website"
+        category = select_combobox(path_page, "#source", "Career Websites")
+        assert category is not None
+        assert path_page.locator("#picked").inner_text().strip() == "Corporate Website"
+    finally:
+        path_page.close()
+
+
+_PREVIOUS_NOTE = """
+<h1>My Information</h1>
+<div data-automation-id="formField-candidateIsPreviousWorker">
+  <label id="prev-legend">Have you previously been employed by AAON?<br>
+    Current Employees: Please apply via your internal Workday account.</label>
+  <div role="radiogroup" aria-labelledby="prev-legend">
+    <input id="prev-yes" type="radio" name="candidateIsPreviousWorker" value="true">
+    <label for="prev-yes">Yes</label>
+    <input id="prev-no" type="radio" name="candidateIsPreviousWorker" value="false">
+    <label for="prev-no">No</label>
+  </div>
+</div>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+</script>
+"""
+
+
+def test_previous_worker_note_still_answers_no_and_answer_commits(browser, monkeypatch):
+    from autofill.dom_ui import commit_visible, control_committed
+    from autofill.extract import extract_page
+    from autofill.resolver import ResolverResponse
+    from autofill.stepfill import fill_resolved_page
+
+    def fake_resolve(binding, *, session_id, step, fields, questions):
+        del binding, session_id, step, fields, questions
+        return ResolverResponse(fields={}, answers=[])
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    try:
+        page.set_content(_PREVIOUS_NOTE)
+        outcome = fill_resolved_page(
+            page,
+            _binding(),
+            session_id="session-a",
+            ats_name="workday",
+            step="my information",
+        )
+        assert page.locator("#prev-no").is_checked()
+        assert page.locator("#prev-yes").is_checked() is False
+        texts = " ".join(str(item.get("text") or "") for item in outcome.manual_questions).casefold()
+        assert "previously" not in texts
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+    answer_page = browser.new_page()
+    try:
+        answer_page.set_content(_PREVIOUS_NOTE)
+        control = next(item for item in extract_page(answer_page).controls if item.kind == "radio")
+        filled = commit_visible(
+            answer_page,
+            {
+                "selector": control.selector,
+                "value": "No",
+                "values": ["No"],
+                "answerType": "single_select",
+                "text": control.label,
+            },
+        )
+        assert filled["filled"] is True, filled
+        assert control_committed(answer_page, control.selector) is True
+        assert answer_page.locator("#prev-no").is_checked()
+        assert answer_page.evaluate("() => window.__submitted") is False
+    finally:
+        answer_page.close()
+
+
+def test_phone_device_type_is_mobile_without_an_answer(browser):
+    from autofill.fill import fill_one_page
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_PHONE_TYPE)
+        fill_one_page(
+            page,
+            _person(),
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#phoneNumber--phoneType").inner_text().strip() == "Mobile"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
+def test_fill_one_page_rewrites_address_after_country_clears_it(browser):
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(_CLEARED)
+        person = _person(personal={"country": "United States of America"})
+        fill_one_page(
+            page,
+            person,
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert page.locator("#country").input_value() == "United States of America"
+        assert page.locator("#line1").input_value() == "43-g, james street"
+        assert page.locator("#city").input_value() == "Tulsa"
+        assert page.locator("#postal").input_value() == "74101"
+        assert page.locator("#phone").input_value() == "9185550100"
+        assert page.locator("#state").input_value() == "Oklahoma"
+    finally:
+        page.close()
+
+
+_MULTI_ADD = """
+<main>
+<h1>My Experience</h1>
+<div role="group" aria-labelledby="Work-Experience-section">
+  <h4 id="Work-Experience-section">Work Experience</h4>
+  <button type="button" data-automation-id="add-button">Add</button>
+  <div id="work" hidden>
+    <label for="company">Company</label>
+    <input id="company">
+    <label for="title">Job Title</label>
+    <input id="title">
+  </div>
+</div>
+<div role="group" aria-labelledby="Education-section">
+  <h4 id="Education-section">Education</h4>
+  <button type="button" data-automation-id="add-button">Add</button>
+  <div id="edu" hidden>
+    <label for="school">School</label>
+    <input id="school">
+  </div>
+</div>
+<div role="group" aria-labelledby="Languages-section">
+  <h4 id="Languages-section">Languages</h4>
+  <button type="button" data-automation-id="add-button">Add</button>
+</div>
+<button type="button" id="next" data-automation-id="pageFooterNextButton">Save and Continue</button>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__clicked = [];
+  window.__submitted = false;
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+  document.getElementById("next").addEventListener("click", () => window.__clicked.push("next"));
+  function addButton(section) {
+    return document.querySelector("[aria-labelledby='" + section + "'] [data-automation-id='add-button']");
+  }
+  addButton("Work-Experience-section").addEventListener("click", () => {
+    window.__clicked.push("add-work");
+    document.getElementById("work").hidden = false;
+  });
+  addButton("Education-section").addEventListener("click", () => {
+    window.__clicked.push("add-edu");
+    document.getElementById("edu").hidden = false;
+  });
+  addButton("Languages-section").addEventListener("click", () => window.__clicked.push("add-lang"));
+</script>
+</main>
+"""
+
+
+def test_my_experience_add_buttons_are_scoped_and_do_not_fail_the_page(browser):
+    from autofill.engine import AutofillOptions, autofill_application
+    from autofill.extract import extract_page
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_MULTI_ADD)
+        buttons = [button for button in extract_page(page).buttons if button.automation_id == "add-button"]
+        assert len(buttons) == 3
+        assert len({button.selector for button in buttons}) == 3
+        assert any("Work-Experience-section" in button.selector for button in buttons)
+        person = _person(
+            employment=[{"company": "Other Co", "title": "Engineer"}],
+            education=[{"school": "State University", "degree": "BS"}],
+        )
+        result = autofill_application(
+            "https://aaon.wd108.myworkdayjobs.com/AAON/job/Redmond-OR/Controls-Engineer_JR102838/apply",
+            person,
+            options=AutofillOptions(page=page, max_pages=1),
+        )
+        clicked = page.evaluate("() => window.__clicked.slice()")
+        assert result.status != "FAILED"
+        assert "add-work" in clicked
+        assert "add-edu" in clicked
+        assert "add-lang" not in clicked
+        assert page.locator("#company").input_value() == "Other Co"
+        assert page.locator("#title").input_value() == "Engineer"
+        assert page.locator("#school").input_value() == "State University"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
+_PREFILLED = """
+<main>
+<h1>My Information</h1>
+<label for="email">Email<abbr>*</abbr></label>
+<input id="email" type="email" required value="">
+<button type="button" id="next" data-automation-id="pageFooterNextButton" aria-disabled="true">
+  Save and Continue
+</button>
+<button type="submit" id="submit">Submit</button>
+<script>
+  window.__clicked = [];
+  window.__submitted = false;
+  const email = document.getElementById("email");
+  const next = document.getElementById("next");
+  email.addEventListener("input", () => {
+    if (email.value.indexOf("@") !== -1) next.removeAttribute("aria-disabled");
+  });
+  next.addEventListener("click", () => {
+    window.__clicked.push("next");
+    document.querySelector("h1").textContent = "Review";
+    email.remove();
+    next.remove();
+  });
+  document.getElementById("submit").addEventListener("click", (event) => {
+    event.preventDefault();
+    window.__submitted = true;
+  });
+</script>
+</main>
+"""
+
+
+def test_hidden_resume_input_still_blocks_and_experience_is_added(browser):
+    from autofill.fill import fill_one_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            _MULTI_ADD.replace(
+                "</main>",
+                """
+                <div role="group" aria-labelledby="Resume/CV-section">
+                  <h4 id="Resume/CV-section">Resume/CV</h4>
+                  <label>Resume/CV</label>
+                  <input data-automation-id="file-upload-input-ref" type="file">
+                </div>
+                <style>[data-automation-id="file-upload-input-ref"] { display: none; }</style>
+                </main>
+                """,
+            )
+        )
+        fields, _snapshot, blocked, _manual = fill_one_page(
+            page,
+            _person(employment=[{"company": "Other Co", "title": "Engineer"}]),
+            cover_letter_path=None,
+            cover_letter_text=None,
+            job=None,
+            resume_uploaded=False,
+        )
+        assert blocked is True
+        assert any(item.action == "resume_required" for item in fields)
+        assert "add-work" in page.evaluate("() => window.__clicked.slice()")
+        assert page.locator("#company").input_value() == "Other Co"
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        page.close()
+
+
+def test_reentered_page_presses_save_and_continue(browser):
+    from autofill.engine import AutofillOptions, autofill_application
+
+    assert HUMAN_SUBMIT_ONLY is True
+    page = browser.new_page()
+    try:
+        page.set_content(_PREFILLED)
+        result = autofill_application(
+            "https://aaon.wd108.myworkdayjobs.com/AAON/job/Redmond-OR/Controls-Engineer_JR102838/apply",
+            _person(),
+            options=AutofillOptions(page=page, max_pages=3),
+        )
+        assert "next" in page.evaluate("() => window.__clicked.slice()")
+        assert result.next_clicks >= 1
+        assert page.locator("h1").inner_text().strip() == "Review"
+        assert page.evaluate("() => window.__submitted") is False
+        assert result.status != "FAILED"
+    finally:
+        page.close()

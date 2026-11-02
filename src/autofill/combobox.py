@@ -264,28 +264,62 @@ _SCOPED_OPTIONS_JS = r"""
       ? "#" + CSS.escape(option.id)
       : "[data-autofill-option='" + option.getAttribute("data-autofill-option") + "']";
     const auto = String(option.getAttribute("data-automation-id") || "").toLowerCase();
-    // A promptOption with no promptLeafNode is a category. Clicking it opens
-    // the nested choices. The value is the leaf, which may use the same name.
-    const leaf = auto === "promptleafnode"
-      || !!option.querySelector("[data-automation-id='promptLeafNode']")
-      || auto !== "promptoption";
-    let folder = !leaf && option.getAttribute("data-autofill-folder") === "true";
-    if (!leaf && !folder) {
-      const marks = option.querySelectorAll("[data-automation-id], [class]");
+    // A category can be marked promptLeafNode and still only open the next
+    // list. The folder cues are the chevron, side charm, and multiselect type 2.
+    // A flat promptOption with none of those commits on click.
+    function folderCue(node) {
+      if (!node || !node.getAttribute) return false;
+      if (node.getAttribute("data-autofill-folder") === "true") return true;
+      if ((node.getAttribute("data-uxi-multiselectlistitem-type") || "") === "2") return true;
+      const attrs = node.attributes ? Array.from(node.attributes) : [];
+      for (const attr of attrs) {
+        const name = String(attr.name || "").toLowerCase();
+        const value = String(attr.value || "").toLowerCase();
+        if (name.indexOf("sidecharm") !== -1 && (value === "true" || value === "1")) return true;
+      }
+      return false;
+    }
+    let folder = folderCue(option);
+    if (!folder) {
+      const marks = option.querySelectorAll(
+        "[data-automation-id], [class], svg, [data-uxi-multiselectlistitem-type], [data-uxi-hassidecharm]"
+      );
       for (const mark of marks) {
-        const auto = String(mark.getAttribute("data-automation-id") || "").toLowerCase();
+        if (folderCue(mark)) {
+          folder = true;
+          break;
+        }
+        const markAuto = String(mark.getAttribute("data-automation-id") || "").toLowerCase();
         const cls = String(mark.getAttribute("class") || "").toLowerCase();
-        if (auto.indexOf("chevron") !== -1 || cls.indexOf("chevron") !== -1) {
+        if (markAuto.indexOf("chevron") !== -1 || cls.indexOf("chevron") !== -1) {
           folder = true;
           break;
         }
       }
     }
+    // A calling-code pill from Country Phone Code is not a source option.
+    // The phone field's own menu still lists those rows.
+    function phoneCodeField(node) {
+      const field = node && node.closest ? node.closest("[data-automation-id^='formField']") : null;
+      const ident = (
+        (field ? field.getAttribute("data-automation-id") || "" : "") + " " +
+        (node.id || "") + " " +
+        (node.getAttribute("name") || "")
+      ).toLowerCase();
+      return ident.indexOf("phonecode") !== -1 || ident.indexOf("countrycode") !== -1
+        || (ident.indexOf("phone") !== -1 && ident.indexOf("code") !== -1);
+    }
+    if (!phoneCodeField(el) && /\(\+\d+\)/.test(label)) continue;
+    const leaf = !folder && (
+      auto === "promptleafnode"
+      || !!option.querySelector("[data-automation-id='promptLeafNode']")
+      || auto !== "promptoption"
+    );
     options.push({
       label: label,
       value: option.getAttribute("data-value") || label,
       selector: itemSelector,
-      leaf: leaf && !folder,
+      leaf: leaf,
       folder: folder,
     });
   }
