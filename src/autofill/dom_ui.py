@@ -682,35 +682,86 @@ _PILL_FN_JS = r"""
       ).forEach((child) => child.remove());
       return clean(clone.textContent);
     }
-    const root = el.closest("[data-automation-id^='formField']")
-      || el.closest("[data-automation-id='multiSelectContainer']")
-      || el.closest("[data-automation-id='multiselectInputContainer']")
-      || el.parentElement;
-    if (!root || !root.querySelectorAll) return "";
+    const prompt = el.closest("[data-automation-id='multiSelectContainer']")
+      || el.closest("[data-automation-id='multiselectInputContainer']");
+    const field = el.closest("[data-automation-id^='formField']");
+    const roots = [];
+    function addRoot(node) {
+      if (node && node.querySelectorAll && roots.indexOf(node) === -1) roots.push(node);
+    }
+    function adjacentList(container) {
+      // A pill sibling of this prompt. Stop at the next prompt so Country
+      // Phone Code's list is not How Did You Hear's value.
+      function walk(start, step) {
+        let sibling = start;
+        while (sibling) {
+          const auto = ((sibling.getAttribute && sibling.getAttribute("data-automation-id")) || "").toLowerCase();
+          if (
+            auto === "multiselectcontainer" ||
+            auto === "multiselectinputcontainer" ||
+            auto.indexOf("formfield") === 0
+          ) {
+            return null;
+          }
+          if (sibling.querySelector && sibling.querySelector(
+            "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+          )) {
+            return null;
+          }
+          if (auto === "selecteditemlist") return sibling;
+          if (sibling.querySelector && sibling.querySelector("[data-automation-id='selectedItemList']")) {
+            return sibling;
+          }
+          sibling = sibling[step];
+        }
+        return null;
+      }
+      return walk(container.nextElementSibling, "nextElementSibling")
+        || walk(container.previousElementSibling, "previousElementSibling");
+    }
+    if (prompt) addRoot(prompt);
+    if (prompt) {
+      const beside = adjacentList(prompt);
+      if (beside) addRoot(beside);
+    }
+    if (field) {
+      const prompts = field.querySelectorAll("[data-automation-id='multiSelectContainer']");
+      if (prompts.length <= 1) addRoot(field);
+    }
+    if (!roots.length) addRoot(field || prompt || el.parentElement);
     const found = [];
     function add(text) {
       if (junk(text) || found.indexOf(text) !== -1) return;
       found.push(text);
     }
-    root.querySelectorAll("[data-automation-id='selectedItemList']").forEach((list) => {
-      if (hiddenNode(list)) return;
-      const items = list.querySelectorAll(
-        "[data-automation-id='selectedItem'], li, [role='option']"
-      );
-      const nodes = items.length ? Array.from(items) : [list];
-      nodes.forEach((node) => {
-        if (hiddenNode(node)) return;
-        add(itemText(node));
+    function readLists(root) {
+      const lists = [];
+      const rootAuto = ((root.getAttribute && root.getAttribute("data-automation-id")) || "").toLowerCase();
+      if (rootAuto === "selecteditemlist") lists.push(root);
+      root.querySelectorAll("[data-automation-id='selectedItemList']").forEach((list) => lists.push(list));
+      lists.forEach((list) => {
+        if (hiddenNode(list)) return;
+        const items = list.querySelectorAll(
+          "[data-automation-id='selectedItem'], li, [role='option']"
+        );
+        const nodes = items.length ? Array.from(items) : [list];
+        nodes.forEach((node) => {
+          if (hiddenNode(node)) return;
+          add(itemText(node));
+        });
       });
-    });
+    }
+    roots.forEach(readLists);
     if (!found.length) {
-      root.querySelectorAll(
-        "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel'], " +
-        "[data-automation-id='selectedItemText']"
-      ).forEach((node) => {
-        if (hiddenNode(node)) return;
-        if (node.closest("[role='option'], [data-automation-id='promptOption']")) return;
-        add(itemText(node));
+      roots.forEach((root) => {
+        root.querySelectorAll(
+          "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel'], " +
+          "[data-automation-id='selectedItemText']"
+        ).forEach((node) => {
+          if (hiddenNode(node)) return;
+          if (node.closest("[role='option'], [data-automation-id='promptOption']")) return;
+          add(itemText(node));
+        });
       });
     }
     return found.join(", ");

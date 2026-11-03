@@ -467,6 +467,34 @@ def test_phone_country_menu_uses_the_address_or_the_calling_code():
     assert unanswered.action == "unanswered"
 
 
+def test_saved_how_heard_uses_one_value_and_stops_on_disagreement():
+    from autofill.mapping import saved_how_heard
+
+    asked = control("How Did You Hear About Us?", kind="combobox")
+    profile_only = CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "screening": {"how_heard": "Social Media"},
+        }
+    )
+    assert saved_how_heard(asked, profile_only) == "Social Media"
+    both = CandidateProfile.from_dict(
+        {
+            "personal": {"full_name": "Casey Example", "email": "casey.example@example.com"},
+            "screening": {"how_heard": "Social Media"},
+            "application_answers": [{"question": "How did you hear about us?", "answer": "Job Board"}],
+        }
+    )
+    assert saved_how_heard(asked, both) == ""
+    postal = control(
+        "Postal Code",
+        kind="combobox",
+        automation_id="searchBox",
+        form_automation_id="formField-countryPhoneCode",
+    )
+    assert map_field(postal, profile_only).key == "phone_country"
+
+
 def test_phone_extension_and_address_line_2_are_not_copies():
     """Extension is not the phone number. Line 2 stays blank unless it is distinct."""
     person = CandidateProfile.from_dict(
@@ -493,7 +521,7 @@ def test_phone_extension_and_address_line_2_are_not_copies():
     assert map_field(control("Extension"), person).text == ""
     phone = map_field(control("Phone Number", input_type="tel", national_phone=True), person)
     assert phone.key == "phone"
-    assert phone.text == "9175550100"
+    assert phone.text == "917-555-0100"
     assert not phone.text.startswith("0")
     line1 = map_field(control("Address Line 1"), person)
     assert line1.key == "address"

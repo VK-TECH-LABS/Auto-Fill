@@ -67,8 +67,9 @@ def test_phone_beside_a_calling_code_menu_is_national_and_a_single_box_is_not():
     national = map_field(_control("Phone Number", input_type="tel", national_phone=True), person)
     assert national.key == "phone"
     assert national.action == "fill"
-    assert national.text == NATIONAL
+    assert national.text == "555-010-0199"
     assert "+1" not in national.text
+    assert national_phone_digits(national.text) == NATIONAL
     full = map_field(_control("Phone", autocomplete="tel", input_type="tel"), person)
     assert full.text == EXAMPLE_PHONE
     explicit = map_field(
@@ -81,6 +82,26 @@ def test_phone_beside_a_calling_code_menu_is_national_and_a_single_box_is_not():
         person,
     )
     assert international.text == NATIONAL
+
+
+def test_us_national_mask_is_dashed_and_other_countries_stay_digits():
+    from autofill.mapping import workday_phone_text
+
+    assert workday_phone_text("+1475-441-1744", country="United States", national=True) == "475-441-1744"
+    assert workday_phone_text("+1 (917) 555-0100", country="US", national=True) == "917-555-0100"
+    assert workday_phone_text("4754411744", country="United States", national=True) == "475-441-1744"
+    assert workday_phone_text("+44 20 7946 0958", country="United Kingdom", national=True) == "2079460958"
+    india = workday_phone_text("+91 98765 43210", country="India", national=True)
+    assert india == national_phone_digits("+91 98765 43210")
+    assert "-" not in india
+    assert workday_phone_text("9876543210", country="India", national=True) == "9876543210"
+    digits = workday_phone_text("+1475-441-1744", country="United States", national=True, digits_only=True)
+    assert digits == "4754411744"
+    paren = map_field(
+        _control("Phone Number", input_type="tel", national_phone=True, placeholder="(###) ###-####"),
+        _person("+1475-441-1744"),
+    )
+    assert paren.text == "(475) 441-1744"
 
 
 def test_phone_format_alert_asks_for_national_digits():
@@ -303,7 +324,7 @@ def test_resolver_fills_national_phone_and_source_and_does_not_guess_yes_no(brow
             ats_name="workday",
             step="my information",
         )
-        assert page.locator("#national").input_value() == NATIONAL
+        assert page.locator("#national").input_value() == "555-010-0199"
         assert page.locator("#full").input_value() == EXAMPLE_PHONE
         assert page.locator("#code").input_value() == "US"
         assert "Job Board" in page.locator("#picked").inner_text()
@@ -862,7 +883,7 @@ def test_phone_country_extension_and_address_line_2(browser):
         )
         assert page.locator("#phone-picked").inner_text().strip() == "United States of America (+1)"
         phone = page.locator("#national").input_value()
-        assert phone == "9175550100"
+        assert phone == "917-555-0100"
         assert not phone.startswith("0")
         assert page.locator("#ext").input_value() == ""
         assert page.locator("#line1").input_value() == "100 Broadway"
@@ -871,6 +892,99 @@ def test_phone_country_extension_and_address_line_2(browser):
         assert page.locator("#postal").input_value() == "10001"
         assert page.evaluate("() => window.__submitted") is False
     finally:
+        page.close()
+
+
+_SHARED_CONTACT = """
+<div data-automation-id="formField-contact">
+  <label>Postal Code</label>
+  <input id="postal" name="postal">
+  <label>Country Phone Code</label>
+  <div id="phone-box" data-automation-id="multiSelectContainer">
+    <ul data-automation-id="selectedItemList">
+      <li id="phone-pill">United States of America (+1)</li>
+    </ul>
+    <input data-automation-id="searchBox" role="combobox" aria-label="Search" placeholder="Search">
+  </div>
+  <label>How Did You Hear About Us?</label>
+  <div id="hear-box" data-automation-id="multiSelectContainer">
+    <input data-automation-id="searchBox" role="combobox" aria-label="Search" placeholder="Search">
+  </div>
+  <label for="phone">Phone Number</label>
+  <input id="phone" type="tel">
+</div>
+"""
+
+
+def test_shared_contact_section_keeps_phone_code_and_hear_about_apart(browser):
+    """Postal Code is not the calling-code search. Hear About is not that search either."""
+    from autofill.dom_ui import prompt_pill_text
+    from autofill.extract import extract_page
+
+    page = browser.new_page()
+    try:
+        page.set_content(_SHARED_CONTACT)
+        controls = extract_page(page).controls
+        code = next(
+            control
+            for control in controls
+            if control.kind == "combobox" and control.label.casefold() == "country phone code"
+        )
+        heard = next(control for control in controls if "how did you hear" in control.label.casefold())
+        postal = next(control for control in controls if control.element_id == "postal")
+        assert postal.label.casefold() == "postal code"
+        assert "postal" not in code.label.casefold()
+        assert code.selector != heard.selector
+        assert map_field(code, _person()).key == "phone_country"
+        assert map_field(postal, _person()).key == "postal_code"
+        assert map_field(heard, _person(screening={"how_heard": "Social Media"})).key == "how_heard"
+        boxes = page.evaluate(
+            """(selectors) => selectors.map((selector) => {
+              const el = document.querySelector(selector);
+              const box = el && el.closest("#phone-box, #hear-box");
+              return box ? box.id : "";
+            })""",
+            [code.selector, heard.selector],
+        )
+        assert boxes == ["phone-box", "hear-box"]
+        assert "United States" in prompt_pill_text(page, code.selector)
+        assert prompt_pill_text(page, heard.selector) == ""
+    finally:
+        page.close()
+
+
+def test_saved_how_heard_is_written_on_the_source_prompt(browser, monkeypatch):
+    """A saved Social Media / source value is selected. It is not left only on the card."""
+    from autofill.answers import bind_catalogue, reset_catalogue
+    from autofill.resolver import ResolverResponse
+    from autofill.safeguards import HUMAN_SUBMIT_ONLY
+    from autofill.stepfill import fill_resolved_page
+
+    assert HUMAN_SUBMIT_ONLY is True
+    person = _person(screening={"how_heard": "GM Careers Website"})
+    token = bind_catalogue(person)
+
+    def fake_resolve(binding, *, session_id, step, fields, questions):
+        del binding, session_id, step, fields, questions
+        return ResolverResponse(fields={}, answers=[])
+
+    monkeypatch.setattr("autofill.stepfill.resolve_step", fake_resolve)
+    page = browser.new_page()
+    try:
+        page.set_content(_NESTED_HEAR)
+        outcome = fill_resolved_page(
+            page,
+            _binding(),
+            session_id="hear-saved",
+            ats_name="workday",
+            step="my information",
+        )
+        assert page.locator("#source-picked").inner_text().strip() == "GM Careers Website"
+        texts = " ".join(str(item.get("text") or "") for item in outcome.manual_questions).casefold()
+        assert "how did you hear" not in texts
+        assert page.evaluate("() => window.__submitted") is False
+    finally:
+        reset_catalogue(token)
         page.close()
 
 
