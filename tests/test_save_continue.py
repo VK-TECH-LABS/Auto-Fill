@@ -154,46 +154,43 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["question"]["popup"]["state"] == "shown"
 
-        # One click records both rows. Nothing is typed until /answer.
+        # One click commits both rows: Application Answers, the employer controls, one card.
         fake.popup["questionId"] = "q-color"
         fake.click_rows([
             {"questionId": "q-color", "values": ["red"]},
             {"questionId": "q-visa", "values": ["Sponsorship no"]},
         ])
-        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert body["question"]["popup"] == {
-            "state": "answered",
-            "source": "employer_tab",
-            "nonce": nonce,
-            "values": [
-                {"questionId": "q-color", "values": ["Red"]},
-                {"questionId": "q-visa", "values": ["Sponsorship no"]},
-            ],
-        }
-        assert fake.applied == []
         shows = len(fake.shown)
+        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
+        assert "question" not in body
+        assert [item["value"] for item in fake.applied] == ["Red", "Sponsorship no"]
+        assert len(fake.shown) == shows  # The sibling was already on the card.
+        assert fake.popup is None  # Closed once nothing is left to ask.
+        job = helper.get(sid)
+        assert any(row.question == _COLOR["text"] and row.answer == "Red" for row in job.profile.application_answers)
+        visa_saved = any(
+            row.question == _VISA["text"] and row.answer == "Sponsorship no" for row in job.profile.application_answers
+        )
+        assert visa_saved
+        learned = {row["question"]: row["answer"] for row in body["learnedApplicationAnswers"]}
+        assert learned[_COLOR["text"]] == "Red"
+        assert learned[_VISA["text"]] == "Sponsorship no"
+        assert {row["questionId"] for row in body["savedAnswers"]} == {"q-color", "q-visa"}
 
+        # A later panel post of the same values confirms and does not write them again.
         code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
             "id": "q-color", "value": "Red", "binding": _binding("sess-a", "101"),
         })
         assert code == 200, answered
         assert answered["verified"] is True
-        assert fake.applied[0]["value"] == "Red"
-        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert body["question"]["id"] == "q-visa"
-        assert len(fake.shown) == shows  # The sibling was already on the card.
-        job = helper.get(sid)
-        assert any(row.question == _COLOR["text"] and row.answer == "Red" for row in job.profile.application_answers)
-
         code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
             "id": "q-visa", "value": "Sponsorship no", "binding": _binding("sess-a", "101"),
         })
         assert code == 200
-        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
-        assert "question" not in body
+        assert [item["value"] for item in fake.applied] == ["Red", "Sponsorship no"]
         assert len(fake.shown) == shows
-        assert fake.popup is None  # Closed once nothing is left to ask.
+        assert fake.shown[0]["nonce"] == nonce
     finally:
         helper.close()
         server.shutdown()
@@ -330,8 +327,8 @@ def test_popup_answer_for_a_replaced_session_is_refused(monkeypatch):
         _wait_status(port, old["sessionId"], lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
         fake.click(["Red"])
         _code, body = _request(port, "GET", f"/v1/sessions/{old['sessionId']}")
-        assert body["question"]["popup"]["state"] == "answered"
-        # Another candidate's Apply replaces the job before TileArc posts the answer.
+        assert fake.applied and fake.applied[0]["value"] == "Red"
+        # Another candidate's Apply replaces the job after the click was saved.
         new = _start(port, "sess-b", "202")
         _wait_status(port, new["sessionId"], lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
         applied_before = len(fake.applied)
@@ -355,11 +352,140 @@ def test_popup_answer_for_a_replaced_session_is_refused(monkeypatch):
         server.shutdown()
 
 
+def test_rejected_save_reopens_the_same_card(monkeypatch):
+    """A click that the page does not keep reopens one card. It does not open the next question."""
+
+    class _Reject(_PopupSession):
+        def apply_answer(self, url, profile, target):
+            self.applied.append({"selector": target.get("selector"), "value": target.get("value")})
+            return {"verified": False, "filled": False, "reason": "not_committed"}
+
+    fake = _Reject()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start(port)
+        sid = created["sessionId"]
+        fake.release.set()
+        _wait_status(port, sid, lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
+        nonce = fake.shown[-1]["nonce"]
+        fake.click(["Blue"])
+        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert body["question"]["popup"]["state"] == "shown"
+        assert "values" not in body["question"]["popup"]
+        assert fake.shown[-1]["nonce"] == nonce
+        assert fake.shown[-1]["error"] is True
+        assert "did not accept" in fake.shown[-1]["message"]
+        assert len(fake.shown) == 2
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_hear_about_click_is_saved_and_filled(monkeypatch):
+    """Social Media is an Application Answer and a filled control, not an unconfirmed click."""
+    heard = dict(
+        _COLOR,
+        questionId="q-hear",
+        questionHash="q-hear",
+        fieldKey="how_heard",
+        text="How did you hear about us?",
+        options=["Social Media", "Job Board"],
+        selector="#hear",
+    )
+
+    class _Hear(_PopupSession):
+        def fill(self, url, profile):
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            result = _manual_result(heard)
+            return result, False
+
+        def apply_answer(self, url, profile, target):
+            self.applied.append({"selector": target.get("selector"), "value": target.get("value")})
+            return {
+                "verified": True,
+                "filled": True,
+                "status": Status.READY_FOR_HUMAN_SUBMIT,
+                "open_items": [],
+                "blocking": None,
+            }
+
+    fake = _Hear()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        created = _start(port)
+        sid = created["sessionId"]
+        fake.release.set()
+        _wait_status(port, sid, lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
+        fake.click_rows([{"questionId": "q-hear", "values": ["Social Media"]}])
+        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
+        assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT
+        assert fake.applied == [{"selector": "#hear", "value": "Social Media"}]
+        job = helper.get(sid)
+        assert job.profile.screening.how_heard == "Social Media"
+        assert any(row.answer == "Social Media" for row in job.profile.application_answers)
+        assert any(row["answer"] == "Social Media" for row in body["learnedApplicationAnswers"])
+        assert body["savedAnswers"] == [{"questionId": "q-hear", "values": ["Social Media"]}]
+    finally:
+        helper.close()
+        server.shutdown()
+
+
+def test_work_dates_stay_on_the_profile_row():
+    """A From/To answer updates that employment row and is not reused as an Application Answer."""
+    from autofill.local_helper import _remember_answer
+    from autofill.profile import CandidateProfile
+
+    profile = CandidateProfile.from_dict(
+        {
+            "candidateId": "101",
+            "personal": {"full_name": "Avery Alpha", "email": "avery.alpha@example.com"},
+            "employment": [
+                {"company": "Acme", "title": "Engineer", "start_date": "2020-01", "end_date": "2021-06"},
+                {"company": "Beta", "title": "Tech", "start_date": "", "end_date": ""},
+            ],
+        }
+    )
+    from autofill.local_helper import LocalJob
+
+    job = LocalJob("sid", "https://jobs.example.com/apply")
+    job.profile = profile
+    _remember_answer(
+        job,
+        {
+            "fieldKey": "employment.1.startDate",
+            "text": "From",
+            "kind": "QUESTION",
+            "questionId": "start-2",
+        },
+        {"values": ["2019-05"], "value": "2019-05"},
+    )
+    assert profile.employment[0].start_date == "2020-01"
+    assert profile.employment[1].start_date == "2019-05"
+    assert profile.application_answers == []
+
+
+def test_same_heading_field_replacement_releases_the_blocked_next():
+    """Workday can keep the heading and the Save and Continue button while replacing the form."""
+    from autofill.engine import _release_block
+
+    route = ("https", "wd.test", "/apply", "", "")
+    blocked = ("[data-automation-id='bottom-navigation-next-button']", "Save and Continue")
+    before = (route, (("#email", ""),), "application")
+    replaced = (route, (("#company", ""),), "application")
+    revealed = (route, (("#email", ""), ("#phone", "")), "application")
+    assert _release_block((*blocked, before), before) is False
+    assert _release_block((*blocked, before), revealed) is False
+    assert _release_block((*blocked, before), replaced) is True
+
+
 def test_stale_popup_save_reopens_with_an_error(monkeypatch):
     import autofill.local_helper as lh
 
     monkeypatch.setattr(lh, "_POPUP_SAVE_TIMEOUT_SECONDS", 0.2)
     fake = _PopupSession()
+    # No local commit: the card stays answered until the 45s confirm window ends.
+    fake.apply_answer = None
     helper, server, port = _serve(monkeypatch, fake)
     try:
         created = _start(port)
@@ -476,15 +602,19 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
             assert "Shifts rotate every two weeks." in text
             assert "Avery Alpha" in text
             _shadow_click(page, "Yes")
-        body = wait(lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "answered", sid)
-        popup = body["question"]["popup"]
-        assert popup["values"] == ["Yes"]
-        # TileArc would save + verify here, then post the same value.
-        code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
-            "id": question["id"], "value": popup["values"][0], "binding": binding,
-        })
-        assert code == 200, answered
-        assert answered["verified"] is True
+        body = wait(
+            lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
+            or (b.get("question") or {}).get("popup", {}).get("state") == "answered",
+            sid,
+        )
+        if (body.get("question") or {}).get("id") == question["id"]:
+            popup = body["question"]["popup"]
+            assert popup["values"] == ["Yes"]
+            code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
+                "id": question["id"], "value": popup["values"][0], "binding": binding,
+            })
+            assert code == 200, answered
+            assert answered["verified"] is True
         body = wait(lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
                     and b["question"].get("popup", {}).get("state") == "shown", sid)
         second = body["question"]
@@ -496,12 +626,17 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
             host = page.locator("#tilearc-answer-popup")
             host.locator("textarea").fill("Toyota")
             host.get_by_role("button", name="Save & Continue").click()
-        body = wait(lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "answered", sid)
-        assert body["question"]["popup"]["values"] == ["Toyota"]
-        code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
-            "id": second["id"], "value": "Toyota", "binding": binding,
-        })
-        assert code == 200 and answered["verified"] is True, answered
+        body = wait(
+            lambda b: b.get("status") == Status.READY_FOR_HUMAN_SUBMIT
+            or (b.get("question") or {}).get("popup", {}).get("state") == "answered",
+            sid,
+        )
+        if body.get("status") != Status.READY_FOR_HUMAN_SUBMIT:
+            assert body["question"]["popup"]["values"] == ["Toyota"]
+            code, answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
+                "id": second["id"], "value": "Toyota", "binding": binding,
+            })
+            assert code == 200 and answered["verified"] is True, answered
         body = wait(lambda b: b.get("status") == Status.READY_FOR_HUMAN_SUBMIT, sid)
         assert body["status"] == Status.READY_FOR_HUMAN_SUBMIT, body
         with sync_playwright() as pw:

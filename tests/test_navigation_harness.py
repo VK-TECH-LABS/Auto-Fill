@@ -231,6 +231,23 @@ def test_dropped_second_page_continues_without_clicking_next_again(browser, fixt
         page.close()
 
 
+def test_same_heading_save_and_continue_advances_both_steps(browser, fixture_origin):
+    """A replaced field set is the next step even when the heading stays Application."""
+    page = browser.new_page()
+    try:
+        page.goto(f"{fixture_origin}/same_heading_steps.html")
+        result = _run(page, f"{fixture_origin}/same_heading_steps.html")
+        clicked = page.evaluate("() => window.__clicked")
+        assert clicked == ["Save and Continue", "Save and Continue"]
+        assert "Submit application" not in clicked
+        assert result.next_clicks == 2
+        assert result.pages_advanced == 2
+        assert result.status != Status.NAVIGATION_STALLED
+        assert result.stopped_before_submit is True
+    finally:
+        page.close()
+
+
 def test_stable_save_and_continue_advances_both_steps(browser, fixture_origin):
     page = browser.new_page()
     try:

@@ -7,10 +7,11 @@ choices, and one **Save & Continue** button.
 
 The card never talks to TileArc and never fills the employer field itself.
 Clicking the button records every row on the page. The helper reads that on
-the next status poll and reports it in ``question.popup``. The TileArc Apply
-panel saves the answers and posts them to ``/v1/sessions/{id}/answer``. Later
-posts for the same page set do not open another card. A question that appears
-only after those writes gets one more card. Final Submit is not a control here.
+the next status poll, writes each row to Application Answers, fills the
+employer control, and reports the save. A later ``/answer`` for those same
+values does not write them again and does not open another card. A question
+that appears only after those writes gets one more card. Final Submit is not
+a control here.
 
 The card is one shadow host (``#tilearc-answer-popup``) and one nonce for the
 set. An answer recorded under another nonce is ignored. Extract skips the host
