@@ -52,6 +52,7 @@ from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
     _is_county,
     _is_middle_name,
+    _wants_digits_only,
     _wants_national_digits,
     acknowledgement_kind,
     attestation_manual,
@@ -64,10 +65,12 @@ from autofill.mapping import (
     match_field_key,
     mentions_work_history,
     normalize,
+    phone_mask_kind,
     previous_worker_value,
     record_auto_consent,
     standard_terms_enabled,
     terms_category,
+    workday_phone_text,
 )
 from autofill.models import Control, FieldOutcome, MappedField, Option, PageSnapshot
 from autofill.profile import CandidateProfile
@@ -198,6 +201,35 @@ def flags_for_alerts(blob: str, previous: FillFlags) -> FillFlags:
         digits_phone=previous.digits_phone or phone_format,
         us_dates=previous.us_dates or "valid date" in blob,
         aliases=previous.aliases or "select one" in blob or "required" in blob,
+    )
+
+
+def _phone_country_hint(fields: dict | None = None) -> str:
+    """Country already known for this fill, used only to shape a national phone."""
+    if fields:
+        for key in ("phone.country", "address.country"):
+            text = str(fields.get(key) or "").strip()
+            if text:
+                return text
+    from autofill.answers import current_catalogue
+
+    bound = current_catalogue()
+    if bound is None:
+        return ""
+    return bound[0].personal.country or ""
+
+
+def _format_phone_value(text: str, control: Control, flags: FillFlags, fields: dict | None = None) -> str:
+    """National US numbers use ``###-###-####``. A format alert retries digits."""
+    mask = "" if flags.digits_phone else phone_mask_kind(control)
+    if not (flags.digits_phone or _wants_national_digits(control) or mask):
+        return text
+    return workday_phone_text(
+        text,
+        country=_phone_country_hint(fields),
+        national=True,
+        digits_only=bool(flags.digits_phone or _wants_digits_only(control)),
+        mask=mask,
     )
 
 
@@ -905,10 +937,8 @@ def _refill_after_country(
         text = "" if raw is None else str(raw).strip()
         if not text:
             text = _profile_address_value(ask.field_key)
-        if ask.field_key == "phone" and text and (_wants_national_digits(control) or flags.digits_phone):
-            from autofill.mapping import workday_phone_text
-
-            text = workday_phone_text(text, national=True)
+        if ask.field_key == "phone" and text:
+            text = _format_phone_value(text, control, flags, response.fields)
         if not text:
             continue
         _write_control(page, control, text, outcome, key=ask.field_key, flags=flags)
@@ -2556,13 +2586,10 @@ def _apply_ask(
         return
     raw_value = response.fields.get(ask.field_key, "")
     text = "" if raw_value is None else str(raw_value)
-    # A national box beside a calling-code menu rejects "+1 …". A format alert
-    # on a later pass uses the same rule, so the leading country digit is not
-    # typed again as if it were part of the subscriber number.
-    if ask.field_key == "phone" and (_wants_national_digits(ask.controls[0]) or flags.digits_phone):
-        from autofill.mapping import workday_phone_text
-
-        text = workday_phone_text(text, national=True)
+    # A national box beside a calling-code menu rejects "+1 …". A US number is
+    # written as ###-###-####. A format alert on a later pass drops the dashes.
+    if ask.field_key == "phone":
+        text = _format_phone_value(text, ask.controls[0], flags, response.fields)
     if flags.us_dates and _looks_iso(text):
         text = _force_us_date(text)
     _write_control(page, ask.controls[0], text, outcome, key=ask.field_key, flags=flags)
@@ -3784,6 +3811,38 @@ def _keep_live_pill(
     return True
 
 
+def _answer_text(answer: ResolverAnswer | None) -> str:
+    if answer is None:
+        return ""
+    if str(answer.value or "").strip():
+        return str(answer.value).strip()
+    if len(answer.values) == 1 and str(answer.values[0] or "").strip():
+        return str(answer.values[0]).strip()
+    return ""
+
+
+def _is_how_heard(ask: _Ask) -> bool:
+    from autofill.answers import _how_heard
+
+    parts = [ask.match.text if ask.match else "", _question_text(ask.controls)]
+    if ask.controls:
+        parts.append(ask.controls[0].label)
+    return _how_heard(normalize(" ".join(part for part in parts if part)))
+
+
+def _profile_how_heard(ask: _Ask) -> str:
+    """A saved source for this prompt. Empty when the profile does not have one."""
+    from autofill.answers import current_catalogue
+    from autofill.mapping import saved_how_heard
+
+    if not ask.controls:
+        return ""
+    bound = current_catalogue()
+    if bound is None:
+        return ""
+    return saved_how_heard(ask.controls[0], bound[0])
+
+
 def _apply_question(
     page,
     ask: _Ask,
@@ -3825,6 +3884,18 @@ def _apply_question(
         else:
             _manual(outcome, match, blocking=True, controls=ask.controls)
             return
+    if _is_how_heard(ask) and not _answer_text(answer):
+        heard = _profile_how_heard(ask)
+        if heard:
+            from autofill.resolver import ResolverAnswer
+
+            answer = ResolverAnswer(
+                intent=None,
+                value=heard,
+                confidence="HIGH",
+                source="saved_answer",
+                text=match.text or heard,
+            )
     if match.intent == "SALARY_EXPECTATION" and not _salary_answer_ok(match, answer):
         # A minimum, or a HIGH single number, is not a range. Ask the person.
         shape = salary_shape(match.text)

@@ -760,6 +760,23 @@ def _alias_set(token: str) -> set[str]:
 
 _CALLING_CODES = ("44", "1")
 _NANP_WITH_COUNTRY = re.compile(r"^1\d{10}$")
+_US_GROUPED = re.compile(r"^(?:\+1|1)[\s\-.]*(?:\(\s*\d{3}\s*\)|\d{3})[\s\-.]+\d{3}[\s\-.]+\d{4}$")
+_US_DASHED_BODY = re.compile(r"^\(?\d{3}\)?[\s.\-]+\d{3}[\s.\-]+\d{4}$")
+_MASK_PAREN = re.compile(r"\(\s*[#x9_0]{3}\s*\)\s*[#x9_0]{3}\s*-\s*[#x9_0]{4}", re.IGNORECASE)
+_MASK_DASHED = re.compile(r"[#x9_0]{3}\s*-\s*[#x9_0]{3}\s*-\s*[#x9_0]{4}", re.IGNORECASE)
+_NANP_COUNTRIES = frozenset(
+    {
+        "us",
+        "usa",
+        "u s",
+        "u s a",
+        "united states",
+        "united states of america",
+        "america",
+        "canada",
+    }
+)
+_PHONE_FORM_TOKENS = ("countryphonecode", "phonecountry", "callingcode", "dialcode")
 
 
 def national_phone_digits(phone: str) -> str:
@@ -930,9 +947,7 @@ def _profile_text(
     if key == "email":
         return personal.email
     if key == "phone":
-        if _wants_national_digits(control):
-            return workday_phone_text(personal.phone, country=personal.country, national=True)
-        return personal.phone
+        return phone_fill_text(control, personal.phone, country=personal.country)
     if key == "address":
         return personal.address
     if key == "address_line2":
@@ -1168,17 +1183,126 @@ _PHONE_COUNTRY_LABELS = frozenset(
 )
 
 
-def workday_phone_text(phone: str, *, country: str = "", national: bool = False) -> str:
-    """National digits for a phone box that already has a calling-code control.
+def _compact_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", normalize(value))
 
-    ``+1475-441-1744`` beside United States (+1) becomes ``4754411744``.
-    ``country`` names that control for callers; the digits come from the number.
+
+def _nanp_country(country: str) -> bool:
+    token = normalize(country)
+    if token in _NANP_COUNTRIES:
+        return True
+    folded = str(country or "").casefold()
+    return "(+1)" in folded or folded.strip().endswith("+1")
+
+
+def _us_shaped_phone(phone: str) -> bool:
+    """True when the number is already grouped like a US national number."""
+    raw = " ".join(str(phone or "").strip().split())
+    if not raw:
+        return False
+    if _US_GROUPED.fullmatch(raw):
+        return True
+    compact = re.sub(r"[^\d+]", "", raw)
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    if compact.startswith("+") and not compact.startswith("+1"):
+        return False
+    body = raw
+    digits = re.sub(r"\D", "", raw)
+    if compact.startswith("+1") or (re.search(r"[()\-.]", raw) and _NANP_WITH_COUNTRY.fullmatch(digits)):
+        body = re.sub(r"^(?:\+|00)?1[\s\-.]?", "", raw).strip()
+    return bool(_US_DASHED_BODY.fullmatch(body))
+
+
+def _nanp_national(phone: str, country: str = "") -> bool:
+    """A 10-digit NANP national number. An India or UK number is not one."""
+    if len(national_phone_digits(phone)) != 10:
+        return False
+    if _us_shaped_phone(phone):
+        return True
+    compact = re.sub(r"[^\d+]", "", str(phone or "").strip())
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    if compact.startswith("+"):
+        return bool(re.fullmatch(r"\+1\d{10}", compact))
+    return _nanp_country(country)
+
+
+def phone_mask_kind(control: Control) -> str:
+    """The mask this control already shows: ``paren``, ``dashed``, ``digits``, or empty.
+
+    The hint is the placeholder and accessible name. A neighboring Postal Code
+    label is not a phone mask.
     """
-    if country and not national:
+    hint = " ".join(part for part in (control.placeholder, control.aria_label, control.prompt) if part)
+    if _MASK_PAREN.search(hint):
+        return "paren"
+    if _MASK_DASHED.search(hint):
+        return "dashed"
+    folded = hint.casefold()
+    if "digits only" in folded or re.search(r"\bdigits\b", folded):
+        return "digits"
+    return ""
+
+
+def _wants_digits_only(control: Control) -> bool:
+    """A numeric keypad or copy that asks for digits, when no dashed mask is shown."""
+    if phone_mask_kind(control) in {"dashed", "paren"}:
+        return False
+    if control.input_mode == "numeric":
+        return True
+    return bool(re.search(r"\bdigits\b", haystack(control)))
+
+
+def _dashed_us(digits: str) -> str:
+    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+
+
+def _paren_us(digits: str) -> str:
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+
+
+def workday_phone_text(
+    phone: str,
+    *,
+    country: str = "",
+    national: bool = False,
+    digits_only: bool = False,
+    mask: str = "",
+) -> str:
+    """National number for a box that already has a calling-code control.
+
+    A US number beside United States (+1) is ``###-###-####``.
+    ``+1475-441-1744`` becomes ``475-441-1744``. ``digits_only`` keeps
+    ``4754411744`` for a numeric box or a format alert that rejected the mask.
+    A non-NANP national number stays digits. ``mask`` follows a placeholder
+    the control already documents, such as ``(###) ###-####``.
+    """
+    if not national and not digits_only and not mask:
         return phone
-    if national:
-        return national_phone_digits(phone)
-    return phone
+    number = national_phone_digits(phone)
+    if digits_only or mask == "digits":
+        return number
+    if mask == "paren" and len(number) == 10:
+        return _paren_us(number)
+    if (mask == "dashed" or _nanp_national(phone, country)) and len(number) == 10:
+        return _dashed_us(number)
+    return number
+
+
+def phone_fill_text(control: Control, phone: str, *, country: str = "", digits_only: bool = False) -> str:
+    """The phone string to type. A full international box keeps the profile value."""
+    mask = phone_mask_kind(control)
+    national = _wants_national_digits(control) or bool(mask)
+    if not national and not digits_only:
+        return phone
+    return workday_phone_text(
+        phone,
+        country=country,
+        national=True,
+        digits_only=digits_only or _wants_digits_only(control),
+        mask="" if digits_only else mask,
+    )
 
 
 def _is_phone_country_menu(control: Control) -> bool:
@@ -1187,14 +1311,14 @@ def _is_phone_country_menu(control: Control) -> bool:
     Rows such as ``United States +1`` are the menu. A closed menu has no rows
     yet, so a Country combobox next to the phone input is the same field.
     ``Country Phone Code`` is that menu even when it is closed. An address
-    ``Country / Territory`` menu is not.
+    ``Country / Territory`` menu is not. A Postal Code box in the same section
+    is not, even when a label walk would name the search box after it.
     """
-    ident = re.sub(
-        r"[^a-z0-9]",
-        "",
-        normalize(f"{control.element_id} {control.name} {control.automation_id} {control.selector}"),
-    )
-    if any(token in ident for token in ("countryphonecode", "phonecountry", "callingcode", "dialcode")):
+    own = _compact_token(f"{control.element_id} {control.name} {control.automation_id} {control.selector}")
+    form = _compact_token(control.form_automation_id)
+    if any(token in own for token in _PHONE_FORM_TOKENS):
+        return True
+    if control.kind in {"select", "combobox"} and any(token in form for token in _PHONE_FORM_TOKENS):
         return True
     hits = 0
     for option in control.options:
@@ -1715,6 +1839,10 @@ def map_field(
         input_type=control.input_type,
         input_mode=control.input_mode,
         role=control.role,
+        selector=control.selector,
+        automation_id=control.automation_id,
+        form_automation_id=control.form_automation_id,
+        national_phone=control.national_phone,
         phone_adjacent=control.phone_adjacent
         or normalize(control.nearby) in {"phone", "mobile", "telephone", "mobile phone"},
     )
@@ -1828,6 +1956,33 @@ def _same_answer(left: str, right: str) -> bool:
     if left_flag or right_flag:
         return left_flag == right_flag
     return normalize(left) == normalize(right)
+
+
+def saved_how_heard(
+    control: Control,
+    profile: CandidateProfile,
+    job: JobContext | None = None,
+) -> str:
+    """How the candidate heard about the role, when this control asks that.
+
+    The screening value and one saved application answer are used when they
+    agree, or when only one is set. Disagreement stays blank so a person chooses.
+    """
+    from autofill.answers import _how_heard
+
+    texts = _question_texts(control)
+    if not texts or not any(_how_heard(normalize(text)) for text in texts):
+        return ""
+    explicit = profile.screening.how_heard.strip()
+    approved = _explicit_answer(control, profile, job=job)
+    if approved is not None and approved.action == "unanswered" and "disagree" in (approved.reason or "").casefold():
+        return ""
+    approved_text = ""
+    if approved is not None and approved.action != "unanswered":
+        approved_text = (approved.text or approved.option_label or "").strip()
+    if explicit and approved_text and not _same_answer(explicit, approved_text):
+        return ""
+    return explicit or approved_text
 
 
 def _ask_person(key: str | None, reason: str) -> MappedField:

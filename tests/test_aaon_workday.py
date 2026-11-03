@@ -1717,8 +1717,9 @@ def test_phone_country_prompt_is_not_postal_code(browser):
     finally:
         page.close()
     formatted = workday_phone_text("+1475-441-1744", country="United States", national=True)
-    assert formatted == "4754411744"
+    assert formatted == "475-441-1744"
     assert not formatted.startswith("+")
+    assert "4754411744" == "".join(character for character in formatted if character.isdigit())
 
 
 def test_hear_about_answer_is_an_application_answer_not_a_work_date():

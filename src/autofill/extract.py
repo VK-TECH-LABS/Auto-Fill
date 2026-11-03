@@ -89,28 +89,62 @@ EXTRACT_JS = r"""
     );
   }
 
+  function precedes(left, right) {
+    if (!left || !right || left === right || !left.compareDocumentPosition) return false;
+    return !!(left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+
+  function nextFormControl(start, scope) {
+    // The next visible input after this label. A hidden dial-code input is not it.
+    if (!start || !scope || !scope.querySelectorAll) return null;
+    const nodes = scope.querySelectorAll("input, select, textarea, [role='combobox']");
+    for (const node of nodes) {
+      if (!precedes(start, node) || start.contains(node)) continue;
+      const type = (node.getAttribute("type") || "").toLowerCase();
+      if (type === "hidden" || type === "submit" || type === "button" || type === "reset" || type === "image") {
+        continue;
+      }
+      if (isHidden(node)) continue;
+      return node;
+    }
+    return null;
+  }
+
   function fieldQuestionNode(el) {
     // The question label for a prompt lives on the form field, not on the
     // inner search box. The nearest form field wins so a later question is
-    // not pulled in.
+    // not pulled in. A Postal Code label earlier in that field names the
+    // postal input, not this search box.
     let node = el;
     for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
       const auto = (node.getAttribute && node.getAttribute("data-automation-id")) || "";
       const tag = node.tagName ? node.tagName.toLowerCase() : "";
       if (auto.indexOf("formField") !== 0 && tag !== "fieldset") continue;
       const labels = node.querySelectorAll("label, legend, [data-automation-id='formLabel']");
+      let match = null;
       for (const label of labels) {
+        const targetId = label.getAttribute("for") || "";
+        const explicit = !!(targetId && el.id && targetId === el.id);
+        if (!explicit && !precedes(label, el)) continue;
         if (label.contains(el)) continue;
         const text = cleanPrompt(textOf(label));
         if (!text || isGenericPrompt(text) || isSectionHeading(label, text)) continue;
-        const targetId = label.getAttribute("for") || "";
-        if (targetId && el.id && targetId !== el.id) continue;
-        if (targetId && !el.id) {
+        if (targetId) {
           const target = document.getElementById(targetId);
-          if (target && target !== el && !target.contains(el) && !el.contains(target)) continue;
+          if (target === el || (target && (target.contains(el) || el.contains(target)))) {
+            match = label;
+            continue;
+          }
+          if (explicit) {
+            match = label;
+            continue;
+          }
+          if (target && !isHidden(target)) continue;
         }
-        return label;
+        const next = nextFormControl(label, node);
+        if (next === el || (next && (next.contains(el) || el.contains(next)))) match = label;
       }
+      if (match) return match;
     }
     return null;
   }
@@ -269,16 +303,45 @@ EXTRACT_JS = r"""
     if (wrapping) return cleanPrompt(textOf(wrapping));
     const parent = el.parentElement;
     if (!parent) return "";
-    const labels = [];
-    for (const child of Array.from(parent.children)) {
+    const before = [];
+    const after = [];
+    const kids = Array.from(parent.children);
+    const here = kids.indexOf(el);
+    for (const child of kids) {
       if (child === el || (child.contains && child.contains(el))) continue;
       const tag = child.tagName ? child.tagName.toLowerCase() : "";
       if (tag !== "label" && tag !== "span") continue;
       if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
       const text = cleanPrompt(textOf(child));
-      if (text && !isSectionHeading(child, text)) labels.push(text);
+      if (!text || isSectionHeading(child, text)) continue;
+      // A label past another input names that input. The label before this
+      // control wins over a following field title such as Country Phone Code.
+      const at = kids.indexOf(child);
+      if (here >= 0 && at >= 0) {
+        const start = Math.min(here, at);
+        const end = Math.max(here, at);
+        let blocked = false;
+        for (let index = start + 1; index < end; index += 1) {
+          const between = kids[index];
+          const betweenTag = between.tagName ? between.tagName.toLowerCase() : "";
+          if (betweenTag === "input" || betweenTag === "select" || betweenTag === "textarea") {
+            blocked = true;
+            break;
+          }
+          if (between.querySelector && between.querySelector("input, select, textarea")) {
+            blocked = true;
+            break;
+          }
+        }
+        if (blocked) continue;
+        if (at < here) before.push(text);
+        else after.push(text);
+      } else {
+        before.push(text);
+      }
     }
-    return labels.join(" ").trim();
+    if (before.length) return before.join(" ").trim();
+    return after.join(" ").trim();
   }
 
   function groupQuestion(el) {
@@ -641,6 +704,11 @@ EXTRACT_JS = r"""
     return cleanPrompt(bits.join(" "));
   }
 
+  function formFieldId(el) {
+    const field = el && el.closest ? el.closest("[data-automation-id^='formField']") : null;
+    return field ? (field.getAttribute("data-automation-id") || "") : "";
+  }
+
   function selectorFor(el) {
     if (el.id) return "#" + CSS.escape(el.id);
     const name = el.getAttribute("name");
@@ -682,8 +750,22 @@ EXTRACT_JS = r"""
           count = 1;
         }
         if (count > 1) {
-          if (fieldAuto) return "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare;
-          return "[role='group'][aria-labelledby='" + CSS.escape(labelled) + "'] " + bare;
+          const scoped = fieldAuto
+            ? "[data-automation-id='" + CSS.escape(fieldAuto) + "'] " + bare
+            : "[role='group'][aria-labelledby='" + CSS.escape(labelled) + "'] " + bare;
+          // Two prompts in one form field share that scoped selector. The first
+          // search box must not also be How Did You Hear.
+          let matches = [];
+          try {
+            matches = Array.from(scope.querySelectorAll(scoped));
+          } catch (error) {
+            matches = [];
+          }
+          if (matches.length <= 1) return scoped;
+          if (!el.getAttribute("data-autofill-target")) {
+            el.setAttribute("data-autofill-target", Math.random().toString(36).slice(2));
+          }
+          return scoped + "[data-autofill-target='" + el.getAttribute("data-autofill-target") + "']";
         }
       }
       return bare;
@@ -861,6 +943,7 @@ EXTRACT_JS = r"""
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
         phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
         nationalPhone: nationalPhone(el),
+        formFieldId: formFieldId(el),
       });
     }
 
@@ -996,6 +1079,7 @@ EXTRACT_JS = r"""
         group: "",
         prompt: "",
         phoneAdjacent: phoneAdjacent(inner || el),
+        formFieldId: formFieldId(inner || el),
       });
     }
   });
@@ -1754,6 +1838,7 @@ def parse_snapshot(data: dict) -> PageSnapshot:
                 max_length=_max_length(raw.get("maxLength")),
                 phone_adjacent=bool(raw.get("phoneAdjacent", False)),
                 national_phone=bool(raw.get("nationalPhone", False)),
+                form_automation_id=str(raw.get("formFieldId", "") or ""),
             )
         )
     buttons = [

@@ -48,6 +48,8 @@ class Control:
     phone_adjacent: bool = False
     # True when this phone box sits beside a separate calling-code control.
     national_phone: bool = False
+    # Owning Workday ``formField-*`` id. A search box's own id is often just searchBox.
+    form_automation_id: str = ""
     frame_url: str = ""
 
 
