@@ -1800,11 +1800,12 @@ def _forward_block(opts: AutofillOptions, button, signature: tuple) -> tuple:
 
 
 def _release_block(block: tuple | None, current_sig: tuple) -> bool:
-    """Drop the block when the route or the heading changed.
+    """Drop the block when this is no longer the page the click happened on.
 
-    A click that only reveals fields keeps the same step. The same Next stays
-    ineligible so it is not pressed again. A new heading or route is the next
-    step, and a stable Save and Continue there is eligible.
+    A click that only reveals fields keeps the previous fields on screen. The
+    same Next stays ineligible so it is not pressed again. A new route, a new
+    heading, or a field set that replaced the old one is the next step, even
+    when Workday keeps the same Save and Continue button and the same heading.
     """
     if block is None:
         return False
@@ -1813,7 +1814,14 @@ def _release_block(block: tuple | None, current_sig: tuple) -> bool:
         return False
     if not isinstance(before, tuple) or len(before) < 3 or len(current_sig) < 3:
         return True
-    return before[0] != current_sig[0] or before[2] != current_sig[2]
+    if before[0] != current_sig[0] or before[2] != current_sig[2]:
+        return True
+    old_fields = set(before[1]) if isinstance(before[1], (list, tuple, set, frozenset)) else set()
+    new_fields = set(current_sig[1]) if isinstance(current_sig[1], (list, tuple, set, frozenset)) else set()
+    if not old_fields:
+        return bool(new_fields)
+    kept = old_fields & new_fields
+    return len(kept) * 2 < len(old_fields)
 
 
 def _log_move(session_id: str, action: str, result: str) -> None:

@@ -6,16 +6,18 @@ binds ``127.0.0.1`` only, fills through ``autofill_application``, and never
 clicks Final Submit.
 
 When a fill stops on ``MANUAL_ANSWER_REQUIRED``, ``GET /v1/sessions/{id}``
-includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``).
-The helper also shows a Save & Continue popup on the employer tab
-(:mod:`autofill.answer_popup`). ``question.popup.state`` is ``shown`` while it
-waits, and ``answered`` with ``values`` once the employee clicked Save &
-Continue. The TileArc panel saves that answer to Application Answers, checks
-the save, and then posts it to the answer route below. The helper never
-stores an answer in TileArc itself.
-``POST /v1/sessions/{id}/answer`` writes that answer in the same Chrome tab
-and returns ``verified``. Callers persist ``confirmedByEmployee`` only when
-``verified`` is true. This process does not store that flag.
+includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``)
+and ``questions`` for every required gap already on that page. The helper
+shows one centered Save & Continue card for that set
+(:mod:`autofill.answer_popup`). A valid click writes each row onto this
+candidate's Application Answers and fills the employer control, then reports
+``verified``. The card closes on success. The same card reopens on a bad
+choice, a rejected write, or when the click cannot be committed within 45s.
+``POST /v1/sessions/{id}/answer`` still accepts the same values. A repeat of
+a value this click already saved returns ``verified`` and does not write it
+again. Callers persist ``confirmedByEmployee`` only when ``verified`` is
+true. This process does not store that flag. ``savedAnswers`` and
+``learnedApplicationAnswers`` are the rows the host can upsert.
 ``stopped_before_submit`` is false only when ``submitted`` is true.
 
 Idle detach drops the CDP client. It does not close the browser object and
@@ -408,6 +410,10 @@ class LocalJob:
         self._credential_candidate = ""
         # Candidate preference from session create. False checks no terms box.
         self.standard_terms_authorized = False
+        # Values this job already wrote from a Save & Continue click or /answer.
+        # Keyed by question id, hash, and field key. ``saved_rows`` is the public list.
+        self.saved_answers: dict[str, list[str]] = {}
+        self.saved_rows: list[dict[str, Any]] = []
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -431,6 +437,8 @@ class LocalJob:
         self.notice = ""
         self.blocking = None
         self.open_items = []
+        self.saved_answers = {}
+        self.saved_rows = []
 
     def drop_resume(self) -> None:
         if self.resume is not None:
@@ -536,9 +544,11 @@ class LocalJob:
                 body["questions"] = listed
         if self.error:
             body["error"] = self.error
-        learned = _learned_sms(self)
+        learned = _learned_rows(self)
         if learned:
             body["learnedApplicationAnswers"] = learned
+        if self.saved_rows:
+            body["savedAnswers"] = [dict(row) for row in self.saved_rows]
         return body
 
 
@@ -1495,6 +1505,8 @@ class LocalHelper:
         started = time.perf_counter()
         if job.superseded:
             raise AnswerRejected(410, _failure(job, "replaced"))
+        if _payload_already_saved(job, payload):
+            return _answer_body(job, {"verified": True, "filled": True}, started)
         if job.profile is None or job.question is None or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
             raise AnswerRejected(409, _failure(job, "not_at_human_stop"))
         if not _has_identifier(payload):
@@ -1535,6 +1547,7 @@ class LocalHelper:
                 raise AnswerRejected(code, body)
             return body
         _remember_answer(job, item, target)
+        _note_saved(job, item, target)
         card_before = list(job.card_ids)
         self._adopt_follow(job, report, target)
         follow_ids = [row["id"] for row in _open_question_rows(job)]
@@ -1670,6 +1683,8 @@ class LocalHelper:
         popup["state"] = "shown" if shown else "unavailable"
         popup.pop("values", None)
         popup.pop("answeredAt", None)
+        popup.pop("committing", None)
+        popup["committed"] = False
         job.popup = popup
 
     def _sync_popup(self, job: LocalJob) -> None:
@@ -1688,9 +1703,12 @@ class LocalHelper:
         ):
             self._present_popup(job)
             return
-        if popup.get("state") in {"answered", "saving"}:
-            if popup.get("state") == "answered" and (
-                time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS
+        if popup.get("state") in {"answered", "saving", "confirmed"}:
+            if (
+                popup.get("state") == "answered"
+                and not popup.get("committing")
+                and not popup.get("committed")
+                and time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS
             ):
                 self._present_popup(
                     job,
@@ -1727,9 +1745,85 @@ class LocalHelper:
         popup["answeredAt"] = time.monotonic()
         counted = len(stored) if isinstance(stored, list) else 1
         logger.info("session=%s popup_answered values=%s", job.session_id, counted)
+        if getattr(self._session, "apply_answer", None) is None:
+            self._arm_popup_timeout(job)
+            return
+        self._commit_popup_answers(job, stored)
+
+    def _arm_popup_timeout(self, job: LocalJob) -> None:
+        """Re-show the same card when a click cannot be committed in time."""
         timer = threading.Timer(_POPUP_SAVE_TIMEOUT_SECONDS + 1, self.refresh_popup, args=(job.session_id,))
         timer.daemon = True
         timer.start()
+
+    def _commit_popup_answers(self, job: LocalJob, stored: list[Any]) -> None:
+        """Write every row from one Save & Continue click, then confirm.
+
+        Application Answers are updated inside the same write as the employer
+        control. A sibling already on this card does not get its own card.
+        A rejected write reopens this card. A click that cannot be committed
+        is left for the 45s timeout.
+        """
+        rows = _popup_answer_rows(job, stored)
+        if not rows or job.superseded:
+            return
+        popup = job.popup if isinstance(job.popup, dict) else None
+        if popup is not None:
+            popup["committing"] = True
+            popup["state"] = "saving"
+        message = getattr(self._session, "question_popup_message", None)
+        if message is not None and popup is not None:
+            try:
+                message(str(popup.get("nonce") or ""), "Saving to TileArc…", error=False, reopen=False)
+            except Exception:
+                pass
+        wrote: list[str] = []
+        for row in rows:
+            if job.superseded or self._current != job.session_id:
+                return
+            payload = {"id": row["questionId"], "values": list(row["values"])}
+            if _payload_already_saved(job, payload):
+                wrote.append(row["questionId"])
+                continue
+            if job.question is None or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
+                break
+            try:
+                body = self._answer_job(job, payload)
+            except AnswerRejected:
+                self._reopen_save_card(job)
+                return
+            except HumanSubmissionRequired:
+                self._reopen_save_card(job)
+                return
+            except Exception:
+                logger.info("session=%s popup_commit_failed", job.session_id)
+                self._reopen_save_card(job)
+                return
+            if not body.get("verified"):
+                return
+            wrote.append(row["questionId"])
+        popup = job.popup if isinstance(job.popup, dict) else None
+        if popup is not None:
+            popup["committing"] = False
+            popup["committed"] = True
+        open_ids = {row["id"] for row in _open_question_rows(job)}
+        if wrote and open_ids.intersection(wrote) and popup is not None and popup.get("state") == "saving":
+            self._reopen_save_card(job)
+            return
+        if job.question is None:
+            self._arm_idle()
+
+    def _reopen_save_card(self, job: LocalJob) -> None:
+        """Same nonce, same rows, after a write the employer page did not keep."""
+        popup = job.popup if isinstance(job.popup, dict) else None
+        if popup is not None:
+            popup["committing"] = False
+            popup["committed"] = False
+        self._present_popup(
+            job,
+            message="The employer page did not accept that answer. Check it and click Save & Continue again.",
+            error=True,
+        )
 
     def _remember_result(self, job: LocalJob, result: ApplicationResult) -> None:
         job.card_ids = []
@@ -2354,9 +2448,11 @@ def _popup_view(job: LocalJob) -> dict[str, Any] | None:
         return None
     state = str(popup.get("state") or "")
     view: dict[str, Any] = {"state": state, "source": "employer_tab"}
-    if state in {"answered", "saving"} and popup.get("values"):
+    if state in {"answered", "saving", "confirmed"} and popup.get("values"):
         view["nonce"] = str(popup.get("nonce") or "")
         view["values"] = list(popup["values"])
+    if popup.get("committed") or state == "confirmed":
+        view["confirmed"] = True
     return view
 
 
@@ -2394,6 +2490,115 @@ def _learned_sms(job: LocalJob) -> list[dict]:
     from autofill.sms_consent import learned_application_answers
 
     return learned_application_answers(job.profile, _job_candidate(job))
+
+
+def _learned_rows(job: LocalJob) -> list[dict]:
+    """Session answers the host can upsert, including How Did You Hear.
+
+    Recruitment SMS stays in its existing shape. Work-entry dates are not
+    listed: those live on the Application Profile row, not as an answer.
+    """
+    from autofill.sms_consent import is_sms_answer_row
+
+    rows = _learned_sms(job)
+    profile = job.profile
+    if profile is None:
+        return rows
+    seen = {str(item.get("question") or "").casefold() for item in rows}
+    candidate = _job_candidate(job) or profile.candidate_id.strip()
+    for item in profile.application_answers:
+        if not item.from_session or is_sms_answer_row(item):
+            continue
+        question = str(item.question or "").strip()
+        answer = str(item.answer or "").strip()
+        if not question or not answer or question.casefold() in seen:
+            continue
+        row: dict[str, Any] = {
+            "question": question,
+            "answer": answer,
+            "candidateId": candidate,
+        }
+        if item.key:
+            row["key"] = item.key
+        if item.intent:
+            row["intent"] = item.intent
+        rows.append(row)
+        seen.add(question.casefold())
+    return rows
+
+
+def _is_profile_date(item: dict[str, Any]) -> bool:
+    """Work and education dates belong on the profile row, not the answer catalogue."""
+    key = str(item.get("fieldKey") or "")
+    return re.fullmatch(r"(employment|education)\.\d+\.(startDate|endDate)", key) is not None
+
+
+def _note_saved(job: LocalJob, item: dict[str, Any], target: dict[str, Any]) -> None:
+    """Remember a verified write so a repeat Save or /answer does not type it again."""
+    values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+    if not values:
+        value = str(target.get("value") or "").strip()
+        if value:
+            values = [value]
+    if not values:
+        return
+    tokens = [
+        str(item.get(key) or "").strip()
+        for key in ("questionId", "questionHash", "fieldKey")
+    ]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return
+    for token in tokens:
+        job.saved_answers[token] = list(values)
+    primary = tokens[0]
+    if any(str(row.get("questionId") or "") == primary for row in job.saved_rows):
+        return
+    job.saved_rows.append({"questionId": primary, "values": list(values)})
+
+
+def _payload_already_saved(job: LocalJob, payload: dict[str, Any]) -> bool:
+    """True when this post repeats a value the page already accepted."""
+    tokens = [
+        str(payload.get(key) or "").strip()
+        for key in ("id", "questionId", "questionHash", "fieldKey")
+    ]
+    saved: list[str] | None = None
+    for token in tokens:
+        if token and token in job.saved_answers:
+            saved = job.saved_answers[token]
+            break
+    if saved is None:
+        return False
+    try:
+        incoming = _answer_values(job, payload)
+    except AnswerRejected:
+        return False
+    if not incoming:
+        return True
+    return [value.casefold() for value in incoming] == [value.casefold() for value in saved]
+
+
+def _popup_answer_rows(job: LocalJob, stored: list[Any]) -> list[dict[str, Any]]:
+    """One click's rows. A single-question card is stored as a list of strings."""
+    if not stored:
+        return []
+    if isinstance(stored[0], str):
+        popup = job.popup if isinstance(job.popup, dict) else {}
+        qid = str(popup.get("questionId") or (job.question or {}).get("id") or "")
+        values = [str(value) for value in stored if str(value).strip()]
+        if not qid or not values:
+            return []
+        return [{"questionId": qid, "values": values}]
+    rows: list[dict[str, Any]] = []
+    for item in stored:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("questionId") or "").strip()
+        values = [str(value) for value in item.get("values") or [] if str(value).strip()]
+        if qid and values:
+            rows.append({"questionId": qid, "values": values})
+    return rows
 
 
 def _is_hear_item(item: dict[str, Any]) -> bool:
@@ -2475,6 +2680,10 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
     if profile is None:
         return
     _keep_profile_row(profile, item, target)
+    if _is_profile_date(item):
+        # Work and education dates stay on that profile row. An Application
+        # Answer would be reused onto Job 1 the next time the wording matches.
+        return
     if _is_hear_item(item):
         _remember_hear_answer(job, profile, item, target)
         return
