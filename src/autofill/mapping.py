@@ -656,17 +656,19 @@ def _statement_parts(control: Control) -> list[str]:
 def _create_account_acknowledgement(control: Control) -> bool:
     """The required Workday Create Account box, after the deny-list has passed.
 
-    A bare ``I ACCEPT`` on any required checkbox is the same control (JCI).
-    A bare ``I consent`` is accepted only on ``createAccountCheckbox`` (KBR):
+    A bare ``I ACCEPT`` is the same control (JCI), including when the input
+    omits ``required``. A bare ``I consent`` is accepted only on
+    ``createAccountCheckbox`` (KBR):
     the same two words elsewhere stay manual. A privacy or terms sentence on
     that box is standard even when the company name sits inside it (Boeing).
     """
     parts = _statement_parts(control)
     if not parts:
         return False
-    if control.kind == "checkbox" and (control.required or _create_account_checkbox(control)):
-        if any(_CREATE_ACCOUNT_SHORT.fullmatch(part) for part in parts):
-            return True
+    # JCI's box is the two words "I ACCEPT". Workday often omits ``required``
+    # and puts ``createAccountCheckbox`` on the field wrapper, not the input.
+    if control.kind == "checkbox" and any(_CREATE_ACCOUNT_SHORT.fullmatch(part) for part in parts):
+        return True
     if not _create_account_checkbox(control):
         return False
     if any(_CREATE_ACCOUNT_BOX_SHORT.fullmatch(part) for part in parts):
@@ -679,6 +681,24 @@ def _create_account_acknowledgement(control: Control) -> bool:
         and re.search(r"\b(?:privacy|terms of (?:use|service)|terms and conditions)\b", combined)
         and re.search(r"\bi (?:accept|consent|agree|acknowledge)\b", combined)
     )
+
+
+def account_checkbox_required(control: Control) -> bool:
+    """Create Account will not proceed without this box.
+
+    Workday validates it in script, so the input may omit ``required``. The
+    automation id may sit on ``formField-createAccountCheckbox`` rather than
+    the input. A bare ``I ACCEPT`` is that box. A standard privacy sentence
+    is that box. A bare ``I consent`` is that box only when the automation id
+    says so.
+    """
+    if control.kind != "checkbox":
+        return False
+    if control.required or _create_account_checkbox(control):
+        return True
+    if terms_category(control) in AUTO_CONSENT_CATEGORIES:
+        return True
+    return False
 
 
 def terms_category(control: Control) -> str:
@@ -1765,12 +1785,9 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason,
         )
     if control.kind == "checkbox":
-        if control.input_type in {"aria-checkbox", "switch"} or control.role == "switch":
-            return MappedField(
-                key=key,
-                action="unanswered",
-                reason="Custom checkbox left for a person.",
-            )
+        # Native and custom boxes use the same yes/no. Consent, marketing, and
+        # attestations never reach here. The click is kept only when the page
+        # reports the box checked.
         answer = yes_no(text)
         if answer == "yes":
             return MappedField(key=key, action="check", text=text, reason=reason)

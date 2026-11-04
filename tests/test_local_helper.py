@@ -1892,3 +1892,68 @@ def test_reconnect_limit_is_not_continuable(monkeypatch):
     finally:
         server.shutdown()
         helper.close()
+
+
+class _VerifyContinueSession(_FakeSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+        self.release.set()
+
+    def fill(self, url, profile, human_resolved=False, verify_pending=False, **_ignored):
+        self.calls.append({"human_resolved": human_resolved, "verify_pending": verify_pending})
+        self.started.set()
+        status = Status.EMAIL_VERIFICATION_REQUIRED if len(self.calls) == 1 else Status.READY_FOR_HUMAN_SUBMIT
+        result = ApplicationResult(
+            status=status,
+            ats="workday",
+            current_step="account",
+            login_status="LOGIN_REQUIRED",
+            stopped_before_submit=True,
+        )
+        return result, False
+
+
+def test_verified_continue_after_email_verification_signs_in_again(monkeypatch):
+    fake = _VerifyContinueSession()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, created = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+        })
+        assert code == 202, created
+        sid = created["sessionId"]
+        assert _wait_job(port, sid)["status"] == "EMAIL_VERIFICATION_REQUIRED"
+        job = helper.get(sid)
+        assert job is not None
+        job.verify_pending = True
+        code, body = _request(port, "POST", f"/v1/sessions/{sid}/continue", {"verified": True})
+        assert code == 200, body
+        assert len(fake.calls) == 2
+        assert fake.calls[1]["human_resolved"] is True
+        assert fake.calls[1]["verify_pending"] is False
+        assert job.verify_pending is False
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_profile_for_another_candidate_is_refused(monkeypatch):
+    fake = _FakeSession()
+    fake.release.set()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        profile = _profile("Avery Alpha", "avery@example.com")
+        profile["candidateId"] = "someone-else"
+        code, body = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": profile,
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 409
+        assert body["reason"] == "candidate_mismatch"
+        assert fake.started.is_set() is False
+    finally:
+        server.shutdown()
+        helper.close()

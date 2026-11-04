@@ -327,7 +327,7 @@ def test_disagreeing_saved_answers_are_a_conflict():
     assert _gap_kind([control], mapped) == "ANSWER_CONFLICT"
 
 
-def test_custom_checkbox_is_not_checked_from_a_saved_yes():
+def test_custom_checkbox_uses_a_saved_yes_and_consent_does_not():
     from autofill.mapping import map_field
 
     person = _profile()
@@ -336,11 +336,19 @@ def test_custom_checkbox_is_not_checked_from_a_saved_yes():
         kind="checkbox",
         label="Send me the handbook?",
         input_type="aria-checkbox",
+        role="checkbox",
         selector="#hand",
     )
     mapped = map_field(control, person)
-    assert mapped.action == "unanswered"
-    assert "Custom checkbox" in mapped.reason
+    assert mapped.action == "check"
+    consent = Control(
+        kind="checkbox",
+        label="I agree to binding arbitration",
+        input_type="aria-checkbox",
+        role="checkbox",
+        selector="#arb",
+    )
+    assert map_field(consent, person).action == "skip"
 
 
 def test_checkbox_group_checks_only_a_full_match():
