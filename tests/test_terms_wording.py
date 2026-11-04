@@ -47,6 +47,9 @@ ACCEPT_VECTORS = [
     "I agree to the terms and privacy policy",
     "I have read and understood the Applicant Privacy Policy",
     "I agree to the Terms & Conditions",
+    "I have received the Applicant Privacy Notice",
+    "I have received the Boeing Applicant Privacy Notice",
+    "I ACCEPT",
 ]
 
 # Must stay CONSENT (manual): marketing, SMS, AI recording, arbitration, e-sign,
@@ -64,6 +67,8 @@ DENY_VECTORS = [
     "I agree to share my demographic information",
     "I agree to the terms of employment",
     "I agree",
+    "I consent",
+    "I consent to export compliance screening",
 ]
 
 
@@ -156,6 +161,9 @@ GENERIC_URL = "https://careers.example.org/candidate/account/register"
         "Yes, I have read and consent to the terms and conditions",
         "I acknowledge that I have read and understand the Privacy Notice",
         "I have read and accept the Data Privacy Notice",
+        "I ACCEPT",
+        "I consent",
+        "I have received the Boeing Applicant Privacy Notice",
     ],
 )
 def test_authorized_workday_register_checks_box_and_creates_account(site, label):
@@ -181,6 +189,8 @@ def test_authorized_workday_register_checks_box_and_creates_account(site, label)
         "I consent to sign documents with an electronic signature",
         "I authorize a background check",
         "I certify that the information I provide is true",
+        "I agree",
+        "I agree to export compliance screening",
     ],
 )
 def test_workday_deny_wording_is_not_checked_and_create_account_is_not_pressed(site, label):
