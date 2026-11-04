@@ -26,8 +26,13 @@ from autofill.local_helper import HELPER_PORT, default_profile_dir
 
 HEALTH_SERVICE = "auto-fill-local"
 INSTALLER_BASENAME = "TileArc-AutoFill-Helper-Setup-staging.exe"
-MACOS_INSTALLER_BASENAME = "TileArc-AutoFill-Helper-Setup-staging.dmg"
-MACOS_ARTIFACT_NAME = "TileArc-AutoFill-Helper-Setup-staging-macos"
+MACOS_INSTALLER_BASENAME_ARM64 = "TileArc-AutoFill-Helper-Setup-staging-arm64.dmg"
+MACOS_INSTALLER_BASENAME_X86_64 = "TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg"
+# Apple Silicon disk image. Intel Macs install MACOS_INSTALLER_BASENAME_X86_64.
+MACOS_INSTALLER_BASENAME = MACOS_INSTALLER_BASENAME_ARM64
+MACOS_ARTIFACT_NAME_ARM64 = "TileArc-AutoFill-Helper-Setup-staging-macos-arm64"
+MACOS_ARTIFACT_NAME_X86_64 = "TileArc-AutoFill-Helper-Setup-staging-macos-x86_64"
+MACOS_ARTIFACT_NAME = MACOS_ARTIFACT_NAME_ARM64
 MACOS_APP_NAME = "TileArc Auto-Fill Helper (STAGING).app"
 MACOS_VOLUME_NAME = "TileArc Auto-Fill Helper (STAGING)"
 MACOS_BUNDLE_ID = "com.vktechlabs.tilearc.autofill.helper.staging"

@@ -26,8 +26,12 @@ from autofill.local_helper import HELPER_PORT, default_profile_dir
 from autofill.win_launcher import (
     MACOS_APP_NAME,
     MACOS_ARTIFACT_NAME,
+    MACOS_ARTIFACT_NAME_ARM64,
+    MACOS_ARTIFACT_NAME_X86_64,
     MACOS_BUNDLE_ID,
     MACOS_INSTALLER_BASENAME,
+    MACOS_INSTALLER_BASENAME_ARM64,
+    MACOS_INSTALLER_BASENAME_X86_64,
     MACOS_LOGIN_LABEL,
     MACOS_RELEASE_TAG,
     MACOS_VOLUME_NAME,
@@ -244,13 +248,22 @@ def test_staging_macos_artifact_is_the_installer_contract():
     publish = (ROOT / "macos" / "publish-draft.sh").read_text(encoding="utf-8")
     readme = (ROOT / "macos" / "dmg-readme.txt").read_text(encoding="utf-8")
 
-    assert MACOS_INSTALLER_BASENAME in workflow
-    assert MACOS_INSTALLER_BASENAME in build
-    assert MACOS_INSTALLER_BASENAME in employee
-    assert MACOS_INSTALLER_BASENAME in publish
-    assert MACOS_INSTALLER_BASENAME in windows
-    assert MACOS_ARTIFACT_NAME in workflow
-    assert MACOS_ARTIFACT_NAME in build
+    assert MACOS_INSTALLER_BASENAME == MACOS_INSTALLER_BASENAME_ARM64
+    assert MACOS_ARTIFACT_NAME == MACOS_ARTIFACT_NAME_ARM64
+    assert MACOS_INSTALLER_BASENAME_ARM64 != MACOS_INSTALLER_BASENAME_X86_64
+    for filename in (MACOS_INSTALLER_BASENAME_ARM64, MACOS_INSTALLER_BASENAME_X86_64):
+        assert filename in workflow
+        assert filename in build
+        assert filename in employee
+        assert filename in publish
+        assert filename in windows
+        assert filename in windows_employee
+        assert filename in windows_build
+        assert filename in readme
+    assert MACOS_ARTIFACT_NAME_ARM64 in workflow
+    assert MACOS_ARTIFACT_NAME_ARM64 in build
+    assert MACOS_ARTIFACT_NAME_X86_64 in workflow
+    assert MACOS_ARTIFACT_NAME_X86_64 in build
     assert MACOS_APP_NAME in spec
     assert MACOS_APP_NAME in employee
     assert MACOS_APP_NAME in readme
@@ -258,8 +271,13 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert MACOS_RELEASE_TAG in workflow
     assert MACOS_RELEASE_TAG in publish
     assert MACOS_RELEASE_TAG in build
-    assert "runs-on: macos-latest" in workflow
+    assert "runs-on: ${{ matrix.runner }}" in workflow
+    assert "runner: macos-latest" in workflow
+    assert "runner: macos-15-intel" in workflow
+    assert "Build Setup.dmg (${{ matrix.arch }})" in workflow
+    assert "Add macOS assets to draft release" in workflow
     assert "runs-on: windows-latest" in windows
+    assert "path: dist/TileArc-AutoFill-Helper-Setup-staging.exe" in windows
     assert "TileArc-AutoFill-Helper-Setup-staging.exe" in windows
     assert "bash macos/build.sh" in workflow
     assert "bash macos/smoke.sh" in workflow
@@ -275,8 +293,17 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert "xattr -dr com.apple.quarantine" in employee
     assert "Apple Silicon" in employee
     assert "Intel" in employee
+    assert "Apple Silicon" in publish
+    assert "Intel" in publish
+    assert "sha256sum" in publish
+    assert "gh release delete-asset" in publish
+    assert "TileArc-AutoFill-Helper-Setup-staging.dmg" in publish
+    assert "path: dist/TileArc-AutoFill-Helper-Setup-staging.dmg" not in workflow
     assert "hosted TileArc companion" in employee
-    assert "Intel Macs stay on the hosted companion" in build
+    assert "hosted companion remains the fallback" in build
+    assert "Intel Macs stay on the hosted companion" not in build
+    assert "An Intel Mac uses the hosted TileArc companion" not in employee
+    assert "macos-15-intel" in build
     assert "vinayaka/fillo-extension" in employee
     assert "Final Submit" in employee
     assert MACOS_LOGIN_LABEL in employee
@@ -299,6 +326,72 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert "MACOS_EMPLOYEE.md" in windows_employee
     assert MACOS_INSTALLER_BASENAME in windows_build
     assert "pyinstaller==6.16.0" in script
+    assert "macos_require_dmg_name" in script
+    assert "lipo" in script
+    assert "macos_require_dmg_name" in smoke
+    assert 'target_arch=None' in spec
+
+
+def _disk_name(function: str, arg: str) -> subprocess.CompletedProcess[str]:
+    script = ROOT / "macos" / "disk-name.sh"
+    return subprocess.run(
+        ["bash", "-c", f'source "$1"; {function} "$2"', "bash", str(script), arg],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_disk_names_match_the_installer_constants():
+    arm = _disk_name("macos_dmg_basename_for", "arm64")
+    intel = _disk_name("macos_dmg_basename_for", "x86_64")
+    assert arm.returncode == 0
+    assert intel.returncode == 0
+    assert arm.stdout.strip() == MACOS_INSTALLER_BASENAME_ARM64
+    assert intel.stdout.strip() == MACOS_INSTALLER_BASENAME_X86_64
+    arm_label = _disk_name("macos_dmg_label_for", "arm64")
+    intel_label = _disk_name("macos_dmg_label_for", "x86_64")
+    assert arm_label.stdout.strip() == "Apple Silicon (arm64)"
+    assert intel_label.stdout.strip() == "Intel (x86_64)"
+    rejected = _disk_name("macos_dmg_basename_for", "aarch64")
+    assert rejected.returncode != 0
+
+
+def test_disk_name_rejects_a_mismatched_requested_dmg():
+    script = ROOT / "macos" / "disk-name.sh"
+    mismatched = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; TILEARC_MACOS_DMG="$2" macos_require_dmg_name',
+            "bash",
+            str(script),
+            "TileArc-AutoFill-Helper-Setup-staging.dmg",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatched.returncode != 0
+    host = subprocess.run(["uname", "-m"], check=True, capture_output=True, text=True).stdout.strip()
+    if host not in {"arm64", "x86_64"}:
+        return
+    expected = _disk_name("macos_dmg_basename_for", host).stdout.strip()
+    matched = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; TILEARC_MACOS_DMG="$2" macos_require_dmg_name',
+            "bash",
+            str(script),
+            expected,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert matched.returncode == 0
+    assert matched.stdout.strip() == expected
 
 
 def test_macos_debug_port_is_visible_without_proc(monkeypatch):

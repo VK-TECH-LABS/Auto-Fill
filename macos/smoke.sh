@@ -4,11 +4,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=disk-name.sh
+source "$ROOT/macos/disk-name.sh"
 APP_NAME="TileArc Auto-Fill Helper (STAGING).app"
 BIN_REL="Contents/MacOS/TileArcAutoFillHelper"
 APP="$ROOT/dist/$APP_NAME"
 BIN="$APP/$BIN_REL"
-DMG="$ROOT/dist/TileArc-AutoFill-Helper-Setup-staging.dmg"
+DMG="$ROOT/dist/$(macos_require_dmg_name)"
 SUPPORT="$HOME/Library/Application Support/TileArc/AutoFill"
 DOCTOR="$SUPPORT/doctor.json"
 PLIST="$HOME/Library/LaunchAgents/com.vktechlabs.tilearc.autofill.helper.staging.plist"
@@ -205,7 +207,23 @@ if [[ ! -f "$INSTALLED" ]]; then
   echo "disk image is missing $INSTALLED" >&2
   exit 1
 fi
+host="$(macos_disk_arch)"
+recorded="$(tr -d '[:space:]' < "$MOUNT/Build-arch.txt")"
+if [[ "$recorded" != "$host" ]]; then
+  echo "Build-arch.txt says ${recorded}; this runner is ${host}" >&2
+  exit 1
+fi
+label="$(macos_dmg_label_for "$host")"
+if ! grep -q "$label" "$MOUNT/How to install (STAGING).txt"; then
+  echo "disk readme does not say ${label}" >&2
+  exit 1
+fi
+installed_arch="$(lipo -archs "$INSTALLED")"
+if [[ "$installed_arch" != "$host" ]]; then
+  echo "helper binary is ${installed_arch}; expected ${host}" >&2
+  exit 1
+fi
 assert_doctor "$INSTALLED"
 assert_running "$INSTALLED"
 assert_plist_absent
-echo "Smoke passed for TileArc-AutoFill-Helper-Setup-staging.dmg"
+echo "Smoke passed for $(basename "$DMG") (${label})"

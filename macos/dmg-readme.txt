@@ -1,7 +1,11 @@
 TileArc Auto-Fill Helper (STAGING)
 
-This disk image is for TileArc staging on an Apple Silicon Mac.
+This disk image is for TileArc staging on an {{ARCH_LABEL}} Mac.
 It is not the production helper.
+
+Apple Silicon Macs use TileArc-AutoFill-Helper-Setup-staging-arm64.dmg.
+Intel Macs, including a 2020 MacBook, use TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg.
+Build-arch.txt on this disk records the architecture of this image.
 
 1. Drag "TileArc Auto-Fill Helper (STAGING).app" onto Applications.
 2. Eject this disk.
