@@ -740,6 +740,47 @@ def _path_parts(desired: str) -> list[str]:
     return parts
 
 
+_MENU_OPEN_JS = r"""() => {
+  function shown(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || node.hidden) return false;
+    const box = node.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  }
+  const options = document.querySelectorAll("[data-automation-id='promptOption'], [role='listbox']");
+  for (const node of options) {
+    if (shown(node)) return true;
+  }
+  const expanded = document.querySelector("[aria-expanded='true']");
+  return !!(expanded && shown(expanded));
+}"""
+
+
+def close_open_menu(page) -> None:
+    """Close a prompt a category click left open.
+
+    One Escape only steps back from a nested leaf to the parent menu. Repeat
+    until the menu is gone. Once it is closed, Escape is not pressed again, so
+    a committed value is not cleared.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    for _ in range(3):
+        open_menu = False
+        if evaluate is not None:
+            try:
+                open_menu = bool(evaluate(_MENU_OPEN_JS))
+            except Exception:
+                open_menu = False
+        if not open_menu:
+            return
+        try:
+            dismiss_combobox(page)
+        except Exception:
+            return
+        _pause(page, 40)
+
+
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
     """Open the menu once, read option text, and close it.
 
@@ -784,11 +825,11 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
             if parent and child_label:
                 _remember_label(labels, f"{parent} > {child_label}", limit)
         try:
-            dismiss_combobox(page)
+            close_open_menu(page)
         except Exception:
             return labels
     try:
-        dismiss_combobox(page)
+        close_open_menu(page)
     except Exception:
         return labels
     return labels
@@ -1375,7 +1416,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             match = fallback
             clicked_leaf = True
     if match is None or not match.selector:
-        dismiss_combobox(page)
+        close_open_menu(page)
         return None
     if not clicked_leaf:
         click_choice(page, match.selector, match.label)
@@ -1405,7 +1446,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     _keyboard_commit(page, selector, desired, match)
     if _kept_after_close(page, selector, match, desired, accept_input=True):
         return match
-    dismiss_combobox(page)
+    close_open_menu(page)
     return None
 
 

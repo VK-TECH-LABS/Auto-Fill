@@ -54,6 +54,7 @@ from autofill.mapping import (
     _is_middle_name,
     _wants_digits_only,
     _wants_national_digits,
+    account_checkbox_required,
     acknowledgement_kind,
     attestation_manual,
     haystack,
@@ -5313,7 +5314,13 @@ def _accept_standard_term(page, ask) -> bool:
     if len(ask.controls) != 1:
         return False
     control = ask.controls[0]
-    if control.kind != "checkbox" or control.input_type in {"aria-checkbox", "switch"} or not control.required:
+    choice = control.input_type in {"", "checkbox", "aria-checkbox", "switch"} or control.role in {
+        "checkbox",
+        "switch",
+    }
+    if control.kind != "checkbox" or not choice:
+        return False
+    if not (control.required or account_checkbox_required(control)):
         return False
     category = terms_category(control)
     if category not in AUTO_CONSENT_CATEGORIES:
