@@ -483,12 +483,13 @@ def test_same_heading_field_replacement_releases_the_blocked_next():
     assert _release_block((*blocked, shared), swapped) is True
 
 
-def test_stale_popup_save_reopens_with_an_error(monkeypatch):
-    import autofill.local_helper as lh
+def test_popup_save_is_confirmed_before_a_fill_exists(monkeypatch):
+    """A click is stored on this candidate even when the page cannot be written yet.
 
-    monkeypatch.setattr(lh, "_POPUP_SAVE_TIMEOUT_SECONDS", 0.2)
+    The old 45s path reported "TileArc did not confirm the save" and left the
+    employer fields empty. The save is the confirmation. Filling waits.
+    """
     fake = _PopupSession()
-    # No local commit: the card stays answered until the 45s confirm window ends.
     fake.apply_answer = None
     helper, server, port = _serve(monkeypatch, fake)
     try:
@@ -498,13 +499,15 @@ def test_stale_popup_save_reopens_with_an_error(monkeypatch):
         _wait_status(port, sid, lambda b: b.get("status") == Status.MANUAL_ANSWER_REQUIRED)
         fake.click(["Blue"])
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert body["question"]["popup"]["state"] == "answered"
-        time.sleep(0.4)
-        _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
-        assert body["question"]["popup"]["state"] == "shown"
-        assert fake.shown[-1]["error"] is True
-        assert "did not confirm" in fake.shown[-1]["message"]
+        assert body["question"]["popup"]["state"] == "confirmed"
+        assert body["question"]["popup"]["confirmed"] is True
+        assert body["question"]["popup"]["candidateId"] == "101"
+        assert body["answerSave"] == {"confirmed": True, "candidateId": "101"}
+        learned = {row["question"]: row for row in body["learnedApplicationAnswers"]}
+        assert learned[_COLOR["text"]]["answer"] == "Blue"
+        assert learned[_COLOR["text"]]["candidateId"] == "101"
         assert fake.applied == []
+        assert all("did not confirm" not in item["message"] for item in fake.shown)
     finally:
         helper.close()
         server.shutdown()

@@ -67,13 +67,25 @@ class Personal:
     github_url: str = ""
     portfolio_url: str = ""
     website_url: str = ""
+    # Given and family names from the TileArc handoff. Empty means split full_name.
+    first_name: str = ""
+    family_name: str = ""
 
     @property
     def first_token(self) -> str:
+        explicit = self.first_name.strip()
+        if explicit:
+            return explicit
+        # A payload that only sent a family name must not be typed into First name.
+        if self.family_name.strip() and self.full_name.strip() == self.family_name.strip():
+            return ""
         return split_name(self.full_name)[0]
 
     @property
     def last_name(self) -> str:
+        explicit = self.family_name.strip()
+        if explicit:
+            return explicit
         return split_name(self.full_name)[1]
 
     @property
@@ -252,7 +264,11 @@ class CandidateProfile:
                 stacklevel=2,
             )
             personal_raw.pop("password", None)
+        given = _text(personal_raw, "first_name")
+        family = _text(personal_raw, "last_name")
         full_name = _text(personal_raw, "full_name")
+        if not full_name:
+            full_name = " ".join(part for part in (given, family) if part).strip()
         email = _text(personal_raw, "email")
         if not full_name:
             raise ProfileError("personal.full_name is required.")
@@ -276,6 +292,8 @@ class CandidateProfile:
             personal=Personal(
                 full_name=full_name,
                 email=email,
+                first_name=given,
+                family_name=family,
                 phone=_text(personal_raw, "phone"),
                 address=_text(personal_raw, "address"),
                 address_line2=_text(personal_raw, "address_line2"),
@@ -334,8 +352,40 @@ class CandidateProfile:
             education_history=_education_list(data.get("education")),
             internships=_internship_list(data.get("internships")),
             projects=_project_list(data.get("projects")),
-            application_answers=_answer_list(data.get("applicationAnswers") or data.get("application_answers")),
+            application_answers=_answer_list(
+                data.get("applicationAnswers") or data.get("application_answers"),
+                _text(data, "candidateId") or _text(data, "candidate_id"),
+            ),
         )
+
+
+def _alias_personal_keys(personal: dict) -> None:
+    """Copy Fillo handoff names onto the keys the profile stores.
+
+    ``firstName`` and ``lastName`` stay separate. They are not joined and
+    then split again. ``state`` is the province field.
+    """
+    aliases = {
+        "firstName": "first_name",
+        "givenName": "first_name",
+        "given_name": "first_name",
+        "lastName": "last_name",
+        "familyName": "last_name",
+        "family_name": "last_name",
+        "surname": "last_name",
+        "fullName": "full_name",
+        "legalName": "full_name",
+        "legal_name": "full_name",
+        "state": "province_state",
+        "province": "province_state",
+        "region": "province_state",
+        "postalCode": "postal_code",
+        "zip": "postal_code",
+        "middleName": "middle_name",
+    }
+    for source, dest in aliases.items():
+        if personal.get(source) not in (None, "") and not personal.get(dest):
+            personal[dest] = personal[source]
 
 
 def _accept_extended_shape(data: dict) -> dict:
@@ -379,6 +429,7 @@ def _accept_extended_shape(data: dict) -> dict:
         for source, dest in alias.items():
             if address.get(source) and not personal.get(dest):
                 personal[dest] = address[source]
+    _alias_personal_keys(personal)
     merged["personal"] = personal
 
     compensation = dict(_section(merged, "compensation"))
@@ -514,5 +565,16 @@ def _answer_row(entry: dict) -> ApplicationAnswer:
     )
 
 
-def _answer_list(raw: object) -> list[ApplicationAnswer]:
-    return [_answer_row(entry) for entry in _objects(raw, "applicationAnswers")]
+def _answer_list(raw: object, owner: str = "") -> list[ApplicationAnswer]:
+    """Approved answers for this candidate.
+
+    A row that names a different ``candidateId`` is dropped. A row with no
+    candidate id stays, which is how older payloads are shaped.
+    """
+    rows: list[ApplicationAnswer] = []
+    for entry in _objects(raw, "applicationAnswers"):
+        tagged = _text(entry, "candidateId") or _text(entry, "candidate_id")
+        if owner and tagged and tagged != owner:
+            continue
+        rows.append(_answer_row(entry))
+    return rows
