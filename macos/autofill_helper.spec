@@ -79,7 +79,10 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    # universal2 keeps both slices of PyInstaller's fat bootloader.
+    # Unset, PyInstaller thins that bootloader to the runner (arm64 on
+    # macos-latest). An Intel Mac then shows the prohibitory icon.
+    target_arch="universal2",
     codesign_identity=None,
     entitlements_file=None,
 )

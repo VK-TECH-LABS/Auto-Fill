@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build TileArc-AutoFill-Helper-Setup-staging.dmg on macOS.
-# Employees do not run this. GitHub Actions runs it on macos-latest.
+# Build the Universal TileArc-AutoFill-Helper-Setup-staging.dmg on macOS.
+# Employees do not run this. GitHub Actions runs it on macos-latest (Apple Silicon).
+# The frozen app contains Intel x86_64 and Apple Silicon arm64 slices.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,13 +12,50 @@ VOLUME="TileArc Auto-Fill Helper (STAGING)"
 APP="$ROOT/dist/$APP_NAME"
 BIN="$APP/Contents/MacOS/TileArcAutoFillHelper"
 DMG="$ROOT/dist/TileArc-AutoFill-Helper-Setup-staging.dmg"
+FRAMEWORK_PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+# Last Python 3.12 release that ships a macOS universal2 installer.
+PY_PKG_URL="https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg"
+PY_PKG_SHA256="8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4"
+VENV="$ROOT/.venv-macos-universal"
 
-echo "Installing Auto-Fill and PyInstaller"
-python3 -m pip install --upgrade pip
-python3 -m pip install -e . "pyinstaller==6.16.0"
+python_is_universal() {
+  local bin="$1"
+  [[ -x "$bin" ]] || return 1
+  local archs
+  archs="$(lipo -archs "$bin" 2>/dev/null || true)"
+  [[ "$archs" == *x86_64* && "$archs" == *arm64* ]]
+}
 
-echo "Freezing the helper"
-python3 -m PyInstaller --noconfirm --clean macos/autofill_helper.spec
+if [[ "$(uname -m)" == "arm64" ]]; then
+  if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+    echo "Installing Rosetta so smoke.sh can execute the x86_64 slice"
+    sudo softwareupdate --install-rosetta --agree-to-license
+  fi
+  arch -x86_64 /usr/bin/true
+fi
+
+if ! python_is_universal "$FRAMEWORK_PY"; then
+  echo "Installing Python 3.12.10 universal2 from python.org"
+  curl -fL --retry 3 -o /tmp/python-3.12.10-macos11.pkg "$PY_PKG_URL"
+  echo "${PY_PKG_SHA256}  /tmp/python-3.12.10-macos11.pkg" | shasum -a 256 -c -
+  xattr -c /tmp/python-3.12.10-macos11.pkg 2>/dev/null || true
+  sudo installer -pkg /tmp/python-3.12.10-macos11.pkg -target /
+fi
+if ! python_is_universal "$FRAMEWORK_PY"; then
+  echo "Python at $FRAMEWORK_PY is not a universal2 binary" >&2
+  exit 1
+fi
+"$FRAMEWORK_PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else "need Python 3.12")'
+
+echo "Installing Auto-Fill and PyInstaller into a universal2 virtualenv"
+rm -rf "$VENV"
+"$FRAMEWORK_PY" -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip
+"$VENV/bin/python" -m pip install -e . "pyinstaller==6.16.0"
+"$VENV/bin/python" "$ROOT/macos/universal_node.py"
+
+echo "Freezing the universal2 helper"
+"$VENV/bin/python" -m PyInstaller --noconfirm --clean macos/autofill_helper.spec
 
 if [[ ! -f "$BIN" ]]; then
   echo "Missing $BIN" >&2
@@ -25,7 +63,9 @@ if [[ ! -f "$BIN" ]]; then
   exit 1
 fi
 
-python3 - "$APP" <<'PY'
+bash "$ROOT/macos/check_universal.sh" "$APP"
+
+"$VENV/bin/python" - "$APP" <<'PY'
 import subprocess
 import sys
 from pathlib import Path
@@ -83,6 +123,8 @@ if verify.returncode != 0:
     sys.exit(f"codesign --verify failed with {verify.returncode}")
 PY
 
+bash "$ROOT/macos/check_universal.sh" "$APP"
+
 stage="$(mktemp -d)"
 cleanup() {
   rm -rf "$stage"
@@ -93,7 +135,8 @@ ditto "$APP" "$stage/$APP_NAME"
 cp "$ROOT/docs/MACOS_EMPLOYEE.md" "$stage/MACOS_EMPLOYEE.md"
 cp "$ROOT/macos/dmg-readme.txt" "$stage/How to install (STAGING).txt"
 ln -s /Applications "$stage/Applications"
-uname -m > "$stage/Build-arch.txt"
+# Record the Mach-O slices inside the app. uname -m is only the runner.
+printf '%s\n' universal2 x86_64 arm64 > "$stage/Build-arch.txt"
 
 echo "Creating $DMG"
 hdiutil create \

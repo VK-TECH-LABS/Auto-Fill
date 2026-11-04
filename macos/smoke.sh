@@ -22,6 +22,58 @@ if [[ ! -f "$DMG" ]]; then
   exit 1
 fi
 
+can_run_arch() {
+  arch "-$1" /usr/bin/true >/dev/null 2>&1
+}
+
+if [[ "$(uname -m)" == "arm64" ]] && ! can_run_arch x86_64; then
+  echo "Installing Rosetta so the Intel slice can run"
+  sudo softwareupdate --install-rosetta --agree-to-license
+fi
+if [[ "$(uname -m)" == "arm64" ]] && ! can_run_arch x86_64; then
+  echo "The x86_64 slice cannot run on this Apple Silicon Mac" >&2
+  exit 1
+fi
+
+expect_node_arch() {
+  local node="$1"
+  local arch_name="$2"
+  local expect="$3"
+  local err
+  err="$(mktemp)"
+  local out
+  if ! out="$(arch "-$arch_name" "$node" -e 'process.stdout.write(process.arch + "\n")' 2>"$err")"; then
+    echo "Playwright node failed under arch -$arch_name ($node)" >&2
+    cat "$err" >&2 || true
+    rm -f "$err"
+    exit 1
+  fi
+  rm -f "$err"
+  if [[ "$out" != "$expect" ]]; then
+    echo "Playwright node under -$arch_name printed [$out], expected [$expect] ($node)" >&2
+    exit 1
+  fi
+  echo "Playwright node $arch_name reports $out"
+}
+
+assert_node_slices() {
+  local app="$1"
+  local found=0
+  while IFS= read -r -d '' node; do
+    found=1
+    if can_run_arch arm64; then
+      expect_node_arch "$node" arm64 arm64
+    fi
+    if can_run_arch x86_64; then
+      expect_node_arch "$node" x86_64 x64
+    fi
+  done < <(find "$app" -type f -path '*/playwright/driver/node' -print0)
+  if [[ "$found" -eq 0 ]]; then
+    echo "Playwright node is missing from $app" >&2
+    exit 1
+  fi
+}
+
 stop_helper() {
   pkill -f "Contents/MacOS/TileArcAutoFillHelper" >/dev/null 2>&1 || true
   sleep 1
@@ -40,9 +92,10 @@ show_logs() {
 
 assert_doctor() {
   local exe="$1"
-  echo "Doctor: $exe"
+  shift
+  echo "Doctor: $* $exe"
   rm -f "$DOCTOR"
-  if ! python3 - "$exe" "$DOCTOR" <<'PY'
+  if ! python3 - "$exe" "$DOCTOR" "$@" <<'PY'
 import json
 import subprocess
 import sys
@@ -51,8 +104,9 @@ from pathlib import Path
 
 exe = sys.argv[1]
 doctor = Path(sys.argv[2])
+prefix = sys.argv[3:]
 try:
-    completed = subprocess.run([exe, "--doctor"], timeout=60, check=False)
+    completed = subprocess.run([*prefix, exe, "--doctor"], timeout=180, check=False)
 except subprocess.TimeoutExpired:
     sys.exit("doctor timed out")
 deadline = time.time() + 5
@@ -148,8 +202,10 @@ assert_loopback() {
 
 assert_running() {
   local exe="$1"
+  shift
   stop_helper
-  "$exe" >/dev/null 2>&1 &
+  echo "Launch: $* $exe"
+  "$@" "$exe" >/dev/null 2>&1 &
   local pid=$!
   if ! wait_health; then
     show_logs
@@ -171,8 +227,14 @@ assert_plist_absent() {
 
 rm -f "$PLIST"
 stop_helper
+bash "$ROOT/macos/check_universal.sh" "$APP"
+assert_node_slices "$APP"
 assert_doctor "$BIN"
 assert_running "$BIN"
+if can_run_arch x86_64 && [[ "$(uname -m)" != "x86_64" ]]; then
+  assert_doctor "$BIN" arch -x86_64
+  assert_running "$BIN" arch -x86_64
+fi
 assert_plist_absent
 
 MOUNT="$(python3 - "$DMG" <<'PY'
@@ -201,8 +263,22 @@ cleanup_mount() {
 trap cleanup_mount EXIT
 
 INSTALLED="$MOUNT/$APP_NAME/$BIN_REL"
+MOUNTED_APP="$MOUNT/$APP_NAME"
 if [[ ! -f "$INSTALLED" ]]; then
   echo "disk image is missing $INSTALLED" >&2
+  exit 1
+fi
+bash "$ROOT/macos/check_universal.sh" "$MOUNTED_APP"
+assert_node_slices "$MOUNTED_APP"
+arch_file="$MOUNT/Build-arch.txt"
+if [[ ! -f "$arch_file" ]]; then
+  echo "disk image is missing Build-arch.txt" >&2
+  exit 1
+fi
+arch_text="$(cat "$arch_file")"
+if [[ "$arch_text" != *"universal2"* || "$arch_text" != *"x86_64"* || "$arch_text" != *"arm64"* ]]; then
+  echo "Build-arch.txt does not list universal2, x86_64, and arm64:" >&2
+  echo "$arch_text" >&2
   exit 1
 fi
 assert_doctor "$INSTALLED"

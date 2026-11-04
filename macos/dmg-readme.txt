@@ -1,7 +1,11 @@
 TileArc Auto-Fill Helper (STAGING)
 
-This disk image is for TileArc staging on an Apple Silicon Mac.
+This disk image is for TileArc staging.
+It is a Universal build for Intel Macs (x86_64) and Apple Silicon Macs (arm64).
 It is not the production helper.
+The Mac needs macOS 13.5 or newer.
+
+Build-arch.txt on this disk lists universal2, x86_64, and arm64.
 
 1. Drag "TileArc Auto-Fill Helper (STAGING).app" onto Applications.
 2. Eject this disk.

@@ -275,8 +275,19 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert "xattr -dr com.apple.quarantine" in employee
     assert "Apple Silicon" in employee
     assert "Intel" in employee
+    assert "Universal" in employee
+    assert "x86_64" in employee
+    assert "arm64" in employee
+    assert "13.5" in employee
+    assert "Build-arch.txt" in employee
     assert "hosted TileArc companion" in employee
-    assert "Intel Macs stay on the hosted companion" in build
+    assert "An Intel Mac uses the hosted TileArc companion" not in employee
+    assert "universal2" in build
+    assert '"arch": "universal2"' in build
+    assert "x86_64" in build
+    assert "13.5" in build
+    assert "assets[].digest" in build
+    assert "Intel Macs stay on the hosted companion" not in build
     assert "vinayaka/fillo-extension" in employee
     assert "Final Submit" in employee
     assert MACOS_LOGIN_LABEL in employee
@@ -294,11 +305,55 @@ def test_staging_macos_artifact_is_the_installer_contract():
     assert 'repo="${TILEARC_RELEASE_REPO:-VK-TECH-LABS/Auto-Fill}"' in publish
     assert '-R "$repo"' in publish
     assert "application/x-apple-diskimage" in build
-    assert '"arch": "arm64"' in build
     assert "TileArc-AutoFill-Helper-Setup-staging.exe" in build
+    assert 'target_arch="universal2"' in spec
+    assert "macos/universal_node.py" in script
+    assert "macos/check_universal.sh" in script
+    assert "python-3.12.10-macos11.pkg" in script
+    assert "8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4" in script
+    assert "uname -m >" not in script
+    assert "printf '%s\\n' universal2 x86_64 arm64" in script
+    assert "lipo -archs" in (ROOT / "macos" / "check_universal.sh").read_text(encoding="utf-8")
+    assert "process.arch" in smoke
+    assert "check_universal.sh" in smoke
+    assert "arch -x86_64" in smoke
+    assert "Universal" in publish
+    assert "assets[].digest" in publish
+    assert "sha256" in publish
+    assert "Universal" in windows_build
+    assert "(Apple Silicon)" not in windows_build
+    universal = (ROOT / "macos" / "universal_node.py").read_text(encoding="utf-8")
+    assert "macosx_11_0_arm64" in universal
+    assert "macosx_10_13_x86_64" in universal
+    assert "macosx_11_0_universal2" in universal
     assert "MACOS_EMPLOYEE.md" in windows_employee
     assert MACOS_INSTALLER_BASENAME in windows_build
     assert "pyinstaller==6.16.0" in script
+
+
+def test_playwright_universal2_wheel_is_not_used_for_the_node():
+    import importlib.util
+
+    path = ROOT / "macos" / "universal_node.py"
+    spec = importlib.util.spec_from_file_location("universal_node", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.slice_for_playwright_wheel("playwright-1.64.1-py3-none-macosx_11_0_arm64.whl") == "arm64"
+    assert module.slice_for_playwright_wheel("playwright-1.64.1-py3-none-macosx_10_13_x86_64.whl") == "x86_64"
+    assert module.slice_for_playwright_wheel("playwright-1.64.1-py3-none-macosx_11_0_universal2.whl") is None
+    arm = module.playwright_download_args("1.64.1", "macosx_11_0_arm64", (3, 12))
+    intel = module.playwright_download_args("1.64.1", "macosx_10_13_x86_64", (3, 12))
+    assert "macosx_11_0_arm64" in arm
+    assert "macosx_10_13_x86_64" in intel
+    assert "universal2" not in arm
+    assert "universal2" not in intel
+    greenlet = module.greenlet_download_args("3.5.6", (3, 12))
+    assert "macosx_11_0_universal2" in greenlet
+    assert "cp312" in greenlet
+    with pytest.raises(ValueError):
+        module.playwright_download_args("1.64.1", "macosx_11_0_universal2", (3, 12))
 
 
 def test_macos_debug_port_is_visible_without_proc(monkeypatch):

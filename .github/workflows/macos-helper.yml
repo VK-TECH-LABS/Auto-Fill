@@ -1,6 +1,8 @@
 # Staging macOS disk image for the loopback Auto-Fill helper.
-# Employees download TileArc-AutoFill-Helper-Setup-staging.dmg. They do not install Python.
+# Employees download one Universal DMG: TileArc-AutoFill-Helper-Setup-staging.dmg
+# (Intel x86_64 and Apple Silicon arm64). They do not install Python.
 # A push to staging adds that disk image to draft tag tilearc-autofill-helper-staging.
+# The release asset digest is assets[].digest (sha256:...) on that filename.
 name: macOS helper (staging)
 
 on:
@@ -19,9 +21,9 @@ concurrency:
 
 jobs:
   installer:
-    name: Build Setup.dmg
+    name: Build Universal Setup.dmg
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

@@ -10,6 +10,7 @@ tools/local-cdp-poc/evidence/work/
 
 # Python
 .venv/
+.venv-macos-universal/
 venv/
 __pycache__/
 *.py[cod]

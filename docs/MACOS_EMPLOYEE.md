@@ -2,7 +2,9 @@
 
 This installs the staging helper on your Mac. You do not need Python, and you do not install the Windows Setup file.
 
-Use this only for **TileArc staging**. It is not the production installer. The disk image is built for **Apple Silicon** Macs (M1 or newer). An Intel Mac uses the hosted TileArc companion for this staging build.
+Use this only for **TileArc staging**. It is not the production installer. The disk image is a **Universal** build. The same file runs on **Intel** Macs (`x86_64`, including a 2020 MacBook Pro) and on **Apple Silicon** Macs (`arm64`).
+
+The Mac needs **macOS 13.5 or newer**. The bundled Playwright driver is a Universal Node binary, and both slices require macOS 13.5. Open `Build-arch.txt` on the disk. It lists `universal2`, `x86_64`, and `arm64`.
 
 The helper runs on this computer at `http://127.0.0.1:9410`. It opens a **separate Chrome profile** for applications. It does not use your everyday Chrome, and it does not click Final Submit. You still submit the application yourself.
 
@@ -13,7 +15,7 @@ Install **Google Chrome** if it is not already installed. Chrome has to be the n
 ## Install
 
 1. Download **TileArc-AutoFill-Helper-Setup-staging.dmg** from TileArc (Download Installer) or from the staging release your team shared.
-2. Open the disk image.
+2. Open the disk image. If the app icon is a circle with a slash through it and macOS says the app is not supported on this Mac, that file is an older Apple Silicon-only image. Download the disk image again from the current staging draft and check `Build-arch.txt` for `universal2`.
 3. Drag **TileArc Auto-Fill Helper (STAGING)** onto the Applications folder.
 4. Eject the disk image.
 5. Open your Applications folder. **Right-click** the app and choose **Open**.
@@ -63,7 +65,7 @@ The extension talks to the helper at `http://127.0.0.1:9410`. It does not use a 
 - Read the form. The helper stops for questions it should not guess.
 - **You click Final Submit.** The helper will not.
 
-If the helper is not running, TileArc can still use the hosted companion. Installing this helper does not turn the companion off.
+If the helper is not running, the hosted TileArc companion can still run the application. Installing this helper does not turn the companion off.
 
 ## Remove it
 
