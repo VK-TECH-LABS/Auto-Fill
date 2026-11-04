@@ -41,6 +41,7 @@ from autofill.login import (
     account_view,
     run_login,
     score_account,
+    sign_in_verification_holding,
     stop_account,
     verification_present,
 )
@@ -504,14 +505,29 @@ def _pane_stop(page, snapshot, session, opts: AutofillOptions, ats_name: str | N
             account=account,
             **extra,
         )
-    if _protocol_070(opts) and verification_present(snapshot) and not opts.human_resolved:
+    if _protocol_070(opts) and not opts.human_resolved and (
+        verification_present(snapshot) or sign_in_verification_holding(snapshot)
+    ):
         session.mark(Status.EMAIL_VERIFICATION_REQUIRED)
+        holding = sign_in_verification_holding(snapshot)
+        account = None
+        message = "Email verification is required. Auto-Fill does not read mail."
+        if holding:
+            from autofill.account_flow import _VERIFY_FIRST_MESSAGE
+
+            message = _VERIFY_FIRST_MESSAGE
+            try:
+                account = account_view(snapshot, url, ats_name, mode="login", alternate=False)
+                account["verifyBeforeSignIn"] = True
+            except Exception:
+                account = None
         return snapshot, _result(
             session,
             status=Status.EMAIL_VERIFICATION_REQUIRED,
             ats=ats_name,
             login_status=login_status,
-            messages=["Email verification is required. Auto-Fill does not read mail."],
+            messages=[message],
+            account=account,
             **extra,
         )
     password_fields = any(control.kind == "password" and not control.hidden for control in snapshot.controls)

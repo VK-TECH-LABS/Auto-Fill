@@ -504,6 +504,10 @@ STANDARD_TERMS_DENY: tuple[str, ...] = (
     "interview analysis",
     "video analysis",
     "salary",
+    "export compliance",
+    "export control",
+    "itar",
+    "ofac",
 )
 # The whole statement, after normalize() drops a final period:
 # [yes] <verb> [the] <document> (and [the] <document>)* [for|of|at <owner>]
@@ -515,9 +519,13 @@ _PRIVACY_OWNER = (
     r"(?:candidate|applicant|job applicant|recruitment|recruiting|career|careers|global|data"
     r"|personal data|data protection|employee|hr)"
 )
+# A company name may sit in front of "Applicant Privacy Notice" (Boeing:
+# "the Boeing Applicant Privacy Notice"). At most four plain words, and only
+# in front of a privacy document so "terms of use" is unchanged.
+_PRIVACY_PREFIX = r"(?:[a-z0-9]+ ){0,4}"
 _TERMS_DOCUMENT = (
     r"(?:terms of service|terms and conditions|terms conditions|terms of use"
-    rf"|(?:{_PRIVACY_OWNER} ){{0,2}}privacy (?:policy|notice|statement)"
+    rf"|{_PRIVACY_PREFIX}(?:{_PRIVACY_OWNER} ){{0,2}}privacy (?:policy|notice|statement)"
     r"|data protection (?:policy|notice|statement)"
     r"|terms)"
 )
@@ -528,10 +536,10 @@ _TERMS_DOCUMENT = (
 # and never carries another verb or a second promise (checked in code).
 _READ_OBJECT = r"(?:agree to|agree with|accept|consent to|acknowledge|understand|understood)"
 _TERMS_VERB = (
-    rf"(?:i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    rf"(?:i have (?:read|reviewed|received)(?: and {_READ_OBJECT})?"
     rf"|i have (?:read|reviewed) understood and {_READ_OBJECT}"
     rf"|i have (?:read|reviewed) and understood and {_READ_OBJECT}"
-    rf"|i (?:acknowledge|confirm) that i have (?:read|reviewed)(?: and {_READ_OBJECT})?"
+    rf"|i (?:acknowledge|confirm) that i have (?:read|reviewed|received)(?: and {_READ_OBJECT})?"
     r"|i acknowledge receipt of"
     r"|i understand and (?:agree to|accept|acknowledge)"
     r"|i agree to|i agree with|i accept|i consent to|i acknowledge)"
@@ -609,6 +617,51 @@ def _is_submission_consent(statement: str) -> bool:
     return bool(text) and _SUBMISSION_CONSENT.fullmatch(text) is not None
 
 
+# Workday's Create Account checkbox. The label is often only "I ACCEPT" or
+# "I consent"; the privacy notice sits in the paragraph above it.
+_CREATE_ACCOUNT_BOX_IDS = frozenset({"createaccountcheckbox"})
+_CREATE_ACCOUNT_SHORT = re.compile(r"(?:yes )?i accept$")
+_CREATE_ACCOUNT_BOX_SHORT = re.compile(r"(?:yes )?i (?:accept|consent)$")
+
+
+def _create_account_checkbox(control: Control) -> bool:
+    auto = (control.automation_id or "").casefold()
+    form = (control.form_automation_id or "").casefold()
+    return auto in _CREATE_ACCOUNT_BOX_IDS or "createaccountcheckbox" in form
+
+
+def _statement_parts(control: Control) -> list[str]:
+    return [normalize(part) for part in (control.label, control.prompt, control.aria_label) if part]
+
+
+def _create_account_acknowledgement(control: Control) -> bool:
+    """The required Workday Create Account box, after the deny-list has passed.
+
+    A bare ``I ACCEPT`` on any required checkbox is the same control (JCI).
+    A bare ``I consent`` is accepted only on ``createAccountCheckbox`` (KBR):
+    the same two words elsewhere stay manual. A privacy or terms sentence on
+    that box is standard even when the company name sits inside it (Boeing).
+    """
+    parts = _statement_parts(control)
+    if not parts:
+        return False
+    if control.kind == "checkbox" and (control.required or _create_account_checkbox(control)):
+        if any(_CREATE_ACCOUNT_SHORT.fullmatch(part) for part in parts):
+            return True
+    if not _create_account_checkbox(control):
+        return False
+    if any(_CREATE_ACCOUNT_BOX_SHORT.fullmatch(part) for part in parts):
+        return True
+    combined = normalize(" ".join(parts))
+    if _is_standard_terms(combined):
+        return True
+    return bool(
+        combined
+        and re.search(r"\b(?:privacy|terms of (?:use|service)|terms and conditions)\b", combined)
+        and re.search(r"\bi (?:accept|consent|agree|acknowledge)\b", combined)
+    )
+
+
 def terms_category(control: Control) -> str:
     """``STANDARD_TERMS`` or ``STANDARD_SUBMISSION_CONSENT`` for a plain checkbox.
 
@@ -622,6 +675,8 @@ def terms_category(control: Control) -> str:
     blob = normalize(f"{haystack(control)} {control.prompt} {control.group} {option_text}")
     if _DENY_TERMS_RE.search(blob) or _MARKETING_RE.search(blob):
         return "CONSENT"
+    if control.kind == "checkbox" and _create_account_acknowledgement(control):
+        return "STANDARD_TERMS"
     for part in (control.label, control.prompt, control.group, control.aria_label):
         if not part:
             continue

@@ -71,12 +71,19 @@ def _email_control(snapshot: PageSnapshot) -> Control | None:
     for control in snapshot.controls:
         if control.hidden or control.kind not in {"text", "combobox"}:
             continue
+        auto = (control.automation_id or "").casefold()
+        form = (control.form_automation_id or "").casefold()
+        # Workday's Email Address box is type=text. The automation id is stable
+        # when the visible label is not copied onto the input.
+        if auto in {"email", "username"} or form in {"formfield-email", "formfield-username"}:
+            return control
         parts = (
             control.label,
             control.name,
             control.element_id,
             control.autocomplete,
             control.placeholder,
+            control.aria_label,
         )
         blob = " ".join(part for part in parts if part).casefold()
         if control.input_type == "email" or "email" in blob or "username" in blob or "user name" in blob:
@@ -296,6 +303,20 @@ _OTP_TEXT_RE = re.compile(
     r"verify your email|check your (?:inbox|email)|we sent (?:you )?(?:a|an) (?:code|email|link)",
     re.IGNORECASE,
 )
+# Already on the Sign In page, before anyone types. SNC: "An email has been sent
+# to you. Please verify your account." A password box is still visible, so this
+# is not an OTP page, but signing in now can lock the account.
+_EMAIL_ALREADY_SENT_RE = re.compile(
+    r"(?:"
+    r"(?:an |the )?e-?mail has been sent"
+    r"|please verify your account"
+    r"|verify your account"
+    r"|multi-?factor authentication"
+    r"|two-?factor authentication"
+    r"|authenticator app"
+    r")",
+    re.IGNORECASE,
+)
 _OTP_LABEL_RE = re.compile(r"\b(verification code|passcode|otp|code)\b", re.IGNORECASE)
 _OTP_PIN_RE = re.compile(r"\bpin\b", re.IGNORECASE)
 _DIAL_OR_POSTAL_RE = re.compile(
@@ -489,7 +510,14 @@ def score_account(snapshot: PageSnapshot, url: str = "") -> AccountScore:
         if _TERMS_RE.search(_control_blob(control) + " " + control.prompt + " " + control.group):
             register += 1
             break
-    create_link = bool(_REGISTER_RE.search(link_names) or "createAccountLink" in ids)
+    content_names = " ".join(
+        button.name for button in snapshot.buttons if not button.in_header and not button.in_ad
+    )
+    # "Create Account" is often a button, not a link, and some tenants omit
+    # data-automation-id="createAccountLink". The sign-in pane still offers it.
+    create_link = bool(
+        _REGISTER_RE.search(link_names) or _REGISTER_RE.search(content_names) or "createAccountLink" in ids
+    )
     signin_link = bool(_LOGIN_RE.search(link_names))
     signin_pane = ("signInSubmitButton" in ids or (len(passwords) == 1 and login > 0)) and not register_pane
     if signin_pane and create_link:
@@ -558,6 +586,25 @@ def _job_application(snapshot: PageSnapshot) -> bool:
                 continue
             return True
     return False
+
+
+def sign_in_verification_holding(snapshot: PageSnapshot) -> bool:
+    """Sign In already says the verification email was sent, or MFA is up.
+
+    The password boxes are still on the page. Nothing should be typed until
+    the person finishes that step and presses Continue. A Create Account form
+    is not this page.
+    """
+    if create_account_form(snapshot):
+        return False
+    if not (snapshot.password_present or _passwords(snapshot)):
+        return False
+    text = " ".join(
+        part
+        for part in (snapshot.banner, snapshot.heading, snapshot.page_text, *snapshot.alerts)
+        if part
+    )
+    return bool(_EMAIL_ALREADY_SENT_RE.search(text))
 
 
 def verification_present(snapshot: PageSnapshot) -> bool:

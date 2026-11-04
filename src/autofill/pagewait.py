@@ -993,6 +993,20 @@ def _account_chrome(snapshot: PageSnapshot) -> bool:
     return "sign in" in names or "log in" in names or "create account" in names
 
 
+def _account_identity(control: Control) -> bool:
+    """The sign-in email box. Workday uses type=text, not type=email."""
+    auto = (control.automation_id or "").casefold()
+    form = (control.form_automation_id or "").casefold()
+    if auto in {"email", "username"} or form in {"formfield-email", "formfield-username"}:
+        return True
+    blob = " ".join(
+        part
+        for part in (control.label, control.aria_label, control.placeholder, control.autocomplete, control.name)
+        if part
+    ).casefold()
+    return "email" in blob or "username" in blob or "user name" in blob
+
+
 def _application_fields(snapshot: PageSnapshot) -> bool:
     for control in snapshot.controls:
         if control.hidden or control.kind in {"password", "hidden"}:
@@ -1000,6 +1014,8 @@ def _application_fields(snapshot: PageSnapshot) -> bool:
         if control.kind in {"file", "textarea", "select", "radio", "combobox"}:
             return True
         if control.kind == "text" and control.input_type not in {"email", "password"}:
+            if _account_identity(control):
+                continue
             return True
     return False
 

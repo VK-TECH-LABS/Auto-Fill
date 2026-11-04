@@ -26,6 +26,7 @@ from autofill.login import (
     redact_site_error,
     score_account,
     sign_in_switch_target,
+    sign_in_verification_holding,
     verification_present,
 )
 from autofill.mapping import (
@@ -170,6 +171,21 @@ def _perform_account_action(
             return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "register"}
     if scored.mode != mode:
         return {"ok": False, "reason": "mode_mismatch", "detected": scored.mode or "login"}
+    if mode == "login" and sign_in_verification_holding(snapshot):
+        # The employer already asked the person to open the verification email
+        # (or to finish MFA). Typing the password now can lock the account.
+        paused = {
+            "ok": True,
+            "outcome": "verification_required",
+            "status": "EMAIL_VERIFICATION_REQUIRED",
+            "verifyBeforeSignIn": True,
+            "message": _VERIFY_FIRST_MESSAGE,
+            "siteErrors": [],
+            "account": _view(snapshot, page.url or "", ats, "login", scored.alternate, []),
+        }
+        if isinstance(paused["account"], dict):
+            paused["account"]["verifyBeforeSignIn"] = True
+        return _attach_proof(paused, {}, [], standard_terms=standard_terms)
     if mode == "register":
         # Refuse before any keystroke. A secret that misses the rules on this
         # pane is not typed and Create Account is not clicked.
