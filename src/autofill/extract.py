@@ -89,6 +89,44 @@ EXTRACT_JS = r"""
     );
   }
 
+  function isPostalName(text) {
+    const folded = cleanPrompt(text).toLowerCase();
+    return (
+      folded === "postal code" ||
+      folded === "zip" ||
+      folded === "zip code" ||
+      folded === "postcode" ||
+      folded === "postal"
+    );
+  }
+
+  function acceptsQuestionLength(text) {
+    // A short label is a question. A longer sentence is one only when it asks.
+    if (!text) return false;
+    if (text.length <= 240) return true;
+    return text.length <= 500 && text.indexOf("?") !== -1;
+  }
+
+  function labelNamesOther(label, el) {
+    // <label for="postal"> names the postal input, not the search box beside it.
+    if (!label || !label.getAttribute || !el) return false;
+    const targetId = label.getAttribute("for") || "";
+    if (!targetId) return false;
+    const target = document.getElementById(targetId);
+    if (!target || target === el) return false;
+    if (el.contains && el.contains(target)) return false;
+    if (target.contains && target.contains(el)) return false;
+    return true;
+  }
+
+  function callingCodeSearch(node) {
+    if (!node || !node.getAttribute) return false;
+    const role = (node.getAttribute("role") || "").toLowerCase();
+    const auto = (node.getAttribute("data-automation-id") || "").toLowerCase();
+    const tag = node.tagName ? node.tagName.toLowerCase() : "";
+    return auto === "searchbox" || role === "combobox" || tag === "select";
+  }
+
   function precedes(left, right) {
     if (!left || !right || left === right || !left.compareDocumentPosition) return false;
     return !!(left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING);
@@ -314,6 +352,10 @@ EXTRACT_JS = r"""
       if (child.querySelector && child.querySelector("input, select, textarea, button")) continue;
       const text = cleanPrompt(textOf(child));
       if (!text || isSectionHeading(child, text)) continue;
+      if (labelNamesOther(child, el)) continue;
+      // The Postal Code title names the postal input. A calling-code search
+      // that sits in that row is not the postal field.
+      if (callingCodeSearch(el) && isPostalName(text)) continue;
       // A label past another input names that input. The label before this
       // control wins over a following field title such as Country Phone Code.
       const at = kids.indexOf(child);
@@ -639,7 +681,15 @@ EXTRACT_JS = r"""
           }
           const tag = prev.tagName ? prev.tagName.toLowerCase() : "";
           if (tag === "label" || tag === "legend") {
+            if (labelNamesOther(prev, el)) {
+              prev = prev.previousElementSibling;
+              continue;
+            }
             const text = textOf(prev);
+            if (callingCodeSearch(el) && isPostalName(text)) {
+              prev = prev.previousElementSibling;
+              continue;
+            }
             if (text && !isSectionHeading(prev, text) && !isGenericPrompt(text)) found = text;
           }
           const blocks =
@@ -652,9 +702,14 @@ EXTRACT_JS = r"""
           if (blocks && !found) break;
           if (!found) {
             const inner = prev.querySelector && prev.querySelector("label, legend");
-            if (inner && !isHidden(inner)) {
+            if (inner && !isHidden(inner) && !labelNamesOther(inner, el)) {
               const text = textOf(inner);
-              if (text && !isSectionHeading(inner, text) && !isGenericPrompt(text)) found = text;
+              if (
+                text &&
+                !isSectionHeading(inner, text) &&
+                !isGenericPrompt(text) &&
+                !(callingCodeSearch(el) && isPostalName(text))
+              ) found = text;
             }
           }
           if (!found) {
@@ -662,7 +717,7 @@ EXTRACT_JS = r"""
             const text = cleanPrompt(textOf(prev));
             if (
               text &&
-              text.length <= 200 &&
+              acceptsQuestionLength(text) &&
               !isSectionHeading(prev, text) &&
               !isGenericPrompt(text) &&
               (
@@ -1114,7 +1169,7 @@ EXTRACT_JS = r"""
       if (!prev || !prev.tagName) continue;
       if (prev.querySelector && prev.querySelector("input, select, textarea, button")) continue;
       const text = textOf(prev);
-      if (text && text.length <= 200 && !isSectionHeading(prev, text)) return text;
+      if (text && acceptsQuestionLength(text) && !isSectionHeading(prev, text)) return text;
     }
     return "";
   }
@@ -1211,25 +1266,31 @@ EXTRACT_JS = r"""
   }
 
   function phoneAdjacent(el) {
-    // A Country menu that shares a small wrapper with the phone input.
-    // Stop at the form so a later address Country is not pulled in.
+    // A calling-code menu that shares a small wrapper with the phone input.
+    // The search box often says "Search", and a Postal Code label in the same
+    // row is not this menu. Stop at the form so a later address Country, or a
+    // second prompt such as How Did You Hear, is not pulled in.
     const label = controlLabel(el);
-    if (label && label !== "country" && label.indexOf("country ") !== 0) return false;
+    const specific = label && !isGenericPrompt(label) && !isPostalName(label);
+    if (
+      specific &&
+      label !== "country" &&
+      label.indexOf("country ") !== 0 &&
+      label.indexOf("phone") === -1 &&
+      label.indexOf("dial") === -1 &&
+      label.indexOf("calling") === -1
+    ) return false;
     let node = el;
     for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
       const tag = node.tagName ? node.tagName.toLowerCase() : "";
       if (tag === "form" || tag === "body" || tag === "html") break;
-      const tels = node.querySelectorAll("input[type='tel'], input[autocomplete='tel'], input[id='phone']");
+      const tels = node.querySelectorAll(
+        "input[type='tel'], input[autocomplete='tel'], input[autocomplete='tel-national'], input[id='phone']"
+      );
       if (!tels.length) continue;
-      let menus = 0;
-      for (const input of node.querySelectorAll("input[role='combobox'], select")) {
-        const aria = (input.getAttribute("aria-label") || "").toLowerCase();
-        const type = (input.getAttribute("type") || "").toLowerCase();
-        if (aria === "search" || type === "search") continue;
-        menus += 1;
-      }
-      if (menus <= 1) return true;
-      break;
+      const menus = node.querySelectorAll("select, [role='combobox']");
+      if (tels.length === 1 && menus.length === 1) return true;
+      if (menus.length > 1) break;
     }
     return false;
   }
@@ -1410,7 +1471,7 @@ EXTRACT_JS = r"""
       const tag = prev.tagName.toLowerCase();
       const cls = (prev.getAttribute("class") || "").toLowerCase();
       const text = questionText(prev);
-      if (!text || text.length > 200 || isSectionHeading(prev, text)) continue;
+      if (!text || !acceptsQuestionLength(text) || isSectionHeading(prev, text)) continue;
       if (
         tag === "label" ||
         tag === "legend" ||

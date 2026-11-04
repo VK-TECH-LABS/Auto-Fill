@@ -1181,6 +1181,8 @@ _PHONE_COUNTRY_LABELS = frozenset(
         "dial code",
     }
 )
+# A calling-code search can be labeled with the postal field that shares its row.
+_STOLEN_POSTAL_LABELS = frozenset({"postal code", "zip", "zip code", "postcode", "postal", "search"})
 
 
 def _compact_token(value: str) -> str:
@@ -1330,6 +1332,12 @@ def _is_phone_country_menu(control: Control) -> bool:
         return False
     label = normalize(control.label or control.aria_label)
     if label in _PHONE_COUNTRY_LABELS:
+        return True
+    # The menu sits on the phone input. An empty label, "Search", or a Postal
+    # Code title stolen from the next field is still the calling code.
+    if control.phone_adjacent and (
+        not label or label in _STOLEN_POSTAL_LABELS or label in {"country", "country code", "phone country"}
+    ):
         return True
     if label not in {"country", "country code", "phone country"}:
         return False

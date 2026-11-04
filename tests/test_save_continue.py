@@ -477,6 +477,10 @@ def test_same_heading_field_replacement_releases_the_blocked_next():
     assert _release_block((*blocked, before), before) is False
     assert _release_block((*blocked, before), revealed) is False
     assert _release_block((*blocked, before), replaced) is True
+    # Most fields stay. One leaves and one arrives. That is the next step.
+    shared = (route, (("#email", ""), ("#phone", ""), ("#city", ""), ("#role", "")), "application")
+    swapped = (route, (("#email", ""), ("#phone", ""), ("#city", ""), ("#school", "")), "application")
+    assert _release_block((*blocked, shared), swapped) is True
 
 
 def test_stale_popup_save_reopens_with_an_error(monkeypatch):

@@ -1804,8 +1804,9 @@ def _release_block(block: tuple | None, current_sig: tuple) -> bool:
 
     A click that only reveals fields keeps the previous fields on screen. The
     same Next stays ineligible so it is not pressed again. A new route, a new
-    heading, or a field set that replaced the old one is the next step, even
-    when Workday keeps the same Save and Continue button and the same heading.
+    heading, a field set that replaced the old one, or a set that both drops
+    some controls and adds others is the next step, even when Workday keeps
+    the same Save and Continue button and the same heading.
     """
     if block is None:
         return False
@@ -1820,6 +1821,12 @@ def _release_block(block: tuple | None, current_sig: tuple) -> bool:
     new_fields = set(current_sig[1]) if isinstance(current_sig[1], (list, tuple, set, frozenset)) else set()
     if not old_fields:
         return bool(new_fields)
+    removed = old_fields - new_fields
+    added = new_fields - old_fields
+    # A partial step change keeps most controls (name, email, phone) and
+    # swaps the rest. A reveal only adds controls and stays blocked.
+    if removed and added:
+        return True
     kept = old_fields & new_fields
     return len(kept) * 2 < len(old_fields)
 

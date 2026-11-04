@@ -234,7 +234,9 @@ _SCOPED_OPTIONS_JS = r"""
       }
     }
   }
-  if (!optionNodes.length && allowSingle) {
+  // An open prompt whose next level is a plain listbox (role=option rows,
+  // not promptLeafNode) is still this control's menu. Two menus are not guessed.
+  if (!optionNodes.length && (allowSingle || promptOpen(el))) {
     // One unclaimed visible list. Two menus means we will not guess which one.
     // A selected-item list is a value, not a menu.
     const boxes = [];
@@ -309,7 +311,24 @@ _SCOPED_OPTIONS_JS = r"""
       return ident.indexOf("phonecode") !== -1 || ident.indexOf("countrycode") !== -1
         || (ident.indexOf("phone") !== -1 && ident.indexOf("code") !== -1);
     }
-    if (!phoneCodeField(el) && /\(\+\d+\)/.test(label)) continue;
+    function besideNationalPhone(node) {
+      // The only menu in a small group with one phone input is the calling code.
+      // A second prompt on the same form is not, so its menu still drops (+1) pills.
+      let cursor = node;
+      for (let depth = 0; cursor && depth < 5; depth += 1, cursor = cursor.parentElement) {
+        const tag = cursor.tagName ? cursor.tagName.toLowerCase() : "";
+        if (tag === "form" || tag === "body" || tag === "html") break;
+        const tels = cursor.querySelectorAll(
+          "input[type='tel'], input[autocomplete='tel'], input[autocomplete='tel-national']"
+        );
+        if (!tels.length) continue;
+        const menus = cursor.querySelectorAll("select, [role='combobox']");
+        if (tels.length === 1 && menus.length === 1) return true;
+        if (menus.length > 1) break;
+      }
+      return false;
+    }
+    if (!phoneCodeField(el) && !besideNationalPhone(el) && /\(\+\d+\)/.test(label)) continue;
     const leaf = !folder && (
       auto === "promptleafnode"
       || !!option.querySelector("[data-automation-id='promptLeafNode']")
@@ -347,7 +366,6 @@ _COMMIT_JS = r"""
     if (!text || !wanted) return false;
     return text === wanted || text.indexOf(wanted) !== -1 || wanted.indexOf(text) !== -1;
   }
-  const field = el.closest(".field, .select, fieldset") || el.parentElement;
   function promptValueRoot(node) {
     // The search box lives in multiselectInputContainer. The selected pill is
     // a sibling of that box, inside the outer multiSelectContainer.
@@ -358,13 +376,26 @@ _COMMIT_JS = r"""
   }
   const promptRoot = promptValueRoot(el);
   const fieldRoot = el.closest("[data-automation-id^='formField']");
+  // The widget root holds the hidden value and this menu's error. A shared
+  // fieldset is not that root, so a sibling question's error is not this one.
+  const field = promptRoot || fieldRoot || el.closest(".field, .select") || el.parentElement;
   let error = el.getAttribute("aria-invalid") === "true";
+  // A leftover "required" flag is stale once the value is visible. A format
+  // error, or any other message, still blocks the commit.
+  let blocking = false;
   if (field) {
     const nodes = field.querySelectorAll("[role='alert'], .field-error, .error-message, .select-error, .error");
     for (const node of nodes) {
       if (!shown(node)) continue;
-      const text = (node.innerText || node.textContent || "").trim();
-      if (text) error = true;
+      const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      error = true;
+      const folded = text.toLowerCase();
+      const stale = folded.indexOf("required") !== -1 || folded.indexOf("must have a value") !== -1;
+      const format = folded.indexOf("invalid phone") !== -1
+        || folded.indexOf("valid format") !== -1
+        || folded.indexOf("valid date") !== -1;
+      if (format || !stale) blocking = true;
     }
   }
   let hiddenOk = false;
@@ -426,7 +457,7 @@ _COMMIT_JS = r"""
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
     buttonOk = fold(el.innerText || el.textContent) === wanted;
   }
-  return { error, hiddenOk, shownOk, pillOk, ariaOk, tracksValue, inputOk, buttonOk };
+  return { error, blocking, hiddenOk, shownOk, pillOk, ariaOk, tracksValue, inputOk, buttonOk };
 }
 """
 
@@ -450,16 +481,92 @@ def _combobox_committed(page, selector: str, label: str, *, accept_input: bool =
         return False
     if not isinstance(state, dict):
         return False
-    # A Workday selected pill is the commit. The search box can stay
-    # aria-invalid after that pill is chosen. A painted menu label with a
-    # field error is not a commit; that widget is retried from the keyboard.
-    if state.get("pillOk"):
+    # A visible choice is the commit. The search box can stay aria-invalid,
+    # and a stale "required" message can stay, after that choice is painted.
+    # A format error or any other field message is not a commit.
+    visible = (
+        state.get("pillOk")
+        or state.get("hiddenOk")
+        or state.get("ariaOk")
+        or state.get("shownOk")
+        or state.get("buttonOk")
+    )
+    if visible and not state.get("blocking"):
         return True
-    if state.get("error"):
+    if state.get("blocking") or state.get("error"):
         return False
-    if state.get("hiddenOk") or state.get("ariaOk") or state.get("shownOk") or state.get("buttonOk"):
-        return True
     return bool(accept_input and state.get("inputOk"))
+
+
+_CLEAR_SATISFIED_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  function placeholder(text) {
+    const folded = clean(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+    if (!folded) return true;
+    return /^(select one|select|choose|choose one|please select|please select one|search)$/.test(folded);
+  }
+  const tag = String(el.tagName || "");
+  let shown = "";
+  if (tag === "SELECT") {
+    const option = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+    shown = clean(option ? (option.text || option.label || el.value) : el.value);
+  } else if (tag === "INPUT" || tag === "TEXTAREA") {
+    shown = clean(el.value);
+  } else {
+    shown = clean(el.innerText || el.textContent);
+  }
+  if (!shown || placeholder(shown)) return false;
+  const field = (el.closest && (
+    el.closest("[data-automation-id^='formField']") ||
+    el.closest(".field, .form-group, .jv-form-field")
+  )) || el.parentElement;
+  let formatError = false;
+  if (field && field.querySelectorAll) {
+    const nodes = field.querySelectorAll(
+      "[data-automation-id='errorMessage'], [data-automation-id='errorWidget'], " +
+      "[role='alert'], .field-error, .error-message"
+    );
+    for (const node of nodes) {
+      if (node === el || (node.contains && node.contains(el))) continue;
+      const text = clean(node.innerText || node.textContent).toLowerCase();
+      if (!text) continue;
+      if (
+        text.indexOf("invalid phone") !== -1 ||
+        text.indexOf("valid format") !== -1 ||
+        text.indexOf("valid date") !== -1
+      ) {
+        formatError = true;
+        continue;
+      }
+      if (text.indexOf("required") === -1 && text.indexOf("must have a value") === -1) continue;
+      node.remove();
+    }
+  }
+  if (!formatError) el.removeAttribute("aria-invalid");
+  return true;
+}"""
+
+
+def clear_satisfied_invalid(page, selector: str) -> None:
+    """Drop a stale required flag once this control shows a real value.
+
+    A format error stays, so a phone or date retry can still see it. An empty
+    control and a placeholder such as Select One are left invalid.
+    """
+    if not selector:
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(_CLEAR_SATISFIED_JS, selector)
+    except Exception:
+        return
 
 
 def _read_options(page, selector: str, *, allow_single: bool = False) -> list[Option]:
@@ -1169,6 +1276,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     focus_field(page, selector)
     shown = _selected_text(page, selector)
     if _labels_match(desired, shown) or any(_labels_match(part, shown) for part in _path_parts(desired)[-1:]):
+        clear_satisfied_invalid(page, selector)
         return Option(value=shown, label=shown, selector=selector)
     if _is_school_field(page, selector):
         return search_school(page, selector, desired)
@@ -1236,9 +1344,11 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             _pause(page, 50)
             match = leaf
     if _committed_choice(page, selector, match, desired, accept_input=not typed):
+        clear_satisfied_invalid(page, selector)
         return match
     _keyboard_commit(page, selector, desired, match)
     if _committed_choice(page, selector, match, desired, accept_input=True):
+        clear_satisfied_invalid(page, selector)
         return match
     dismiss_combobox(page)
     return None
@@ -1596,6 +1706,7 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
     for _attempt in range(2):
         shown = _button_text(page, selector)
         if _answer_matches(shown, intended):
+            clear_satisfied_invalid(page, selector)
             _note_listbox(selector, question, intended, clicked or shown, shown)
             return Option(value=intended, label=shown, selector=selector)
         try:
@@ -1611,6 +1722,7 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
             _close_listbox(page)
             shown = _button_text(page, selector)
             if _answer_matches(shown, intended):
+                clear_satisfied_invalid(page, selector)
                 _note_listbox(selector, question, intended, clicked or shown, shown)
                 return Option(value=intended, label=shown, selector=selector)
             continue
@@ -1634,6 +1746,7 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
         _close_listbox(page)
         shown = _settled_button_label(page, selector)
         if _answer_matches(shown, intended):
+            clear_satisfied_invalid(page, selector)
             _note_listbox(selector, question, intended, clicked, shown)
             return Option(value=intended, label=shown, selector=match.selector)
         _close_listbox(page)
@@ -1644,6 +1757,7 @@ def select_listbox_button(page, selector: str, desired: str, question: str = "")
         shown = _button_text(page, selector)
     _note_listbox(selector, question, intended, clicked, shown)
     if _answer_matches(shown, intended):
+        clear_satisfied_invalid(page, selector)
         return Option(value=intended, label=shown, selector=selector)
     return None
 
