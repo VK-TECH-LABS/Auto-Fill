@@ -884,6 +884,20 @@ def _committed_choice(page, selector: str, match: Option, desired: str, *, accep
     return _labels_match(desired, shown) or _labels_match(match.label, shown)
 
 
+def _commit_held(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
+    """True once the widget still shows the choice. A late pill is a commit.
+
+    The first read is immediate. A menu that paints the choice on the next
+    frame is waited on. A search string left in the box is not a commit
+    unless ``accept_input`` is set.
+    """
+    for _attempt in range(8):
+        if _committed_choice(page, selector, match, desired, accept_input=accept_input):
+            return True
+        _pause(page, 40)
+    return False
+
+
 _SCHOOL_FIELD_JS = r"""(selector) => {
   const el = document.querySelector(selector);
   if (!el) return false;
@@ -967,6 +981,12 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
         children = _await_menu(page, selector, 800)
         leaves = _real_leaves(children)
         leaf = _prefer_leaf(leaf_name, leaves)
+        if leaf is None and leaf_name:
+            # The next level is a search box. The leaf is not in the DOM
+            # until the query is typed.
+            _type_filter(page, selector, leaf_name)
+            searched = _await_menu(page, selector, 1000)
+            leaf = _prefer_leaf(leaf_name, _real_leaves(searched) or searched)
         if leaf is None and not parts and len(leaves) == 1 and _labels_match(desired, current.label):
             leaf = leaves[0]
         if leaf is None or not leaf.selector:
@@ -1294,7 +1314,9 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     folder_hit = match if match is not None and match.folder else None
     if match is not None and match.folder:
         match = None
-    if match is None and folder_hit is None and not _path_parts(desired):
+    # A category menu is drilled first. Typing the leaf here hides the folder.
+    folders_present = any(option.folder for option in top_level)
+    if match is None and folder_hit is None and not _path_parts(desired) and not folders_present:
         for term in _filter_terms(desired):
             _type_filter(page, selector, term, school=school)
             typed = True
@@ -1343,11 +1365,11 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             click_choice(page, leaf.selector, leaf.label)
             _pause(page, 50)
             match = leaf
-    if _committed_choice(page, selector, match, desired, accept_input=not typed):
+    if _commit_held(page, selector, match, desired, accept_input=not typed):
         clear_satisfied_invalid(page, selector)
         return match
     _keyboard_commit(page, selector, desired, match)
-    if _committed_choice(page, selector, match, desired, accept_input=True):
+    if _commit_held(page, selector, match, desired, accept_input=True):
         clear_satisfied_invalid(page, selector)
         return match
     dismiss_combobox(page)

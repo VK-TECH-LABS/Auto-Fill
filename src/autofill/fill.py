@@ -256,12 +256,6 @@ def _native_checkbox(control: Control) -> bool:
     return True
 
 
-def _yes_no_labels(control: Control) -> bool:
-    names = {(option.label or option.value or "").strip().casefold() for option in control.options}
-    names.discard("")
-    return names == {"yes", "no"}
-
-
 def _choice_selected(target, selector: str) -> bool:
     """True when the clicked Yes/No button itself reads as chosen.
 
@@ -301,6 +295,26 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 detail="A choice button is not a text field.",
             )
         if mapped.action == "fill":
+            if mapped.key == "city" and control.kind in {"text", "textarea", "combobox"}:
+                from autofill.stepfill import commit_city_text
+
+                report = commit_city_text(target, control.selector, mapped.text or "")
+                if not report.get("filled"):
+                    return _outcome(
+                        control,
+                        mapped,
+                        action="unanswered",
+                        detail="Value did not stay on the page.",
+                    )
+                remember_confirmed(control, mapped.text or "", field_key=mapped.key or "")
+                refresh_preview(page)
+                return _outcome(control, mapped, detail="filled")
+            if mapped.key == "email":
+                from autofill.dom_ui import prime_primary_email
+                from autofill.mapping import is_confirm_email
+
+                if is_confirm_email(control):
+                    prime_primary_email(target, control.selector, mapped.text or "")
             current = _shown_value(locator)
             if not overwrite and current.strip() and not _value_matches(current, mapped.text or ""):
                 return _outcome(
@@ -325,16 +339,23 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             if control.kind == "radio":
                 selector = mapped.option_selector or control.selector
                 if control.input_type == "aria-radio":
-                    if not _yes_no_labels(control):
+                    from autofill.mapping import attestation_manual, is_consent_choice, is_demographic_control
+
+                    if (
+                        is_consent_choice(control)
+                        or is_demographic_control(control)
+                        or attestation_manual(control)
+                    ):
                         return _outcome(
                             control,
                             mapped,
                             action="unanswered",
-                            detail="Custom radio left for a person.",
+                            detail="This statement stays manual.",
                         )
+                    from autofill.dom_ui import await_aria_checked
                     from autofill.safeguards import press_aria_radio
 
-                    if not press_aria_radio(target, selector):
+                    if not press_aria_radio(target, selector) and not await_aria_checked(target, selector):
                         return _outcome(
                             control,
                             mapped,

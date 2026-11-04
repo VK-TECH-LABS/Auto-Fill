@@ -394,6 +394,25 @@ def haystack(control: Control) -> str:
     return normalize(" ".join(part for part in parts if part))
 
 
+def is_confirm_email(control: Control) -> bool:
+    """A second email box that must repeat this candidate's email.
+
+    ``emailConfirmation`` and ``Confirm email`` are that box. A verification
+    code, a password, and a marketing opt-in are not.
+    """
+    if control.kind not in {"text", "textarea", "combobox"} and control.input_type not in {"email", "text", ""}:
+        return False
+    blob = haystack(control)
+    if not blob or re.search(r"\b(code|otp|pin|password)\b", blob):
+        return False
+    compact = re.sub(r"[^a-z0-9]", "", blob)
+    if "email" not in compact:
+        return False
+    if re.search(r"\b(confirm|re ?enter|retype|repeat|verify)\b", blob):
+        return True
+    return any(token in compact for token in ("confirmemail", "emailconfirm", "reenteremail", "verifyemail"))
+
+
 def option_stance(label: str) -> str:
     """``agree``, ``decline``, or empty for one opt-in or opt-out label.
 
@@ -1598,6 +1617,10 @@ def _match_rule(control: Control) -> str | None:
         return None
     if _is_address_line2(control):
         return "address_line2"
+    if is_confirm_email(control):
+        # The same address as Email. A glued name such as emailConfirmation
+        # does not contain the word "email", so the generic rule misses it.
+        return "email"
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]
@@ -1628,6 +1651,10 @@ def _match_rule(control: Control) -> str | None:
         if rule.kinds is not None and control.kind not in rule.kinds:
             continue
         if rule.key == "years_of_experience_total" and _specific_years_question(blob):
+            continue
+        if rule.key == "email" and re.search(r"\b(code|otp|pin)\b", blob):
+            # A verification code is not the email address. The sign-in pause
+            # still waits for the person to finish that step.
             continue
         if rule.key == "current_company" and not is_current_company_label(control):
             continue
