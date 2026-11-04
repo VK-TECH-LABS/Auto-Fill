@@ -724,6 +724,11 @@ def _create_account_privacy_gate(control: Control) -> bool:
     blob = _consent_blob(control)
     if not blob or _HARD_MANUAL_RE.search(blob):
         return False
+    parts = _statement_parts(control)
+    # Bare "I agree" is not a privacy acknowledgement, including on
+    # createAccountCheckbox and next to a terms paragraph.
+    if any(re.fullmatch(r"(?:yes )?i agree", part) for part in parts):
+        return False
     if _READ_NOTICE_RE.search(blob):
         # "I have read the privacy policy and agree to receive marketing emails"
         # is still a marketing opt-in. A short "I understand" box is not, even
@@ -735,9 +740,16 @@ def _create_account_privacy_gate(control: Control) -> bool:
         return True
     parts = _statement_parts(control)
     if any(_SHORT_ACCOUNT_ACK.fullmatch(part) for part in parts):
+        # "I accept" is the JCI box. "I consent" is that box only when the
+        # automation id says so. "I understand" needs the notice or that id.
+        # Bare "I agree" stays manual even on createAccountCheckbox.
         if any(_CREATE_ACCOUNT_SHORT.fullmatch(part) for part in parts):
             return True
-        return bool(_create_account_checkbox(control) or _NOTICE_NAME_RE.search(blob))
+        if any(re.fullmatch(r"(?:yes )?i consent", part) for part in parts):
+            return _create_account_checkbox(control)
+        if any(re.fullmatch(r"(?:yes )?i understand", part) for part in parts):
+            return bool(_create_account_checkbox(control) or _NOTICE_NAME_RE.search(blob))
+        return False
     # The label is only the notice name (the link). A sentence that also opts
     # into job alerts or a newsletter is not this box.
     if (control.required or _create_account_checkbox(control)) and _NOTICE_NAME_RE.search(blob):
@@ -758,6 +770,10 @@ def _create_account_acknowledgement(control: Control) -> bool:
     """
     parts = _statement_parts(control)
     if not parts:
+        return False
+    # Bare "I agree" is not the privacy box, even when the paragraph above it
+    # mentions terms and the automation id is createAccountCheckbox.
+    if any(re.fullmatch(r"(?:yes )?i agree", part) for part in parts):
         return False
     # JCI's box is the two words "I ACCEPT". Workday often omits ``required``
     # and puts ``createAccountCheckbox`` on the field wrapper, not the input.

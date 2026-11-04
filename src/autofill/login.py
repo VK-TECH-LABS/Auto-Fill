@@ -897,48 +897,6 @@ def email_sign_in_button(snapshot: PageSnapshot):
     return None
 
 
-def open_create_account(page, snapshot: PageSnapshot) -> PageSnapshot | None:
-    """Open the Sign In pane's Create Account control once.
-
-    Returns the new snapshot, or None when there is no such control or the
-    click does not reveal a Create Account form. Header Sign In is not used.
-    """
-    chosen: tuple[str, str, str] | None = None
-    for link in snapshot.links:
-        if getattr(link, "in_header", False) or getattr(link, "in_ad", False):
-            continue
-        if link.automation_id == "createAccountLink" or _REGISTER_RE.search(link.name or ""):
-            if link.selector and link.name:
-                chosen = (link.selector, link.name, "")
-                break
-    if chosen is None:
-        for button in snapshot.buttons:
-            if getattr(button, "in_header", False) or getattr(button, "in_ad", False) or button.disabled:
-                continue
-            if button.automation_id == "createAccountLink" or _REGISTER_RE.search(button.name or ""):
-                if "submit application" in (button.name or "").casefold():
-                    continue
-                if button.selector and button.name:
-                    chosen = (button.selector, button.name, button.control_type or "")
-                    break
-    if chosen is None:
-        return None
-    selector, name, control_type = chosen
-    try:
-        activate_account_switch(page, selector, name, control_type=control_type)
-    except Exception:
-        logger.info("create account: click failed")
-        return None
-    try:
-        fresh = extract_page(page)
-    except Exception:
-        return None
-    if create_account_form(fresh) or score_account(fresh).mode == "register":
-        logger.info("create account: form opened")
-        return fresh
-    return None
-
-
 def open_email_sign_in(page, snapshot: PageSnapshot) -> PageSnapshot | None:
     """Click "Sign in with email" and wait for the email or password box.
 

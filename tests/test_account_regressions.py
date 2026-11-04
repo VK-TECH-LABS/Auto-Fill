@@ -56,6 +56,13 @@ def test_create_account_privacy_boxes_are_standard_and_compound_opt_ins_are_not(
     notice_only = _box("Boeing Applicant Privacy Notice")
     assert terms_category(notice_only) == "STANDARD_TERMS"
     assert terms_category(_box("I agree")) == "CONSENT"
+    on_the_create_box = _box(
+        "I agree",
+        automation_id="createAccountCheckbox",
+        prompt="By creating an external account you are agreeing to the Terms and Conditions.",
+    )
+    assert terms_category(on_the_create_box) == "CONSENT"
+    assert terms_category(_box("I consent", automation_id="createAccountCheckbox")) == "STANDARD_TERMS"
     assert terms_category(_box("I understand")) == "CONSENT"
     assert terms_category(_box("I agree to the Privacy Policy and to receive job alerts")) == "CONSENT"
     assert terms_category(_box("I agree to binding arbitration")) == "CONSENT"
