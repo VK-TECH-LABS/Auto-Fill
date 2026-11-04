@@ -772,6 +772,33 @@ EXTRACT_JS = r"""
     return field ? (field.getAttribute("data-automation-id") || "") : "";
   }
 
+  function inheritedAccountId(el) {
+    // Workday puts email / createAccountCheckbox on a wrapper. The input
+    // itself often has no data-automation-id, so sign-in and the terms box
+    // were invisible to the account flow.
+    if (!el) return "";
+    const own = el.getAttribute && el.getAttribute("data-automation-id");
+    if (own) return own;
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const auto = (node.getAttribute && node.getAttribute("data-automation-id")) || "";
+      const folded = auto.toLowerCase();
+      if (!folded || folded === "click_filter") continue;
+      if (
+        folded === "email" ||
+        folded === "username" ||
+        folded === "password" ||
+        folded === "verifypassword" ||
+        folded === "createaccountcheckbox" ||
+        (folded.indexOf("createaccount") === 0 && folded.indexOf("link") === -1)
+      ) {
+        return auto;
+      }
+      if (folded.indexOf("formfield") === 0) break;
+    }
+    return "";
+  }
+
   function selectorFor(el) {
     if (el.id) return "#" + CSS.escape(el.id);
     const name = el.getAttribute("name");
@@ -1002,7 +1029,7 @@ EXTRACT_JS = r"""
         nearby: textOf(headingNode).slice(0, 160),
         group: legendText(el) || (inputType === "checkbox" ? formFieldQuestion(el) : ""),
         prompt: inputType === "checkbox" ? groupQuestion(el) : "",
-        automationId: el.getAttribute("data-automation-id") || "",
+        automationId: inheritedAccountId(el),
         maxLength: el.maxLength > 0 && el.maxLength < 100000 ? el.maxLength : null,
         phoneAdjacent: kind === "combobox" || kind === "select" ? phoneAdjacent(el) : false,
         nationalPhone: nationalPhone(el),
@@ -1099,7 +1126,7 @@ EXTRACT_JS = r"""
         nearby: "",
         group: question && question !== own ? question : formFieldQuestion(el),
         prompt: question && question !== own ? question : "",
-        automationId: el.getAttribute("data-automation-id") || "",
+        automationId: inheritedAccountId(el),
       });
     }
   });

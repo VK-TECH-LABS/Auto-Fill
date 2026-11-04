@@ -3605,7 +3605,7 @@ def _restore_choice(page, record: dict) -> dict | None:
     if _choice_record_is_consent(record):
         return {"via": "consent", "result": "skipped"}
     hint = _confirmed_hint(record)
-    from autofill.safeguards import commit_native_choice, press_aria_radio
+    from autofill.safeguards import press_aria_radio
 
     missed: dict | None = None
     for target in _frame_targets(page):
@@ -3628,8 +3628,10 @@ def _restore_choice(page, record: dict) -> dict | None:
         turn_on = hint.get("choice") == "radio" or want.casefold() not in {"no", "false", "unchecked"}
         if bool(found.get("selected")) is turn_on:
             return {"via": via, "result": "kept"}
-        if found.get("native"):
-            ok = commit_native_choice(target, selector, on=turn_on)
+        if found.get("native") or role in {"checkbox", "switch"}:
+            from autofill.safeguards import commit_choice
+
+            ok = commit_choice(target, selector, on=turn_on)
         elif role == "radio":
             ok = press_aria_radio(target, selector)
         else:

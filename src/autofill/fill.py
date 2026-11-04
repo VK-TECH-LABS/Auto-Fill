@@ -245,17 +245,6 @@ _CHOICE_STATE_JS = r"""(el) => {
 }"""
 
 
-def _native_checkbox(control: Control) -> bool:
-    """A real checkbox input. Custom ``role=checkbox`` and switches are reported only."""
-    if control.kind != "checkbox":
-        return False
-    if control.input_type in {"aria-checkbox", "switch", "aria-radio"}:
-        return False
-    if control.role == "switch":
-        return False
-    return True
-
-
 def _choice_selected(target, selector: str) -> bool:
     """True when the clicked Yes/No button itself reads as chosen.
 
@@ -456,21 +445,17 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
             refresh_preview(page)
             return _outcome(control, mapped, detail=mapped.option_label or "selected")
         if mapped.action == "check":
-            if not _native_checkbox(control):
-                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
-            from autofill.safeguards import commit_native_choice
+            from autofill.safeguards import commit_choice
 
-            if not commit_native_choice(target, control.selector, on=True):
+            if not commit_choice(target, control.selector, on=True):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
             remember_confirmed(control, "yes", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
             return _outcome(control, mapped, detail="checked")
         if mapped.action == "uncheck":
-            if not _native_checkbox(control):
-                return _outcome(control, mapped, action="unanswered", detail="Custom checkbox left for a person.")
-            from autofill.safeguards import commit_native_choice
+            from autofill.safeguards import commit_choice
 
-            if not commit_native_choice(target, control.selector, on=False):
+            if not commit_choice(target, control.selector, on=False):
                 return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
             remember_confirmed(control, "no", field_key=mapped.key or "", choice="checkbox")
             refresh_preview(page)
@@ -488,16 +473,16 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
 def _accept_standard_checkbox(page, control: Control) -> bool:
     """Check one required standard-terms box when the session flag is on."""
     from autofill.mapping import AUTO_CONSENT_CATEGORIES, record_auto_consent, standard_terms_enabled, terms_category
-    from autofill.safeguards import commit_native_choice
+    from autofill.safeguards import commit_choice
 
-    if not standard_terms_enabled() or not _native_checkbox(control):
+    if not standard_terms_enabled() or control.kind != "checkbox":
         return False
     if not control.required or not control.selector:
         return False
     category = terms_category(control)
     if category not in AUTO_CONSENT_CATEGORIES:
         return False
-    if not commit_native_choice(page, control.selector, on=True):
+    if not commit_choice(page, control.selector, on=True):
         return False
     record_auto_consent(control, category)
     remember_confirmed(control, "yes", field_key=category, choice="checkbox")
@@ -555,12 +540,10 @@ def _fill_checkbox_group(
         raw = mapped.text.strip()
         values = [part.strip() for part in raw.split(",") if part.strip()] if "," in raw else [raw]
     chosen = match_all_options(values, options) if values else None
-    if chosen is None or any(not _native_checkbox(item) for item in visible):
+    if chosen is None:
         reason = mapped.reason or "No option matched this group."
-        if values and chosen is None and "disagree" not in reason and "Several options" not in reason:
+        if values and "disagree" not in reason and "Several options" not in reason:
             reason = f"No option matched profile value {mapped.text!r}."
-        if any(not _native_checkbox(item) for item in visible):
-            reason = "Custom checkbox left for a person."
         blank = MappedField(
             key=mapped.key,
             action="unanswered",

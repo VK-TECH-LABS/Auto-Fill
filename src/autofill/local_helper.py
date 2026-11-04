@@ -268,6 +268,51 @@ def _can_continue(job: LocalJob) -> bool:
     return status in {Status.FAILED_RETRYABLE, Status.NAVIGATION_STALLED}
 
 
+# The person pressed Continue on an account wall. A new Apply must not treat
+# these as a crashed fill. ``/continue`` is the only caller.
+_ACCOUNT_CONTINUE_STATUSES = frozenset(
+    {
+        Status.EMAIL_VERIFICATION_REQUIRED,
+        Status.LOGIN_REQUIRED,
+        Status.LOGIN_FAILED,
+        Status.ACCOUNT_CREATION_REQUIRED,
+    }
+)
+
+
+def _continue_allowed(job: LocalJob) -> bool:
+    """Crash recovery, or Continue after sign-in, create-account, or verify-email."""
+    if _can_continue(job):
+        return True
+    if job.superseded or job.submit_claimed() or job.profile is None:
+        return False
+    if job.state != "done" or job.result is None:
+        return False
+    return str(job.result.get("status") or "") in _ACCOUNT_CONTINUE_STATUSES
+
+
+def align_profile_candidate(profile: CandidateProfile, binding: dict[str, str] | None) -> None:
+    """One candidate for this fill. A profile for someone else is refused.
+
+    An empty profile id takes the binding id so answers and saved credentials
+    look up the same person. A different id is not filled.
+    """
+    bound = str((binding or {}).get("candidateId") or "").strip()
+    owner = str(getattr(profile, "candidate_id", "") or "").strip()
+    if bound and owner and bound != owner:
+        raise AnswerRejected(
+            409,
+            {
+                "reason": "candidate_mismatch",
+                "verified": False,
+                "filled": False,
+                "stopped_before_submit": True,
+            },
+        )
+    if bound and not owner:
+        profile.candidate_id = bound
+
+
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
     if not left or not right:
         return False
@@ -407,6 +452,8 @@ class LocalJob:
         self.last_navigation: dict[str, str] | None = None
         # Workday account registered here. Continue without verified does not sign in.
         self.verify_pending = False
+        # The person pressed Continue. Sticky, same as the hosted session.
+        self.human_resolved = False
         self._credential_candidate = ""
         # Candidate preference from session create. False checks no terms box.
         self.standard_terms_authorized = False
@@ -621,6 +668,7 @@ class LocalHelper:
         old rule and is refused while a live fill runs.
         """
         url = validate_application_url(application_url)
+        align_profile_candidate(profile, binding)
         if resume_ref is not None and binding is None:
             raise BindingError("A resume needs a TileArc binding.")
         recover = False
@@ -939,12 +987,17 @@ class LocalHelper:
             if not _binding_matches(job, payload.get("binding")):
                 job.drop_resume()
                 raise AnswerRejected(409, _failure(job, "binding_mismatch"))
-            if not _can_continue(job):
+            if not _continue_allowed(job):
                 raise AnswerRejected(409, _failure(job, "not_continuable"))
             if job.continue_attempts >= _CONTINUE_CAP:
                 raise AnswerRejected(409, _failure(job, "continue_limit"))
             if job.profile is None:
                 raise AnswerRejected(409, _failure(job, "not_continuable"))
+            # Continue is the person asking the fill to go on. verified is the
+            # only proof they opened the verification email, so the password
+            # stays untyped until then. human_resolved lets a banner that is
+            # still on Sign In stop blocking once that proof arrived.
+            job.human_resolved = True
             if payload.get("verified") is True:
                 job.verify_pending = False
             if self._active is not None:
@@ -1224,6 +1277,8 @@ class LocalHelper:
             kwargs["protocol_version"] = "0.7.0"
         if _accepts(fill, "standard_terms_authorized"):
             kwargs["standard_terms_authorized"] = bool(getattr(job, "standard_terms_authorized", False))
+        if _accepts(fill, "human_resolved"):
+            kwargs["human_resolved"] = bool(getattr(job, "human_resolved", False))
         return kwargs
 
     def _save_credential(self, job: LocalJob, email: str, username: str, password: str, scope: str) -> None:

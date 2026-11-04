@@ -1043,7 +1043,13 @@ _LABEL_PRESS_JS = r"""(selector) => {
     }
   }
   if (!label) return "missing";
-  if (label.closest(action) || label.querySelector(action)) return "refused";
+  if (label.closest(action)) return "refused";
+  // A privacy-notice link sits inside the label (Boeing). Clicking the label
+  // node toggles the checkbox. The event target is the label, not that link.
+  if (label.querySelector(action)) {
+    label.click();
+    return "clicked";
+  }
   label.click();
   return "clicked";
 }"""
@@ -1146,10 +1152,16 @@ def commit_native_choice(page, selector: str, *, on: bool = True) -> bool:
         else:
             locator.uncheck(force=True, timeout=3000)
 
+    def dom_click() -> None:
+        evaluate_click = getattr(page, "evaluate", None)
+        if evaluate_click is None:
+            return
+        evaluate_click(_INPUT_CLICK_JS, selector)
+
     def label() -> None:
         press_choice_label(page, selector)
 
-    for attempt in (pointer, forced, label):
+    for attempt in (pointer, forced, dom_click, label):
         state = _choice_state(page, selector)
         if on and state is True:
             return True
@@ -1176,6 +1188,52 @@ def commit_native_choice(page, selector: str, *, on: bool = True) -> bool:
     if on:
         return state is True
     return state is False
+
+
+_INPUT_CLICK_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el || el.tagName !== "INPUT") return false;
+  const type = String(el.type || el.getAttribute("type") || "").toLowerCase();
+  if (type !== "checkbox" && type !== "radio") return false;
+  if (el.disabled) return false;
+  el.click();
+  return true;
+}"""
+
+
+_ARIA_BOX_JS = r"""({ selector, on }) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  if (role !== "checkbox" && role !== "switch") return false;
+  if (el.closest("a[href], button, [role='button'], [role='link'], input[type='submit']")) return false;
+  const want = !!on;
+  const checked = () => el.getAttribute("aria-checked") === "true";
+  if (checked() === want) return true;
+  el.click();
+  return checked() === want;
+}"""
+
+
+def commit_choice(page, selector: str, *, on: bool = True) -> bool:
+    """Check or uncheck a native box or a ``role=checkbox`` / switch, then reread it.
+
+    True only when the page still reports that state. A highlighted row and an
+    unreadable widget are not a commit.
+    """
+    if commit_native_choice(page, selector, on=on):
+        return True
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return evaluate(_ARIA_BOX_JS, {"selector": selector, "on": on}) is True
+    except Exception:
+        return False
 
 
 _ARIA_RADIO_JS = r"""(selector) => {

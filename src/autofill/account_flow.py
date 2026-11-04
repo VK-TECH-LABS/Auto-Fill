@@ -31,6 +31,7 @@ from autofill.login import (
 )
 from autofill.mapping import (
     AUTO_CONSENT_CATEGORIES,
+    account_checkbox_required,
     bind_standard_terms,
     consume_auto_consents,
     record_auto_consent,
@@ -38,7 +39,7 @@ from autofill.mapping import (
     terms_category,
 )
 from autofill.models import ButtonControl, Control, PageSnapshot
-from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch, commit_native_choice
+from autofill.safeguards import SubmitBlockedError, activate_account, activate_account_switch, commit_choice
 
 _logger = logging.getLogger("autofill.account")
 _WAIT_SECONDS = 15.0
@@ -311,8 +312,8 @@ _CONSENT_PREFIX = "Consent needs a person: "
 
 def _required_box(control: Control) -> bool:
     # Workday validates its Create Account box in script, so the input may not
-    # carry ``required``; its automation id says the site needs it.
-    return bool(control.required or control.automation_id == "createAccountCheckbox")
+    # carry ``required``. The automation id may sit on the field wrapper.
+    return account_checkbox_required(control)
 
 
 def _accept_account_terms(page, snapshot: PageSnapshot, *, accept: bool) -> tuple[list[dict], list[str]]:
@@ -336,7 +337,13 @@ def _accept_account_terms(page, snapshot: PageSnapshot, *, accept: bool) -> tupl
         checked = False
         required = _required_box(control)
         already = required and _is_checked(page, control.selector) is True
-        if accept and category in AUTO_CONSENT_CATEGORIES and required and control.input_type in {"", "checkbox"}:
+        # A custom role=checkbox is the same Create Account box when Workday
+        # does not use a native input. The click still has to stick.
+        choice = control.input_type in {"", "checkbox", "aria-checkbox", "switch"} or control.role in {
+            "checkbox",
+            "switch",
+        }
+        if accept and category in AUTO_CONSENT_CATEGORIES and required and choice:
             if check_registered(page, control.selector):
                 record_auto_consent(control, category)
                 checked = True
@@ -382,13 +389,14 @@ def _is_checked(page, selector: str) -> bool | None:
 
 
 def check_registered(page, selector: str) -> bool:
-    """Check one native box and confirm the page kept it.
+    """Check one box and confirm the page kept it.
 
-    Pointer check, then a forced check, then the label. A script that sets
-    ``input.checked`` paints the box but a React form such as Workday never
-    sees it. An unreadable state is not proof.
+    Pointer check, then a forced check, then a DOM click, then the label.
+    A script that sets ``input.checked`` paints the box but a React form such
+    as Workday never sees it. A privacy-notice link inside the label is not
+    the click. An unreadable state is not proof.
     """
-    return commit_native_choice(page, selector, on=True)
+    return commit_choice(page, selector, on=True)
 
 
 def _covered_pane_button(snapshot: PageSnapshot, button: ButtonControl) -> bool:

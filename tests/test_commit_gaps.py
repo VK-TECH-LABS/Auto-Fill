@@ -266,6 +266,39 @@ _NESTED_SEARCH = """
 """
 
 
+def test_open_menu_highlight_is_not_a_committed_value(browser):
+    """A highlighted row in an open prompt is not the employer field's value."""
+    from autofill.combobox import _combobox_committed
+
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <input id="source" role="combobox" aria-expanded="true" aria-activedescendant="opt"
+              aria-controls="menu" value="">
+            <ul id="menu" role="listbox" style="display:block;min-height:24px">
+              <li id="opt" role="option" aria-selected="true">LinkedIn</li>
+              <li role="option">Indeed</li>
+            </ul>
+            """
+        )
+        assert _combobox_committed(page, "#source", "LinkedIn") is False
+        page.evaluate(
+            """() => {
+              document.getElementById("source").setAttribute("aria-expanded", "false");
+              document.getElementById("menu").hidden = true;
+              const pill = document.createElement("span");
+              pill.id = "picked";
+              pill.setAttribute("data-automation-id", "selectedItem");
+              pill.textContent = "LinkedIn";
+              document.body.appendChild(pill);
+            }"""
+        )
+        assert _combobox_committed(page, "#source", "LinkedIn") is True
+    finally:
+        page.close()
+
+
 def test_hear_about_nested_search_types_the_leaf_and_keeps_it(browser):
     from autofill.combobox import select_combobox
     from autofill.safeguards import HUMAN_SUBMIT_ONLY

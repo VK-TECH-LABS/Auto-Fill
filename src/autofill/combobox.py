@@ -424,8 +424,23 @@ _COMMIT_JS = r"""
   const single = root.querySelector(".select__single-value, [class*='singleValue']");
   if (single && matches(single.textContent)) shownOk = true;
   let ariaOk = false;
+  // An open menu's highlighted row is not the value on the employer field.
+  // aria-activedescendant and aria-selected paint that highlight. The commit
+  // is a pill, a hidden input, or the closed control.
+  function menuOpen(node) {
+    if (!node || !node.getAttribute) return false;
+    if (node.getAttribute("aria-expanded") === "true") return true;
+    const listId = node.getAttribute("aria-controls") || node.getAttribute("aria-owns") || "";
+    if (listId) {
+      const list = document.getElementById(listId);
+      if (list && shown(list)) return true;
+    }
+    const activeList = document.querySelector("[data-automation-id='activeListContainer']");
+    return !!(activeList && shown(activeList));
+  }
+  const openMenu = menuOpen(el);
   const activeId = el.getAttribute("aria-activedescendant") || "";
-  if (activeId) {
+  if (!openMenu && activeId) {
     tracksValue = true;
     const active = document.getElementById(activeId);
     if (active && matches(active.textContent)) ariaOk = true;
@@ -446,7 +461,7 @@ _COMMIT_JS = r"""
     }
   }
   const picked = root.querySelector("[role='option'][aria-selected='true']");
-  if (picked) {
+  if (!openMenu && picked) {
     tracksValue = true;
     if (matches(picked.textContent)) ariaOk = true;
   }
@@ -882,6 +897,26 @@ def _committed_choice(page, selector: str, match: Option, desired: str, *, accep
         return True
     shown = _selected_text(page, selector)
     return _labels_match(desired, shown) or _labels_match(match.label, shown)
+
+
+def _kept_after_close(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
+    """The choice is on the field after the menu closes.
+
+    Escape drops a highlight that was never written. A pill or closed value
+    that is still there is the commit.
+    """
+    if not _commit_held(page, selector, match, desired, accept_input=accept_input):
+        return False
+    clear_satisfied_invalid(page, selector)
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        pass
+    _pause(page, 40)
+    if _committed_choice(page, selector, match, desired, accept_input=accept_input):
+        clear_satisfied_invalid(page, selector)
+        return True
+    return False
 
 
 def _commit_held(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
@@ -1365,12 +1400,10 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             click_choice(page, leaf.selector, leaf.label)
             _pause(page, 50)
             match = leaf
-    if _commit_held(page, selector, match, desired, accept_input=not typed):
-        clear_satisfied_invalid(page, selector)
+    if _kept_after_close(page, selector, match, desired, accept_input=not typed):
         return match
     _keyboard_commit(page, selector, desired, match)
-    if _commit_held(page, selector, match, desired, accept_input=True):
-        clear_satisfied_invalid(page, selector)
+    if _kept_after_close(page, selector, match, desired, accept_input=True):
         return match
     dismiss_combobox(page)
     return None

@@ -240,3 +240,37 @@ def test_slice4_fills_factual_aria_yes_no_and_restores_factual_choices(page):
     assert page.locator("#night").is_checked() is True
     assert page.locator("#yes").is_checked() is True
     assert page.locator("#terms").is_checked() is False
+
+
+def test_custom_checkbox_group_checks_only_the_approved_option(page):
+    page.set_content(
+        """
+        <fieldset>
+          <legend>How did you hear about us?</legend>
+          <div role="checkbox" id="site" aria-checked="false">Company Website</div>
+          <div role="checkbox" id="li" aria-checked="false">LinkedIn</div>
+          <div role="checkbox" id="arb" aria-checked="false">I agree to binding arbitration</div>
+        </fieldset>
+        <script>
+          document.querySelectorAll("[role='checkbox']").forEach(function (node) {
+            node.addEventListener("click", function () {
+              var on = node.getAttribute("aria-checked") === "true";
+              node.setAttribute("aria-checked", on ? "false" : "true");
+            });
+          });
+        </script>
+        """
+    )
+    from autofill.fill import _fill_checkbox_group
+
+    person = _profile()
+    person.application_answers = []
+    person.screening.how_heard = "LinkedIn"
+    snapshot = extract_page(page)
+    group = [control for control in snapshot.controls if control.kind == "checkbox"]
+    heard = [control for control in group if control.selector in {"#site", "#li"}]
+    outcomes = _fill_checkbox_group(page, heard, person, job=None, cursor=None, manual=[])
+    assert page.locator("#li").get_attribute("aria-checked") == "true"
+    assert page.locator("#site").get_attribute("aria-checked") == "false"
+    assert page.locator("#arb").get_attribute("aria-checked") == "false"
+    assert any(item.action == "check" for item in outcomes)
