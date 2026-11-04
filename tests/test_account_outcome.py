@@ -122,13 +122,15 @@ def test_alert_already_on_screen_before_the_press_is_ignored(workday):
     assert page.evaluate("window.__created") == 1
 
 
-def test_flashing_alert_then_sign_in_still_waits_for_verification(workday):
+def test_flashing_alert_then_plain_sign_in_is_registered_not_a_verify_hold(workday):
+    # A blank Sign In pane is not "email has been sent". The account action does
+    # not type the password; the fill that follows signs in once.
     page = workday(flash=FLASH, holdMs=350, spinnerMs=400)
     result = _register(page)
     assert result["ok"] is True, result
     assert result["outcome"] == "registered"
-    assert result["status"] == Status.EMAIL_VERIFICATION_REQUIRED
-    assert result["verifyBeforeSignIn"] is True
+    assert result["status"] == ""
+    assert not result.get("verifyBeforeSignIn")
     assert page.evaluate("window.__signedIn") == 0
 
 

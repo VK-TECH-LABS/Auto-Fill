@@ -1479,7 +1479,9 @@ class LocalHelper:
             )
         outcome = str(report.get("outcome") or "")
         verify_card = report.get("status") == Status.EMAIL_VERIFICATION_REQUIRED
-        if report.get("verifyBeforeSignIn") or outcome == "registered" or verify_card:
+        # A plain Sign In after Create Account is not a verify hold. Parking
+        # every registration left Email and Password empty (GM, SNC, Clark).
+        if report.get("verifyBeforeSignIn") or verify_card:
             job.verify_pending = True
         if job.profile is not None and outcome in {"signed_in", "registered", "verification_required"}:
             fill = self._session.fill
@@ -2851,25 +2853,33 @@ def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str
     kind = canonical_blocker_kind(item.get("kind"))
     if kind in {"CONSENT", "CONSENT_CHOICE", "DEMOGRAPHIC"}:
         return ""
-    if str(item.get("challenge") or "") == "confirm":
-        return ""
     raw_key = str(item.get("fieldKey") or "").strip()
     if raw_key == "recruitment_sms_consent":
         return ""
+    text = re.sub(r"[*✱＊]", " ", str(item.get("text") or item.get("prompt") or "").casefold())
+    text = re.sub(r"\([^)]*required[^)]*\)", " ", text)
+    text = re.sub(r"\bis required\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # A salary confirm stays manual. Confirm email is the profile email.
+    if str(item.get("challenge") or "") == "confirm" and "email" not in text:
+        return ""
     key = _BASIC_ALIASES.get(raw_key.casefold(), raw_key)
     getter = _BASIC_FIELDS.get(key)
-    if getter is None:
-        text = str(item.get("text") or item.get("prompt") or "").casefold()
+    if getter is None or not str(getter(profile) or "").strip():
         if "email" in text and any(token in text for token in ("confirm", "re-enter", "reenter", "verify")):
             getter = _BASIC_FIELDS["email"]
-        elif text.strip() in {"email", "email address"}:
+        elif text in {"email", "email address"} or text.startswith("email "):
             getter = _BASIC_FIELDS["email"]
-        elif text.strip() in {"city", "current city"} or "place of residence" in text:
+        elif text in {"city", "current city"} or "place of residence" in text:
             getter = _BASIC_FIELDS["city"]
         elif "first name" in text or "given name" in text:
             getter = _BASIC_FIELDS["first_name"]
-        elif "last name" in text or "family name" in text:
+        elif "last name" in text or "family name" in text or "surname" in text:
             getter = _BASIC_FIELDS["last_name"]
+        elif "phone" in text or "mobile" in text:
+            getter = _BASIC_FIELDS["phone"]
+        elif text in {"state", "province", "region"}:
+            getter = _BASIC_FIELDS["state"]
     if getter is None:
         return ""
     return str(getter(profile) or "").strip()

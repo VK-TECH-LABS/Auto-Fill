@@ -654,6 +654,19 @@ def _account_wall(page, snapshot, session, opts: AutofillOptions, ats_name: str 
 _CREATE_ACCOUNT_MESSAGE = "Create an employer account. Nothing was typed."
 
 
+def _opened_create_account(page, snapshot, url: str):
+    """The Create Account form after one click from a Sign In pane, or None.
+
+    A click that leaves Sign In in place is not a register stop. Nothing is typed.
+    """
+    from autofill.login import open_create_account
+
+    scored = score_account(snapshot, url)
+    if scored.mode == "register" or not scored.alternate:
+        return None
+    return open_create_account(page, snapshot)
+
+
 def _login_stop(
     session,
     snapshot,
@@ -718,11 +731,24 @@ def _account_sign_in_pane(snapshot, url: str) -> bool:
         return False
 
 
-def _verify_first(opts: AutofillOptions, ats_name: str | None, url: str) -> bool:
-    """A Workday account registered in this session is still waiting for its verification email."""
+def _verify_first(opts: AutofillOptions, ats_name: str | None, url: str, snapshot=None) -> bool:
+    """Hold Sign In only when this page itself says the verification email was sent.
+
+    A stale ``verify_pending`` flag on a plain Email/Password form is not a hold.
+    Those fields are filled with the saved login. A page that says the email was
+    sent, or that the account is not verified yet, still waits.
+    """
     from autofill.account_flow import _is_workday
 
-    return bool(opts.verify_pending) and _protocol_070(opts) and _is_workday(ats_name, url)
+    if not (opts.verify_pending and _protocol_070(opts) and _is_workday(ats_name, url)):
+        return False
+    if snapshot is None:
+        return True
+    if sign_in_verification_holding(snapshot):
+        return True
+    from autofill.login import login_failure_reason
+
+    return login_failure_reason(snapshot) == "unverified"
 
 
 def _verify_before_sign_in(session, snapshot, url: str, ats_name: str | None) -> ApplicationResult:
@@ -1114,17 +1140,39 @@ def autofill_application(
             )
             creds = credential_provider.get_credentials(context, session.candidate_id) if credential_provider else None
             if creds is None or not creds.password or not (creds.email or creds.username):
+                here = getattr(page, "url", "") or application_url
+                opened = _opened_create_account(page, snapshot, here)
+                if opened is not None:
+                    session.mark(Status.ACCOUNT_CREATION_REQUIRED)
+                    scored = score_account(opened, here)
+                    return _result(
+                        session,
+                        status=Status.ACCOUNT_CREATION_REQUIRED,
+                        ats=ats_name,
+                        login_status="NOT_REQUIRED",
+                        messages=[_CREATE_ACCOUNT_MESSAGE],
+                        account=account_view(
+                            opened,
+                            here,
+                            ats_name,
+                            mode="register",
+                            alternate=scored.alternate,
+                        ),
+                        fields_detected=len(visible_fields(opened)),
+                        fields_filled=0,
+                        fields_skipped=0,
+                    )
                 return _login_stop(
                     session,
                     snapshot,
-                    getattr(page, "url", "") or application_url,
+                    here,
                     ats_name,
                     opts,
                     messages=["No credentials for this candidate and site. Nothing was typed."],
                     login_status="NOT_REQUIRED",
                 )
             here = getattr(page, "url", "") or application_url
-            if _verify_first(opts, ats_name, here):
+            if _verify_first(opts, ats_name, here, snapshot):
                 # RC-V1 (BW 2026-10-27): the account was just created and the
                 # site now shows Sign In. Typing the new password before the
                 # verification email is opened fails ("verify your account")

@@ -132,29 +132,30 @@ def test_workday_email_already_in_use_counts_as_existing_account():
 # --- Browser fixtures -------------------------------------------------------
 
 
-def test_create_account_returning_to_sign_in_waits_for_verification(workday):
+def test_create_account_returning_to_plain_sign_in_is_not_a_verify_hold(workday):
     page = workday()
     result = _action(page, "register")
     assert result["ok"] is True, result
     assert result["outcome"] == "registered"
-    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED"
-    assert result["verifyBeforeSignIn"] is True
+    assert result["status"] == ""
+    assert not result.get("verifyBeforeSignIn")
     assert page.evaluate("window.__created") == 1
-    # The new password is never typed into Sign In before the verification email.
+    # run_account_action does not type into Sign In. The fill does that once.
     assert page.evaluate("window.__signedIn") == 0
     assert page.locator("#input-15").input_value() == ""
     assert SECRET not in str(result)
 
 
-def test_slow_workday_spinner_still_waits_for_verification(workday):
-    # Ameren 2026-10-26: Workday's spinner ran past 1.5 s, the engine read the empty
-    # pane as "registered", resumed, and signed in before verification (wrong_or_locked).
+def test_slow_workday_spinner_then_plain_sign_in_is_registered(workday):
+    # Ameren 2026-10-26: the spinner can run 2-3 s. A plain Sign In after it is
+    # still a successful registration. It is not a verify hold unless the page
+    # says the email was sent. The account action does not press Sign In.
     page = workday(spinner_ms=2500)
     result = _action(page, "register")
     assert result["ok"] is True, result
     assert result["outcome"] == "registered"
-    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED", result
-    assert result["verifyBeforeSignIn"] is True
+    assert result["status"] == "", result
+    assert not result.get("verifyBeforeSignIn")
     assert page.evaluate("window.__signedIn") == 0
     assert page.locator("#input-15").input_value() == ""
 
@@ -172,15 +173,16 @@ def test_slow_workday_spinner_into_application_counts_as_registered(workday):
     assert elapsed < 2.5 + 3.0, elapsed
 
 
-def test_register_on_a_sign_in_pane_follows_create_account_and_waits_for_verification(workday):
-    # KLA opens on Sign In. The Companion bridge asks for mode=register; the engine
-    # follows the pane's own Create Account link, registers, and does not sign in.
+def test_register_on_a_sign_in_pane_follows_create_account(workday):
+    # The Companion bridge asks for mode=register. The engine follows the pane's
+    # Create Account link. A plain Sign In afterwards is registered, not a verify
+    # hold, and this action does not press Sign In.
     page = workday(start="signin", spinner_ms=2500)
     result = _action(page, "register")
     assert result["ok"] is True, result
     assert result["outcome"] == "registered"
-    assert result["status"] == "EMAIL_VERIFICATION_REQUIRED"
-    assert result["verifyBeforeSignIn"] is True
+    assert result["status"] == ""
+    assert not result.get("verifyBeforeSignIn")
     assert page.evaluate("window.__created") == 1
     assert page.evaluate("window.__signedIn") == 0
 

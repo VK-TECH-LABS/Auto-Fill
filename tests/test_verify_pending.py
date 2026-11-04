@@ -7,9 +7,11 @@ the brand-new password at once; Workday answered "Verify your account before you
 sign in" and the session went LOGIN_FAILED (one failed try toward a lockout).
 
 Now:
-* the service marks the session ``verify_pending`` after such a register, and the
-  engine stops on the existing EMAIL_VERIFICATION_REQUIRED card at the next Sign In
-  pane instead of calling ``run_login``;
+* the engine stops on the verify card only when the open Sign In page says the
+  email was sent or the account is not verified yet;
+* a plain Sign In, including one with a stale ``verify_pending`` flag, is signed
+  in once with the saved password. An unverified answer becomes the verify card
+  and is not retried;
 * a LOGIN_FAILED whose banner says the account is not verified becomes the same
   verify card (protocol 0.7.0), so Continue signs in once after the person verifies;
 * Continue with ``humanResolved`` *and* ``verified`` clears ``verify_pending`` (R4: humanResolved
@@ -139,9 +141,13 @@ def test_rc_v1_slow_sign_in_after_create_account_is_classified_registered_resume
     assert page.evaluate("window.__signedIn") == 0
 
 
-def test_verify_pending_sign_in_pane_stops_on_verify_card_and_types_nothing(workday, caplog):
+def test_verify_pending_on_a_page_that_already_says_verify_types_nothing(workday, caplog):
     caplog.set_level(logging.INFO)
-    page = workday(start="signin", unverified="1")
+    page = workday(start="signin")
+    page.evaluate(
+        "document.getElementById('err').textContent = "
+        "'An email has been sent to you. Please verify your account.'"
+    )
     result = _fill(page, verify_pending=True)
     assert result.status == Status.EMAIL_VERIFICATION_REQUIRED
     assert result.messages == [_VERIFY_FIRST_MESSAGE]
@@ -149,16 +155,32 @@ def test_verify_pending_sign_in_pane_stops_on_verify_card_and_types_nothing(work
     assert page.evaluate("document.querySelector('#input-15').value") == ""
     assert result.account is not None and result.account.get("verifyBeforeSignIn") is True
     assert result.account.get("mode") == "login"
-    assert "verify_before_sign_in=true reason=registered_unverified" in caplog.text
+    assert "LOGIN_PASSWORD" not in caplog.text
     assert SECRET not in str(result) and SECRET not in caplog.text
 
 
-def test_verify_pending_even_after_an_earlier_continue_does_not_sign_in(workday):
-    """human_resolved is sticky on the session; only verify_pending decides here."""
+def test_verify_pending_plain_sign_in_tries_once_and_stops_when_unverified(workday):
+    """The banner appears only after Sign In. One try, then the verify card. No retry."""
+    page = workday(start="signin", unverified="1")
+    result = _fill(page, verify_pending=True)
+    assert page.evaluate("window.__signedIn") == 1
+    assert result.status == Status.EMAIL_VERIFICATION_REQUIRED
+    assert result.messages == [LOGIN_FAILED_MESSAGES["unverified"]]
+    assert result.account is not None and result.account.get("verifyBeforeSignIn") is True
+    assert SECRET not in str(result)
+
+
+def test_stale_verify_pending_on_a_plain_sign_in_uses_saved_credentials(workday):
+    """A plain Sign In is not an email-verification hold, even if the flag is stale.
+
+    GM 2026-11-04: the companion stayed on "Email verification is waiting" while
+    Email and Password were empty. The saved login is typed once.
+    """
     page = workday(start="signin")
     result = _fill(page, verify_pending=True, human=True)
-    assert result.status == Status.EMAIL_VERIFICATION_REQUIRED
-    assert page.evaluate("window.__signedIn") == 0
+    assert page.evaluate("window.__signedIn") == 1
+    assert result.status != Status.EMAIL_VERIFICATION_REQUIRED
+    assert result.login_status == "AUTHENTICATED"
 
 
 def test_after_verification_continue_signs_in_once_and_reaches_the_form(workday):

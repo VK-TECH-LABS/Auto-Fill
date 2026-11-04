@@ -641,6 +641,52 @@ def _is_submission_consent(statement: str) -> bool:
 _CREATE_ACCOUNT_BOX_IDS = frozenset({"createaccountcheckbox"})
 _CREATE_ACCOUNT_SHORT = re.compile(r"(?:yes )?i accept$")
 _CREATE_ACCOUNT_BOX_SHORT = re.compile(r"(?:yes )?i (?:accept|consent)$")
+# A short Create Account acknowledgement. "I agree" alone is not enough; the
+# notice has to be on the box. "I accept" is the JCI box with no other words.
+_SHORT_ACCOUNT_ACK = re.compile(r"(?:yes )?i (?:accept|agree|consent|understand)$")
+# Legal promises that stay manual even on a Create Account checkbox.
+_HARD_MANUAL_CONSENT = (
+    "arbitration",
+    "background check",
+    "e sign",
+    "esign",
+    "electronic signature",
+    "signature",
+    "under penalty",
+    "perjury",
+    "sms",
+    "text message",
+    "text messages",
+    "recording",
+    "notetaker",
+    "note taker",
+    "artificial intelligence",
+    "ai",
+    "demographic",
+    "gender",
+    "race",
+    "ethnicity",
+    "veteran",
+    "disability",
+    "biometric",
+    "drug test",
+    "certify",
+    "attest",
+    "attestation",
+    "waive",
+    "waiver",
+)
+_HARD_MANUAL_RE = _phrase_re(_HARD_MANUAL_CONSENT)
+_NOTICE_NAME_RE = re.compile(
+    r"\b(?:privacy (?:policy|notice|statement)|recruitment notice|applicant privacy notice)\b"
+)
+# "I have received the Boeing Applicant Privacy Notice" and
+# "I declare that I have read the HPE Recruitment Notice and agree to ... processing".
+# "I understand that the Zekelman Privacy Policy will apply" is the same gate.
+_READ_NOTICE_RE = re.compile(
+    r"i (?:have (?:read|received|reviewed)|declare that i have read|understand that)"
+    r".{0,180}(?:privacy (?:policy|notice|statement)|recruitment notice|applicant privacy)"
+)
 
 
 def _create_account_checkbox(control: Control) -> bool:
@@ -651,6 +697,54 @@ def _create_account_checkbox(control: Control) -> bool:
 
 def _statement_parts(control: Control) -> list[str]:
     return [normalize(part) for part in (control.label, control.prompt, control.aria_label) if part]
+
+
+def _consent_blob(control: Control) -> str:
+    """Label, prompt, and the paragraph sitting on the same checkbox."""
+    return normalize(
+        " ".join(
+            part
+            for part in (control.label, control.prompt, control.aria_label, control.group, control.nearby)
+            if part
+        )
+    )
+
+
+def _create_account_privacy_gate(control: Control) -> bool:
+    """The required Create Account privacy box, including a short acknowledgement.
+
+    Workday often labels the box only "I understand" or "I have received the
+    … Privacy Notice" and puts job-alert boilerplate in the paragraph above it.
+    That boilerplate does not make the box a marketing opt-in. Arbitration,
+    SMS, e-sign, background checks, and certifications still stay manual.
+    A sentence that itself adds job alerts or a newsletter stays manual too.
+    """
+    if control.kind != "checkbox":
+        return False
+    blob = _consent_blob(control)
+    if not blob or _HARD_MANUAL_RE.search(blob):
+        return False
+    if _READ_NOTICE_RE.search(blob):
+        # "I have read the privacy policy and agree to receive marketing emails"
+        # is still a marketing opt-in. A short "I understand" box is not, even
+        # when the paragraph above it mentions job alerts.
+        parts = _statement_parts(control)
+        short = any(_SHORT_ACCOUNT_ACK.fullmatch(part) for part in parts)
+        if not short and (_MARKETING_RE.search(blob) or re.search(r"\bjob alerts?\b", blob)):
+            return False
+        return True
+    parts = _statement_parts(control)
+    if any(_SHORT_ACCOUNT_ACK.fullmatch(part) for part in parts):
+        if any(_CREATE_ACCOUNT_SHORT.fullmatch(part) for part in parts):
+            return True
+        return bool(_create_account_checkbox(control) or _NOTICE_NAME_RE.search(blob))
+    # The label is only the notice name (the link). A sentence that also opts
+    # into job alerts or a newsletter is not this box.
+    if (control.required or _create_account_checkbox(control)) and _NOTICE_NAME_RE.search(blob):
+        if _DENY_TERMS_RE.search(blob) or _MARKETING_RE.search(blob):
+            return False
+        return True
+    return False
 
 
 def _create_account_acknowledgement(control: Control) -> bool:
@@ -710,6 +804,11 @@ def terms_category(control: Control) -> str:
     """
     if control.kind not in _TERMS_KINDS:
         return "CONSENT"
+    # The Create Account privacy gate is decided before the marketing deny-list.
+    # "I understand" next to a privacy notice stays standard even when the
+    # paragraph also mentions job alerts. A compound opt-in does not match it.
+    if control.kind == "checkbox" and _create_account_privacy_gate(control):
+        return "STANDARD_TERMS"
     option_text = " ".join(part for option in control.options for part in (option.label, option.value) if part)
     blob = normalize(f"{haystack(control)} {control.prompt} {control.group} {option_text}")
     if _DENY_TERMS_RE.search(blob) or _MARKETING_RE.search(blob):

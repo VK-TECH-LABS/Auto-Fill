@@ -866,19 +866,24 @@ def _wait_for_outcome(
             continue
         pending_errors, pending_since = set(), None
         if mode == "register" and _returned_to_sign_in(last, page.url or ""):
-            # Workday accepted the form and went back to Sign In. Signing in
-            # now, before the verification email, fails with "wrong email or
-            # password or your account might be locked" and can lock it.
-            _logger.info("account_outcome=registered next=verify_before_sign_in")
-            return {
-                "ok": True,
-                "outcome": "registered",
-                "status": "EMAIL_VERIFICATION_REQUIRED",
-                "verifyBeforeSignIn": True,
-                "message": _VERIFY_FIRST_MESSAGE,
-                "siteErrors": [],
-                "account": _view(last, page.url or "", ats, "login", False, []),
-            }
+            # The site accepted Create Account and is showing Sign In.
+            # A page that says the verification email was sent stays on the
+            # verify card. A plain Sign In is registered; the same run signs
+            # in once with the password just stored. One unverified answer
+            # stops there and is not retried.
+            if sign_in_verification_holding(last):
+                _logger.info("account_outcome=registered next=verify_before_sign_in")
+                return {
+                    "ok": True,
+                    "outcome": "registered",
+                    "status": "EMAIL_VERIFICATION_REQUIRED",
+                    "verifyBeforeSignIn": True,
+                    "message": _VERIFY_FIRST_MESSAGE,
+                    "siteErrors": [],
+                    "account": _view(last, page.url or "", ats, "login", False, []),
+                }
+            _logger.info("account_outcome=registered next=sign_in")
+            return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
         if not last.password_present:
             if application_form_visible(last):
                 return _success(mode)
