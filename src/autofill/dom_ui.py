@@ -1321,6 +1321,87 @@ def focus_field(page: Any, selector: str) -> bool:
     return moved
 
 
+def await_aria_checked(page: Any, selector: str) -> bool:
+    """True when ``aria-checked`` becomes true. A click that paints on the next frame counts."""
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    script = """(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      return !!el && el.getAttribute("aria-checked") === "true";
+    }"""
+    for _attempt in range(8):
+        try:
+            if evaluate(script, selector) is True:
+                return True
+        except Exception:
+            return False
+        wait = getattr(page, "wait_for_timeout", None)
+        if wait is None:
+            return False
+        try:
+            wait(40)
+        except Exception:
+            return False
+    return False
+
+
+_PRIMARY_EMAIL_JS = r"""({ selector, email }) => {
+  let self = null;
+  try { self = document.querySelector(selector); } catch (error) { return ""; }
+  const wanted = String(email || "").trim().toLowerCase();
+  const nodes = document.querySelectorAll("input, textarea");
+  for (const node of nodes) {
+    if (node === self) continue;
+    const type = String(node.getAttribute("type") || node.type || "").toLowerCase();
+    if (type === "hidden" || type === "password" || type === "checkbox" || type === "radio") continue;
+    let label = "";
+    if (node.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+      if (explicit) label = explicit.innerText || explicit.textContent || "";
+    }
+    const text = [
+      node.id || "",
+      node.getAttribute("name") || "",
+      node.getAttribute("aria-label") || "",
+      node.getAttribute("placeholder") || "",
+      label,
+    ].join(" ").toLowerCase();
+    if (text.indexOf("email") === -1) continue;
+    if (/confirm|re-?enter|retype|verify|repeat/.test(text)) continue;
+    const current = String(node.value || "").trim();
+    if (current && current.toLowerCase() !== wanted) return "";
+    if (current) return "";
+    if (node.id) return "#" + CSS.escape(node.id);
+  }
+  return "";
+}"""
+
+
+def prime_primary_email(page: Any, selector: str, email: str) -> None:
+    """Write this candidate's email into an empty Email box before Confirm email.
+
+    Confirm email compares itself to Email on blur. Filling confirm first
+    clears it. A box that already holds a different address is left alone.
+    """
+    text = str(email or "").strip()
+    if not selector or not text:
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        primary = str(evaluate(_PRIMARY_EMAIL_JS, {"selector": selector, "email": text}) or "")
+    except Exception:
+        return
+    if not primary or primary == selector:
+        return
+    type_visible(page, primary, text)
+
+
 def type_visible(page: Any, selector: str, text: str) -> bool:
     """Scroll the field to center, then type it. Returns false when the page cannot type."""
     if not selector:
@@ -1715,6 +1796,21 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
             return {"filled": False, "reason": "not_committed"}
         clear_highlight(page, selector)
         return {"filled": True}
+    if _is_city_target(target) and not _choice(answer_type):
+        from autofill.stepfill import commit_city_text
+
+        try:
+            report = commit_city_text(page, selector, values[0])
+        except Exception:
+            report = {"filled": False, "reason": "not_committed"}
+        if report.get("filled"):
+            clear_highlight(page, selector)
+            return {"filled": True}
+        missed: dict[str, Any] = {"filled": False, "reason": str(report.get("reason") or "not_committed")}
+        options = [str(item) for item in report.get("options") or [] if str(item).strip()]
+        if options:
+            missed["options"] = options
+        return missed
     if _looks_like_combobox(page, selector):
         from autofill.combobox import select_combobox
 
@@ -1766,6 +1862,8 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         if not chosen:
             return {"filled": False, "reason": "not_committed"}
     else:
+        if _is_confirm_email_target(target):
+            prime_primary_email(page, selector, values[0])
         if not type_visible(page, selector, values[0]):
             return {"filled": False, "reason": "not_committed"}
     if not _committed(
@@ -1924,7 +2022,29 @@ def _commit_aria_radio(page: Any, selector: str, value: str) -> bool:
         return False
     from autofill.safeguards import press_aria_radio
 
-    return press_aria_radio(page, target)
+    if press_aria_radio(page, target):
+        return True
+    return await_aria_checked(page, target)
+
+
+def _is_city_target(target: dict[str, Any]) -> bool:
+    """A City answer. Current location stays on the suggestion-id path."""
+    key = str(target.get("fieldKey") or "").strip()
+    if key in {"city", "address.city"}:
+        return True
+    text = str(target.get("text") or target.get("label") or "").strip().casefold()
+    return text in {"city", "town"}
+
+
+def _is_confirm_email_target(target: dict[str, Any]) -> bool:
+    from autofill.mapping import is_confirm_email
+    from autofill.models import Control
+
+    key = str(target.get("fieldKey") or "").strip()
+    if key and key not in {"email"} and "email" not in key:
+        return False
+    text = str(target.get("text") or target.get("label") or "")
+    return is_confirm_email(Control(kind="text", label=text, name=text))
 
 
 def _check_box(page: Any, selector: str) -> dict[str, Any]:

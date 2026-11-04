@@ -40,6 +40,18 @@ def test_identity_contact_and_address_labels():
     assert digits.text == "5550100199"
 
 
+def test_confirm_email_uses_the_same_address_and_a_code_does_not():
+    filled = profile()
+    confirm = map_field(control("Confirm email"), filled)
+    assert confirm.key == "email"
+    assert confirm.text == "casey.example@example.com"
+    glued = map_field(control("", name="emailConfirmation"), filled)
+    assert glued.key == "email"
+    assert glued.text == "casey.example@example.com"
+    code = map_field(control("Email verification code"), filled)
+    assert code.key != "email"
+
+
 def test_current_location_uses_city_state_and_country():
     filled = profile()
     mapped = map_field(control("Current location"), filled)

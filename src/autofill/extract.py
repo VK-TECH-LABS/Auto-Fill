@@ -393,6 +393,14 @@ EXTRACT_JS = r"""
     const legendNode = el.closest("fieldset") ? el.closest("fieldset").querySelector("legend") : null;
     const legend = questionPrompt(legendText(el));
     if (legend && !isSectionHeading(legendNode, legend)) return legend;
+    // The question can be the radiogroup's accessible name. The first option
+    // (LinkedIn, Job Board) is not the question.
+    const group = el.closest("[role='radiogroup'], fieldset");
+    if (group) {
+      const named = questionPrompt(group.getAttribute("aria-label") || "");
+      const option = optionText(el);
+      if (named && named !== option && !isEmployeeNote(named) && !isSectionHeading(group, named)) return named;
+    }
     const option = optionText(el);
     const stop = el.closest("form") || document.body;
     let node = el;

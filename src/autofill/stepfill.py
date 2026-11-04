@@ -2089,6 +2089,163 @@ def commit_location_answer(page, target: dict) -> dict[str, Any]:
     return result
 
 
+_CITY_TYPEAHEAD_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  const auto = String(el.getAttribute("aria-autocomplete") || "").toLowerCase();
+  if (role === "combobox" || auto === "list" || auto === "both") return true;
+  return !!el.getAttribute("aria-controls");
+}"""
+
+
+def _city_typeahead(page, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_CITY_TYPEAHEAD_JS, selector))
+    except Exception:
+        return False
+
+
+def _type_city_query(page, selector: str, text: str) -> bool:
+    """Type a city without blurring. A blur before the suggestion clears the box."""
+    field = page.locator(selector)
+    try:
+        field.fill("")
+        field.press_sequentially(text, delay=type_char_delay())
+        return True
+    except Exception:
+        return bool(type_visible(page, selector, text))
+
+
+def _seal_control(page, selector: str) -> None:
+    """Blur the control so a framework that commits on focusout keeps the value."""
+    from autofill.dom_ui import install
+
+    install(page)
+    try:
+        page.evaluate(
+            """(selector) => {
+              const el = document.querySelector(selector);
+              if (!el || !window.__afUI || typeof window.__afUI.seal !== "function") return false;
+              return window.__afUI.seal(el);
+            }""",
+            selector,
+        )
+    except Exception:
+        try:
+            page.locator(selector).blur()
+        except Exception:
+            return
+
+
+def _shown_city(page, selector: str) -> str:
+    try:
+        shown = str(page.locator(selector).input_value() or "").strip()
+    except Exception:
+        shown = ""
+    if shown:
+        return shown
+    try:
+        from autofill.combobox import selected_pill_text
+
+        return selected_pill_text(page, selector).strip()
+    except Exception:
+        return ""
+
+
+def _city_value_kept(page, selector: str, expected: str, city: str, region: str, country: str) -> bool:
+    """The box still shows this city. A different place is not a commit."""
+    for _attempt in range(4):
+        shown = _shown_city(page, selector)
+        if shown:
+            if normalize(shown) == normalize(expected):
+                return True
+            if region or country:
+                # A typed city with no chosen place is not this state and country.
+                if _place_agrees(shown, city, region, country):
+                    return True
+            elif normalize(shown) == normalize(city) or (
+                _same_city(shown, city) and normalize(shown.split(",")[0]) in _city_names(city)
+            ):
+                return True
+        _pause(page, 40)
+    return False
+
+
+def _folded_city(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _plain_city_kept(page, selector: str, text: str) -> bool:
+    """A plain city may be trimmed or lowercased. That is still the same value."""
+    shown = _shown_city(page, selector)
+    return bool(shown) and _folded_city(shown) == _folded_city(text)
+
+
+def commit_city_text(page, selector: str, value: str) -> dict[str, Any]:
+    """Write a City box and keep it.
+
+    A plain text city is written in one pass. The page may trim or lowercase
+    it. A suggestion list is clicked before blur. The profile's state and
+    country choose among places that share the city. A list with no matching
+    place is not guessed, and the typed query is not left behind.
+    """
+    text = str(value or "").strip()
+    if not selector:
+        return {"filled": False, "reason": "no_selector"}
+    if not text:
+        return {"filled": False, "reason": "empty"}
+    if not _city_typeahead(page, selector):
+        if not type_visible(page, selector, text):
+            return {"filled": False, "reason": "not_committed"}
+        if _plain_city_kept(page, selector, text):
+            return {"filled": True}
+        return {"filled": False, "reason": "not_committed"}
+    city, region, country = _location_parts({"location": text, "address.city": text.split(",")[0].strip()})
+    region, country = _with_profile_place(region, country)
+    query = city or text
+    if not _type_city_query(page, selector, query):
+        return {"filled": False, "reason": "not_committed"}
+    options = _poll_location_options(page, selector, 10, 40)
+    if not options:
+        _seal_control(page, selector)
+        if _city_value_kept(page, selector, text, city, "", ""):
+            return {"filled": True}
+        return {"filled": False, "reason": "not_committed"}
+    match = _match_location(options, city=city, region=region, country=country)
+    if match is None and not region and not country:
+        hits = [item for item in options if _same_city(item[0], city)]
+        if len(hits) == 1:
+            match = hits[0]
+    labels = [label for label, _item in options]
+    if match is None:
+        _clear_location_entry(page, page.locator(selector))
+        return {"filled": False, "reason": "not_committed", "options": labels}
+    try:
+        click_choice(page, match[1], match[0])
+    except Exception:
+        _clear_location_entry(page, page.locator(selector))
+        return {"filled": False, "reason": "not_committed", "options": labels}
+    if not _city_value_kept(page, selector, match[0], city, region, country) and _keyboard_may_commit(
+        options, match, city, region, country
+    ):
+        try:
+            _keep_enter_from_submitting(page)
+            field = page.locator(selector)
+            field.press("ArrowDown")
+            field.press("Enter")
+        except Exception:
+            pass
+    _seal_control(page, selector)
+    if _city_value_kept(page, selector, match[0], city, region, country):
+        return {"filled": True}
+    _clear_location_entry(page, page.locator(selector))
+    return {"filled": False, "reason": "not_committed", "options": labels}
+
+
 def _watch_location_search(page, trace: dict[str, Any]):
     """Remember the Lever suggestion response. The city text is not logged."""
     try:
