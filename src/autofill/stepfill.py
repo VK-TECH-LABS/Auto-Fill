@@ -2791,6 +2791,21 @@ _VISIBLE_VALUE_JS = r"""(selector) => {
     const checked = nodes.find((node) => node.checked);
     return checked ? String(checked.value || "yes") : "";
   }
+  const autoId = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+  const promptHost = el.closest && (
+    el.closest("[data-automation-id='multiSelectContainer']") ||
+    el.closest("[data-automation-id='multiselectInputContainer']")
+  );
+  if (promptHost || autoId === "searchbox" || autoId === "monikersearchbox" || autoId === "promptsearchbox") {
+    const pill = promptHost && promptHost.querySelector(
+      "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel']"
+    );
+    if (pill && !pill.hidden) {
+      const text = String(pill.textContent || "").replace(/\s+/g, " ").trim();
+      if (text) return text;
+    }
+    return "";
+  }
   if (!("value" in el)) return null;
   return String(el.value || "");
 }"""
@@ -2929,6 +2944,8 @@ _MATCH_VALUE_JS = r"""(hint) => {
           if (!placeholder(pillText)) return pillText;
         }
       }
+      // The search box text is the filter, not a committed answer.
+      return "";
     }
     if (role === "combobox" || role === "listbox") {
       const typed = "value" in el ? String(el.value || "") : "";

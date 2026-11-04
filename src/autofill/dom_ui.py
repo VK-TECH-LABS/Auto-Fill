@@ -856,8 +856,20 @@ _COMMITTED_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
       return shown.length > 0 && !placeholder(shown);
     }
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
-      const typed = String(el.value || "").trim();
-      if (typed && !placeholder(typed)) return true;
+      const autoId = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+      const promptHost = el.closest(
+        "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+      );
+      const promptSearch = !!promptHost
+        || autoId === "searchbox"
+        || autoId === "monikersearchbox"
+        || autoId === "promptsearchbox";
+      // A Workday prompt keeps the filter in the search box. That text is not
+      // the choice. The pill, or a Greenhouse single-value, is the commit.
+      if (!promptSearch) {
+        const typed = String(el.value || "").trim();
+        if (typed && !placeholder(typed)) return true;
+      }
       // The pill can sit outside the search wrapper, including a selectedItemList
       // that is a sibling of multiSelectContainer. aria-invalid does not clear it.
       const pill = autofillPillText(el);

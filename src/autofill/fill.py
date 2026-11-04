@@ -221,6 +221,11 @@ def _verified_or_blank(control: Control, mapped: MappedField, locator, expected:
     shown = _shown_value(locator)
     if not _value_verified(shown, expected):
         return _outcome(control, mapped, action="unanswered", detail="Value did not stay on the page.")
+    from autofill.combobox import clear_satisfied_invalid
+
+    host = getattr(locator, "page", None)
+    if host is not None:
+        clear_satisfied_invalid(host, control.selector)
     remember_confirmed(control, shown.strip(), field_key=mapped.key or "")
     refresh_preview(getattr(locator, "page", None))
     return _outcome(control, mapped, detail="filled")

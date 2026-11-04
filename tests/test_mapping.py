@@ -493,6 +493,15 @@ def test_saved_how_heard_uses_one_value_and_stops_on_disagreement():
         form_automation_id="formField-countryPhoneCode",
     )
     assert map_field(postal, profile_only).key == "phone_country"
+    stolen = control(
+        "Postal Code",
+        kind="combobox",
+        automation_id="searchBox",
+        phone_adjacent=True,
+    )
+    assert map_field(stolen, profile_only).key == "phone_country"
+    blank = control("Search", kind="combobox", aria_label="Search", phone_adjacent=True)
+    assert map_field(blank, profile_only).key == "phone_country"
 
 
 def test_phone_extension_and_address_line_2_are_not_copies():
