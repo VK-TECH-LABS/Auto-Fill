@@ -26,6 +26,24 @@ def control(label: str, **kwargs) -> Control:
     return Control(**data)
 
 
+def test_separate_handoff_names_fill_first_and_last():
+    """First and Last use the handoff parts, not the first token of a combined name."""
+    person = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Mary Ann Smith",
+                "first_name": "Mary Ann",
+                "last_name": "Smith",
+                "email": "mary.ann.smith@example.com",
+            }
+        }
+    )
+    assert map_field(control("First name"), person).text == "Mary Ann"
+    assert map_field(control("Last name"), person).text == "Smith"
+    assert map_field(control("Legal first name"), person).text == "Mary Ann"
+    assert "Ann Smith" not in map_field(control("Last name"), person).text
+
+
 def test_identity_contact_and_address_labels():
     filled = profile()
     assert map_field(control("First name"), filled).text == "Casey"

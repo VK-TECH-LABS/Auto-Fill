@@ -71,6 +71,43 @@ def test_preferred_name_is_used_for_the_public_name():
     assert profile.personal.last_name == "Example"
 
 
+def test_handoff_first_and_last_stay_separate():
+    """Fillo sends given and family names on their own. Do not split a combined name."""
+    profile = CandidateProfile.from_dict(
+        {
+            "basics": {
+                "firstName": "Mary Ann",
+                "lastName": "Smith",
+                "email": "mary.ann.smith@example.com",
+                "city": "Fresno",
+                "state": "CA",
+            }
+        }
+    )
+    assert profile.personal.first_name == "Mary Ann"
+    assert profile.personal.family_name == "Smith"
+    assert profile.personal.first_token == "Mary Ann"
+    assert profile.personal.last_name == "Smith"
+    assert profile.personal.full_name == "Mary Ann Smith"
+    assert profile.personal.city == "Fresno"
+    assert profile.personal.province_state == "CA"
+
+    # A different combined full_name must not replace the handoff parts.
+    explicit = CandidateProfile.from_dict(
+        {
+            "personal": {
+                "full_name": "Mary Ann Smith",
+                "first_name": "Mary Ann",
+                "last_name": "Smith",
+                "email": "mary.ann.smith@example.com",
+            }
+        }
+    )
+    assert explicit.personal.first_token == "Mary Ann"
+    assert explicit.personal.last_name == "Smith"
+    assert explicit.personal.full_name == "Mary Ann Smith"
+
+
 def test_screening_defaults_are_blank():
     profile = CandidateProfile.from_dict(
         {"personal": {"full_name": "Casey Example", "email": "casey.example@example.com"}}

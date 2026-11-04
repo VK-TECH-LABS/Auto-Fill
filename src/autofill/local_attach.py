@@ -1644,9 +1644,57 @@ class DedicatedApplySession:
         if selector:
             self._held.add(selector)
         followed = self._follow_answer(page, application_url, profile, cancel=cancel, resume=resume)
+        followed = self._advance_past_verified_gap(
+            page,
+            application_url,
+            profile,
+            followed,
+            selector,
+            cancel=cancel,
+            resume=resume,
+        )
         followed["verified"] = True
         followed["filled"] = True
         return followed
+
+    def _advance_past_verified_gap(
+        self,
+        page: Any,
+        application_url: str,
+        profile: CandidateProfile,
+        followed: dict[str, Any],
+        selector: str,
+        *,
+        cancel: CancelGate | None,
+        resume: LocalResume | None,
+    ) -> dict[str, Any]:
+        """Do not ask again for the value just verified. Continue when it was the last gap."""
+        if not selector or followed.get("continued"):
+            return followed
+        items = [item for item in followed.get("open_items") or [] if isinstance(item, dict)]
+        if not items:
+            return followed
+        kept = [item for item in items if str(item.get("selector") or "") != selector]
+        if len(kept) == len(items):
+            return followed
+        if kept:
+            narrowed = dict(followed)
+            narrowed["open_items"] = kept
+            narrowed["blocking"] = dict(kept[0])
+            return narrowed
+        if cancel is not None:
+            cancel.check()
+        result = self._continue_fill(page, application_url, profile, cancel=cancel, resume=resume)
+        if _optional_submitted(page) is True:
+            raise LocalAttachError("The page reported a submit. The local driver does not submit applications.")
+        self._remember_mark(page)
+        return {
+            "status": result.status,
+            "open_items": list(result.open_items),
+            "blocking": result.blocking,
+            "result": result,
+            "continued": True,
+        }
 
     def resume_action(
         self,

@@ -7,18 +7,23 @@ clicks Final Submit.
 
 When a fill stops on ``MANUAL_ANSWER_REQUIRED``, ``GET /v1/sessions/{id}``
 includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``)
-and ``questions`` for every required gap already on that page. The helper
-shows one centered Save & Continue card for that set
-(:mod:`autofill.answer_popup`). A valid click writes each row onto this
-candidate's Application Answers and fills the employer control, then reports
-``verified``. The card closes on success. The same card reopens on a bad
-choice, a rejected write, or when the click cannot be committed within 45s.
-``POST /v1/sessions/{id}/answer`` still accepts the same values. A repeat of
-a value this click already saved returns ``verified`` and does not write it
-again. Callers persist ``confirmedByEmployee`` only when ``verified`` is
-true. This process does not store that flag. ``savedAnswers`` and
-``learnedApplicationAnswers`` are the rows the host can upsert.
-``stopped_before_submit`` is false only when ``submitted`` is true.
+and ``questions`` for every required gap already on that page. Profile basics
+already on the Application Profile (name, email, city, and the same kind of
+field) are written from that profile and are not put on the card. The helper
+shows one centered Save & Continue card for the remaining set
+(:mod:`autofill.answer_popup`). A valid click records each row on this
+candidate first (``answerSave.candidateId`` and ``learnedApplicationAnswers``).
+Only after that confirmation does it fill the employer control and, when the
+page is complete, continue. The card closes on success. The same card reopens
+on a bad choice or a rejected write. A click that cannot be stored on this
+candidate reopens with "TileArc did not confirm the save". A question this
+click already saved is not asked again. ``POST /v1/sessions/{id}/answer``
+still accepts the same values. A repeat of a value this click already saved
+returns ``verified`` and does not write it again. Callers persist
+``confirmedByEmployee`` only when ``verified`` is true. This process does not
+store that flag. ``savedAnswers`` and ``learnedApplicationAnswers`` are the
+rows the host can upsert onto this candidate. ``stopped_before_submit`` is
+false only when ``submitted`` is true.
 
 Idle detach drops the CDP client. It does not close the browser object and
 it does not kill Chrome, including a browser this process did not launch.
@@ -291,6 +296,25 @@ def _continue_allowed(job: LocalJob) -> bool:
     return str(job.result.get("status") or "") in _ACCOUNT_CONTINUE_STATUSES
 
 
+def _with_binding_owner(raw: dict, binding: dict[str, str] | None) -> dict:
+    """Copy a profile payload so answer rows are filtered for the bound candidate.
+
+    An empty profile id takes the binding id before parsing. A payload that
+    already names a candidate is left alone; a mismatch is refused later.
+    """
+    bound = str((binding or {}).get("candidateId") or "").strip()
+    if not bound:
+        return raw
+    owner = raw.get("candidateId")
+    if owner is None or (isinstance(owner, str) and not owner.strip()):
+        owner = raw.get("candidate_id")
+    if isinstance(owner, str) and owner.strip():
+        return raw
+    copied = dict(raw)
+    copied["candidateId"] = bound
+    return copied
+
+
 def align_profile_candidate(profile: CandidateProfile, binding: dict[str, str] | None) -> None:
     """One candidate for this fill. A profile for someone else is refused.
 
@@ -311,6 +335,50 @@ def align_profile_candidate(profile: CandidateProfile, binding: dict[str, str] |
         )
     if bound and not owner:
         profile.candidate_id = bound
+
+
+def _profile_digest(profile: CandidateProfile | None) -> tuple:
+    """Basics, work, education, and approved answers. Used to notice a newer payload."""
+    if profile is None:
+        return ()
+    personal = profile.personal
+    basics = (
+        profile.candidate_id,
+        personal.full_name,
+        personal.first_name,
+        personal.family_name,
+        personal.email,
+        personal.phone,
+        personal.address,
+        personal.city,
+        personal.province_state,
+        personal.country,
+        personal.postal_code,
+        personal.preferred_name,
+    )
+    work = tuple(
+        (row.company, row.title, row.start_date, row.end_date, row.current, row.location)
+        for row in profile.employment
+    )
+    education = tuple(
+        (row.school, row.degree, row.field_of_study, row.start_date, row.end_date)
+        for row in profile.education_history
+    )
+    answers = tuple(
+        (item.question, item.answer, item.intent, item.key, item.employer)
+        for item in profile.application_answers
+    )
+    heard = profile.screening.how_heard
+    return (basics, work, education, answers, heard)
+
+
+def _can_refresh_profile(job: LocalJob) -> bool:
+    """An idle human stop can take a newer profile. A running or finished fill cannot."""
+    if job.superseded or job.submit_claimed() or job.state in {"queued", "running"}:
+        return False
+    if job.result is None:
+        return False
+    return str(job.result.get("status") or "") == Status.MANUAL_ANSWER_REQUIRED
 
 
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
@@ -461,6 +529,12 @@ class LocalJob:
         # Keyed by question id, hash, and field key. ``saved_rows`` is the public list.
         self.saved_answers: dict[str, list[str]] = {}
         self.saved_rows: list[dict[str, Any]] = []
+        # Set only after a Save & Continue click is stored on this candidate,
+        # and before the employer control is written.
+        self.save_confirmed_candidate = ""
+        # Digest of the payload this job was started or refreshed with.
+        # Answers learned during the fill are not part of it.
+        self.adopted_digest: tuple = ()
 
     def submit_claimed(self) -> bool:
         """True only when the page reported a submit. A missing flag is not a claim."""
@@ -486,6 +560,7 @@ class LocalJob:
         self.open_items = []
         self.saved_answers = {}
         self.saved_rows = []
+        self.save_confirmed_candidate = ""
 
     def drop_resume(self) -> None:
         if self.resume is not None:
@@ -596,6 +671,8 @@ class LocalJob:
             body["learnedApplicationAnswers"] = learned
         if self.saved_rows:
             body["savedAnswers"] = [dict(row) for row in self.saved_rows]
+        if self.save_confirmed_candidate:
+            body["answerSave"] = {"confirmed": True, "candidateId": self.save_confirmed_candidate}
         return body
 
 
@@ -693,6 +770,7 @@ class LocalHelper:
                         current.resume.drop()
                     current.resume = claimed
                 current.profile = profile
+                current.adopted_digest = _profile_digest(profile)
                 if standard_terms_authorized:
                     current.standard_terms_authorized = True
                 current.continue_attempts += 1
@@ -708,25 +786,51 @@ class LocalHelper:
                     self._staged.pop(resume_ref, None)
                 if standard_terms_authorized:
                     current.standard_terms_authorized = True
-                return current
+                changed = current.adopted_digest != _profile_digest(profile)
+                if not changed or not _can_refresh_profile(current) or self._active is not None:
+                    return current
+                # The portal sent this candidate's latest profile while the fill
+                # is waiting. Keep the session and fill the open page with it.
+                current.profile = profile
+                current.adopted_digest = _profile_digest(profile)
+                current.saved_answers = {}
+                current.saved_rows = []
+                current.save_confirmed_candidate = ""
+                current.popup = None
+                current.card_ids = []
+                current.extra_shown = False
+                current.notice = ""
+                current.error = ""
+                current.state = "queued"
+                self._generation += 1
+                self._active = current.session_id
+                job = current
+                recover = True
             else:
                 resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
                 active = self._jobs.get(self._active) if self._active else None
                 if active is not None and not active.superseded and binding is None:
                     raise LocalAttachError("A fill is already running on this dedicated profile.")
                 incoming = (binding or {}).get("candidateId") or ""
+                incoming_ids = {token for token in (incoming, (profile.candidate_id or "").strip()) if token}
                 preserve = current if (same and current is not None and _create_keeps_failed(current)) else None
                 for old in {job.session_id: job for job in (current, active) if job is not None}.values():
                     if old is preserve:
                         continue
                     if not old.superseded:
-                        previous = (old.binding or {}).get("candidateId") or ""
-                        if incoming and previous and incoming != previous:
-                            self._credentials.drop_candidate(previous)
+                        previous_ids = {(old.binding or {}).get("candidateId") or ""}
+                        if old.profile is not None:
+                            previous_ids.add((old.profile.candidate_id or "").strip())
+                        previous_ids.discard("")
+                        for previous in previous_ids:
+                            if previous not in incoming_ids:
+                                self._credentials.drop_candidate(previous)
+                                self._drop_staged_candidate(previous)
                         old.end("replaced")
                         logger.info("session=%s superseded reason=replaced", old.session_id)
                 self._generation += 1
                 job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
+                job.adopted_digest = _profile_digest(profile)
                 job.standard_terms_authorized = bool(standard_terms_authorized)
                 self._jobs[job.session_id] = job
                 self._current = job.session_id
@@ -773,6 +877,13 @@ class LocalHelper:
         """Drop expired staged files. Call with the lock held."""
         now = time.monotonic()
         for ref in [ref for ref, row in self._staged.items() if row.expired(now)]:
+            self._staged.pop(ref, None)
+
+    def _drop_staged_candidate(self, candidate_id: str) -> None:
+        """Drop staged resumes for one candidate. Call with the lock held."""
+        if not candidate_id:
+            return
+        for ref in [ref for ref, row in self._staged.items() if row.candidate_id == candidate_id]:
             self._staged.pop(ref, None)
 
     def staged_count(self) -> int:
@@ -976,6 +1087,7 @@ class LocalHelper:
         job = self.get(session_id)
         if job is None:
             raise LocalAttachError("No such session.")
+        fresh_profile = _continue_profile(job, payload.get("profile"))
         with self._lock:
             if job.superseded or (self._current is not None and self._current != session_id):
                 raise AnswerRejected(410, _failure(job, "replaced"))
@@ -989,6 +1101,9 @@ class LocalHelper:
                 raise AnswerRejected(409, _failure(job, "binding_mismatch"))
             if not _continue_allowed(job):
                 raise AnswerRejected(409, _failure(job, "not_continuable"))
+            if fresh_profile is not None:
+                job.profile = fresh_profile
+                job.adopted_digest = _profile_digest(fresh_profile)
             if job.continue_attempts >= _CONTINUE_CAP:
                 raise AnswerRejected(409, _failure(job, "continue_limit"))
             if job.profile is None:
@@ -1499,6 +1614,8 @@ class LocalHelper:
                 self._remember_result(job, result)
                 job.state = "done"
                 self._capture_open_page(job)
+                self._commit_known_basics(job)
+                _release_answered_questions(job)
                 self._present_popup(job)
             job.target_id = self._session.tab.target_id if self._session.tab is not None else job.target_id
             if box is not None:
@@ -1572,6 +1689,11 @@ class LocalHelper:
         if not str(item.get("selector") or "").strip():
             raise AnswerRejected(409, _failure(job, "element_not_found"))
         target = _prepared_target(job, item, payload)
+        _reject_profile_mismatch(job)
+        # The answer is stored on this candidate before the page is written,
+        # so a continuation inside the write can reuse it and cannot run first.
+        _remember_answer(job, item, target)
+        _mark_save_confirmed(job)
         apply = getattr(self._session, "apply_answer", None)
         if apply is None:
             raise AnswerRejected(409, _failure(job, "element_not_found"))
@@ -1613,6 +1735,8 @@ class LocalHelper:
             return _answer_body(job, report, started)
         if card_before and follow_ids and job.extra_shown and set(follow_ids) - set(card_before):
             return _answer_body(job, report, started)
+        self._commit_known_basics(job)
+        _release_answered_questions(job)
         self._present_popup(job)
         return _answer_body(job, report, started)
 
@@ -1641,6 +1765,55 @@ class LocalHelper:
         done = threading.Event()
         self._queue.put(("popup", {"job": job, "done": done}))
         done.wait(timeout=_POPUP_SYNC_WAIT_SECONDS)
+
+    def _commit_known_basics(self, job: LocalJob) -> None:
+        """Write profile basics that are still empty. Do not ask for them.
+
+        Name, email (including confirm email), city, and the same kind of
+        field come from the Application Profile. A value the page does not
+        keep stays on the card. Consent, salary confirm, and unknown questions
+        are not touched.
+        """
+        apply = getattr(self._session, "apply_answer", None)
+        if apply is None or job.profile is None or job.superseded:
+            return
+        attempted: set[str] = set()
+        for _ in range(8):
+            if job.superseded or job.profile is None:
+                return
+            pending = []
+            for item in job.open_items:
+                if _item_saved(job, item):
+                    continue
+                if not _profile_basic_value(job.profile, item):
+                    continue
+                token = str(item.get("selector") or item.get("questionId") or "")
+                if not token or token in attempted:
+                    continue
+                pending.append(item)
+            if not pending:
+                return
+            item = pending[0]
+            token = str(item.get("selector") or item.get("questionId") or "")
+            attempted.add(token)
+            try:
+                value = _profile_basic_value(job.profile, item)
+                target = _prepared_target(job, item, {"id": str(item.get("questionId") or ""), "values": [value]})
+            except AnswerRejected:
+                continue
+            kwargs: dict[str, Any] = {}
+            if _accepts_cancel(apply):
+                kwargs["cancel"] = job.gate
+            if job.resume is not None and _accepts(apply, "resume"):
+                kwargs["resume"] = job.resume
+            try:
+                report = apply(job.application_url, job.profile, target, **kwargs)
+            except Exception:
+                return
+            if not isinstance(report, dict) or not report.get("verified"):
+                continue
+            _note_saved(job, item, target)
+            self._adopt_follow(job, report, target)
 
     def _present_popup(
         self,
@@ -1704,7 +1877,9 @@ class LocalHelper:
             popup["questionId"] = ids[0]
             popup["questionIds"] = list(ids)
         job.card_ids = list(ids)
-        restored = _restored_map(popup) if error or popup.get("values") else None
+        restored = _profile_suggestions(job, rows)
+        if error or popup.get("values"):
+            restored.update(_restored_map(popup))
         try:
             kwargs = {
                 "nonce": popup["nonce"],
@@ -1715,7 +1890,7 @@ class LocalHelper:
                 "error": error,
                 "force": True,
                 "locked": locked,
-                "restored": restored,
+                "restored": restored or None,
             }
             if _accepts(show, "note"):
                 kwargs["note"] = _profile_popup_note(rows)
@@ -1739,6 +1914,8 @@ class LocalHelper:
         popup.pop("values", None)
         popup.pop("answeredAt", None)
         popup.pop("committing", None)
+        popup.pop("confirmed", None)
+        popup.pop("candidateId", None)
         popup["committed"] = False
         job.popup = popup
 
@@ -1795,13 +1972,22 @@ class LocalHelper:
                     reopen=True,
                 )
             return
-        popup["state"] = "answered"
         popup["values"] = stored
         popup["answeredAt"] = time.monotonic()
         counted = len(stored) if isinstance(stored, list) else 1
         logger.info("session=%s popup_answered values=%s", job.session_id, counted)
+        if not _confirm_popup_save(job, stored):
+            self._present_popup(
+                job,
+                message=(
+                    "TileArc did not confirm the save. Keep the TileArc tab open, "
+                    "then click Save & Continue again."
+                ),
+                error=True,
+            )
+            return
         if getattr(self._session, "apply_answer", None) is None:
-            self._arm_popup_timeout(job)
+            # The save is on this candidate. Filling waits until the session can write.
             return
         self._commit_popup_answers(job, stored)
 
@@ -2066,12 +2252,33 @@ def _credential_failure(
     return body
 
 
+def _continue_profile(job: LocalJob, raw: Any) -> CandidateProfile | None:
+    """Latest profile on ``POST /continue``, or None when the body has none."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise AnswerRejected(422, _failure(job, "profile_invalid"))
+    try:
+        profile = CandidateProfile.from_dict(_with_binding_owner(raw, job.binding))
+    except ProfileError as exc:
+        raise AnswerRejected(422, _failure(job, "profile_invalid")) from exc
+    align_profile_candidate(profile, job.binding)
+    return profile
+
+
 def _fill_identity(job: LocalJob) -> dict[str, str]:
-    """Binding ids for the engine. The helper session id is only a fallback."""
+    """Binding ids for the engine. The helper session id is only a fallback.
+
+    The profile id is used when the create had no binding, so a later candidate
+    still looks like a change and the previous person's cookies are cleared.
+    """
     binding = job.binding or {}
+    candidate = str(binding.get("candidateId") or "").strip()
+    if not candidate and job.profile is not None:
+        candidate = (job.profile.candidate_id or "").strip()
     return {
         "session_id": binding.get("tilearcSessionId") or job.session_id,
-        "candidate_id": binding.get("candidateId") or "",
+        "candidate_id": candidate,
         "job_id": binding.get("jobId") or "",
     }
 
@@ -2166,7 +2373,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise LocalAttachError("profile must be an object.")
             binding = parse_binding(payload.get("binding"))
             resume_ref = parse_resume_claim(payload.get("resume"))
-            profile = CandidateProfile.from_dict(profile_raw)
+            profile = CandidateProfile.from_dict(_with_binding_owner(profile_raw, binding))
             if resume_ref is None:
                 job = self.server.helper.submit(
                 url,
@@ -2367,9 +2574,14 @@ def question_view(item: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _open_question_rows(job: LocalJob) -> list[dict[str, Any]]:
-    """Page-set rows plus the control selector. The selector is not part of the status."""
+    """Page-set rows plus the control selector. The selector is not part of the status.
+
+    A question this job already saved is left off the card.
+    """
     rows: list[dict[str, Any]] = []
     for item in job.open_items:
+        if _item_saved(job, item):
+            continue
         view = question_view(item)
         if view is None:
             continue
@@ -2506,8 +2718,11 @@ def _popup_view(job: LocalJob) -> dict[str, Any] | None:
     if state in {"answered", "saving", "confirmed"} and popup.get("values"):
         view["nonce"] = str(popup.get("nonce") or "")
         view["values"] = list(popup["values"])
-    if popup.get("committed") or state == "confirmed":
+    if popup.get("confirmed") or popup.get("committed") or state == "confirmed":
         view["confirmed"] = True
+        candidate = str(popup.get("candidateId") or "")
+        if candidate:
+            view["candidateId"] = candidate
     return view
 
 
@@ -2586,6 +2801,169 @@ def _is_profile_date(item: dict[str, Any]) -> bool:
     """Work and education dates belong on the profile row, not the answer catalogue."""
     key = str(item.get("fieldKey") or "")
     return re.fullmatch(r"(employment|education)\.\d+\.(startDate|endDate)", key) is not None
+
+
+_BASIC_FIELDS = {
+    "first_name": lambda profile: profile.personal.preferred_or_first,
+    "last_name": lambda profile: profile.personal.last_name,
+    "full_name": lambda profile: profile.personal.full_name,
+    "legal_name": lambda profile: profile.personal.full_name,
+    "preferred_name": lambda profile: profile.personal.preferred_name.strip(),
+    "email": lambda profile: profile.personal.email,
+    "phone": lambda profile: profile.personal.phone,
+    "address": lambda profile: profile.personal.address,
+    "city": lambda profile: profile.personal.city,
+    "state": lambda profile: profile.personal.province_state,
+    "postal_code": lambda profile: profile.personal.postal_code,
+    "country": lambda profile: profile.personal.country,
+    "location": lambda profile: ", ".join(
+        part.strip()
+        for part in (
+            profile.personal.city,
+            profile.personal.province_state,
+            profile.personal.country,
+        )
+        if part and part.strip()
+    ),
+}
+_BASIC_ALIASES = {
+    "address.city": "city",
+    "address.region": "state",
+    "address.state": "state",
+    "address.postalcode": "postal_code",
+    "address.postal_code": "postal_code",
+    "address.country": "country",
+    "address.line1": "address",
+    "firstname": "first_name",
+    "lastname": "last_name",
+    "fullname": "full_name",
+    "givenname": "first_name",
+    "familyname": "last_name",
+}
+
+
+def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str:
+    """A profile basic for this gap, or empty when the person must answer.
+
+    Confirm email uses the profile email. Consent, demographics, and a salary
+    confirm stay manual.
+    """
+    kind = canonical_blocker_kind(item.get("kind"))
+    if kind in {"CONSENT", "CONSENT_CHOICE", "DEMOGRAPHIC"}:
+        return ""
+    if str(item.get("challenge") or "") == "confirm":
+        return ""
+    raw_key = str(item.get("fieldKey") or "").strip()
+    if raw_key == "recruitment_sms_consent":
+        return ""
+    key = _BASIC_ALIASES.get(raw_key.casefold(), raw_key)
+    getter = _BASIC_FIELDS.get(key)
+    if getter is None:
+        text = str(item.get("text") or item.get("prompt") or "").casefold()
+        if "email" in text and any(token in text for token in ("confirm", "re-enter", "reenter", "verify")):
+            getter = _BASIC_FIELDS["email"]
+        elif text.strip() in {"email", "email address"}:
+            getter = _BASIC_FIELDS["email"]
+        elif text.strip() in {"city", "current city"} or "place of residence" in text:
+            getter = _BASIC_FIELDS["city"]
+        elif "first name" in text or "given name" in text:
+            getter = _BASIC_FIELDS["first_name"]
+        elif "last name" in text or "family name" in text:
+            getter = _BASIC_FIELDS["last_name"]
+    if getter is None:
+        return ""
+    return str(getter(profile) or "").strip()
+
+
+def _profile_suggestions(job: LocalJob, rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Prefill a card row from the profile when the page would not take the value."""
+    profile = job.profile
+    if profile is None:
+        return {}
+    suggested: dict[str, list[str]] = {}
+    for row in rows:
+        value = _profile_basic_value(profile, row)
+        qid = str(row.get("id") or "")
+        if value and qid:
+            suggested[qid] = [value]
+    return suggested
+
+
+def _item_saved(job: LocalJob, item: dict[str, Any]) -> bool:
+    tokens = [
+        str(item.get(key) or "").strip()
+        for key in ("id", "questionId", "questionHash", "fieldKey")
+    ]
+    return any(token and token in job.saved_answers for token in tokens)
+
+
+def _reject_profile_mismatch(job: LocalJob) -> None:
+    """Refuse a save when the profile belongs to someone other than the binding."""
+    bound = _job_candidate(job)
+    owner = (job.profile.candidate_id or "").strip() if job.profile is not None else ""
+    if bound and owner and bound != owner:
+        raise AnswerRejected(409, _failure(job, "candidate_mismatch"))
+
+
+def _mark_save_confirmed(job: LocalJob) -> None:
+    """The answer is on this candidate. Fill has not run yet."""
+    owner = _job_candidate(job)
+    job.save_confirmed_candidate = owner
+    popup = job.popup if isinstance(job.popup, dict) else None
+    if popup is None:
+        return
+    popup["confirmed"] = True
+    popup["candidateId"] = owner
+
+
+def _confirm_popup_save(job: LocalJob, stored: list[Any]) -> bool:
+    """Store one click on this candidate. False when it cannot be stored."""
+    if job.profile is None:
+        return False
+    try:
+        _reject_profile_mismatch(job)
+    except AnswerRejected:
+        return False
+    rows = _popup_answer_rows(job, stored)
+    if not rows:
+        return False
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in rows:
+        item = _match_item(job, {"id": row["questionId"]})
+        if item is None:
+            return False
+        try:
+            target = _prepared_target(job, item, {"id": row["questionId"], "values": list(row["values"])})
+        except AnswerRejected:
+            return False
+        prepared.append((item, target))
+    for item, target in prepared:
+        _remember_answer(job, item, target)
+    _mark_save_confirmed(job)
+    popup = job.popup if isinstance(job.popup, dict) else None
+    if popup is not None:
+        popup["state"] = "confirmed"
+        popup["committed"] = True
+    return True
+
+
+def _release_answered_questions(job: LocalJob) -> None:
+    """Drop gaps this job already saved so the card does not ask them again."""
+    if not job.open_items:
+        return
+    kept = [item for item in job.open_items if not _item_saved(job, item)]
+    if len(kept) == len(job.open_items):
+        return
+    job.open_items = kept
+    if kept:
+        job.blocking = dict(kept[0])
+        job.question = pending_question(Status.MANUAL_ANSWER_REQUIRED, job.blocking, kept)
+        return
+    job.blocking = None
+    job.question = None
+    if job.result is not None and str(job.result.get("status") or "") == Status.MANUAL_ANSWER_REQUIRED:
+        job.result["status"] = Status.READY_FOR_HUMAN_SUBMIT
+        job.result["stopped_before_submit"] = not job.submit_claimed()
 
 
 def _note_saved(job: LocalJob, item: dict[str, Any], target: dict[str, Any]) -> None:
