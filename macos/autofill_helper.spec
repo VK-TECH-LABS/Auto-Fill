@@ -79,6 +79,10 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    # None freezes a thin binary for this Mac. Do not set "universal2":
+    # Playwright's driver node and greenlet are thin Mach-O for one architecture,
+    # and lipo cannot merge that tree into one app. CI builds arm64 and x86_64
+    # as separate disk images.
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,

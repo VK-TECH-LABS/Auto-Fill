@@ -106,7 +106,8 @@ jobs:
           Employees: docs/WINDOWS_EMPLOYEE.md
           Download link notes: windows/BUILD.md
 
-          macOS asset on this same draft tag: TileArc-AutoFill-Helper-Setup-staging.dmg
+          macOS Apple Silicon (arm64): TileArc-AutoFill-Helper-Setup-staging-arm64.dmg
+          macOS Intel (x86_64): TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg
           macOS employees: docs/MACOS_EMPLOYEE.md
           macOS download link notes: macos/BUILD.md
           EOF

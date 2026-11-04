@@ -2,7 +2,14 @@
 
 This installs the staging helper on your Mac. You do not need Python, and you do not install the Windows Setup file.
 
-Use this only for **TileArc staging**. It is not the production installer. The disk image is built for **Apple Silicon** Macs (M1 or newer). An Intel Mac uses the hosted TileArc companion for this staging build.
+Use this only for **TileArc staging**. It is not the production installer. There are two disk images. Install the one that matches the chip in your Mac:
+
+- **Apple Silicon** (M1, M2, M3, M4, or newer): `TileArc-AutoFill-Helper-Setup-staging-arm64.dmg`
+- **Intel** (including a 2020 MacBook): `TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg`
+
+To see the chip, open the Apple menu and choose **About This Mac**. The line named Chip or Processor says Apple M1 (or a later M-series chip) or Intel.
+
+The Apple Silicon disk image does not open on an Intel Mac. macOS shows a prohibitory icon. Download the Intel disk image instead.
 
 The helper runs on this computer at `http://127.0.0.1:9410`. It opens a **separate Chrome profile** for applications. It does not use your everyday Chrome, and it does not click Final Submit. You still submit the application yourself.
 
@@ -12,7 +19,9 @@ Install **Google Chrome** if it is not already installed. Chrome has to be the n
 
 ## Install
 
-1. Download **TileArc-AutoFill-Helper-Setup-staging.dmg** from TileArc (Download Installer) or from the staging release your team shared.
+1. Download the disk image for your Mac from TileArc (Download Installer) or from the staging release your team shared.
+   - Apple Silicon: **TileArc-AutoFill-Helper-Setup-staging-arm64.dmg**
+   - Intel: **TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg**
 2. Open the disk image.
 3. Drag **TileArc Auto-Fill Helper (STAGING)** onto the Applications folder.
 4. Eject the disk image.
@@ -63,7 +72,7 @@ The extension talks to the helper at `http://127.0.0.1:9410`. It does not use a 
 - Read the form. The helper stops for questions it should not guess.
 - **You click Final Submit.** The helper will not.
 
-If the helper is not running, TileArc can still use the hosted companion. Installing this helper does not turn the companion off.
+If the helper is not running, TileArc can still use the hosted TileArc companion. Installing this helper does not turn the companion off.
 
 ## Remove it
 

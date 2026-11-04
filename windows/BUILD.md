@@ -42,4 +42,4 @@ Output: `dist/TileArc-AutoFill-Helper-Setup-staging.exe`.
 
 ## macOS
 
-Employees on macOS install `TileArc-AutoFill-Helper-Setup-staging.dmg` (Apple Silicon). That asset is added to the same draft tag `tilearc-autofill-helper-staging`. See `macos/BUILD.md` and `docs/MACOS_EMPLOYEE.md`. The Windows Setup.exe stays the Windows download.
+Employees on macOS install the disk image for their chip. Apple Silicon uses `TileArc-AutoFill-Helper-Setup-staging-arm64.dmg`. Intel uses `TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg`. Both assets are added to the same draft tag `tilearc-autofill-helper-staging`. See `macos/BUILD.md` and `docs/MACOS_EMPLOYEE.md`. The Windows Setup.exe stays the Windows download.
