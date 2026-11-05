@@ -1819,7 +1819,13 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             picked = None
         if picked is None:
-            return {"filled": False, "reason": "not_committed"}
+            from autofill.combobox import take_opened_children
+
+            options = take_opened_children()
+            nested: dict[str, Any] = {"filled": False, "reason": "not_committed"}
+            if options:
+                nested["options"] = options
+            return nested
         if not control_committed(page, selector):
             return {"filled": False, "reason": "not_committed"}
         clear_highlight(page, selector)

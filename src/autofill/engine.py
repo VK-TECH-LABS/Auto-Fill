@@ -418,9 +418,11 @@ def _refresh_error_page(page, snapshot):
 
 
 def _with_study_gaps(page, snapshot, profile, gaps: list) -> list:
-    from autofill.stepfill import unmatched_study_gaps
+    from autofill.stepfill import invalid_phone_gaps, unknown_link_gaps, unmatched_study_gaps
 
     extra = unmatched_study_gaps(page, snapshot, profile)
+    extra.extend(unknown_link_gaps(page, snapshot, profile))
+    extra.extend(invalid_phone_gaps(page, snapshot, profile))
     seen = {str(item.get("selector") or "") for item in gaps}
     for item in extra:
         selector = str(item.get("selector") or "")
@@ -1373,6 +1375,24 @@ def autofill_application(
                     manual.extend(refill_manual)
                     _note_fill(refilled, opts, run_started, inspect_state)
                 else:
+                    # Ask the questions already on the page before parking on
+                    # the resume. The file stays manual either way.
+                    pending = _with_study_gaps(
+                        page,
+                        snapshot,
+                        candidate_profile,
+                        required_gaps(page, snapshot, candidate_profile),
+                    )
+                    if pending:
+                        return _manual_for_gaps(
+                            session,
+                            pending,
+                            ats=ats_name,
+                            login_status=login_status,
+                            fields=fields,
+                            manual=manual,
+                            submit_controls=submit_controls,
+                        )
                     session.mark("RESUME_UPLOAD_REQUIRED")
                     detected, filled, skipped = _counts(fields)
                     return _result(

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from contextvars import ContextVar
 
 from autofill.dom_ui import focus_field, latest_listbox_choices, note_listbox_choice, prompt_pill_text, type_char_delay
 from autofill.intents import match_option_exact
@@ -26,6 +27,10 @@ from autofill.safeguards import (
 )
 
 logger = logging.getLogger("autofill.combobox")
+
+# Child labels seen when a click opened a nested menu instead of committing.
+# The answer card reads these once and asks for the leaf. A later success clears them.
+_OPENED_CHILDREN: ContextVar[tuple[str, ...]] = ContextVar("autofill_opened_children", default=())
 
 # A menu may show any of these for one country. Longer names are typed first.
 # Calling codes let a phone-country row such as "United States +1" match too.
@@ -781,6 +786,82 @@ def close_open_menu(page) -> None:
         _pause(page, 40)
 
 
+def take_opened_children() -> list[str]:
+    """Leaf labels from a click that opened a nested menu, then clear them."""
+    found = [label for label in _OPENED_CHILDREN.get() if label]
+    _OPENED_CHILDREN.set(())
+    return found
+
+
+def _note_children(parent: str, children: list[Option]) -> None:
+    """Remember ``Parent > Child`` labels so the card can ask for the leaf."""
+    labels: list[str] = []
+    parent_name = (parent or "").strip()
+    for child in children:
+        if not child.leaf or child.folder:
+            continue
+        name = (child.label or child.value).strip()
+        if not name or _menu_junk(name):
+            continue
+        if parent_name:
+            path = f"{parent_name} > {name}"
+            if path not in labels:
+                labels.append(path)
+        if name not in labels:
+            labels.append(name)
+    if labels:
+        _OPENED_CHILDREN.set(tuple(labels))
+
+
+def child_for_answer(desired: str, parent: str, children: list[Option]) -> Option | None:
+    """The leaf ``desired`` names under this parent.
+
+    A parent name with several children is not a commit. A different parent,
+    including whichever row is first, is not used.
+    """
+    parts = _path_parts(desired)
+    if parts and not _labels_match(parts[0], parent):
+        return None
+    leaf_name = parts[-1] if parts else desired
+    leaves = _real_leaves(children)
+    if not parts and _labels_match(leaf_name, parent):
+        if len(leaves) == 1:
+            return leaves[0]
+        return None
+    return _prefer_leaf(leaf_name, leaves)
+
+
+def terminal_menu_labels(
+    found: list[Option],
+    children_by_parent: list[tuple[str, list[Option]]],
+    *,
+    limit: int = 200,
+) -> list[str]:
+    """Choices a person can save. A folder that opened leaves is not one of them."""
+    labels: list[str] = []
+    opened = {
+        parent
+        for parent, kids in children_by_parent
+        if any(child.leaf and not child.folder and (child.label or child.value).strip() for child in kids)
+    }
+    for option in found:
+        label = (option.label or option.value).strip()
+        if option.folder and label in opened:
+            continue
+        _remember_label(labels, label, limit)
+    for parent, kids in children_by_parent:
+        for child in kids:
+            if not child.leaf or child.folder:
+                continue
+            name = (child.label or child.value).strip()
+            if not name:
+                continue
+            _remember_label(labels, name, limit)
+            if parent:
+                _remember_label(labels, f"{parent} > {name}", limit)
+    return labels
+
+
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
     """Open the menu once, read option text, and close it.
 
@@ -796,12 +877,10 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
         found = _open_for_options(page, selector)
     except Exception:
         found = []
-    labels: list[str] = []
     folders = [option for option in found if option.folder and option.selector]
-    for option in found:
-        _remember_label(labels, option.label or option.value, limit)
+    nested: list[tuple[str, list[Option]]] = []
     for folder in folders:
-        if len(labels) >= limit:
+        if sum(len(kids) for _parent, kids in nested) >= limit:
             break
         try:
             opened = _open_for_options(page, selector)
@@ -817,22 +896,16 @@ def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]
         _pause(page, 50)
         children = _await_menu(page, selector, 800)
         parent = (current.label or folder.label).strip()
-        for child in children:
-            if not child.leaf:
-                continue
-            child_label = (child.label or child.value).strip()
-            _remember_label(labels, child_label, limit)
-            if parent and child_label:
-                _remember_label(labels, f"{parent} > {child_label}", limit)
+        nested.append((parent, list(children)))
         try:
             close_open_menu(page)
         except Exception:
-            return labels
+            return terminal_menu_labels(found, nested, limit=limit)
     try:
         close_open_menu(page)
     except Exception:
-        return labels
-    return labels
+        return terminal_menu_labels(found, nested, limit=limit)
+    return terminal_menu_labels(found, nested, limit=limit)
 
 
 def _same_option(left: Option, right: Option) -> bool:
@@ -1055,17 +1128,18 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
             continue
         _pause(page, 50)
         children = _await_menu(page, selector, 800)
-        leaves = _real_leaves(children)
-        leaf = _prefer_leaf(leaf_name, leaves)
-        if leaf is None and leaf_name:
+        parent_label = (current.label or folder.label).strip()
+        leaf = child_for_answer(desired, parent_label, children)
+        if leaf is None and leaf_name and not _labels_match(leaf_name, parent_label):
             # The next level is a search box. The leaf is not in the DOM
             # until the query is typed.
             _type_filter(page, selector, leaf_name)
             searched = _await_menu(page, selector, 1000)
-            leaf = _prefer_leaf(leaf_name, _real_leaves(searched) or searched)
-        if leaf is None and not parts and len(leaves) == 1 and _labels_match(desired, current.label):
-            leaf = leaves[0]
+            leaf = child_for_answer(desired, parent_label, searched)
+            if leaf is None:
+                children = searched
         if leaf is None or not leaf.selector:
+            _note_children(parent_label, children)
             try:
                 dismiss_combobox(page)
             except Exception:
@@ -1369,6 +1443,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     """
     if not selector or not desired.strip():
         return None
+    _OPENED_CHILDREN.set(())
     focus_field(page, selector)
     shown = _selected_text(page, selector)
     if _labels_match(desired, shown) or any(_labels_match(part, shown) for part in _path_parts(desired)[-1:]):
@@ -1431,20 +1506,19 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         if leaf is None and match.folder and not _committed_choice(
             page, selector, match, desired, accept_input=not typed
         ):
-            leaves = _real_leaves(children)
-            parts = _path_parts(desired)
-            if parts:
-                leaf = _prefer_leaf(parts[-1], leaves)
-            elif len(leaves) == 1:
-                leaf = leaves[0]
+            leaf = child_for_answer(desired, match.label, children)
+        if leaf is None and match.folder:
+            _note_children(match.label, children)
         if leaf is not None and leaf.selector:
             click_choice(page, leaf.selector, leaf.label)
             _pause(page, 50)
             match = leaf
     if _kept_after_close(page, selector, match, desired, accept_input=not typed):
+        _OPENED_CHILDREN.set(())
         return match
     _keyboard_commit(page, selector, desired, match)
     if _kept_after_close(page, selector, match, desired, accept_input=True):
+        _OPENED_CHILDREN.set(())
         return match
     close_open_menu(page)
     return None

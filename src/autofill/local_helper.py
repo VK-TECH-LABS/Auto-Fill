@@ -281,8 +281,29 @@ _ACCOUNT_CONTINUE_STATUSES = frozenset(
         Status.LOGIN_REQUIRED,
         Status.LOGIN_FAILED,
         Status.ACCOUNT_CREATION_REQUIRED,
+        Status.RESUME_UPLOAD_REQUIRED,
+        Status.MANUAL_ANSWER_REQUIRED,
+        Status.CAPTCHA_REQUIRED,
     }
 )
+
+# Shown on the employer tab when the fill pauses and there is no question to save.
+# Proceed continues this same Apply window. It does not upload a resume or submit.
+_PAUSE_NOTICES = {
+    Status.RESUME_UPLOAD_REQUIRED: (
+        "Upload the resume in this Apply window, then click Proceed. Auto-Fill will not upload it."
+    ),
+    Status.CAPTCHA_REQUIRED: (
+        "Complete the verification on this page, then click Proceed. This stays the same Apply window."
+    ),
+    Status.EMAIL_VERIFICATION_REQUIRED: (
+        "Open the verification email, then click Proceed. Sign-in continues in this window."
+    ),
+    Status.LOGIN_REQUIRED: "Finish sign-in on this page, then click Proceed.",
+    Status.LOGIN_FAILED: "The sign-in did not stick. Fix it on this page, then click Proceed.",
+    Status.ACCOUNT_CREATION_REQUIRED: "Finish the account step on this page, then click Proceed.",
+    Status.NAVIGATION_STALLED: "The page did not move. Fix what the employer is asking, then click Proceed.",
+}
 
 
 def _continue_allowed(job: LocalJob) -> bool:
@@ -673,6 +694,9 @@ class LocalJob:
             body["savedAnswers"] = [dict(row) for row in self.saved_rows]
         if self.save_confirmed_candidate:
             body["answerSave"] = {"confirmed": True, "candidateId": self.save_confirmed_candidate}
+        action = _manual_action(self)
+        if action:
+            body["manualAction"] = action
         return body
 
 
@@ -1446,8 +1470,23 @@ class LocalHelper:
             reason = password_meets_policy(password, password_policy(extract_page(page)), email)
             if reason:
                 raise AnswerRejected(422, _credential_failure(job, reason, scope))
-        if mode == "login" and job.verify_pending and not payload.get("verified"):
+        snap = None
+        try:
+            from autofill.account_flow import plain_sign_in_page
+            from autofill.extract import extract_page
+
+            snap = extract_page(page)
+        except Exception:
+            snap = None
+        if (
+            mode == "login"
+            and job.verify_pending
+            and not payload.get("verified")
+            and not plain_sign_in_page(snap, getattr(page, "url", "") or job.application_url)
+        ):
             raise AnswerRejected(409, _credential_failure(job, "verification_pending", scope))
+        if plain_sign_in_page(snap, getattr(page, "url", "") or job.application_url):
+            job.verify_pending = False
         if payload.get("verified") is True:
             job.verify_pending = False
         self._save_credential(job, email, username, password, scope)
@@ -1473,6 +1512,22 @@ class LocalHelper:
             self._credentials.drop(str(getattr(job, "_credential_candidate", "") or ""), scope)
             raise AnswerRejected(422, _credential_failure(job, "password_policy", scope))
         if not report.get("ok"):
+            errors = [str(item) for item in report.get("siteErrors") or []]
+            consent = [item for item in errors if item.startswith("Consent needs a person")]
+            if consent and mode == "register":
+                statement = consent[0].split(":", 1)[-1].strip() or "A required consent needs a person."
+                job.result = {"status": Status.MANUAL_ANSWER_REQUIRED, "stopped_before_submit": True}
+                job.notice = statement
+                job.question = None
+                job.open_items = []
+                job.state = "done"
+                self._present_popup(
+                    job,
+                    message=(
+                        "This consent stays manual. Check it on the page if it is not a standard "
+                        "privacy notice, then click Proceed."
+                    ),
+                )
             raise AnswerRejected(
                 422 if report.get("reason") in {"site_rejected", "account_exists"} else 409,
                 _credential_failure(job, str(report.get("reason") or "not_at_account_step"), scope, report),
@@ -1483,6 +1538,16 @@ class LocalHelper:
         # every registration left Email and Password empty (GM, SNC, Clark).
         if report.get("verifyBeforeSignIn") or verify_card:
             job.verify_pending = True
+        if job.verify_pending:
+            try:
+                from autofill.account_flow import plain_sign_in_page
+                from autofill.extract import extract_page
+
+                live = extract_page(page)
+            except Exception:
+                live = None
+            if plain_sign_in_page(live, getattr(page, "url", "") or job.application_url):
+                job.verify_pending = False
         if job.profile is not None and outcome in {"signed_in", "registered", "verification_required"}:
             fill = self._session.fill
             kwargs = self._auth_kwargs(fill, job)
@@ -1715,6 +1780,9 @@ class LocalHelper:
             job.state = "error"
             raise AnswerRejected(409, _failure(job, "submit_reported"))
         if not report.get("verified"):
+            reported = [str(option) for option in (report.get("options") or []) if str(option).strip()]
+            if reported:
+                item["options"] = reported
             code = 422 if report.get("reason") == "needs_option" else 200
             self._present_popup(
                 job,
@@ -1837,12 +1905,17 @@ class LocalHelper:
             except Exception:
                 return
 
-        waiting = (
-            _public_status(job) == Status.MANUAL_ANSWER_REQUIRED and not job.superseded and job.profile is not None
-        )
+        waiting = _popup_waiting(job)
         rows = _open_question_rows(job) if waiting else []
-        if not rows and waiting and job.notice:
-            rows = [{"id": "validation", "prompt": job.notice, "type": "text", "options": [], "selector": ""}]
+        proceed_only = False
+        if not rows and waiting and (job.notice or _public_status(job) in _PAUSE_NOTICES):
+            prompt = job.notice or _PAUSE_NOTICES.get(
+                _public_status(job), "Click Proceed to continue this Apply window."
+            )
+            rows = [{"id": "proceed", "prompt": prompt, "type": "text", "options": [], "selector": ""}]
+            # Save & Continue stays disabled: there is no answer to store.
+            # Proceed is the way back into this same Apply window.
+            proceed_only = True
             locked = True
         else:
             locked = False
@@ -1896,6 +1969,8 @@ class LocalHelper:
             }
             if _accepts(show, "note"):
                 kwargs["note"] = _profile_popup_note(rows)
+            if _accepts(show, "proceed_only"):
+                kwargs["proceed_only"] = proceed_only
             shown = show(rows[0], **kwargs)
         except TypeError:
             try:
@@ -1921,15 +1996,78 @@ class LocalHelper:
         popup["committed"] = False
         job.popup = popup
 
+    def _proceed_job(self, job: LocalJob) -> None:
+        """Continue this Apply window after Proceed. No new browser and no Final Submit."""
+        if job.superseded or job.profile is None:
+            return
+        manual_resume = _public_status(job) == Status.RESUME_UPLOAD_REQUIRED
+        if manual_resume:
+            tab = getattr(self._session, "tab", None)
+            page = getattr(tab, "page", None) if tab is not None else None
+            attached = False
+            if page is not None:
+                from autofill.resume_manual import resume_file_attached
+
+                try:
+                    attached = bool(resume_file_attached(page))
+                except Exception:
+                    attached = False
+            if not attached:
+                job.notice = _PAUSE_NOTICES[Status.RESUME_UPLOAD_REQUIRED]
+                self._present_popup(
+                    job,
+                    message="No resume is on this page yet. Upload it here, then click Proceed.",
+                )
+                return
+        job.human_resolved = True
+        fill = getattr(self._session, "fill", None)
+        if fill is None:
+            self._present_popup(job, message="This Apply window is still open. Click Proceed again once it is ready.")
+            return
+        try:
+            kwargs: dict[str, Any] = {}
+            if _accepts_cancel(fill):
+                kwargs["cancel"] = job.gate
+            if _accepts(fill, "fresh"):
+                kwargs["fresh"] = False
+            # A resume pause means the employee attached the file. Do not push bytes.
+            if job.resume is not None and not manual_resume and _accepts(fill, "resume"):
+                kwargs["resume"] = job.resume
+            identity = _fill_identity(job)
+            for key, value in identity.items():
+                if _accepts(fill, key):
+                    kwargs[key] = value
+            kwargs.update(self._auth_kwargs(fill, job))
+            closer = getattr(self._session, "close_question_popup", None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception:
+                    pass
+            result, submitted = fill(job.application_url, job.profile, **kwargs)
+        except Exception as exc:
+            logger.info("session=%s popup_proceed_failed error=%s", job.session_id, type(exc).__name__)
+            self._present_popup(job, message="Could not continue yet. Fix the page, then click Proceed.", error=True)
+            return
+        job.submitted = submitted
+        if job.superseded:
+            return
+        self._remember_result(job, result)
+        job.state = "done"
+        self._capture_open_page(job)
+        self._commit_known_basics(job)
+        _release_answered_questions(job)
+        self._present_popup(job)
+
     def _sync_popup(self, job: LocalJob) -> None:
         """Worker thread. Pick up a Save & Continue click, re-show a lost card, time out a stale save."""
-        if job.superseded or _public_status(job) != Status.MANUAL_ANSWER_REQUIRED:
+        if not _popup_waiting(job):
             return
         if job.question is None and not job.notice:
             return
         popup = job.popup
         covered = set(popup.get("questionIds") or []) if isinstance(popup, dict) else set()
-        current = job.question["id"] if job.question is not None else "validation"
+        current = job.question["id"] if job.question is not None else "proceed"
         if (
             popup is None
             or popup.get("state") == "unavailable"
@@ -1959,6 +2097,10 @@ class LocalHelper:
         if not read.get("present"):
             # The page re-rendered. Same nonce, same rows.
             self._present_popup(job)
+            return
+        if read.get("state") == "proceed":
+            logger.info("session=%s popup_proceed", job.session_id)
+            self._proceed_job(job)
             return
         if read.get("state") != "answered":
             return
@@ -2085,6 +2227,8 @@ class LocalHelper:
         job.question = pending_question(result.status, job.blocking, job.open_items)
         if job.question is None and result.status == Status.MANUAL_ANSWER_REQUIRED and result.messages:
             job.notice = str(result.messages[0]).strip()
+        elif job.question is None and result.status in _PAUSE_NOTICES:
+            job.notice = _PAUSE_NOTICES[result.status]
 
     def _adopt_follow(self, job: LocalJob, report: dict[str, Any], target: dict[str, Any]) -> None:
         result = report.get("result")
@@ -2278,6 +2422,8 @@ def _fill_identity(job: LocalJob) -> dict[str, str]:
     candidate = str(binding.get("candidateId") or "").strip()
     if not candidate and job.profile is not None:
         candidate = (job.profile.candidate_id or "").strip()
+    if not candidate:
+        candidate = str(getattr(job, "_credential_candidate", "") or "").strip()
     return {
         "session_id": binding.get("tilearcSessionId") or job.session_id,
         "candidate_id": candidate,
@@ -3159,6 +3305,26 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
         kind=kind,
         employers=employer_keys(url=job.application_url),
     )
+
+
+def _popup_waiting(job: LocalJob) -> bool:
+    """True while the employer tab should show the one card."""
+    if job.superseded or job.profile is None:
+        return False
+    status = str((job.result or {}).get("status") or "")
+    if job.ended:
+        return False
+    if status == Status.MANUAL_ANSWER_REQUIRED:
+        return True
+    return status in _PAUSE_NOTICES
+
+
+def _manual_action(job: LocalJob) -> str:
+    """The pause the employee can clear, then Proceed. Empty when the fill is not paused."""
+    if job.notice:
+        return str(job.notice)
+    status = str((job.result or {}).get("status") or "")
+    return _PAUSE_NOTICES.get(status, "")
 
 
 def _public_status(job: LocalJob) -> str:

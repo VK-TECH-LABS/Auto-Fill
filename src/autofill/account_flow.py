@@ -740,6 +740,21 @@ def _returned_to_sign_in(snapshot: PageSnapshot, url: str) -> bool:
     return not scored.application and scored.mode == "login"
 
 
+def plain_sign_in_page(snapshot: PageSnapshot | None, url: str) -> bool:
+    """A Sign In pane that does not say the verification email was sent.
+
+    A stale verify flag must not block typing the password that was just stored
+    for this candidate. A page that does say the email was sent is not plain.
+    """
+    if snapshot is None or not snapshot.password_present:
+        return False
+    if sign_in_verification_holding(snapshot):
+        return False
+    if login_failure_reason(snapshot) == "unverified":
+        return False
+    return _returned_to_sign_in(snapshot, url)
+
+
 def _is_workday(ats: str | None, url: str) -> bool:
     lowered = (url or "").lower()
     return (ats or "").lower() == "workday" or "myworkdayjobs." in lowered or ".workday.com" in lowered
@@ -920,17 +935,10 @@ def _wait_for_outcome(
             "account": _view(last, page.url or "", ats, mode, alternate, []),
         }
     if mode == "register" and workday and not application_form_visible(last):
-        # Still no form after the full wait: do not resume into Sign In with the new
-        # password. The person checks the verification email, then presses Continue.
-        _logger.info("account_outcome=registered next=verify_before_sign_in reason=no_settle")
-        return {
-            "ok": True,
-            "outcome": "registered",
-            "status": "EMAIL_VERIFICATION_REQUIRED",
-            "verifyBeforeSignIn": True,
-            "message": _VERIFY_FIRST_MESSAGE,
-            "siteErrors": [],
-            "account": None,
-        }
+        # The wait ended without a form. That is not proof the verification
+        # email was sent. A later plain Sign In uses the password just stored.
+        # A page that actually says the email was sent is classified above.
+        _logger.info("account_outcome=registered next=sign_in reason=no_settle")
+        return {"ok": True, "outcome": "registered", "status": "", "siteErrors": [], "account": None}
     outcome = "registered" if mode == "register" else "signed_in"
     return {"ok": True, "outcome": outcome, "status": "", "siteErrors": [], "account": None}
