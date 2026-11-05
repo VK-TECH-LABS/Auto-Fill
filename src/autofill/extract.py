@@ -648,6 +648,26 @@ EXTRACT_JS = r"""
     return stripStar(cleaned);
   }
 
+  function accountStatement(root, el) {
+    // Workday puts the Create Account sentence in the field, with the notice
+    // title as a link. The link text alone is not the statement the privacy
+    // gate classifies, so the box stayed unchecked and Create Account still ran.
+    const field = el.closest && el.closest("[data-automation-id^='formField']");
+    if (!field) return "";
+    const auto = (field.getAttribute("data-automation-id") || "").toLowerCase();
+    if (auto.indexOf("createaccountcheckbox") === -1) return "";
+    const clone = field.cloneNode(true);
+    for (const node of clone.querySelectorAll("input, button, select, textarea")) node.remove();
+    const text = cleanPrompt(textOf(clone));
+    if (!text || text.length > 500) return "";
+    if (!/privacy|recruitment notice|terms of (?:use|service)|terms and conditions|applicant privacy/i.test(text)) {
+      return "";
+    }
+    const own = labelFor(root, el);
+    if (own && own.length >= text.length) return "";
+    return text;
+  }
+
   function labelFor(root, el) {
     const bits = [];
     if (el.id) {
@@ -746,6 +766,22 @@ EXTRACT_JS = r"""
               )
             ) {
               found = text;
+            }
+          }
+          if (!found) {
+            const title = cleanPrompt(textOf(prev));
+            if (
+              title &&
+              title.length <= 240 &&
+              !isSectionHeading(prev, title) &&
+              !isGenericPrompt(title) &&
+              (
+                title.indexOf("?") !== -1 ||
+                /[*✱＊]/.test(title) ||
+                /^(?:linked\s?in|twitter|x|github|git hub|portfolio|website)$/i.test(title)
+              )
+            ) {
+              found = title;
             }
           }
           if (found) break;
@@ -1013,7 +1049,7 @@ EXTRACT_JS = r"""
         kind,
         name: el.getAttribute("name") || "",
         elementId: el.id || "",
-        label: labelFor(root, el),
+        label: accountStatement(root, el) || labelFor(root, el),
         placeholder: el.getAttribute("placeholder") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: el.getAttribute("autocomplete") || "",
@@ -1025,7 +1061,9 @@ EXTRACT_JS = r"""
               (promptWidget ||
                 role === "combobox" ||
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
-                classToken.indexOf("autocomplete") !== -1) &&
+                classToken.indexOf("autocomplete") !== -1 ||
+                kind === "text" ||
+                kind === "textarea") &&
               controlMarkedRequired(el)
             ),
         hidden: isHidden(el),
@@ -1263,8 +1301,22 @@ EXTRACT_JS = r"""
     // Ashby prints the asterisk on a question title that is not the first
     // label in the field. An optional social field does not get that mark.
     const entry = el.closest && el.closest("[data-field-path], .ashby-application-form-field-entry");
-    if (!entry) return false;
-    const titles = entry.querySelectorAll("label, .ashby-application-form-question-title, legend");
+    if (!entry) {
+      // A required question whose asterisk sits on the title above the input
+      // (Ashby prints it on a div, not on a <label for>).
+      let node = el;
+      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+        const prev = node.previousElementSibling;
+        if (!prev || isHidden(prev)) continue;
+        if (prev.querySelector && prev.querySelector("input, select, textarea, button")) break;
+        if (hasRequirementMark(prev) && !labelSaysOptional(el, prev)) return true;
+        break;
+      }
+      return false;
+    }
+    const titles = entry.querySelectorAll(
+      "label, .ashby-application-form-question-title, legend, div, p"
+    );
     for (const title of titles) {
       if (!title || title.contains(el)) continue;
       // Phone's required title must not make a nested opt-in radio required.

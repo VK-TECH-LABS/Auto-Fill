@@ -270,6 +270,62 @@ def _file_attached(locator) -> bool:
         return False
 
 
+# Identity, contact, and work/education values come from the latest profile.
+# A box that already holds an older email or title is replaced. A free-text
+# answer the person typed, and that is not one of these keys, stays.
+_PROFILE_OWNED_KEYS = frozenset(
+    {
+        "email",
+        "first_name",
+        "last_name",
+        "full_name",
+        "legal_name",
+        "preferred_name",
+        "phone",
+        "address",
+        "city",
+        "state",
+        "province_state",
+        "postal_code",
+        "country",
+        "current_company",
+        "current_job_title",
+        "linkedin_url",
+        "github_url",
+        "portfolio_url",
+        "website_url",
+        "employment_location",
+    }
+)
+
+
+_REPLACE_OWNED: ContextVar[bool] = ContextVar("autofill_replace_owned", default=False)
+
+
+def bind_replace_owned(enabled: bool) -> Token:
+    """Replace profile-owned values that differ from the latest profile.
+
+    Off for a normal fill, so a value already on the page stays. On when this
+    Apply posted a newer profile than the session was using.
+    """
+    return _REPLACE_OWNED.set(bool(enabled))
+
+
+def reset_replace_owned(token: Token) -> None:
+    _REPLACE_OWNED.reset(token)
+
+
+def replace_owned_enabled() -> bool:
+    return bool(_REPLACE_OWNED.get())
+
+
+def _profile_owned(mapped: MappedField) -> bool:
+    key = str(mapped.key or "")
+    if key in _PROFILE_OWNED_KEYS:
+        return True
+    return key.startswith("employment.") or key.startswith("education.")
+
+
 def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: bool = False) -> FieldOutcome:
     if mapped.action in {"skip", "unanswered", "resume_required"}:
         return _outcome(control, mapped)
@@ -305,7 +361,8 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 if is_confirm_email(control):
                     prime_primary_email(target, control.selector, mapped.text or "")
             current = _shown_value(locator)
-            if not overwrite and current.strip() and not _value_matches(current, mapped.text or ""):
+            replace = overwrite or (_profile_owned(mapped) and replace_owned_enabled())
+            if not replace and current.strip() and not _value_matches(current, mapped.text or ""):
                 return _outcome(
                     control,
                     mapped,

@@ -15,6 +15,7 @@ from test_local_helper import (
     _URL,
     _binding,
     _FieldSession,
+    _manual_result,
     _profile,
     _RecoverySession,
     _request,
@@ -413,6 +414,94 @@ def test_saved_question_is_not_asked_again(monkeypatch):
     finally:
         helper.close()
         server.shutdown()
+
+
+def test_idle_pause_adopts_a_newer_profile_email(monkeypatch):
+    """A resume pause is not a reason to keep the email from the previous Apply."""
+
+    class _Resume(_FieldSession):
+        def fill(self, url, profile, *, cancel=None):
+            self.calls.append(profile.personal.email)
+            self.release.set()
+            result = _manual_result(_COLOR)
+            result.status = Status.RESUME_UPLOAD_REQUIRED
+            result.open_items = []
+            result.blocking = None
+            result.manual_questions = []
+            return result, False
+
+    fake = _Resume()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, first = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = first["sessionId"]
+        _wait_status(port, sid, lambda row: row.get("status") == Status.RESUME_UPLOAD_REQUIRED)
+        latest = _profile("Avery Alpha", "avery.updated@example.com")
+        code, refreshed = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": latest,
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202 and refreshed["sessionId"] == sid
+        assert _wait(lambda: "avery.updated@example.com" in fake.calls)
+        job = helper.get(sid)
+        assert job is not None and job.profile is not None
+        assert job.profile.personal.email == "avery.updated@example.com"
+    finally:
+        server.shutdown()
+        helper.close()
+
+
+def test_confirmed_answer_follows_the_same_candidate_only(monkeypatch):
+    fake = _FieldSession()
+    fake.release.set()
+    helper, server, port = _serve(monkeypatch, fake)
+    try:
+        code, first = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": _URL,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101"),
+        })
+        assert code == 202
+        sid = first["sessionId"]
+        _wait_status(port, sid, lambda row: row.get("status") == Status.MANUAL_ANSWER_REQUIRED)
+        job = helper.get(sid)
+        assert job is not None and job.profile is not None
+        from autofill.local_helper import _profile_digest
+        from autofill.profile import ApplicationAnswer
+
+        job.profile.application_answers.append(
+            ApplicationAnswer(question="Favorite color?", answer="Blue", from_session=True)
+        )
+        job.adopted_digest = _profile_digest(job.profile)
+        other_url = "https://boards.greenhouse.io/example/jobs/2"
+        code, again = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": other_url,
+            "profile": _profile("Avery Alpha", "avery@example.com"),
+            "binding": _binding("sess-a", "101", job="12", fingerprint="fp2"),
+        })
+        assert code == 202 and again["sessionId"] != sid
+        nxt = helper.get(again["sessionId"])
+        assert nxt is not None and nxt.profile is not None
+        saved = {row.question: row.answer for row in nxt.profile.application_answers}
+        assert saved.get("Favorite color?") == "Blue"
+        code, stranger = _request(port, "POST", "/v1/sessions", {
+            "applicationUrl": other_url,
+            "profile": _profile("Blake Beta", "blake@example.com"),
+            "binding": _binding("sess-b", "202", job="12", fingerprint="fp3"),
+        })
+        assert code == 202
+        other = helper.get(stranger["sessionId"])
+        assert other is not None and other.profile is not None
+        assert all(row.question != "Favorite color?" for row in other.profile.application_answers)
+    finally:
+        server.shutdown()
+        helper.close()
 
 
 def _start_bound(port: int) -> dict:

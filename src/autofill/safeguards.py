@@ -1217,13 +1217,66 @@ _ARIA_BOX_JS = r"""({ selector, on }) => {
 }"""
 
 
+def _role_box_committed(page, selector: str, *, on: bool) -> bool | None:
+    """The visible role=checkbox beside this input, or None when there is none.
+
+    Workday paints ``role=checkbox`` and ignores a click that only sets
+    ``input.checked``. None means there is no separate role box. False means
+    that box is still not in the requested state, so the native paint is not
+    a commit.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return None
+    try:
+        state = evaluate(_ROLE_BOX_JS, {"selector": selector, "on": on})
+    except Exception:
+        return None
+    # A unit-test page returns its snapshot for every evaluate. Only a real
+    # boolean says a role box was found and read.
+    if not isinstance(state, bool):
+        return None
+    return state
+
+
+_ROLE_BOX_JS = r"""({ selector, on }) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return "absent"; }
+  if (!el) return "absent";
+  let host = el.closest ? el.closest("[role='checkbox'], [role='switch']") : null;
+  if (!host || (host === el && el.tagName === "INPUT")) host = null;
+  if (!host && el.parentElement) {
+    for (const child of el.parentElement.children) {
+      if (!child || child === el) continue;
+      const role = String(child.getAttribute("role") || "").toLowerCase();
+      if (role !== "checkbox" && role !== "switch") continue;
+      if (child.querySelector("input, select, textarea, button")) continue;
+      host = child;
+      break;
+    }
+  }
+  if (!host) return "absent";
+  if (host.closest("a[href], button, [role='button'], [role='link'], input[type='submit']")) return false;
+  const want = !!on;
+  const ok = () => (host.getAttribute("aria-checked") === "true") === want;
+  if (ok()) return true;
+  host.click();
+  return ok();
+}"""
+
+
 def commit_choice(page, selector: str, *, on: bool = True) -> bool:
     """Check or uncheck a native box or a ``role=checkbox`` / switch, then reread it.
 
     True only when the page still reports that state. A highlighted row and an
-    unreadable widget are not a commit.
+    unreadable widget are not a commit. A role box that stays unchecked wins
+    over a native ``checked`` paint.
     """
-    if commit_native_choice(page, selector, on=on):
+    native = commit_native_choice(page, selector, on=on)
+    role = _role_box_committed(page, selector, on=on)
+    if role is False:
+        return False
+    if role is True or native:
         return True
     if not selector:
         return False

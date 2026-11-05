@@ -1281,6 +1281,7 @@ def fill_visible_tab(
     protocol_version: str = "0.7.0",
     standard_terms_authorized: bool = False,
     human_resolved: bool = False,
+    replace_profile_fields: bool = False,
 ) -> ApplicationResult:
     """Fill the already-open tab with the existing engine. The page is not replaced.
 
@@ -1314,6 +1315,7 @@ def fill_visible_tab(
         verify_pending=bool(verify_pending),
         standard_terms_authorized=bool(standard_terms_authorized),
         human_resolved=bool(human_resolved),
+        replace_profile_fields=bool(replace_profile_fields),
         **_resume_options(resume),
     )
     try:
@@ -1517,6 +1519,7 @@ class DedicatedApplySession:
         protocol_version: str = "0.7.0",
         standard_terms_authorized: bool = False,
         human_resolved: bool = False,
+        replace_profile_fields: bool = False,
     ) -> tuple[ApplicationResult, bool | None]:
         """Fill the adopted tab. A page that reports ``__submitted`` is a failure.
 
@@ -1582,6 +1585,7 @@ class DedicatedApplySession:
             protocol_version=self._protocol_version,
             standard_terms_authorized=self._standard_terms_authorized,
             human_resolved=bool(getattr(self, "_human_resolved", False)),
+            replace_profile_fields=bool(replace_profile_fields),
             **_resume_kwargs(resume),
         )
         submitted = _optional_submitted(tab.page)

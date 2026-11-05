@@ -5,6 +5,15 @@ the hosted runner keeps launching its own headless Chromium. This process
 binds ``127.0.0.1`` only, fills through ``autofill_application``, and never
 clicks Final Submit.
 
+``POST /v1/sessions`` is the latest Application Profile for that Apply. The
+same binding and URL with the same profile body returns the live session.
+A different body (email, name, phone, work, education, or an approved
+answer) is adopted and the open page is filled again. Profile-owned fields
+that still show the previous value are rewritten. A value already on the
+page is left alone when the posted profile did not change. Confirmed
+answers stay on that candidate and are merged into the next Apply for the
+same candidate when the posted profile does not already contain them.
+
 When a fill stops on ``MANUAL_ANSWER_REQUIRED``, ``GET /v1/sessions/{id}``
 includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``)
 and ``questions`` for every required gap already on that page. Profile basics
@@ -376,6 +385,10 @@ def _profile_digest(profile: CandidateProfile | None) -> tuple:
         personal.country,
         personal.postal_code,
         personal.preferred_name,
+        personal.linkedin_url,
+        personal.github_url,
+        personal.portfolio_url,
+        personal.website_url,
     )
     work = tuple(
         (row.company, row.title, row.start_date, row.end_date, row.current, row.location)
@@ -394,12 +407,17 @@ def _profile_digest(profile: CandidateProfile | None) -> tuple:
 
 
 def _can_refresh_profile(job: LocalJob) -> bool:
-    """An idle human stop can take a newer profile. A running or finished fill cannot."""
+    """An idle fill can take a newer profile. A running fill or a reported submit cannot.
+
+    The posted body is the latest Application Profile for this Apply. Waiting
+    only on a question card left email, name, phone, work, and education
+    updates on the old snapshot after a hard refresh.
+    """
     if job.superseded or job.submit_claimed() or job.state in {"queued", "running"}:
         return False
-    if job.result is None:
+    if job.state != "done" or job.result is None:
         return False
-    return str(job.result.get("status") or "") == Status.MANUAL_ANSWER_REQUIRED
+    return True
 
 
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
@@ -728,6 +746,10 @@ class LocalHelper:
         )
         self._jobs: dict[str, LocalJob] = {}
         self._staged: dict[str, StagedResume] = {}
+        # Confirmed answers keyed by candidate id. The next Apply for that
+        # candidate merges them when the posted profile does not already
+        # contain the question. Another candidate never sees them.
+        self._learned: dict[str, dict[str, Any]] = {}
         # Candidate + tenantKey. Memory only. Wiped for a candidate when a different one applies.
         self._credentials = MemoryCredentialProvider()
         # The worker's job (fill or answer). The newest live job is ``_current``.
@@ -773,9 +795,21 @@ class LocalHelper:
         if resume_ref is not None and binding is None:
             raise BindingError("A resume needs a TileArc binding.")
         recover = False
+        replace_profile = False
         with self._lock:
+            self._apply_learned(profile)
             current = self._jobs.get(self._current) if self._current else None
             same = _same_live_job(current, url, binding)
+            posted_digest = _profile_digest(profile)
+            if (
+                same
+                and current is not None
+                and current.state in {"queued", "running"}
+                and posted_digest != (current.adopted_digest or _profile_digest(current.profile))
+            ):
+                # This Apply posted a newer profile. The fill already running
+                # is the previous snapshot and must not be returned as current.
+                same = False
             if same and current is not None and current.state in {"queued", "running"}:
                 if resume_ref is not None:
                     self._staged.pop(resume_ref, None)
@@ -830,6 +864,7 @@ class LocalHelper:
                 self._active = current.session_id
                 job = current
                 recover = True
+                replace_profile = True
             else:
                 resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
                 active = self._jobs.get(self._active) if self._active else None
@@ -842,6 +877,7 @@ class LocalHelper:
                     if old is preserve:
                         continue
                     if not old.superseded:
+                        self._keep_learned(old)
                         previous_ids = {(old.binding or {}).get("candidateId") or ""}
                         if old.profile is not None:
                             previous_ids.add((old.profile.candidate_id or "").strip())
@@ -872,8 +908,53 @@ class LocalHelper:
         timer = self._timer
         if timer is not None:
             timer.cancel()
-        self._queue.put(("fill", {"job": job, "profile": profile, "recover": recover}))
+        self._queue.put(
+            ("fill", {"job": job, "profile": profile, "recover": recover, "replace_profile": replace_profile})
+        )
         return job
+
+    def _keep_learned(self, job: LocalJob | None) -> None:
+        """Remember this candidate's confirmed answers before the profile is dropped."""
+        if job is None or job.profile is None:
+            return
+        candidate = _job_candidate(job)
+        if not candidate:
+            return
+        answers = [item for item in job.profile.application_answers if item.from_session]
+        heard = (job.profile.screening.how_heard or "").strip()
+        if not answers and not heard:
+            return
+        bucket = self._learned.setdefault(candidate, {"answers": [], "how_heard": ""})
+        by_question = {item.question.casefold(): item for item in bucket["answers"]}
+        for item in answers:
+            by_question[item.question.casefold()] = item
+        bucket["answers"] = list(by_question.values())
+        if heard:
+            bucket["how_heard"] = heard
+
+    def _apply_learned(self, profile: CandidateProfile) -> None:
+        """Copy this candidate's confirmed answers onto the profile just posted.
+
+        A question the posted profile already answers stays as posted. A
+        different candidate's store is not read.
+        """
+        candidate = (profile.candidate_id or "").strip()
+        if not candidate:
+            return
+        current = self._jobs.get(self._current) if self._current else None
+        if current is not None and _job_candidate(current) == candidate:
+            self._keep_learned(current)
+        bucket = self._learned.get(candidate)
+        if not bucket:
+            return
+        have = {item.question.casefold() for item in profile.application_answers}
+        for item in bucket["answers"]:
+            if item.question.casefold() in have:
+                continue
+            profile.application_answers.append(item)
+            have.add(item.question.casefold())
+        if not (profile.screening.how_heard or "").strip() and bucket.get("how_heard"):
+            profile.screening.how_heard = str(bucket["how_heard"])
 
     def stage_resume(self, data: bytes, filename: str, tilearc_session_id: str, candidate_id: str) -> StagedResume:
         """Hold one resume for the next bound create. PDF only, 10 MB cap, memory only."""
@@ -1125,7 +1206,9 @@ class LocalHelper:
                 raise AnswerRejected(409, _failure(job, "binding_mismatch"))
             if not _continue_allowed(job):
                 raise AnswerRejected(409, _failure(job, "not_continuable"))
+            replace_profile = False
             if fresh_profile is not None:
+                replace_profile = _profile_digest(fresh_profile) != job.adopted_digest
                 job.profile = fresh_profile
                 job.adopted_digest = _profile_digest(fresh_profile)
             if job.continue_attempts >= _CONTINUE_CAP:
@@ -1154,7 +1237,19 @@ class LocalHelper:
         box: dict[str, Any] = {}
         done = threading.Event()
         logger.info("session=%s continue attempt=%s", job.session_id, job.continue_attempts)
-        self._queue.put(("fill", {"job": job, "profile": job.profile, "recover": True, "done": done, "box": box}))
+        self._queue.put(
+            (
+                "fill",
+                {
+                    "job": job,
+                    "profile": job.profile,
+                    "recover": True,
+                    "replace_profile": replace_profile,
+                    "done": done,
+                    "box": box,
+                },
+            )
+        )
         if not done.wait(timeout=_ANSWER_WAIT_SECONDS):
             with self._lock:
                 if self._active == job.session_id:
@@ -1666,6 +1761,8 @@ class LocalHelper:
             if block is not None and _accepts(fill, "nav_block"):
                 kwargs["nav_block"] = block
             kwargs.update(self._auth_kwargs(fill, job))
+            if payload.get("replace_profile") and _accepts(fill, "replace_profile_fields"):
+                kwargs["replace_profile_fields"] = True
             self._window_used = True
             closer = getattr(self._session, "close_question_popup", None)
             if closer is not None:
@@ -3275,6 +3372,7 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
         return
     if _is_hear_item(item):
         _remember_hear_answer(job, profile, item, target)
+        job.adopted_digest = _profile_digest(profile)
         return
     kind = canonical_blocker_kind(item.get("kind"))
     question = str(item.get("text") or "").strip()
@@ -3290,6 +3388,7 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
             kind=kind,
             candidate_id=_job_candidate(job),
         ):
+            job.adopted_digest = _profile_digest(profile)
             return
     if kind in _NO_SESSION_REUSE_KINDS:
         return
@@ -3305,6 +3404,7 @@ def _remember_answer(job: LocalJob, item: dict[str, Any], target: dict[str, Any]
         kind=kind,
         employers=employer_keys(url=job.application_url),
     )
+    job.adopted_digest = _profile_digest(profile)
 
 
 def _popup_waiting(job: LocalJob) -> bool:

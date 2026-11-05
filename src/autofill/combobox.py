@@ -1430,6 +1430,27 @@ def search_field_of_study(page, selector: str, desired: str) -> Option | None:
     return match
 
 
+def _menu_replaced(before: list[Option], after: list[Option]) -> bool:
+    """True when a click opened a different menu.
+
+    A nested prompt often has no chevron. The next list is the proof the row
+    was a folder. An empty menu means the row committed or the menu closed.
+    """
+
+    def labels(options: list[Option]) -> set[str]:
+        found: set[str] = set()
+        for option in options:
+            text = _fold(option.label or option.value)
+            if text and not _menu_junk(option.label or option.value):
+                found.add(text)
+        return found
+
+    after_labels = labels(after)
+    if not after_labels:
+        return False
+    return bool(after_labels - labels(before))
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
@@ -1490,12 +1511,30 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         if fallback is not None:
             match = fallback
             clicked_leaf = True
+    parts = _path_parts(desired)
+    if match is None and len(parts) > 1:
+        # "Job Board > Indeed" when the parent row has no chevron. Click that
+        # row and take the leaf. Do not treat the path text as a missing option.
+        parent = _match_desired(parts[0], top_level) or _match_desired(parts[0], found)
+        if parent is not None and parent.selector:
+            parent.folder = True
+            parent.leaf = False
+            match = parent
     if match is None or not match.selector:
         close_open_menu(page)
         return None
+    opened_submenu = False
     if not clicked_leaf:
+        before = list(found)
         click_choice(page, match.selector, match.label)
         _pause(page, 50)
+        if match.leaf and not match.folder:
+            after = _read_options(page, selector)
+            if _menu_replaced(before, after):
+                match.folder = True
+                match.leaf = False
+                opened_submenu = True
+                _note_children(match.label, after)
     if not match.leaf:
         # The category click opens the nested menu. The leaf is the commit.
         children = _read_options(page, selector)
@@ -1509,10 +1548,15 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             leaf = child_for_answer(desired, match.label, children)
         if leaf is None and match.folder:
             _note_children(match.label, children)
+            opened_submenu = True
         if leaf is not None and leaf.selector:
             click_choice(page, leaf.selector, leaf.label)
             _pause(page, 50)
             match = leaf
+    if opened_submenu and (match.folder or not match.leaf):
+        # The parent name in the search box is not a committed leaf.
+        close_open_menu(page)
+        return None
     if _kept_after_close(page, selector, match, desired, accept_input=not typed):
         _OPENED_CHILDREN.set(())
         return match

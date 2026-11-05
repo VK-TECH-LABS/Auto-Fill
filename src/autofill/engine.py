@@ -177,6 +177,9 @@ class AutofillOptions:
     on_confirmed: Any = None
     confirmed_values: list | None = None
     standard_terms_authorized: bool = False
+    # True when this Apply posted a newer profile. Profile-owned fields that
+    # already hold a different value are rewritten. A normal fill leaves them.
+    replace_profile_fields: bool = False
     # The service registered a Workday account in this session and no person has
     # pressed Continue since. A Sign In pane now means "verify the email first".
     verify_pending: bool = False
@@ -1016,6 +1019,9 @@ def autofill_application(
     catalogue_token = None
     us_token = None
     guard_page = None
+    from autofill.fill import bind_replace_owned, reset_replace_owned
+
+    replace_token = bind_replace_owned(opts.replace_profile_fields)
     try:
         us_token = bind_us_page()
         confirmed_token = bind_confirmed(opts.on_confirmed, opts.confirmed_values)
@@ -1604,6 +1610,7 @@ def autofill_application(
             reset_catalogue(catalogue_token)
         if us_token is not None:
             reset_us_page(us_token)
+        reset_replace_owned(replace_token)
         if owns_browser and browser is not None:
             browser.close()
         if playwright is not None:
