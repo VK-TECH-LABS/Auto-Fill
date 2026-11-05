@@ -3,7 +3,8 @@
 When a local fill stops on ``MANUAL_ANSWER_REQUIRED`` the helper shows one card
 on the employer's application tab for every question already in that page set.
 The card lists each prompt, any instructions printed next to the control, the
-choices, and one **Save & Continue** button.
+choices, and one **Save & Continue** button. **Proceed** continues the same
+Apply window after a manual pause. A pause with no question shows Proceed only.
 
 The card never talks to TileArc and never fills the employer field itself.
 Clicking the button records every row on the page. The helper reads that on
@@ -70,6 +71,7 @@ _SHOW_JS = r"""(args) => {
       border-radius:8px;padding:6px;font:inherit}
     button{margin-top:10px;width:100%;background:#0f766e;color:#fff;border:0;border-radius:8px;
       padding:8px 10px;font:inherit;font-weight:600;cursor:pointer}
+    button.proceed{background:#fff;color:#0f766e;border:1px solid #0f766e}
     button[disabled]{opacity:.5;cursor:default}
     .msg{font-size:12px;margin-top:8px;color:#334155}
     .msg.err{color:#b91c1c}
@@ -138,7 +140,7 @@ _SHOW_JS = r"""(args) => {
       section.appendChild(help);
     }
     const restored = Array.isArray(question.restored) ? question.restored : [];
-    if (!args.locked) {
+    if (!args.locked && !args.proceedOnly) {
       const multi = question.type === "multi_select";
       if (question.options && question.options.length) {
         const group = document.createElement("div");
@@ -173,7 +175,14 @@ _SHOW_JS = r"""(args) => {
   button.type = "button";
   button.setAttribute("data-role", "save-continue");
   button.textContent = "Save & Continue";
+  if (args.proceedOnly) button.style.display = "none";
   card.appendChild(button);
+  const proceed = document.createElement("button");
+  proceed.type = "button";
+  proceed.className = "proceed";
+  proceed.setAttribute("data-role", "proceed");
+  proceed.textContent = "Proceed";
+  card.appendChild(proceed);
   const msg = document.createElement("div");
   msg.className = "msg" + (args.error ? " err" : "");
   msg.setAttribute("data-role", "message");
@@ -197,7 +206,10 @@ _SHOW_JS = r"""(args) => {
     if (args.locked || !sections.length) return false;
     return sections.every((section) => rowValues(section).length > 0);
   }
-  function refresh() { button.disabled = args.locked || state.state !== "ask" || !allPicked(); }
+  function refresh() {
+    button.disabled = !!args.proceedOnly || args.locked || state.state !== "ask" || !allPicked();
+    proceed.disabled = state.state !== "ask";
+  }
   for (const section of sections) {
     for (const input of section.querySelectorAll("input")) input.addEventListener("change", refresh);
     const area = section.querySelector("textarea");
@@ -206,7 +218,7 @@ _SHOW_JS = r"""(args) => {
   button.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (args.locked || state.state !== "ask" || !allPicked()) return;
+    if (args.proceedOnly || args.locked || state.state !== "ask" || !allPicked()) return;
     state.values = sections.map((section) => ({
       questionId: section.getAttribute("data-question-id"),
       values: rowValues(section),
@@ -216,6 +228,18 @@ _SHOW_JS = r"""(args) => {
     for (const input of root.querySelectorAll("input, textarea")) input.disabled = true;
     msg.className = "msg";
     msg.textContent = args.profileSave ? "Saving this work experience entry…" : "Saving to TileArc…";
+    refresh();
+  });
+  proceed.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (state.state !== "ask") return;
+    state.state = "proceed";
+    state.values = null;
+    state.at = Date.now();
+    for (const input of root.querySelectorAll("input, textarea")) input.disabled = true;
+    msg.className = "msg";
+    msg.textContent = "Checking this Apply window and continuing…";
     refresh();
   });
   refresh();
@@ -252,6 +276,8 @@ _MESSAGE_JS = r"""(args) => {
     for (const input of root.querySelectorAll("input, textarea")) input.disabled = false;
     const button = root.querySelector("[data-role=save-continue]");
     if (button) button.disabled = false;
+    const proceed = root.querySelector("[data-role=proceed]");
+    if (proceed) proceed.disabled = false;
   }
   return true;
 }"""
@@ -313,6 +339,7 @@ def show_popup(
     locked: bool = False,
     restored: dict[str, list[str]] | None = None,
     note: str = "",
+    proceed_only: bool = False,
 ) -> bool:
     """Show one card for ``questions`` (or the single ``question``). False when the page refused the script."""
     rows = _rows_for_show(question, questions, selector, restored)
@@ -333,6 +360,7 @@ def show_popup(
                 "locked": bool(locked),
                 "note": note,
                 "profileSave": bool(note),
+                "proceedOnly": bool(proceed_only),
             },
         )
     except Exception:

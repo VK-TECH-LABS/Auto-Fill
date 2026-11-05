@@ -710,6 +710,24 @@ def _consent_blob(control: Control) -> str:
     )
 
 
+def _notice_ack_blocked(blob: str) -> bool:
+    """Hard promises stay manual. "I declare that I have read the … notice" does not.
+
+    The word "declare" is also a certification deny-word. HPE's Create Account
+    box is that notice sentence ("I declare that I have read the HPE Recruitment
+    Notice and agree to HPE processing my personal data…"). Penalty, perjury,
+    and the other hard promises still block, including when they sit beside a
+    privacy sentence.
+    """
+    if not blob or not _HARD_MANUAL_RE.search(blob):
+        return False
+    if not _READ_NOTICE_RE.search(blob):
+        return True
+    stripped = _READ_NOTICE_RE.sub(" ", blob)
+    stripped = re.sub(r"\bdeclare\b", " ", stripped)
+    return bool(_HARD_MANUAL_RE.search(stripped))
+
+
 def _create_account_privacy_gate(control: Control) -> bool:
     """The required Create Account privacy box, including a short acknowledgement.
 
@@ -722,7 +740,7 @@ def _create_account_privacy_gate(control: Control) -> bool:
     if control.kind != "checkbox":
         return False
     blob = _consent_blob(control)
-    if not blob or _HARD_MANUAL_RE.search(blob):
+    if not blob or _notice_ack_blocked(blob):
         return False
     parts = _statement_parts(control)
     # Bare "I agree" is not a privacy acknowledgement, including on

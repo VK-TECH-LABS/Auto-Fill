@@ -5651,6 +5651,112 @@ def _is_prompt_search(control: Control) -> bool:
     return "search" in blob or control.kind == "combobox"
 
 
+_LINK_KEYS = frozenset({"linkedin_url", "github_url", "portfolio_url", "website_url"})
+_TWITTER_RE = re.compile(r"\b(?:twitter|x\.com)\b", re.IGNORECASE)
+_PHONE_INVALID_JS = r"""(selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  if (el.getAttribute("aria-invalid") === "true") return true;
+  const field = (el.closest && el.closest(
+    "[data-automation-id^='formField'], .field, .form-group, [data-field-path]"
+  )) || el.parentElement;
+  const text = field ? String(field.innerText || "").toLowerCase() : "";
+  return text.indexOf("valid format") !== -1 || text.indexOf("enter a valid") !== -1;
+}"""
+
+
+def _link_key(control: Control) -> str:
+    key = match_field_key(control) or ""
+    if key in _LINK_KEYS:
+        return key
+    blob = f"{control.label} {control.aria_label} {control.placeholder} {control.name}"
+    if _TWITTER_RE.search(blob):
+        return "twitter_url"
+    return ""
+
+
+def _profile_link_value(profile: CandidateProfile | None, key: str) -> str:
+    if profile is None or key == "twitter_url":
+        return ""
+    return str(getattr(profile.personal, key, "") or "").strip()
+
+
+def _saved_question(profile: CandidateProfile | None, text: str) -> bool:
+    if profile is None or not text.strip():
+        return False
+    folded = normalize(text)
+    for item in profile.application_answers:
+        if normalize(item.question) == folded and str(item.answer or "").strip():
+            return True
+    return False
+
+
+def unknown_link_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile | None) -> list[dict[str, Any]]:
+    """Empty social and portfolio fields the profile cannot fill.
+
+    LinkedIn, Twitter, GitHub, and Portfolio are often optional, so a
+    required-only scan never asks and the card never opens. A value already
+    on the profile, or already saved for this candidate, is not asked again.
+    """
+    if page is None or profile is None or getattr(page, "evaluate", None) is None:
+        return []
+    gaps: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or control.read_only or not control.selector:
+            continue
+        if control.selector in seen:
+            continue
+        if control.kind not in {"text", "textarea"} and (control.input_type or "") not in {"", "text", "url"}:
+            continue
+        key = _link_key(control)
+        if not key:
+            continue
+        if _profile_link_value(profile, key):
+            continue
+        text = sanitize_question(control.label or control.aria_label or control.placeholder or key)
+        if _saved_question(profile, text):
+            continue
+        if control_committed(page, control.selector):
+            continue
+        seen.add(control.selector)
+        item = _gap_item([control], profile, None)
+        item["fieldKey"] = None if key == "twitter_url" else key
+        item["kind"] = "QUESTION"
+        item["text"] = text
+        item["required"] = bool(control.required)
+        item["blocking"] = bool(control.required)
+        item["answerType"] = "text"
+        item["options"] = []
+        gaps.append(item)
+    return gaps
+
+
+def invalid_phone_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile | None) -> list[dict[str, Any]]:
+    """A phone the employer marked invalid, even when the box is not empty."""
+    evaluate = getattr(page, "evaluate", None) if page is not None else None
+    if evaluate is None:
+        return []
+    for control in snapshot.controls:
+        if control.hidden or not control.selector or match_field_key(control) != "phone":
+            continue
+        try:
+            invalid = bool(evaluate(_PHONE_INVALID_JS, control.selector))
+        except Exception:
+            invalid = False
+        if not invalid:
+            continue
+        item = _gap_item([control], profile, None)
+        item["text"] = "Phone number"
+        item["kind"] = "QUESTION"
+        item["answerType"] = "text"
+        item["options"] = []
+        item["required"] = True
+        item["blocking"] = True
+        return [item]
+    return []
+
+
 def inspect_required(
     page,
     snapshot: PageSnapshot,

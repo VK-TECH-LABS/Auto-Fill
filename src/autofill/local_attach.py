@@ -1869,6 +1869,7 @@ class DedicatedApplySession:
         locked: bool = False,
         restored: dict[str, list[str]] | None = None,
         note: str = "",
+        proceed_only: bool = False,
     ) -> bool:
         """Save & Continue card on the employer tab. Not shown after a detach."""
         page = self._popup_page()
@@ -1889,6 +1890,7 @@ class DedicatedApplySession:
             locked=locked,
             restored=restored,
             note=note,
+            proceed_only=proceed_only,
         )
 
     def read_question_popup(self, nonce: str) -> dict[str, Any]:

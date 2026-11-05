@@ -451,6 +451,16 @@ EXTRACT_JS = r"""
       if (!text || text === option || text.length > 500 || isSectionHeading(label, text)) continue;
       return text;
     }
+    // Workday puts the Create Account notice in a div above the checkbox,
+    // not in a <label>. The link text alone ("HPE Recruitment Notice") is
+    // not the statement the privacy gate classifies.
+    const blocks = field.querySelectorAll("p, div");
+    for (const node of blocks) {
+      if (!node || node.contains(el) || (node.querySelector && node.querySelector("input, select, textarea"))) continue;
+      const text = questionPrompt(textOf(node));
+      if (!text || text.length > 500 || text === option) continue;
+      if (/privacy|recruitment notice|terms of (?:use|service)|terms and conditions/i.test(text)) return text;
+    }
     return "";
   }
 
@@ -1249,7 +1259,23 @@ EXTRACT_JS = r"""
     // A control whose own label says "(optional)" is not required, even when a
     // nearby label carries an asterisk.
     if (labelSaysOptional(el, label)) return false;
-    return !!(label && hasRequirementMark(label));
+    if (label && hasRequirementMark(label)) return true;
+    // Ashby prints the asterisk on a question title that is not the first
+    // label in the field. An optional social field does not get that mark.
+    const entry = el.closest && el.closest("[data-field-path], .ashby-application-form-field-entry");
+    if (!entry) return false;
+    const titles = entry.querySelectorAll("label, .ashby-application-form-question-title, legend");
+    for (const title of titles) {
+      if (!title || title.contains(el)) continue;
+      // Phone's required title must not make a nested opt-in radio required.
+      const targetId = title.getAttribute("for") || "";
+      if (targetId) {
+        const target = document.getElementById(targetId);
+        if (target && target !== el) continue;
+      }
+      if (hasRequirementMark(title) && !labelSaysOptional(el, title)) return true;
+    }
+    return false;
   }
 
   function labelSaysOptional(el, label) {
