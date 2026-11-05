@@ -107,6 +107,17 @@ _MAX_BODY = 1_048_576
 _ANSWER_WAIT_SECONDS = 60
 # A popup answer TileArc has not confirmed by then reopens the popup with an error.
 _POPUP_SAVE_TIMEOUT_SECONDS = 45
+# One status line. A failure never shares the card with a success sentence.
+_STATUS_SAVING = "Saving"
+_STATUS_SAVED = "Saved & Verified"
+_STATUS_FILLED = "Employer Fields Filled"
+_STATUS_READY = "Ready to Proceed"
+_STATUS_UNCONFIRMED = (
+    "TileArc did not confirm the save. Keep the TileArc tab open, then click Save & Continue again."
+)
+_STATUS_REJECTED = (
+    "The employer page did not accept that answer. Check it and click Save & Continue again."
+)
 _POPUP_SYNC_WAIT_SECONDS = 1.5
 # Finished and replaced jobs kept so a late status/answer gets 410, not a fill.
 _MAX_JOBS = 8
@@ -226,13 +237,23 @@ def _expires_epoch(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+def same_apply(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
+    """Same Apply. A new profile fingerprint is a stale snapshot, not a new candidate."""
+    if not left or not right:
+        return False
+    return all(
+        left.get(key, "") == right.get(key, "")
+        for key in ("tilearcSessionId", "candidateId", "jobId")
+    )
+
+
 def _same_live_job(job: LocalJob | None, url: str, binding: dict[str, str] | None) -> bool:
     return bool(
         job is not None
         and binding is not None
         and not job.superseded
         and job.application_url == url
-        and same_binding(job.binding, binding)
+        and same_apply(job.binding, binding)
     )
 
 
@@ -420,6 +441,218 @@ def _can_refresh_profile(job: LocalJob) -> bool:
     return True
 
 
+def _remember_tilearc(job: LocalJob, client: Any, version: str, binding: dict[str, str] | None) -> None:
+    if client is not None:
+        job.tilearc = client
+    if version:
+        job.profile_version = version
+    fingerprint = (binding or {}).get("profileFingerprint") or ""
+    if fingerprint and job.binding is not None:
+        job.binding["profileFingerprint"] = fingerprint
+
+
+def _copy_profile(dst: CandidateProfile, src: CandidateProfile) -> None:
+    dst.personal = src.personal
+    dst.work_authorization = src.work_authorization
+    dst.availability = src.availability
+    dst.compensation = src.compensation
+    dst.experience = src.experience
+    dst.eeo_voluntary = src.eeo_voluntary
+    dst.screening = src.screening
+    dst.documents = src.documents
+    dst.skills = list(src.skills)
+    dst.employment = list(src.employment)
+    dst.education_history = list(src.education_history)
+    dst.internships = list(src.internships)
+    dst.projects = list(src.projects)
+    dst.application_answers = list(src.application_answers)
+    if src.candidate_id:
+        dst.candidate_id = src.candidate_id
+
+
+def _tilearc_client(raw: Any, headers: Any = None) -> Any:
+    """#173 client when this Apply can call TileArc.
+
+    Origin is ``tilearcApi.origin`` or ``TILEARC_API_ORIGIN`` (the packaged
+    staging helper sets the live staging host). Authorization or a cookie is
+    required. Without either, the posted profile is kept and a save is not
+    sent to TileArc.
+    """
+    origin = ""
+    authorization = ""
+    cookie = ""
+    if isinstance(raw, dict):
+        origin = str(raw.get("origin") or "").strip()
+        authorization = str(raw.get("authorization") or "").strip()
+        cookie = str(raw.get("cookie") or "").strip()
+    if headers is not None:
+        if not authorization:
+            authorization = str(headers.get("Authorization") or "").strip()
+        if not cookie:
+            cookie = str(headers.get("Cookie") or "").strip()
+    if not origin:
+        origin = os.environ.get("TILEARC_API_ORIGIN", "").strip()
+    if not origin or (not authorization and not cookie):
+        return None
+    from autofill.tilearc_sync import TilearcClient
+
+    try:
+        return TilearcClient(origin, authorization=authorization, cookie=cookie)
+    except ValueError:
+        return None
+
+
+def _refresh_posted_profile(
+    profile: CandidateProfile,
+    binding: dict[str, str],
+    client: Any,
+) -> tuple[CandidateProfile, dict[str, str], str, bool]:
+    """Latest session profile. A 409 without a new snapshot is refused."""
+    from autofill.tilearc_sync import TilearcTransportError, pull_latest
+
+    try:
+        result = pull_latest(
+            client,
+            session_id=binding.get("tilearcSessionId") or "",
+            candidate_id=binding.get("candidateId") or "",
+            fingerprint=binding.get("profileFingerprint") or "",
+            version="",
+            posted=None,
+        )
+    except TilearcTransportError:
+        return profile, binding, "", False
+    if result.blocked:
+        raise AnswerRejected(
+            409,
+            {
+                "reason": "identity_mismatch",
+                "verified": False,
+                "filled": False,
+                "stopped_before_submit": True,
+            },
+        )
+    updated = dict(binding)
+    if result.fingerprint:
+        updated["profileFingerprint"] = result.fingerprint
+    if not result.profile_body:
+        return profile, updated, result.version, result.stale
+    try:
+        fresh = CandidateProfile.from_dict(_with_binding_owner(result.profile_body, updated))
+    except ProfileError:
+        return profile, updated, result.version, result.stale
+    align_profile_candidate(fresh, updated)
+    return fresh, updated, result.version, result.stale
+
+
+def _refresh_open_profile(job: LocalJob) -> None:
+    """Before each page, refetch. A changed fingerprint or version refills owned fields."""
+    client = getattr(job, "tilearc", None)
+    if client is None or not job.binding or job.profile is None:
+        return
+    from autofill.fill import bind_replace_owned
+    from autofill.tilearc_sync import TilearcTransportError, pull_latest
+
+    try:
+        result = pull_latest(
+            client,
+            session_id=job.binding.get("tilearcSessionId") or "",
+            candidate_id=_job_candidate(job),
+            fingerprint=job.binding.get("profileFingerprint") or "",
+            version=job.profile_version,
+            posted=None,
+        )
+    except TilearcTransportError:
+        return
+    if result.blocked:
+        job.error = "identity_mismatch"
+        raise FillCancelled()
+    if result.fingerprint:
+        job.binding["profileFingerprint"] = result.fingerprint
+    if result.version:
+        job.profile_version = result.version
+    if not result.stale or not result.profile_body:
+        return
+    try:
+        fresh = CandidateProfile.from_dict(_with_binding_owner(result.profile_body, job.binding))
+        align_profile_candidate(fresh, job.binding)
+    except (ProfileError, ValueError):
+        return
+    _copy_profile(job.profile, fresh)
+    bind_replace_owned(True)
+
+
+def _submitted_text(values: list[Any]) -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return " | ".join(cleaned)
+
+
+def _terms_item(item: dict[str, Any]) -> bool:
+    key = str(item.get("fieldKey") or "")
+    text = str(item.get("text") or item.get("prompt") or "").casefold()
+    return key in {"STANDARD_TERMS", "standard_terms"} or "standard terms" in text
+
+
+def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
+    """True only when #173 read-back matches this candidate and this answer.
+
+    A timeout or an older body is read again with GET. Anything else is not confirmed.
+    """
+    client = getattr(job, "tilearc", None)
+    binding = job.binding or {}
+    session_id = binding.get("tilearcSessionId") or ""
+    candidate_id = _job_candidate(job)
+    job_id = binding.get("jobId") or ""
+    if client is None or not session_id or not candidate_id:
+        return False
+    rows = _popup_answer_rows(job, stored)
+    if not rows:
+        return False
+    from autofill.tilearc_sync import TilearcTransportError, ack_is_trusted
+
+    for row in rows:
+        item = _match_item(job, {"id": row["questionId"]})
+        if item is None:
+            return False
+        answer = _submitted_text(list(row["values"]))
+        question = str(item.get("text") or item.get("prompt") or "").strip()
+        key = str(item.get("fieldKey") or "")
+        terms = job.standard_terms_authorized if _terms_item(item) else None
+        try:
+            ack = client.confirm_answer(
+                session_id,
+                candidate_id=candidate_id,
+                job_id=job_id,
+                question=question,
+                answer=answer,
+                key=key,
+                standard_terms_authorized=terms,
+            )
+        except TilearcTransportError:
+            ack = None
+        if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
+            try:
+                ack = client.read_answer(
+                    session_id,
+                    candidate_id=candidate_id,
+                    job_id=job_id,
+                    question=question,
+                )
+            except TilearcTransportError:
+                ack = None
+        if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
+            return False
+        if ack is not None and ack.standard_terms_authorized is True:
+            job.standard_terms_authorized = True
+        if ack is not None and ack.version:
+            previous = job.answer_versions.get(row["questionId"])
+            job.answer_versions[row["questionId"]] = ack.version
+            if previous and previous == ack.version:
+                continue
+    return True
+
+
 def same_binding(left: dict[str, str] | None, right: dict[str, str] | None) -> bool:
     if not left or not right:
         return False
@@ -571,6 +804,15 @@ class LocalJob:
         # Set only after a Save & Continue click is stored on this candidate,
         # and before the employer control is written.
         self.save_confirmed_candidate = ""
+        # Save & Continue receipts: candidate + job + session + data version + values.
+        # A click is not confirmed until this record reads back.
+        self.save_receipts: dict[str, dict[str, Any]] = {}
+        self.save_phase = ""
+        # Vinayaka #173 client, when this Apply named an origin. Empty version
+        # means the session route did not return profileVersion.
+        self.tilearc: Any = None
+        self.profile_version = ""
+        self.answer_versions: dict[str, str] = {}
         # Digest of the payload this job was started or refreshed with.
         # Answers learned during the fill are not part of it.
         self.adopted_digest: tuple = ()
@@ -600,6 +842,8 @@ class LocalJob:
         self.saved_answers = {}
         self.saved_rows = []
         self.save_confirmed_candidate = ""
+        self.save_receipts = {}
+        self.save_phase = ""
 
     def drop_resume(self) -> None:
         if self.resume is not None:
@@ -710,6 +954,10 @@ class LocalJob:
             body["learnedApplicationAnswers"] = learned
         if self.saved_rows:
             body["savedAnswers"] = [dict(row) for row in self.saved_rows]
+        if self.save_phase:
+            body["savePhase"] = self.save_phase
+        if self.profile_version:
+            body["profileVersion"] = self.profile_version
         if self.save_confirmed_candidate:
             body["answerSave"] = {"confirmed": True, "candidateId": self.save_confirmed_candidate}
         action = _manual_action(self)
@@ -774,6 +1022,7 @@ class LocalHelper:
         binding: dict[str, str] | None = None,
         resume_ref: str | None = None,
         standard_terms_authorized: bool = False,
+        tilearc: Any = None,
     ) -> LocalJob:
         """Queue one fill. A bound create replaces the previous job.
 
@@ -794,6 +1043,10 @@ class LocalHelper:
         align_profile_candidate(profile, binding)
         if resume_ref is not None and binding is None:
             raise BindingError("A resume needs a TileArc binding.")
+        version = ""
+        tilearc_stale = False
+        if tilearc is not None and binding is not None:
+            profile, binding, version, tilearc_stale = _refresh_posted_profile(profile, binding, tilearc)
         recover = False
         replace_profile = False
         with self._lock:
@@ -805,7 +1058,10 @@ class LocalHelper:
                 same
                 and current is not None
                 and current.state in {"queued", "running"}
-                and posted_digest != (current.adopted_digest or _profile_digest(current.profile))
+                and (
+                    posted_digest != (current.adopted_digest or _profile_digest(current.profile))
+                    or (version and version != current.profile_version)
+                )
             ):
                 # This Apply posted a newer profile. The fill already running
                 # is the previous snapshot and must not be returned as current.
@@ -815,6 +1071,7 @@ class LocalHelper:
                     self._staged.pop(resume_ref, None)
                 if standard_terms_authorized:
                     current.standard_terms_authorized = True
+                _remember_tilearc(current, tilearc, version, binding)
                 return current
             if same and current is not None and _can_continue(current) and not _create_keeps_failed(current):
                 active = self._jobs.get(self._active) if self._active else None
@@ -838,14 +1095,19 @@ class LocalHelper:
                 self._active = current.session_id
                 job = current
                 recover = True
+                if tilearc_stale:
+                    replace_profile = True
             elif same and current is not None and not _create_keeps_failed(current):
                 if resume_ref is not None:
                     # A double click restaged the same file. The live job keeps its copy.
                     self._staged.pop(resume_ref, None)
                 if standard_terms_authorized:
                     current.standard_terms_authorized = True
-                changed = current.adopted_digest != _profile_digest(profile)
+                changed = current.adopted_digest != _profile_digest(profile) or (
+                    bool(version) and version != current.profile_version
+                )
                 if not changed or not _can_refresh_profile(current) or self._active is not None:
+                    _remember_tilearc(current, tilearc, version, binding)
                     return current
                 # The portal sent this candidate's latest profile while the fill
                 # is waiting. Keep the session and fill the open page with it.
@@ -854,6 +1116,8 @@ class LocalHelper:
                 current.saved_answers = {}
                 current.saved_rows = []
                 current.save_confirmed_candidate = ""
+                current.save_receipts = {}
+                current.save_phase = ""
                 current.popup = None
                 current.card_ids = []
                 current.extra_shown = False
@@ -864,7 +1128,7 @@ class LocalHelper:
                 self._active = current.session_id
                 job = current
                 recover = True
-                replace_profile = True
+                replace_profile = True or tilearc_stale
             else:
                 resume = self._claim_resume(resume_ref, binding) if resume_ref is not None else None
                 active = self._jobs.get(self._active) if self._active else None
@@ -892,10 +1156,16 @@ class LocalHelper:
                 job = LocalJob(uuid.uuid4().hex, url, profile, binding, resume)
                 job.adopted_digest = _profile_digest(profile)
                 job.standard_terms_authorized = bool(standard_terms_authorized)
+                _remember_tilearc(job, tilearc, version, binding)
+                if tilearc_stale:
+                    replace_profile = True
                 self._jobs[job.session_id] = job
                 self._current = job.session_id
                 self._active = job.session_id
                 self._prune()
+        _remember_tilearc(job, tilearc, version, binding)
+        if tilearc_stale:
+            replace_profile = True
         if recover:
             logger.info("session=%s continue attempt=%s", job.session_id, job.continue_attempts)
         else:
@@ -1452,12 +1722,13 @@ class LocalHelper:
             posting = bool(page is not None and _tab_is_posting(page))
             if not url or posting or not same_site(progress.url, url):
                 return False
-        if progress.binding and job.binding and not same_binding(progress.binding, job.binding):
+        if progress.binding and job.binding and not same_apply(progress.binding, job.binding):
             return False
         return True
 
     def _capture_progress(self, job: LocalJob, page: Any) -> None:
         """Store binding, target, URL, and PageMark for the page about to be filled."""
+        _refresh_open_profile(job)
         url = ""
         step = ""
         selectors: frozenset[str] = frozenset()
@@ -1787,8 +2058,12 @@ class LocalHelper:
                 body["verified"] = not job.submit_claimed()
                 box["body"] = body
         except FillCancelled:
-            job.state = "replaced"
-            logger.info("session=%s fill_stopped reason=%s", job.session_id, job.ended or "cancelled")
+            if job.error == "identity_mismatch":
+                job.state = "error"
+                logger.info("session=%s fill_stopped reason=identity_mismatch", job.session_id)
+            else:
+                job.state = "replaced"
+                logger.info("session=%s fill_stopped reason=%s", job.session_id, job.ended or "cancelled")
             if box is not None:
                 box["error"] = AnswerRejected(410, _failure(job, "replaced"))
         except Exception as exc:
@@ -1881,9 +2156,10 @@ class LocalHelper:
             if reported:
                 item["options"] = reported
             code = 422 if report.get("reason") == "needs_option" else 200
+            job.save_phase = "employer_rejected"
             self._present_popup(
                 job,
-                message="The employer page did not accept that answer. Check it and click Save & Continue again.",
+                message=_STATUS_REJECTED,
                 error=True,
             )
             body = _answer_body(job, report, started)
@@ -2179,14 +2455,26 @@ class LocalHelper:
                 and not popup.get("committed")
                 and time.monotonic() - float(popup.get("answeredAt") or 0) > _POPUP_SAVE_TIMEOUT_SECONDS
             ):
-                self._present_popup(
-                    job,
-                    message=(
-                        "TileArc did not confirm the save. Keep the TileArc tab open, "
-                        "then click Save & Continue again."
-                    ),
-                    error=True,
-                )
+                stored = popup.get("values")
+                if getattr(job, "tilearc", None) is not None:
+                    # #173 is the confirmation. A local receipt is not a substitute.
+                    if stored and _tilearc_ack(job, stored) and _confirm_popup_save(job, stored):
+                        job.save_phase = "saved_verified"
+                        if getattr(self._session, "apply_answer", None) is not None:
+                            self._commit_popup_answers(job, stored)
+                        return
+                    job.save_phase = "save_unconfirmed"
+                    self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
+                    return
+                if stored and _receipts_cover(job, stored):
+                    # The answer is already on this candidate. Retry the employer
+                    # write. Do not report a missing save, and do not store it twice.
+                    job.save_phase = "saved_verified"
+                    if getattr(self._session, "apply_answer", None) is not None:
+                        self._commit_popup_answers(job, stored)
+                    return
+                job.save_phase = "save_unconfirmed"
+                self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
             return
         read = self._session.read_question_popup(popup["nonce"])
         if read.get("detached"):
@@ -2217,16 +2505,21 @@ class LocalHelper:
         popup["answeredAt"] = time.monotonic()
         counted = len(stored) if isinstance(stored, list) else 1
         logger.info("session=%s popup_answered values=%s", job.session_id, counted)
-        if not _confirm_popup_save(job, stored):
-            self._present_popup(
-                job,
-                message=(
-                    "TileArc did not confirm the save. Keep the TileArc tab open, "
-                    "then click Save & Continue again."
-                ),
-                error=True,
-            )
+        if getattr(job, "tilearc", None) is not None and not _tilearc_ack(job, stored):
+            job.save_phase = "save_unconfirmed"
+            self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
             return
+        if not _confirm_popup_save(job, stored):
+            job.save_phase = "save_unconfirmed"
+            self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
+            return
+        job.save_phase = "saved_verified"
+        messenger = getattr(self._session, "question_popup_message", None)
+        if messenger is not None:
+            try:
+                messenger(str(popup.get("nonce") or ""), _STATUS_SAVED, error=False, reopen=False)
+            except Exception:
+                pass
         if getattr(self._session, "apply_answer", None) is None:
             # The save is on this candidate. Filling waits until the session can write.
             return
@@ -2254,11 +2547,13 @@ class LocalHelper:
             popup["committing"] = True
             popup["state"] = "saving"
         message = getattr(self._session, "question_popup_message", None)
-        if message is not None and popup is not None:
-            try:
-                message(str(popup.get("nonce") or ""), "Saving to TileArc…", error=False, reopen=False)
-            except Exception:
-                pass
+        if job.save_phase != "saved_verified":
+            job.save_phase = "saving"
+            if message is not None and popup is not None:
+                try:
+                    message(str(popup.get("nonce") or ""), _STATUS_SAVING, error=False, reopen=False)
+                except Exception:
+                    pass
         wrote: list[str] = []
         for row in rows:
             if job.superseded or self._current != job.session_id:
@@ -2282,17 +2577,33 @@ class LocalHelper:
                 self._reopen_save_card(job)
                 return
             if not body.get("verified"):
+                job.save_phase = "employer_rejected"
                 return
             wrote.append(row["questionId"])
+            job.save_phase = "employer_filled"
         popup = job.popup if isinstance(job.popup, dict) else None
         if popup is not None:
             popup["committing"] = False
             popup["committed"] = True
         open_ids = {row["id"] for row in _open_question_rows(job)}
         if wrote and open_ids.intersection(wrote) and popup is not None and popup.get("state") == "saving":
+            job.save_phase = "employer_rejected"
             self._reopen_save_card(job)
             return
+        if wrote and not open_ids.intersection(wrote):
+            job.save_phase = "ready" if not open_ids else "employer_filled"
+            if message is not None and popup is not None:
+                try:
+                    message(
+                        str(popup.get("nonce") or ""),
+                        _STATUS_READY if job.save_phase == "ready" else _STATUS_FILLED,
+                        error=False,
+                        reopen=False,
+                    )
+                except Exception:
+                    pass
         if job.question is None:
+            job.save_phase = "ready"
             self._arm_idle()
 
     def _reopen_save_card(self, job: LocalJob) -> None:
@@ -2301,11 +2612,8 @@ class LocalHelper:
         if popup is not None:
             popup["committing"] = False
             popup["committed"] = False
-        self._present_popup(
-            job,
-            message="The employer page did not accept that answer. Check it and click Save & Continue again.",
-            error=True,
-        )
+        job.save_phase = "employer_rejected"
+        self._present_popup(job, message=_STATUS_REJECTED, error=True)
 
     def _remember_result(self, job: LocalJob, result: ApplicationResult) -> None:
         job.card_ids = []
@@ -2617,15 +2925,17 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(profile_raw, dict):
                 raise LocalAttachError("profile must be an object.")
             binding = parse_binding(payload.get("binding"))
+            tilearc = _tilearc_client(payload.get("tilearcApi"), self.headers)
             resume_ref = parse_resume_claim(payload.get("resume"))
             profile = CandidateProfile.from_dict(_with_binding_owner(profile_raw, binding))
             if resume_ref is None:
                 job = self.server.helper.submit(
-                url,
-                profile,
-                binding,
-                standard_terms_authorized=payload.get("standardTermsAuthorized") is True,
-            )
+                    url,
+                    profile,
+                    binding,
+                    standard_terms_authorized=payload.get("standardTermsAuthorized") is True,
+                    tilearc=tilearc,
+                )
             else:
                 job = self.server.helper.submit(
                     url,
@@ -2633,6 +2943,7 @@ class _Handler(BaseHTTPRequestHandler):
                     binding,
                     resume_ref,
                     standard_terms_authorized=payload.get("standardTermsAuthorized") is True,
+                    tilearc=tilearc,
                 )
         except AnswerRejected as exc:
             self._send(exc.status, exc.body)
@@ -2826,6 +3137,10 @@ def _open_question_rows(job: LocalJob) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in job.open_items:
         if _item_saved(job, item):
+            continue
+        # Name, email, phone, and profile links are filled from the latest
+        # profile. They are not questions on the card.
+        if job.profile is not None and _profile_basic_value(job.profile, item):
             continue
         view = question_view(item)
         if view is None:
@@ -3061,6 +3376,11 @@ _BASIC_FIELDS = {
     "state": lambda profile: profile.personal.province_state,
     "postal_code": lambda profile: profile.personal.postal_code,
     "country": lambda profile: profile.personal.country,
+    "middle_name": lambda profile: profile.personal.middle_name.strip(),
+    "linkedin_url": lambda profile: profile.personal.linkedin_url,
+    "github_url": lambda profile: profile.personal.github_url,
+    "portfolio_url": lambda profile: profile.personal.portfolio_url,
+    "website_url": lambda profile: profile.personal.website_url,
     "location": lambda profile: ", ".join(
         part.strip()
         for part in (
@@ -3084,6 +3404,11 @@ _BASIC_ALIASES = {
     "fullname": "full_name",
     "givenname": "first_name",
     "familyname": "last_name",
+    "middlename": "middle_name",
+    "linkedin": "linkedin_url",
+    "github": "github_url",
+    "portfolio": "portfolio_url",
+    "website": "website_url",
 }
 
 
@@ -3123,6 +3448,17 @@ def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str
             getter = _BASIC_FIELDS["phone"]
         elif text in {"state", "province", "region"}:
             getter = _BASIC_FIELDS["state"]
+        elif "linkedin" in text and "?" not in text and len(text) <= 80:
+            getter = _BASIC_FIELDS["linkedin_url"]
+        elif re.search(r"\bgithub\b", text) and "?" not in text and len(text) <= 80:
+            getter = _BASIC_FIELDS["github_url"]
+        elif "portfolio" in text and "?" not in text and len(text) <= 80:
+            if profile.personal.portfolio_url.strip():
+                getter = _BASIC_FIELDS["portfolio_url"]
+            elif profile.personal.website_url.strip():
+                getter = _BASIC_FIELDS["website_url"]
+        elif "website" in text and "?" not in text and len(text) <= 80:
+            getter = _BASIC_FIELDS["website_url"]
     if getter is None:
         return ""
     return str(getter(profile) or "").strip()
@@ -3156,6 +3492,84 @@ def _reject_profile_mismatch(job: LocalJob) -> None:
     owner = (job.profile.candidate_id or "").strip() if job.profile is not None else ""
     if bound and owner and bound != owner:
         raise AnswerRejected(409, _failure(job, "candidate_mismatch"))
+
+
+def _data_version(job: LocalJob) -> str:
+    """Identity of this save: candidate, job, session, and the profile basics.
+
+    An answer row is not part of the version, so storing the answer does not
+    invalidate the receipt. A different candidate, job, or email does.
+    """
+    import hashlib
+
+    personal = job.profile.personal if job.profile is not None else None
+    binding = job.binding or {}
+    parts = [
+        _job_candidate(job),
+        str(binding.get("jobId") or ""),
+        job.session_id,
+        personal.email if personal is not None else "",
+        personal.first_name if personal is not None else "",
+        personal.family_name if personal is not None else "",
+        personal.full_name if personal is not None else "",
+        personal.phone if personal is not None else "",
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _item_tokens(item: dict[str, Any]) -> list[str]:
+    tokens: list[str] = []
+    for key in ("questionId", "questionHash", "fieldKey", "id"):
+        token = str(item.get(key) or "").strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _stamp_receipt(job: LocalJob, item: dict[str, Any], values: list[str]) -> None:
+    """Bind one stored answer to this candidate, job, session, and data version."""
+    receipt = {
+        "candidateId": _job_candidate(job),
+        "jobId": str((job.binding or {}).get("jobId") or ""),
+        "sessionId": job.session_id,
+        "version": _data_version(job),
+        "values": list(values),
+    }
+    for token in _item_tokens(item):
+        job.save_receipts[token] = receipt
+
+
+def _read_back_receipt(job: LocalJob, item: dict[str, Any], values: list[str]) -> bool:
+    """True only when the stored receipt matches this save. A click is not enough."""
+    wanted = [str(value).strip().casefold() for value in values if str(value).strip()]
+    if not wanted:
+        return False
+    version = _data_version(job)
+    candidate = _job_candidate(job)
+    job_id = str((job.binding or {}).get("jobId") or "")
+    for token in _item_tokens(item):
+        receipt = job.save_receipts.get(token)
+        if not isinstance(receipt, dict):
+            continue
+        if receipt.get("candidateId") != candidate or receipt.get("sessionId") != job.session_id:
+            continue
+        if str(receipt.get("jobId") or "") != job_id or receipt.get("version") != version:
+            continue
+        stored = [str(value).strip().casefold() for value in receipt.get("values") or []]
+        if stored == wanted:
+            return True
+    return False
+
+
+def _receipts_cover(job: LocalJob, stored: list[Any]) -> bool:
+    rows = _popup_answer_rows(job, stored)
+    if not rows:
+        return False
+    for row in rows:
+        item = _match_item(job, {"id": row["questionId"]})
+        if item is None or not _read_back_receipt(job, item, list(row["values"])):
+            return False
+    return True
 
 
 def _mark_save_confirmed(job: LocalJob) -> None:
@@ -3192,6 +3606,10 @@ def _confirm_popup_save(job: LocalJob, stored: list[Any]) -> bool:
         prepared.append((item, target))
     for item, target in prepared:
         _remember_answer(job, item, target)
+        values = [str(value) for value in target.get("values") or [] if str(value).strip()]
+        _stamp_receipt(job, item, values)
+        if not _read_back_receipt(job, item, values):
+            return False
     _mark_save_confirmed(job)
     popup = job.popup if isinstance(job.popup, dict) else None
     if popup is not None:

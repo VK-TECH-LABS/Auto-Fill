@@ -1749,6 +1749,38 @@ def _is_work_experience_location(control: Control) -> bool:
     return "location" in compact or normalize(control.label or "") == "location"
 
 
+def _automation_name_key(control: Control) -> str | None:
+    """A Workday or Ashby id that names the field when the visible title is a section.
+
+    ``legalNameSection_firstName`` is First Name even when the heading above
+    the group is Legal Name. A calling-code id is not a name.
+    """
+    compact = re.sub(
+        r"[^a-z0-9]",
+        "",
+        f"{control.automation_id} {control.form_automation_id} {control.element_id} {control.name}".casefold(),
+    )
+    if not compact:
+        return None
+    if "middlename" in compact or "middleinitial" in compact:
+        return "middle_name"
+    if any(token in compact for token in ("lastname", "familyname", "surname")):
+        return "last_name"
+    if any(token in compact for token in ("firstname", "givenname", "forename")):
+        return "first_name"
+    if "legalname" in compact:
+        return "legal_name"
+    if "linkedin" in compact:
+        return "linkedin_url"
+    if "github" in compact:
+        return "github_url"
+    if "portfolio" in compact:
+        return "portfolio_url"
+    if "website" in compact:
+        return "website_url"
+    return None
+
+
 def _match_rule(control: Control) -> str | None:
     autocomplete = control.autocomplete.strip().casefold()
     blob = haystack(control)
@@ -1774,6 +1806,9 @@ def _match_rule(control: Control) -> str | None:
         # The same address as Email. A glued name such as emailConfirmation
         # does not contain the word "email", so the generic rule misses it.
         return "email"
+    named = _automation_name_key(control)
+    if named and control.kind != "file":
+        return named
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
         # Autocomplete is a stronger signal than a noisy label, except files.
         mapped = _AUTOCOMPLETE[autocomplete]

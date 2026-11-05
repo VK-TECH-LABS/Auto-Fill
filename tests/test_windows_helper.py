@@ -215,9 +215,11 @@ def test_packaged_environment_forces_the_extension_port(monkeypatch, tmp_path):
     monkeypatch.setenv(ENV_FLAG, "0")
     monkeypatch.setenv("AUTOFILL_LOCAL_HELPER_PORT", "9999")
     monkeypatch.delenv("AUTOFILL_LOCAL_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("TILEARC_API_ORIGIN", raising=False)
     profile = apply_packaged_environment()
     assert os.environ[ENV_FLAG] == "1"
     assert os.environ["AUTOFILL_LOCAL_HELPER_PORT"] == str(HELPER_PORT)
+    assert os.environ["TILEARC_API_ORIGIN"] == "https://vinayaka-app-staging-staging.up.railway.app"
     assert profile == tmp_path / "TileArc" / "AutoFill" / "apply-profile"
     assert packaged_profile_dir() == profile
     report = doctor_report()

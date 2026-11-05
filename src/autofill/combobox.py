@@ -794,16 +794,18 @@ def take_opened_children() -> list[str]:
 
 
 def _note_children(parent: str, children: list[Option]) -> None:
-    """Remember ``Parent > Child`` labels so the card can ask for the leaf."""
+    """Remember ``Parent > Child`` labels so the card can ask for the leaf.
+
+    A replaced menu's rows are leaves even when Workday marks them
+    ``promptOption`` with no leaf flag. A folder row is not a choice.
+    """
     labels: list[str] = []
     parent_name = (parent or "").strip()
-    for child in children:
-        if not child.leaf or child.folder:
-            continue
+    for child in _real_leaves(children):
         name = (child.label or child.value).strip()
         if not name or _menu_junk(name):
             continue
-        if parent_name:
+        if parent_name and not _labels_match(name, parent_name):
             path = f"{parent_name} > {name}"
             if path not in labels:
                 labels.append(path)
@@ -862,49 +864,215 @@ def terminal_menu_labels(
     return labels
 
 
+def _mark_terminal(option: Option) -> Option:
+    return Option(
+        value=option.value,
+        label=option.label,
+        selector=option.selector,
+        leaf=True,
+        folder=False,
+    )
+
+
+def _terminals_from(children: list[Option]) -> list[Option]:
+    return [
+        _mark_terminal(child)
+        for child in children
+        if child.selector and not child.folder and not _menu_junk(child.label or child.value)
+    ]
+
+
+def _undo_probe(page, selector: str, pill_before: str) -> None:
+    """Drop a highlight or pill a probe click left behind. The field stays unchosen."""
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        pass
+    _pause(page, 40)
+    shown = _selected_text(page, selector)
+    if not shown or _labels_match(shown, pill_before):
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(
+            """(selector) => {
+              let el = null;
+              try { el = document.querySelector(selector); } catch (error) { return false; }
+              if (!el) return false;
+              const root = el.closest(
+                "[data-automation-id='multiSelectContainer'], " +
+                "[data-automation-id='multiselectInputContainer'], " +
+                "[data-automation-id^='formField']"
+              ) || el.parentElement;
+              if (!root) return false;
+              const pill = root.querySelector(
+                "[data-automation-id='selectedItem'], [data-automation-id='selectedItemText']"
+              );
+              if (!pill) return false;
+              const del = pill.querySelector(
+                "[data-automation-id='DELETE_charm'], button, [role='button']"
+              );
+              if (del) {
+                const press = del["click"];
+                if (press) press.call(del);
+                return true;
+              }
+              pill.textContent = "";
+              pill.hidden = true;
+              return true;
+            }""",
+            selector,
+        )
+    except Exception:
+        return
+
+
+def _probe_row(page, selector: str, option: Option, before: list[Option]) -> tuple[str, list[Option]]:
+    """Click one row. ``folder`` when the menu is replaced. A leaf click is undone."""
+    if not option.selector:
+        return "leaf", []
+    pill_before = _selected_text(page, selector)
+    try:
+        click_choice(page, option.selector, option.label)
+    except Exception:
+        return "leaf", []
+    _pause(page, 50)
+    after = _await_menu(page, selector, 800)
+    if not after:
+        after = _read_options(page, selector, allow_single=True)
+    if _menu_replaced(before, after):
+        return "folder", after
+    _undo_probe(page, selector, pill_before)
+    return "leaf", []
+
+
+def _collapse_child_level(page, selector: str, kids: list[Option], budget: list[int]) -> list[Option]:
+    """Leaves under this menu. One sample click decides whether the level opens again."""
+    deeper = [child for child in kids if child.selector and (child.folder or not child.leaf)]
+    if not deeper or budget[0] <= 0:
+        return _terminals_from(kids)
+    kind, grand = _probe_row(page, selector, deeper[0], kids)
+    budget[0] -= 1
+    if kind != "folder":
+        return _terminals_from(kids)
+    collected: list[Option] = []
+
+    def adopt(mid: str, grands: list[Option]) -> None:
+        mid_name = (mid or "").strip()
+        for leaf in _terminals_from(grands):
+            name = (leaf.label or leaf.value).strip()
+            label = f"{mid_name} > {name}" if mid_name and name and not _labels_match(name, mid_name) else name
+            if not label:
+                continue
+            collected.append(Option(value=label, label=label, selector=leaf.selector, leaf=True, folder=False))
+
+    adopt(deeper[0].label, grand)
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        pass
+    _pause(page, 40)
+    for other in deeper[1:]:
+        if budget[0] <= 0:
+            break
+        opened = _await_menu(page, selector, 400) or kids
+        current = _match_desired(other.label, opened) or other
+        kind, grand = _probe_row(page, selector, current, opened)
+        budget[0] -= 1
+        if kind == "folder":
+            adopt(current.label or other.label, grand)
+            try:
+                dismiss_combobox(page)
+            except Exception:
+                pass
+            _pause(page, 40)
+        else:
+            collected.append(_mark_terminal(other))
+    return collected
+
+
 def list_combobox_options(page, selector: str, *, limit: int = 200) -> list[str]:
-    """Open the menu once, read option text, and close it.
+    """Open the menu, read option text, and close it.
 
     The prompt icon is clicked when the input click does not reveal options.
     Workday search prompts open from that icon, and the menu is ``promptOption``
-    rows, not another field's selected pills. A chevron category is opened so
-    the leaf and the ``Category > Leaf`` path are both choices.
+    rows, not another field's selected pills. A category, including one with no
+    chevron, is opened so the card lists ``Category > Leaf``. A probe click
+    that only highlights a row is undone. The first row is not left selected.
     """
     if not selector:
         return []
     focus_field(page, selector)
+    pill_before = _selected_text(page, selector)
     try:
         found = _open_for_options(page, selector)
     except Exception:
         found = []
-    folders = [option for option in found if option.folder and option.selector]
+    if not found:
+        try:
+            found = _read_options(page, selector, allow_single=True)
+        except Exception:
+            found = []
+    if not _needs_drill(found):
+        try:
+            close_open_menu(page)
+        except Exception:
+            pass
+        return terminal_menu_labels(found, [], limit=limit)
+    rows = [option for option in found if option.selector and (option.folder or not option.leaf)]
+    if not rows:
+        rows = [option for option in found if option.selector]
     nested: list[tuple[str, list[Option]]] = []
-    for folder in folders:
-        if sum(len(kids) for _parent, kids in nested) >= limit:
+    budget = [24]
+    for index, row in enumerate(rows):
+        if budget[0] <= 0 or sum(len(kids) for _parent, kids in nested) >= limit:
             break
         try:
             opened = _open_for_options(page, selector)
         except Exception:
             opened = []
-        current = _match_desired(folder.label, opened) or folder
+        current = _match_desired(row.label, opened) or row
         if not current.selector:
             continue
-        try:
-            click_choice(page, current.selector, current.label)
-        except Exception:
+        before = opened or found
+        kind, kids = _probe_row(page, selector, current, before)
+        budget[0] -= 1
+        parent = (current.label or row.label).strip()
+        if kind != "folder":
+            if index == 0:
+                for option in found:
+                    if not option.folder:
+                        option.leaf = True
+                try:
+                    close_open_menu(page)
+                except Exception:
+                    pass
+                _undo_probe(page, selector, pill_before)
+                return terminal_menu_labels(found, [], limit=limit)
+            row.leaf = True
+            row.folder = False
             continue
-        _pause(page, 50)
-        children = _await_menu(page, selector, 800)
-        parent = (current.label or folder.label).strip()
-        nested.append((parent, list(children)))
+        leaves = _collapse_child_level(page, selector, kids, budget)
+        if leaves:
+            nested.append((parent, leaves))
+            row.folder = True
         try:
-            close_open_menu(page)
+            dismiss_combobox(page)
         except Exception:
-            return terminal_menu_labels(found, nested, limit=limit)
+            pass
+        _pause(page, 40)
+    for option in found:
+        if any(_labels_match(option.label, parent) for parent, _kids in nested if parent):
+            option.folder = True
     try:
         close_open_menu(page)
     except Exception:
-        return terminal_menu_labels(found, nested, limit=limit)
+        labels = terminal_menu_labels(found, nested, limit=limit)
+        _undo_probe(page, selector, pill_before)
+        return labels
+    _undo_probe(page, selector, pill_before)
     return terminal_menu_labels(found, nested, limit=limit)
 
 
@@ -1088,23 +1256,73 @@ def _is_school_field(page, selector: str) -> bool:
 
 
 def _real_leaves(found: list[Option]) -> list[Option]:
-    return [
+    """Rows that can be committed.
+
+    A Workday ``promptOption`` often has no ``promptLeafNode`` and no chevron,
+    so it is neither flagged leaf nor folder. After a parent click those rows
+    are the next level. A row that is flagged as a folder is not a choice.
+    """
+    usable = [
         option
         for option in found
-        if option.leaf and option.selector and not _menu_junk(option.label or option.value)
+        if option.selector and not option.folder and not _menu_junk(option.label or option.value)
     ]
+    proven = [option for option in usable if option.leaf]
+    return proven or usable
+
+
+def _needs_drill(options: list[Option]) -> bool:
+    """True when the open menu is categories, or every row is an unproven prompt."""
+    usable = [
+        option
+        for option in options
+        if (option.label or option.value).strip() and not _menu_junk(option.label or option.value)
+    ]
+    if not usable:
+        return False
+    if any(option.folder for option in usable):
+        return True
+    return not any(option.leaf and not option.folder for option in usable)
+
+
+def _follow_path(page, selector: str, parts: list[str], found: list[Option]) -> Option | None:
+    """Click each segment of ``Parent > Child > Leaf``. The last click is the commit."""
+    menu = list(found)
+    clicked: Option | None = None
+    for index, name in enumerate(parts):
+        match = _match_desired(name, menu)
+        if match is None or not match.selector:
+            return None
+        last = index == len(parts) - 1
+        before = list(menu)
+        try:
+            click_choice(page, match.selector, match.label)
+        except Exception:
+            return None
+        _pause(page, 50)
+        clicked = match
+        if last:
+            return clicked
+        after = _await_menu(page, selector, 800)
+        if not _menu_replaced(before, after):
+            return None
+        menu = after
+    return clicked
 
 
 def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> Option | None:
-    """Open a chevron category and choose the leaf, or the only leaf it contains.
+    """Open a category and choose the leaf, or the only leaf it contains.
 
     ``Career Websites > Corporate Website`` follows that path. A leaf name
     searches each category. A category with one leaf selects that leaf.
+    A prompt row with no chevron is still drilled when the menu has no leaves.
     """
     parts = _path_parts(desired)
+    if len(parts) > 2:
+        return _follow_path(page, selector, parts, found)
     folders = [option for option in found if option.folder and option.selector]
-    if not folders and parts:
-        folders = [option for option in found if not option.leaf and option.selector]
+    if not folders:
+        folders = [option for option in found if option.selector and not option.leaf]
     if not folders:
         return None
     category_name = parts[0] if parts else ""
@@ -1487,8 +1705,9 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     if match is not None and match.folder:
         match = None
     # A category menu is drilled first. Typing the leaf here hides the folder.
-    folders_present = any(option.folder for option in top_level)
-    if match is None and folder_hit is None and not _path_parts(desired) and not folders_present:
+    # An all-promptOption menu has no chevron and no leaf flag. It is still drilled.
+    needs_drill = _needs_drill(top_level)
+    if match is None and folder_hit is None and not _path_parts(desired) and not needs_drill:
         for term in _filter_terms(desired):
             _type_filter(page, selector, term, school=school)
             typed = True
@@ -1500,7 +1719,7 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
                 match = None
             if match is not None:
                 break
-    hierarchical = bool(_path_parts(desired) or any(option.folder for option in top_level) or folder_hit is not None)
+    hierarchical = bool(_path_parts(desired) or needs_drill or folder_hit is not None)
     if hierarchical and match is None:
         drilled = _drill_for_leaf(page, selector, desired, top_level)
         if drilled is not None:
@@ -1528,13 +1747,14 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         before = list(found)
         click_choice(page, match.selector, match.label)
         _pause(page, 50)
-        if match.leaf and not match.folder:
-            after = _read_options(page, selector)
-            if _menu_replaced(before, after):
-                match.folder = True
-                match.leaf = False
-                opened_submenu = True
-                _note_children(match.label, after)
+        # A promptOption is not flagged as a leaf. A click that replaces the
+        # menu is still a folder, whether or not the row looked like a leaf.
+        after = _read_options(page, selector)
+        if _menu_replaced(before, after):
+            match.folder = True
+            match.leaf = False
+            opened_submenu = True
+            _note_children(match.label, after)
     if not match.leaf:
         # The category click opens the nested menu. The leaf is the commit.
         children = _read_options(page, selector)
