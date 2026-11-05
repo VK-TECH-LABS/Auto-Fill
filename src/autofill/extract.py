@@ -75,6 +75,18 @@ EXTRACT_JS = r"""
     return folded === "select" || folded === "please select" || folded === "choose" || folded === "choose one";
   }
 
+  function knownFieldTitle(text) {
+    // A field title above the input. A section heading is not one of these.
+    const folded = cleanPrompt(text).toLowerCase().replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
+    const pattern = new RegExp(
+      "^(?:first name|given name(?: s)?|forename|last name|family name|surname|middle name|" +
+      "middle initial|preferred name|full name|legal name|email(?: address)?|phone(?: number)?|" +
+      "mobile(?: number)?|linkedin(?: profile)?(?: url)?|git ?hub(?: url)?|portfolio(?: url)?|" +
+      "website(?: / portfolio)?(?: url)?|twitter(?: url)?)$"
+    );
+    return pattern.test(folded);
+  }
+
   function isGenericPrompt(text) {
     // "Search" is the placeholder on a prompt widget, not the question.
     const folded = cleanPrompt(text).toLowerCase().replace(/[.…]+$/g, "").trim();
@@ -769,7 +781,11 @@ EXTRACT_JS = r"""
             }
           }
           if (!found) {
-            const title = cleanPrompt(textOf(prev));
+            // cleanPrompt strips a trailing asterisk, so the required mark has
+            // to be tested on the raw title. A short field name under a
+            // section such as Legal Name is still that field's label.
+            const rawTitle = textOf(prev);
+            const title = cleanPrompt(rawTitle);
             if (
               title &&
               title.length <= 240 &&
@@ -777,8 +793,8 @@ EXTRACT_JS = r"""
               !isGenericPrompt(title) &&
               (
                 title.indexOf("?") !== -1 ||
-                /[*✱＊]/.test(title) ||
-                /^(?:linked\s?in|twitter|x|github|git hub|portfolio|website)$/i.test(title)
+                /[*✱＊]/.test(rawTitle) ||
+                knownFieldTitle(rawTitle)
               )
             ) {
               found = title;

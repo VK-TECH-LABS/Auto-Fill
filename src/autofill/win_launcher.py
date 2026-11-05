@@ -61,6 +61,11 @@ def apply_packaged_environment() -> Path:
     os.environ["AUTOFILL_LOCAL_HELPER_PORT"] = str(HELPER_PORT)
     profile = packaged_profile_dir()
     os.environ["AUTOFILL_LOCAL_PROFILE_DIR"] = str(profile)
+    # Vinayaka #173 is the live staging contract. A forwarded cookie or
+    # Authorization header is what lets this process read it back.
+    from autofill.tilearc_sync import STAGING_ORIGIN
+
+    os.environ.setdefault("TILEARC_API_ORIGIN", STAGING_ORIGIN)
     from autofill.local_attach import listening_devtools_port
 
     pinned = listening_devtools_port(profile)

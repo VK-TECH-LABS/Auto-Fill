@@ -187,14 +187,18 @@ _SHOW_JS = r"""(args) => {
   msg.className = "msg" + (args.error ? " err" : "");
   msg.setAttribute("data-role", "message");
   msg.setAttribute("aria-live", "polite");
-  msg.textContent = args.message || "";
+    msg.textContent = args.message || "";
   card.appendChild(msg);
   const note = document.createElement("div");
   note.className = "note";
-  note.textContent = args.note || (
-    "Saved to this candidate's Application Answers in TileArc, then filled here. "
-    + "You still click the final Submit yourself."
-  );
+  note.setAttribute("data-role", "note");
+  // One status line. A failure message is never paired with a success sentence.
+  // Before any save, the note only reminds the person that Final Submit stays theirs.
+  let noteText = "";
+  if (!args.error) {
+    noteText = args.note || (args.message ? "" : "You still click the final Submit yourself.");
+  }
+  note.textContent = noteText;
   card.appendChild(note);
   root.appendChild(card);
   function rowValues(section) {
@@ -227,7 +231,9 @@ _SHOW_JS = r"""(args) => {
     state.at = Date.now();
     for (const input of root.querySelectorAll("input, textarea")) input.disabled = true;
     msg.className = "msg";
-    msg.textContent = args.profileSave ? "Saving this work experience entry…" : "Saving to TileArc…";
+    msg.textContent = "Saving";
+    const noteNode = root.querySelector("[data-role=note]");
+    if (noteNode) noteNode.textContent = "";
     refresh();
   });
   proceed.addEventListener("click", (event) => {
@@ -240,6 +246,8 @@ _SHOW_JS = r"""(args) => {
     for (const input of root.querySelectorAll("input, textarea")) input.disabled = true;
     msg.className = "msg";
     msg.textContent = "Checking this Apply window and continuing…";
+    const proceedNote = root.querySelector("[data-role=note]");
+    if (proceedNote) proceedNote.textContent = "";
     refresh();
   });
   refresh();
@@ -270,6 +278,8 @@ _MESSAGE_JS = r"""(args) => {
     msg.className = "msg" + (args.error ? " err" : "");
     msg.textContent = args.message || "";
   }
+  const note = root.querySelector("[data-role=note]");
+  if (note && args.error) note.textContent = "";
   if (args.reopen) {
     state.state = "ask";
     state.values = null;
