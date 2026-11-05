@@ -635,6 +635,12 @@ _ELEMENT_CLICK_JS = r"""(selector) => {
   try { el = document.querySelector(selector); } catch (error) { return false; }
   if (!el) return false;
   try { el.scrollIntoView({block: "center", inline: "nearest"}); } catch (error) {}
+  const view = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window;
+  const event = { bubbles: true, cancelable: true, view: view };
+  try { el.dispatchEvent(new PointerEvent("pointerdown", event)); } catch (error) {}
+  try { el.dispatchEvent(new MouseEvent("mousedown", event)); } catch (error) {}
+  try { el.dispatchEvent(new PointerEvent("pointerup", event)); } catch (error) {}
+  try { el.dispatchEvent(new MouseEvent("mouseup", event)); } catch (error) {}
   el.click();
   return true;
 }"""

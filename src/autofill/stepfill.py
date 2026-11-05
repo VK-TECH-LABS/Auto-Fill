@@ -5692,11 +5692,11 @@ def _saved_question(profile: CandidateProfile | None, text: str) -> bool:
 
 
 def unknown_link_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile | None) -> list[dict[str, Any]]:
-    """Empty social and portfolio fields the profile cannot fill.
+    """Required link fields the profile cannot fill.
 
-    LinkedIn, Twitter, GitHub, and Portfolio are often optional, so a
-    required-only scan never asks and the card never opens. A value already
-    on the profile, or already saved for this candidate, is not asked again.
+    Optional LinkedIn, Twitter, GitHub, and Portfolio stay blank when the
+    profile has no value. A value already on the profile is filled by the
+    mapper and is not asked again.
     """
     if page is None or profile is None or getattr(page, "evaluate", None) is None:
         return []
@@ -5706,6 +5706,9 @@ def unknown_link_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile | 
         if control.hidden or control.disabled or control.read_only or not control.selector:
             continue
         if control.selector in seen:
+            continue
+        # Optional unknowns stay blank. Only a required link the profile does not have is asked.
+        if not counts_required(control):
             continue
         if control.kind not in {"text", "textarea"} and (control.input_type or "") not in {"", "text", "url"}:
             continue
@@ -5777,6 +5780,9 @@ def inspect_required(
     begin_sms_pass()
     snapshot = _live_snapshot(page, snapshot)
     date_gaps, date_skip, date_done = _split_date_gaps(page, snapshot, profile)
+    from autofill.split_dates import month_year_profile_selectors
+
+    date_skip.update(month_year_profile_selectors(snapshot, profile))
     clusters = _gap_clusters(snapshot)
     committed: set[str] = set()
     open_keys: set[str] = set()

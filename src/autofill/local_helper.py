@@ -628,6 +628,63 @@ def _terms_item(item: dict[str, Any]) -> bool:
     return key in {"STANDARD_TERMS", "standard_terms"} or "standard terms" in text
 
 
+_CHOICE_ANSWER_TYPES = frozenset(
+    {"single_select", "multi_select", "select", "radio", "checkbox", "boolean"}
+)
+
+
+def _option_identity(options: list[Any], value: str) -> str:
+    """The option id for ``value``. A label-only menu uses the path as its id."""
+    folded = value.strip().casefold()
+    leaf = value.split(" > ")[-1].strip().casefold() if " > " in value else folded
+    for option in options:
+        if isinstance(option, dict):
+            label = str(option.get("label") or option.get("path") or option.get("value") or "").strip()
+            ident = str(option.get("id") or option.get("value") or "").strip()
+            path = str(option.get("path") or label).strip()
+            if folded in {label.casefold(), path.casefold()} or leaf == label.casefold():
+                return ident or path or label
+        else:
+            text = str(option).strip()
+            if text.casefold() in {folded, leaf}:
+                return text
+    return value.strip()
+
+
+def _confirm_selection(item: dict[str, Any], values: list[str]) -> dict[str, Any] | None:
+    """#176 selection body. ``None`` for a free-text answer.
+
+    ``values`` and ``selectedOptions`` are the selection. A nested row also
+    sends ``leaf`` / ``leaves``. The typed answer is still posted for a LIVE
+    server that only stores that string.
+    """
+    answer_type = str(item.get("answerType") or item.get("type") or "").casefold()
+    raw_options = item.get("options")
+    options: list[Any] = list(raw_options) if isinstance(raw_options, list) else []
+    nested = any(" > " in value for value in values)
+    if answer_type not in _CHOICE_ANSWER_TYPES and not options and not nested:
+        return None
+    selected: list[dict[str, str]] = []
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        label = text.split(" > ")[-1].strip() if " > " in text else text
+        selected.append({"id": _option_identity(options, text), "label": label, "path": text})
+    if not selected:
+        return None
+    body: dict[str, Any] = {"values": [row["path"] for row in selected], "selectedOptions": selected}
+    leaves = [row for row in selected if " > " in row["path"]]
+    if leaves:
+        body["leaf"] = leaves[-1]
+        body["leaves"] = leaves
+        body["leafId"] = leaves[-1]["id"]
+    elif answer_type in {"single_select", "select", "radio"} and len(selected) == 1:
+        body["leaf"] = selected[0]
+        body["leafId"] = selected[0]["id"]
+    return body
+
+
 def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
     """True only when #173 read-back matches this candidate and this answer.
 
@@ -653,6 +710,7 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
         question = str(item.get("text") or item.get("prompt") or "").strip()
         key = str(item.get("fieldKey") or "")
         terms = job.standard_terms_authorized if _terms_item(item) else None
+        selection = _confirm_selection(item, list(row["values"]))
         try:
             ack = client.confirm_answer(
                 session_id,
@@ -662,12 +720,23 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
                 answer=answer,
                 key=key,
                 standard_terms_authorized=terms,
+                values=selection["values"] if selection else None,
+                selected_options=selection["selectedOptions"] if selection else None,
+                leaf=selection.get("leaf") if selection else None,
+                leaves=selection.get("leaves") if selection else None,
             )
         except TilearcAuthExpired:
             raise
         except (TilearcTransportError, TilearcScopeError):
             ack = None
-        if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
+        if not ack_is_trusted(
+            ack,
+            candidate_id=candidate_id,
+            submitted=answer,
+            choice=selection is not None,
+            values=list(row["values"]),
+            leaf_id=str((selection or {}).get("leafId") or ""),
+        ):
             try:
                 ack = client.read_answer(
                     session_id,
@@ -679,7 +748,14 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
                 raise
             except (TilearcTransportError, TilearcScopeError):
                 ack = None
-        if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
+        if not ack_is_trusted(
+            ack,
+            candidate_id=candidate_id,
+            submitted=answer,
+            choice=selection is not None,
+            values=list(row["values"]),
+            leaf_id=str((selection or {}).get("leafId") or ""),
+        ):
             return False
         if ack is not None and ack.standard_terms_authorized is True:
             job.standard_terms_authorized = True
@@ -3530,7 +3606,13 @@ def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str
             getter = _BASIC_FIELDS["phone"]
         elif text in {"state", "province", "region"}:
             getter = _BASIC_FIELDS["state"]
-        elif "linkedin" in text and "?" not in text and len(text) <= 80:
+        elif (
+            "linkedin" in text
+            and "?" not in text
+            and "willing" not in text
+            and "share" not in text
+            and len(text) <= 80
+        ):
             getter = _BASIC_FIELDS["linkedin_url"]
         elif re.search(r"\bgithub\b", text) and "?" not in text and len(text) <= 80:
             getter = _BASIC_FIELDS["github_url"]

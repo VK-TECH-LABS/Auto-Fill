@@ -927,9 +927,10 @@ def fill_one_page(
         )
         snapshot = extract_page(page)
         note_page_country(page, snapshot)
-        from autofill.split_dates import fill_split_dates
+        from autofill.split_dates import fill_month_year_inputs, fill_split_dates
 
         handled_dates = fill_split_dates(page, profile, snapshot)
+        handled_dates.update(fill_month_year_inputs(page, profile, snapshot))
         cursor = MapCursor(page_heading=snapshot.heading)
         from autofill.stepfill import _clusters
 

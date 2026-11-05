@@ -441,7 +441,15 @@ _COMMIT_JS = r"""
       if (list && shown(list)) return true;
     }
     const activeList = document.querySelector("[data-automation-id='activeListContainer']");
-    return !!(activeList && shown(activeList));
+    if (activeList && shown(activeList)) return true;
+    // A highlighted promptOption is still the open menu. It is not a pill.
+    const rows = document.querySelectorAll("[data-automation-id='promptOption']");
+    for (const row of rows) {
+      if (!shown(row)) continue;
+      if (row.closest("[data-automation-id='selectedItem'], [data-automation-id='selectedItemList']")) continue;
+      return true;
+    }
+    return false;
   }
   const openMenu = menuOpen(el);
   const activeId = el.getAttribute("aria-activedescendant") || "";
@@ -760,6 +768,25 @@ _MENU_OPEN_JS = r"""() => {
   const expanded = document.querySelector("[aria-expanded='true']");
   return !!(expanded && shown(expanded));
 }"""
+
+
+def _release_menu(page, selector: str) -> None:
+    """Close a menu that was not committed and leave the field so the next open starts at the top."""
+    close_open_menu(page)
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return
+    try:
+        evaluate(
+            """(selector) => {
+              let el = null;
+              try { el = document.querySelector(selector); } catch (error) { return; }
+              if (el && el.blur) el.blur();
+            }""",
+            selector,
+        )
+    except Exception:
+        return
 
 
 def close_open_menu(page) -> None:
@@ -1172,6 +1199,30 @@ def _other_leaf(desired: str, current: Option, found: list[Option]) -> Option | 
     return _prefer_leaf(desired, leaves) or _prefer_leaf(current.label, leaves)
 
 
+def _has_pill_slot(page, selector: str) -> bool:
+    """True when the widget commits with a selected-item pill, not the search text."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const root = el.closest(
+        "[data-automation-id='multiSelectContainer'], [data-automation-id^='formField']"
+      ) || el.parentElement;
+      if (!root) return false;
+      return !!root.querySelector(
+        "[data-automation-id='selectedItem'], [data-automation-id='selectedItemText'], " +
+        "[data-automation-id='selectedItemList']"
+      );
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
 def _committed_choice(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
     if _combobox_committed(page, selector, match.label, accept_input=accept_input):
         return True
@@ -1296,7 +1347,10 @@ def _follow_path(page, selector: str, parts: list[str], found: list[Option]) -> 
         last = index == len(parts) - 1
         before = list(menu)
         try:
-            click_choice(page, match.selector, match.label)
+            if last:
+                _choose_listed(page, match.selector, match.label)
+            else:
+                click_choice(page, match.selector, match.label)
         except Exception:
             return None
         _pause(page, 50)
@@ -1364,11 +1418,24 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
                 return None
             continue
         try:
-            click_choice(page, leaf.selector, leaf.label)
+            _choose_listed(page, leaf.selector, leaf.label)
         except Exception:
             continue
         _pause(page, 50)
-        return leaf
+        shown = _selected_text(page, selector)
+        if shown and _labels_match(leaf.label, shown):
+            return leaf
+        # A pill widget ignores the search text. A plain input that kept the
+        # leaf after the menu closed is committed.
+        if _committed_choice(
+            page,
+            selector,
+            leaf,
+            leaf.label,
+            accept_input=not _has_pill_slot(page, selector),
+        ):
+            return leaf
+        continue
     return None
 
 
@@ -1534,7 +1601,7 @@ def search_school(page, selector: str, desired: str) -> Option | None:
             return None
         return None
     try:
-        click_choice(page, match.selector, match.label)
+        _choose_listed(page, match.selector, match.label)
     except Exception:
         return None
     _pause(page, 50)
@@ -1542,9 +1609,13 @@ def search_school(page, selector: str, desired: str) -> Option | None:
         match.label, _selected_text(page, selector)
     ):
         return match
-    if _committed_choice(page, selector, match, match.label, accept_input=True):
+    if _committed_choice(page, selector, match, match.label, accept_input=False):
         return match
-    return match
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        return None
+    return None
 
 
 _STUDY_FIELD_JS = r"""(selector) => {
@@ -1621,8 +1692,10 @@ def search_field_of_study(page, selector: str, desired: str) -> Option | None:
         return None
     focus_field(page, selector)
     shown = _selected_text(page, selector)
-    if _labels_match(query, shown) or (shown and query.casefold() in shown.casefold()):
-        return Option(value=shown, label=shown, selector=selector)
+    already = Option(value=shown, label=shown, selector=selector)
+    if shown and (_labels_match(query, shown) or query.casefold() in shown.casefold()):
+        if _committed_choice(page, selector, already, query, accept_input=False):
+            return already
     _type_filter(page, selector, query, school=True)
     _press_enter(page, selector)
     found = _await_menu(page, selector, 2500)
@@ -1634,7 +1707,7 @@ def search_field_of_study(page, selector: str, desired: str) -> Option | None:
             return None
         return None
     try:
-        click_choice(page, match.selector, match.label)
+        _choose_listed(page, match.selector, match.label)
     except Exception:
         return None
     _pause(page, 50)
@@ -1643,9 +1716,15 @@ def search_field_of_study(page, selector: str, desired: str) -> Option | None:
     ):
         return match
     pill = _selected_text(page, selector)
-    if pill and query.casefold() in pill.casefold():
+    if pill and query.casefold() in pill.casefold() and _committed_choice(
+        page, selector, match, query, accept_input=False
+    ):
         return match
-    return match
+    try:
+        dismiss_combobox(page)
+    except Exception:
+        return None
+    return None
 
 
 def _menu_replaced(before: list[Option], after: list[Option]) -> bool:
@@ -1739,13 +1818,22 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             parent.folder = True
             parent.leaf = False
             match = parent
+    if match is None and len(parts) > 1:
+        # The menu is already the child list. The leaf name is the commit.
+        leaf_only = _prefer_leaf(parts[-1], top_level) or _prefer_leaf(parts[-1], found)
+        if leaf_only is not None and leaf_only.selector and not leaf_only.folder:
+            match = leaf_only
     if match is None or not match.selector:
-        close_open_menu(page)
+        _release_menu(page, selector)
         return None
     opened_submenu = False
     if not clicked_leaf:
         before = list(found)
-        click_choice(page, match.selector, match.label)
+        try:
+            _choose_listed(page, match.selector, match.label)
+        except Exception:
+            _release_menu(page, selector)
+            return None
         _pause(page, 50)
         # A promptOption is not flagged as a leaf. A click that replaces the
         # menu is still a folder, whether or not the row looked like a leaf.
@@ -1770,21 +1858,26 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
             _note_children(match.label, children)
             opened_submenu = True
         if leaf is not None and leaf.selector:
-            click_choice(page, leaf.selector, leaf.label)
+            try:
+                _choose_listed(page, leaf.selector, leaf.label)
+            except Exception:
+                _release_menu(page, selector)
+                return None
             _pause(page, 50)
             match = leaf
     if opened_submenu and (match.folder or not match.leaf):
         # The parent name in the search box is not a committed leaf.
-        close_open_menu(page)
+        _release_menu(page, selector)
         return None
-    if _kept_after_close(page, selector, match, desired, accept_input=not typed):
+    pill_widget = _has_pill_slot(page, selector)
+    if _kept_after_close(page, selector, match, desired, accept_input=not typed and not pill_widget):
         _OPENED_CHILDREN.set(())
         return match
     _keyboard_commit(page, selector, desired, match)
-    if _kept_after_close(page, selector, match, desired, accept_input=True):
+    if _kept_after_close(page, selector, match, desired, accept_input=not pill_widget):
         _OPENED_CHILDREN.set(())
         return match
-    close_open_menu(page)
+    _release_menu(page, selector)
     return None
 
 

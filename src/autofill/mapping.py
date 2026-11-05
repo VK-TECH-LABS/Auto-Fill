@@ -1749,6 +1749,14 @@ def _is_work_experience_location(control: Control) -> bool:
     return "location" in compact or normalize(control.label or "") == "location"
 
 
+def _is_yes_no_prompt(control: Control) -> bool:
+    """A yes/no question. A URL must not be typed into it because it mentions LinkedIn."""
+    if control.kind in {"radio", "checkbox", "buttons"}:
+        return True
+    blob = haystack(control)
+    return bool(re.search(r"\b(would you|are you willing|willing to|do you want|share your)\b", blob))
+
+
 def _automation_name_key(control: Control) -> str | None:
     """A Workday or Ashby id that names the field when the visible title is a section.
 
@@ -1807,6 +1815,8 @@ def _match_rule(control: Control) -> str | None:
         # does not contain the word "email", so the generic rule misses it.
         return "email"
     named = _automation_name_key(control)
+    if named and named.endswith("_url") and _is_yes_no_prompt(control):
+        named = None
     if named and control.kind != "file":
         return named
     if autocomplete in _AUTOCOMPLETE and (control.kind != "file"):
@@ -1847,6 +1857,8 @@ def _match_rule(control: Control) -> str | None:
         if rule.key == "current_company" and not is_current_company_label(control):
             continue
         if any(pattern.search(blob) for pattern in rule.patterns):
+            if rule.key.endswith("_url") and _is_yes_no_prompt(control):
+                continue
             return rule.key
     return None
 
@@ -1866,6 +1878,41 @@ def _skill_answer(control: Control, profile: CandidateProfile) -> MappedField | 
         action="unanswered",
         reason=f"No explicit profile skill for {asked!r}; left for a person.",
     )
+
+
+_DEGREE_FAMILIES = (
+    ("associate", ("associate",)),
+    ("bachelor", ("bachelor", "b s", "b a")),
+    ("master", ("master", "m s", "m a", "mba")),
+    ("doctor", ("doctor", "ph d", "phd")),
+    ("high school", ("high school", "ged")),
+)
+
+
+def _degree_option(desired: str, options: list[Option]) -> Option | None:
+    """One degree radio whose wording is the same level as the profile degree.
+
+    Several options in that level stay unmatched. A different level is not used.
+    """
+    folded = normalize(desired)
+    if not folded:
+        return None
+    family = ""
+    for name, tokens in _DEGREE_FAMILIES:
+        if any(token in folded for token in tokens):
+            family = name
+            break
+    if not family:
+        return None
+    tokens = next(items for name, items in _DEGREE_FAMILIES if name == family)
+    hits = []
+    for option in options:
+        label = normalize(option.label or option.value)
+        if any(token.strip() and token.strip() in label for token in tokens):
+            hits.append(option)
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> MappedField:
@@ -1914,6 +1961,15 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
             reason=reason or "School is chosen from the menu.",
             field_class="PROFILE_FIELD",
         )
+    if key == "field_of_study" and control.kind == "combobox" and not control.options:
+        return MappedField(
+            key=key,
+            action="select",
+            text=text,
+            option_label=text,
+            reason=reason or "Field of study is chosen from the menu.",
+            field_class="PROFILE_FIELD",
+        )
     # A Workday Application Questions dropdown is a button whose menu exists
     # only after it is opened. Do not type the answer into the button.
     if control.kind == "buttons" and control.role == "listbox" and not control.options:
@@ -1937,6 +1993,8 @@ def _from_text(control: Control, key: str, text: str, *, reason: str = "") -> Ma
         if option is None:
             # Country and state aliases stay on the closed alias list.
             option = match_option(text, control.options)
+        if option is None and key == "education_level":
+            option = _degree_option(text, control.options)
         if option is None:
             return MappedField(
                 key=key,
