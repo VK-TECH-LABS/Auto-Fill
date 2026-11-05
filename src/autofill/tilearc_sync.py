@@ -32,6 +32,31 @@ class TilearcTransportError(Exception):
     """The TileArc call did not return a body. The save is not confirmed."""
 
 
+class TilearcAuthExpired(Exception):
+    """401 or 403. The short-lived token is no longer valid. The save is not verified."""
+
+
+class TilearcScopeError(Exception):
+    """This token was issued for a different TileArc session or candidate."""
+
+
+def authorization_header(value: str) -> str:
+    """``Bearer <token>``. A value that already has the prefix is not doubled.
+
+    Another scheme, such as ``Basic``, is left unchanged. An empty value stays empty.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    scheme, _, rest = text.partition(" ")
+    if rest and scheme.lower() == "bearer":
+        token = rest.strip()
+        return f"Bearer {token}" if token else ""
+    if rest:
+        return text
+    return f"Bearer {text}"
+
+
 @dataclass
 class SessionSnapshot:
     profile: dict[str, Any]
@@ -233,16 +258,64 @@ class TilearcClient:
         *,
         authorization: str = "",
         cookie: str = "",
+        session_id: str = "",
+        candidate_id: str = "",
     ) -> None:
         parsed = urlparse(origin.strip())
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
             raise ValueError("TileArc origin must be https and must not carry a secret.")
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
+        self.session_id = (session_id or "").strip()
+        self.candidate_id = (candidate_id or "").strip()
         self._transport = transport
-        self._authorization = authorization.strip()
-        self._cookie = cookie.strip()
+        self._authorization = authorization_header(authorization)
+        self._cookie = (cookie or "").strip()
+        self._remember_secrets()
+
+    def __repr__(self) -> str:
+        return f"TilearcClient(origin={self.origin!r}, session_id={self.session_id!r})"
+
+    def drop(self) -> None:
+        """Forget the token. It is not written to disk."""
+        self._forget_secrets()
+        self._authorization = ""
+        self._cookie = ""
+
+    def _secret_values(self) -> list[str]:
+        values: list[str] = []
+        header = self._authorization
+        if header.lower().startswith("bearer "):
+            token = header.split(None, 1)[1].strip()
+            if token:
+                values.append(token)
+        elif header:
+            values.append(header)
+        if self._cookie:
+            values.append(self._cookie)
+        return values
+
+    def _remember_secrets(self) -> None:
+        from autofill.redact import redaction_filter
+
+        scrub = redaction_filter()
+        for secret in self._secret_values():
+            scrub.add(secret)
+
+    def _forget_secrets(self) -> None:
+        from autofill.redact import redaction_filter
+
+        scrub = redaction_filter()
+        for secret in self._secret_values():
+            scrub.discard(secret)
+
+    def _check_scope(self, session_id: str, candidate_id: str) -> None:
+        if self.session_id and session_id != self.session_id:
+            raise TilearcScopeError()
+        if self.candidate_id and candidate_id != self.candidate_id:
+            raise TilearcScopeError()
 
     def fetch_session(self, session_id: str, candidate_id: str) -> SessionSnapshot | None:
+        self._check_scope(session_id, candidate_id)
         status, body = self._call(
             "GET",
             _SESSION.format(session_id=session_id),
@@ -257,6 +330,7 @@ class TilearcClient:
 
     def local_status(self, session_id: str, candidate_id: str) -> tuple[str, str] | None:
         """``(fingerprint, version)``. ``None`` when the body is an older shape."""
+        self._check_scope(session_id, candidate_id)
         status, body = self._call(
             "GET",
             _STATUS.format(session_id=session_id),
@@ -295,6 +369,7 @@ class TilearcClient:
             payload["key"] = key
         if standard_terms_authorized is not None:
             payload["standardTermsAuthorized"] = standard_terms_authorized
+        self._check_scope(session_id, candidate_id)
         status, body = self._call(
             "POST",
             _ANSWER.format(session_id=session_id),
@@ -306,6 +381,7 @@ class TilearcClient:
         return parse_confirm_body(body)
 
     def read_answer(self, session_id: str, *, candidate_id: str, job_id: str, question: str) -> AnswerAck | None:
+        self._check_scope(session_id, candidate_id)
         status, body = self._call(
             "GET",
             _ANSWER.format(session_id=session_id),
@@ -324,11 +400,16 @@ class TilearcClient:
         query: dict[str, str] | None,
         body: dict[str, Any] | None,
     ) -> tuple[int, Any]:
+        headers = self._outbound_headers(json_body=body is not None)
         if self._transport is not None:
             try:
-                status, payload = self._transport(method, path, query or {}, body)
+                status, payload = self._transport(method, path, query or {}, body, headers)
+            except TilearcAuthExpired:
+                raise
             except Exception as exc:
                 raise TilearcTransportError(type(exc).__name__) from exc
+            if int(status) in {401, 403}:
+                raise TilearcAuthExpired()
             return int(status), payload
         return _urllib_call(
             self.origin,
@@ -339,6 +420,16 @@ class TilearcClient:
             authorization=self._authorization,
             cookie=self._cookie,
         )
+
+    def _outbound_headers(self, *, json_body: bool) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        if self._authorization:
+            headers["Authorization"] = self._authorization
+        if self._cookie:
+            headers["Cookie"] = self._cookie
+        return headers
 
 
 def pull_latest(
@@ -424,6 +515,8 @@ def _urllib_call(
         status = int(exc.code)
     except (URLError, TimeoutError, OSError) as exc:
         raise TilearcTransportError(type(exc).__name__) from exc
+    if status in {401, 403}:
+        raise TilearcAuthExpired()
     if not raw:
         return status, {}
     try:

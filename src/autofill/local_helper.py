@@ -118,6 +118,7 @@ _STATUS_UNCONFIRMED = (
 _STATUS_REJECTED = (
     "The employer page did not accept that answer. Check it and click Save & Continue again."
 )
+_STATUS_SIGN_IN_EXPIRED = "TileArc sign-in expired, re-open Apply"
 _POPUP_SYNC_WAIT_SECONDS = 1.5
 # Finished and replaced jobs kept so a late status/answer gets 410, not a fill.
 _MAX_JOBS = 8
@@ -442,8 +443,12 @@ def _can_refresh_profile(job: LocalJob) -> bool:
 
 
 def _remember_tilearc(job: LocalJob, client: Any, version: str, binding: dict[str, str] | None) -> None:
-    if client is not None:
+    if client is not None and client is not job.tilearc:
+        previous = job.tilearc
         job.tilearc = client
+        drop = getattr(previous, "drop", None)
+        if drop is not None:
+            drop()
     if version:
         job.profile_version = version
     fingerprint = (binding or {}).get("profileFingerprint") or ""
@@ -470,13 +475,24 @@ def _copy_profile(dst: CandidateProfile, src: CandidateProfile) -> None:
         dst.candidate_id = src.candidate_id
 
 
-def _tilearc_client(raw: Any, headers: Any = None) -> Any:
-    """#173 client when this Apply can call TileArc.
+def _sign_in_expired_body() -> dict[str, Any]:
+    return {
+        "reason": "sign_in_expired",
+        "verified": False,
+        "filled": False,
+        "stopped_before_submit": True,
+        "message": _STATUS_SIGN_IN_EXPIRED,
+        "savePhase": "sign_in_expired",
+    }
 
-    Origin is ``tilearcApi.origin`` or ``TILEARC_API_ORIGIN`` (the packaged
-    staging helper sets the live staging host). Authorization or a cookie is
-    required. Without either, the posted profile is kept and a save is not
-    sent to TileArc.
+
+def _tilearc_client(raw: Any, headers: Any = None, binding: dict[str, str] | None = None) -> Any:
+    """#173 client bound to this session and candidate.
+
+    ``tilearcApi.authorization`` is a short-lived Bearer token. A bare token
+    and a ``Bearer `` prefix are the same header. A forwarded Authorization
+    or Cookie header is kept. The token is not logged or written to disk.
+    Without a credential, the posted profile is kept and TileArc is not called.
     """
     origin = ""
     authorization = ""
@@ -494,10 +510,20 @@ def _tilearc_client(raw: Any, headers: Any = None) -> Any:
         origin = os.environ.get("TILEARC_API_ORIGIN", "").strip()
     if not origin or (not authorization and not cookie):
         return None
+    session_id = (binding or {}).get("tilearcSessionId") or ""
+    candidate_id = (binding or {}).get("candidateId") or ""
+    if not session_id or not candidate_id:
+        return None
     from autofill.tilearc_sync import TilearcClient
 
     try:
-        return TilearcClient(origin, authorization=authorization, cookie=cookie)
+        return TilearcClient(
+            origin,
+            authorization=authorization,
+            cookie=cookie,
+            session_id=session_id,
+            candidate_id=candidate_id,
+        )
     except ValueError:
         return None
 
@@ -508,7 +534,7 @@ def _refresh_posted_profile(
     client: Any,
 ) -> tuple[CandidateProfile, dict[str, str], str, bool]:
     """Latest session profile. A 409 without a new snapshot is refused."""
-    from autofill.tilearc_sync import TilearcTransportError, pull_latest
+    from autofill.tilearc_sync import TilearcAuthExpired, TilearcTransportError, pull_latest
 
     try:
         result = pull_latest(
@@ -519,6 +545,8 @@ def _refresh_posted_profile(
             version="",
             posted=None,
         )
+    except TilearcAuthExpired:
+        raise AnswerRejected(401, _sign_in_expired_body()) from None
     except TilearcTransportError:
         return profile, binding, "", False
     if result.blocked:
@@ -550,7 +578,7 @@ def _refresh_open_profile(job: LocalJob) -> None:
     if client is None or not job.binding or job.profile is None:
         return
     from autofill.fill import bind_replace_owned
-    from autofill.tilearc_sync import TilearcTransportError, pull_latest
+    from autofill.tilearc_sync import TilearcAuthExpired, TilearcTransportError, pull_latest
 
     try:
         result = pull_latest(
@@ -561,6 +589,12 @@ def _refresh_open_profile(job: LocalJob) -> None:
             version=job.profile_version,
             posted=None,
         )
+    except TilearcAuthExpired:
+        job.error = "sign_in_expired"
+        job.save_phase = "sign_in_expired"
+        job.notice = _STATUS_SIGN_IN_EXPIRED
+        job.save_confirmed_candidate = ""
+        raise FillCancelled()
     except TilearcTransportError:
         return
     if result.blocked:
@@ -609,7 +643,7 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
     rows = _popup_answer_rows(job, stored)
     if not rows:
         return False
-    from autofill.tilearc_sync import TilearcTransportError, ack_is_trusted
+    from autofill.tilearc_sync import TilearcAuthExpired, TilearcScopeError, TilearcTransportError, ack_is_trusted
 
     for row in rows:
         item = _match_item(job, {"id": row["questionId"]})
@@ -629,7 +663,9 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
                 key=key,
                 standard_terms_authorized=terms,
             )
-        except TilearcTransportError:
+        except TilearcAuthExpired:
+            raise
+        except (TilearcTransportError, TilearcScopeError):
             ack = None
         if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
             try:
@@ -639,7 +675,9 @@ def _tilearc_ack(job: LocalJob, stored: list[Any]) -> bool:
                     job_id=job_id,
                     question=question,
                 )
-            except TilearcTransportError:
+            except TilearcAuthExpired:
+                raise
+            except (TilearcTransportError, TilearcScopeError):
                 ack = None
         if not ack_is_trusted(ack, candidate_id=candidate_id, submitted=answer):
             return False
@@ -844,6 +882,11 @@ class LocalJob:
         self.save_confirmed_candidate = ""
         self.save_receipts = {}
         self.save_phase = ""
+        client = self.tilearc
+        self.tilearc = None
+        drop = getattr(client, "drop", None)
+        if drop is not None:
+            drop()
 
     def drop_resume(self) -> None:
         if self.resume is not None:
@@ -956,6 +999,9 @@ class LocalJob:
             body["savedAnswers"] = [dict(row) for row in self.saved_rows]
         if self.save_phase:
             body["savePhase"] = self.save_phase
+        if self.save_phase == "sign_in_expired":
+            body["message"] = _STATUS_SIGN_IN_EXPIRED
+            body["verified"] = False
         if self.profile_version:
             body["profileVersion"] = self.profile_version
         if self.save_confirmed_candidate:
@@ -2058,14 +2104,24 @@ class LocalHelper:
                 body["verified"] = not job.submit_claimed()
                 box["body"] = body
         except FillCancelled:
-            if job.error == "identity_mismatch":
+            if job.error == "sign_in_expired":
+                job.state = "error"
+                job.save_phase = "sign_in_expired"
+                job.save_confirmed_candidate = ""
+                logger.info("session=%s fill_stopped reason=sign_in_expired", job.session_id)
+                self._present_popup(job, message=_STATUS_SIGN_IN_EXPIRED, error=True)
+                if box is not None:
+                    box["error"] = AnswerRejected(401, _sign_in_expired_body())
+            elif job.error == "identity_mismatch":
                 job.state = "error"
                 logger.info("session=%s fill_stopped reason=identity_mismatch", job.session_id)
+                if box is not None:
+                    box["error"] = AnswerRejected(410, _failure(job, "replaced"))
             else:
                 job.state = "replaced"
                 logger.info("session=%s fill_stopped reason=%s", job.session_id, job.ended or "cancelled")
-            if box is not None:
-                box["error"] = AnswerRejected(410, _failure(job, "replaced"))
+                if box is not None:
+                    box["error"] = AnswerRejected(410, _failure(job, "replaced"))
         except Exception as exc:
             reported_submit = isinstance(exc, LocalAttachError) and "reported a submit" in str(exc)
             if reported_submit:
@@ -2432,8 +2488,22 @@ class LocalHelper:
         _release_answered_questions(job)
         self._present_popup(job)
 
+    def _mark_sign_in_expired(self, job: LocalJob) -> None:
+        """401/403. Do not keep the old snapshot and do not mark the save verified."""
+        job.save_phase = "sign_in_expired"
+        job.notice = _STATUS_SIGN_IN_EXPIRED
+        job.save_confirmed_candidate = ""
+        popup = job.popup if isinstance(job.popup, dict) else None
+        if popup is not None:
+            popup["confirmed"] = False
+            popup["committed"] = False
+            popup["committing"] = False
+        logger.info("session=%s tilearc_auth reason=sign_in_expired", job.session_id)
+        self._present_popup(job, message=_STATUS_SIGN_IN_EXPIRED, error=True)
+
     def _sync_popup(self, job: LocalJob) -> None:
         """Worker thread. Pick up a Save & Continue click, re-show a lost card, time out a stale save."""
+        from autofill.tilearc_sync import TilearcAuthExpired
         if not _popup_waiting(job):
             return
         if job.question is None and not job.notice:
@@ -2458,10 +2528,16 @@ class LocalHelper:
                 stored = popup.get("values")
                 if getattr(job, "tilearc", None) is not None:
                     # #173 is the confirmation. A local receipt is not a substitute.
-                    if stored and _tilearc_ack(job, stored) and _confirm_popup_save(job, stored):
+                    values = list(stored) if isinstance(stored, list) else []
+                    try:
+                        trusted = bool(values) and _tilearc_ack(job, values)
+                    except TilearcAuthExpired:
+                        self._mark_sign_in_expired(job)
+                        return
+                    if trusted and _confirm_popup_save(job, values):
                         job.save_phase = "saved_verified"
                         if getattr(self._session, "apply_answer", None) is not None:
-                            self._commit_popup_answers(job, stored)
+                            self._commit_popup_answers(job, values)
                         return
                     job.save_phase = "save_unconfirmed"
                     self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
@@ -2505,10 +2581,16 @@ class LocalHelper:
         popup["answeredAt"] = time.monotonic()
         counted = len(stored) if isinstance(stored, list) else 1
         logger.info("session=%s popup_answered values=%s", job.session_id, counted)
-        if getattr(job, "tilearc", None) is not None and not _tilearc_ack(job, stored):
-            job.save_phase = "save_unconfirmed"
-            self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
-            return
+        if getattr(job, "tilearc", None) is not None:
+            try:
+                trusted = _tilearc_ack(job, stored)
+            except TilearcAuthExpired:
+                self._mark_sign_in_expired(job)
+                return
+            if not trusted:
+                job.save_phase = "save_unconfirmed"
+                self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
+                return
         if not _confirm_popup_save(job, stored):
             job.save_phase = "save_unconfirmed"
             self._present_popup(job, message=_STATUS_UNCONFIRMED, error=True)
@@ -2925,7 +3007,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(profile_raw, dict):
                 raise LocalAttachError("profile must be an object.")
             binding = parse_binding(payload.get("binding"))
-            tilearc = _tilearc_client(payload.get("tilearcApi"), self.headers)
+            tilearc = _tilearc_client(payload.get("tilearcApi"), self.headers, binding)
             resume_ref = parse_resume_claim(payload.get("resume"))
             profile = CandidateProfile.from_dict(_with_binding_owner(profile_raw, binding))
             if resume_ref is None:

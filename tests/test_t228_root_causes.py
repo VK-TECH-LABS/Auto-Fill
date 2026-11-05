@@ -375,8 +375,8 @@ class _Tilearc:
         self.session = session or (200, {})
         self.calls: list[tuple] = []
 
-    def __call__(self, method, path, query, body):
-        self.calls.append((method, path, dict(query), body))
+    def __call__(self, method, path, query, body, headers=None):
+        self.calls.append((method, path, dict(query), body, dict(headers or {})))
         if path.endswith("/local-status"):
             return self.status
         if path.endswith("/local-answer") and method == "GET":
@@ -435,7 +435,7 @@ def test_timeout_then_get_read_back_confirms_and_a_mismatch_does_not():
     from autofill.local_helper import _tilearc_ack
 
     assert _tilearc_ack(job, stored) is True
-    assert any(method == "GET" and path.endswith("/local-answer") for method, path, _q, _b in timed_out.calls)
+    assert any(method == "GET" and path.endswith("/local-answer") for method, path, *_rest in timed_out.calls)
     mismatch = _Tilearc(
         confirm=(200, {"saved": True}),
         read=(200, _read_back("cand-other", "Job Board or Social Media > Indeed")),
@@ -460,7 +460,7 @@ def test_repost_keeps_the_same_answer_version():
     job.tilearc = _client(script)
     assert _tilearc_ack(job, stored) is True
     assert _tilearc_ack(job, stored) is True
-    posts = [body for method, path, _query, body in script.calls if method == "POST"]
+    posts = [body for method, path, _query, body, _headers in script.calls if method == "POST"]
     assert len(posts) == 2
     assert posts[0]["answer"] == posts[1]["answer"] == "Job Board or Social Media > Indeed"
     assert job.answer_versions["q-hear"] == "ans-9"
@@ -536,13 +536,187 @@ def test_changed_fingerprint_adopts_roster_names_and_409_drops_the_old_snapshot(
     assert refused.profile_body is None
 
 
+def test_bare_and_prefixed_tokens_are_bearer_headers_on_every_call():
+    from autofill.tilearc_sync import TilearcClient, authorization_header
+
+    token = "short-lived-session-token"
+    assert authorization_header(token) == f"Bearer {token}"
+    assert authorization_header(f"Bearer {token}") == f"Bearer {token}"
+    assert authorization_header(f"bearer {token}") == f"Bearer {token}"
+    session = {
+        "candidateId": "cand-t228",
+        "profileFingerprint": "fp-new",
+        "profileVersion": "2026-11-05T18:12:00Z",
+        "profile": {
+            "candidateId": "cand-t228",
+            "personal": {"full_name": "Jahnavi Torra", "email": "jahnavi.torra@example.com"},
+        },
+        "candidateProfile": {
+            "personal": {"first_name": "Jahnavi", "last_name": "Torra", "email": "jahnavi.torra@example.com"}
+        },
+    }
+    script = _Tilearc(
+        status=(200, {"profileFingerprint": "fp-new", "profileVersion": "2026-11-05T18:12:00Z"}),
+        session=(200, session),
+        confirm=(200, _confirm("cand-t228", "Indeed")),
+        read=(200, _read_back("cand-t228", "Indeed")),
+    )
+    client = TilearcClient(
+        "https://vinayaka.example",
+        script,
+        authorization=token,
+        session_id="sess-tile",
+        candidate_id="cand-t228",
+    )
+    client.fetch_session("sess-tile", "cand-t228")
+    client.local_status("sess-tile", "cand-t228")
+    client.confirm_answer(
+        "sess-tile",
+        candidate_id="cand-t228",
+        job_id="job-amat",
+        question="How Did You Hear About Us?",
+        answer="Indeed",
+    )
+    client.read_answer("sess-tile", candidate_id="cand-t228", job_id="job-amat", question="How Did You Hear About Us?")
+    headers = [call[-1] for call in script.calls]
+    assert len(headers) == 4
+    assert {item.get("Authorization") for item in headers} == {f"Bearer {token}"}
+    prefixed = TilearcClient(
+        "https://vinayaka.example",
+        _Tilearc(),
+        authorization=f"Bearer {token}",
+        session_id="sess-tile",
+        candidate_id="cand-t228",
+    )
+    assert prefixed._authorization == f"Bearer {token}"
+    assert token not in repr(client)
+    assert token not in repr(prefixed)
+
+
+def test_expired_token_is_not_a_verified_save(caplog):
+    import json
+    import logging
+
+    from autofill.local_helper import LocalHelper, _tilearc_ack
+    from autofill.redact import install_redaction
+    from autofill.tilearc_sync import TilearcAuthExpired, TilearcClient
+
+    token = "expired-session-token-value"
+    script = _Tilearc(confirm=(401, {"error": "Unauthorized"}))
+    client = TilearcClient(
+        "https://vinayaka.example",
+        script,
+        authorization=token,
+        session_id="sess-tile",
+        candidate_id="cand-t228",
+    )
+    job = LocalJob(
+        "sess-local",
+        "https://jobs.example.com/apply",
+        _person(),
+        {"tilearcSessionId": "sess-tile", "candidateId": "cand-t228", "jobId": "job-amat", "profileFingerprint": "fp"},
+    )
+    job.tilearc = client
+    job.open_items = [{"questionId": "q-hear", "text": "How Did You Hear About Us?", "fieldKey": "how_heard"}]
+    stored = [{"questionId": "q-hear", "values": ["Indeed"]}]
+    install_redaction()
+    caplog.set_level(logging.INFO, logger="autofill.local_helper")
+    logging.getLogger("autofill.local_helper").info("debug %s", token)
+    with pytest.raises(TilearcAuthExpired):
+        _tilearc_ack(job, stored)
+    forbidden = TilearcClient(
+        "https://vinayaka.example",
+        _Tilearc(confirm=(403, {"error": "Forbidden"})),
+        authorization="forbidden-session-token-value",
+        session_id="sess-tile",
+        candidate_id="cand-t228",
+    )
+    job.tilearc = forbidden
+    with pytest.raises(TilearcAuthExpired):
+        _tilearc_ack(job, stored)
+    shown: dict[str, object] = {}
+
+    def present(target, message="", error=False):
+        shown["message"] = message
+        shown["error"] = error
+
+    LocalHelper._mark_sign_in_expired(type("Stub", (), {"_present_popup": staticmethod(present)})(), job)
+    assert shown["message"] == "TileArc sign-in expired, re-open Apply"
+    assert shown["error"] is True
+    assert job.save_phase == "sign_in_expired"
+    assert job.save_confirmed_candidate == ""
+    public = json.dumps(job.public())
+    assert job.public()["verified"] is False
+    assert job.public()["message"] == "TileArc sign-in expired, re-open Apply"
+    assert token not in public
+    assert token not in caplog.text
+    job.end("replaced")
+    assert job.tilearc is None
+    assert forbidden._authorization == ""
+    client.drop()
+    assert client._authorization == ""
+
+
+def test_token_is_not_reused_for_another_session():
+    from autofill.local_helper import _tilearc_client
+    from autofill.tilearc_sync import TilearcClient, TilearcScopeError
+
+    token = "cand-a-session-token-value"
+    client = TilearcClient(
+        "https://vinayaka.example",
+        _Tilearc(),
+        authorization=token,
+        cookie="sid=candidate-a",
+        session_id="sess-a",
+        candidate_id="cand-a",
+    )
+    with pytest.raises(TilearcScopeError):
+        client.fetch_session("sess-b", "cand-a")
+    with pytest.raises(TilearcScopeError):
+        client.local_status("sess-a", "cand-b")
+    other = LocalJob(
+        "sess-local-b",
+        "https://jobs.example.com/apply",
+        _person(),
+        {"tilearcSessionId": "sess-b", "candidateId": "cand-b", "jobId": "job-b", "profileFingerprint": "fp-b"},
+    )
+    assert other.tilearc is None
+    owner = LocalJob(
+        "sess-local-a",
+        "https://jobs.example.com/apply",
+        _person(),
+        {"tilearcSessionId": "sess-a", "candidateId": "cand-a", "jobId": "job-a", "profileFingerprint": "fp-a"},
+    )
+    owner.tilearc = client
+    owner.end("replaced")
+    assert owner.tilearc is None
+    assert other.tilearc is None
+    assert token not in repr(client)
+    forwarded = _tilearc_client(
+        {"origin": "https://vinayaka.example", "cookie": "sid=candidate-a"},
+        {"Authorization": f"Bearer {token}"},
+        {"tilearcSessionId": "sess-a", "candidateId": "cand-a", "jobId": "job-a", "profileFingerprint": "fp-a"},
+    )
+    assert forwarded._authorization == f"Bearer {token}"
+    assert forwarded._cookie == "sid=candidate-a"
+
+
 def test_live_staging_origin_is_used_only_when_credentials_are_forwarded(monkeypatch):
     from autofill.local_helper import _tilearc_client
     from autofill.tilearc_sync import STAGING_ORIGIN
 
     monkeypatch.setenv("TILEARC_API_ORIGIN", STAGING_ORIGIN)
     assert _tilearc_client(None) is None
-    client = _tilearc_client({"authorization": "Bearer staged-token"})
+    client = _tilearc_client(
+        {"authorization": "Bearer staged-token"},
+        None,
+        {
+            "tilearcSessionId": "sess-tile",
+            "candidateId": "cand-t228",
+            "jobId": "job-amat",
+            "profileFingerprint": "fp",
+        },
+    )
     assert client is not None
     assert client.origin == STAGING_ORIGIN
 
