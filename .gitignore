@@ -5,6 +5,9 @@ profile.json
 *.doc
 *.docx
 
+# Chrome profiles created by the local-tab PoC. Evidence JSON and screenshots stay.
+tools/local-cdp-poc/evidence/work/
+
 # Python
 .venv/
 venv/

@@ -44,6 +44,10 @@ class ApprovedAnswerIn(BaseModel):
 
     question: str = Field(min_length=1, max_length=500)
     answer: str = Field(min_length=1, max_length=2000)
+    intent: str = Field(default="", max_length=64)
+    employer: str = Field(default="", max_length=200)
+    # Catalogue key. ``recruitment_sms_consent`` is the recruitment-SMS row.
+    key: str = Field(default="", max_length=64)
 
     @field_validator("question", "answer")
     @classmethod
@@ -52,6 +56,42 @@ class ApprovedAnswerIn(BaseModel):
         if not cleaned:
             raise ValueError("must not be blank")
         return cleaned
+
+    @field_validator("intent")
+    @classmethod
+    def _known_intent(cls, value: str) -> str:
+        from autofill.intents import PROTOCOL_INTENTS
+        from autofill.sms_consent import canonical_sms_intent
+
+        upper = canonical_sms_intent(value.strip()).upper()
+        if upper and upper not in PROTOCOL_INTENTS:
+            raise ValueError("intent is not a known question intent")
+        return upper
+
+    @field_validator("employer")
+    @classmethod
+    def _employer(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("key")
+    @classmethod
+    def _catalogue_key(cls, value: str) -> str:
+        from autofill.sms_consent import canonical_sms_key
+
+        cleaned = value.strip()
+        return canonical_sms_key(cleaned) or cleaned
+
+    @model_validator(mode="after")
+    def _sms_pair(self) -> ApprovedAnswerIn:
+        from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer
+
+        if self.key == SMS_KEY and not self.intent:
+            self.intent = SMS_INTENT
+        if self.intent == SMS_INTENT and not self.key:
+            self.key = SMS_KEY
+        if self.key == SMS_KEY or self.intent == SMS_INTENT:
+            self.answer = canonical_sms_answer(self.answer) or self.answer
+        return self
 
 
 class ResolverIn(BaseModel):
@@ -137,6 +177,10 @@ class ContinueIn(BaseModel):
     resume_uploaded: bool = Field(default=False, alias="resumeUploaded")
     answers_updated: bool = Field(default=False, alias="answersUpdated")
     human_resolved: bool = Field(default=False, alias="humanResolved")
+    # R4 (t182u): the person confirms they opened the employer's verification email.
+    # Only this (with humanResolved) lets the engine type a just-registered password
+    # into Sign In. humanResolved alone re-checks the page and types nothing.
+    verified: bool = Field(default=False, alias="verified")
     candidate_id: str = Field(default="", alias="candidateId", max_length=MAX_REF_LENGTH)
     candidate_ref: str = Field(default="", alias="candidateRef", max_length=MAX_REF_LENGTH)
 
@@ -281,10 +325,32 @@ class BlockingOut(BaseModel):
     answer_type: str = Field(default="text", alias="answerType")
     options: list[str] = Field(default_factory=list)
     required: bool = False
+    challenge: str = ""
+    confidence: str = ""
+    related_fields: list[str] = Field(default_factory=list, alias="relatedFields")
+    salary_shape: str = Field(default="", alias="salaryShape")
+    reason: str = ""
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_salary_hint(self, handler):
+        """Salary confirm fields are omitted when this blocker is not one."""
+        data = handler(self)
+        for key in (
+            "challenge",
+            "confidence",
+            "relatedFields",
+            "related_fields",
+            "salaryShape",
+            "salary_shape",
+            "reason",
+        ):
+            if not data.get(key):
+                data.pop(key, None)
+        return data
 
 
-class AnswerIn(BaseModel):
-    """One saved value for the current blocker or another open item. Memory only."""
+class AnswerRowIn(BaseModel):
+    """One row of an optional page-set body. The single-question fields still work alone."""
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
@@ -294,6 +360,24 @@ class AnswerIn(BaseModel):
     value: str = Field(default="", max_length=8000)
     values: list[str] = Field(default_factory=list, max_length=20)
     confirm: bool = False
+
+
+class AnswerIn(BaseModel):
+    """One saved value for the current blocker or another open item. Memory only.
+
+    ``answers`` is an optional batch of the same shape. When it is set, each row
+    is written and Next runs only after the last row.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    question_id: str = Field(default="", alias="questionId", max_length=128)
+    question_hash: str = Field(default="", alias="questionHash", max_length=128)
+    field_key: str = Field(default="", alias="fieldKey", max_length=128)
+    value: str = Field(default="", max_length=8000)
+    values: list[str] = Field(default_factory=list, max_length=20)
+    confirm: bool = False
+    answers: list[AnswerRowIn] = Field(default_factory=list, max_length=20)
 
     @field_validator("values")
     @classmethod
@@ -308,6 +392,8 @@ class AnswerIn(BaseModel):
 
     @model_validator(mode="after")
     def _target(self) -> AnswerIn:
+        if self.answers:
+            return self
         if not (self.question_id.strip() or self.question_hash.strip() or self.field_key.strip()):
             raise ValueError("questionId, questionHash, or fieldKey is required")
         return self
@@ -370,6 +456,17 @@ class AnswerOut(BaseModel):
     ms: int | None = None
 
 
+class StopQuestionOut(BaseModel):
+    """One question in the current page set. The answer value is not included."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    prompt: str = ""
+    type: str = "text"
+    options: list[str] = Field(default_factory=list)
+
+
 class ManualQuestionOut(BaseModel):
     """A question left blank. The answer value is not included."""
 
@@ -424,6 +521,7 @@ class RunStatusOut(BaseModel):
     progress: ProgressOut = Field(default_factory=ProgressOut)
     paused: bool = False
     blocking: BlockingOut | None = None
+    questions: list[StopQuestionOut] = Field(default_factory=list)
     state_version: int | None = Field(default=None, alias="stateVersion")
     account: dict[str, Any] | None = None
     resume: dict[str, Any] | None = None
@@ -437,6 +535,11 @@ class RunStatusOut(BaseModel):
     phase: Literal["launching", "navigating", "loaded"] = "launching"
     started_at: str | None = Field(default=None, alias="startedAt")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
+    # Affirmative recruitment-SMS answers captured this session. Hosts store
+    # them on the candidate as applicationAnswers with this intent.
+    learned_application_answers: list[dict[str, Any]] | None = Field(
+        default=None, alias="learnedApplicationAnswers"
+    )
     features: list[str] = Field(default_factory=lambda: list(ADVERTISED_FEATURES))
 
     @model_serializer(mode="wrap")
@@ -447,6 +550,10 @@ class RunStatusOut(BaseModel):
                 data.pop(key, None)
         if not data.get("autoConsents"):
             data.pop("autoConsents", None)
+        if not data.get("learnedApplicationAnswers"):
+            data.pop("learnedApplicationAnswers", None)
+        if not data.get("questions"):
+            data.pop("questions", None)
         return data
 
 
@@ -462,10 +569,15 @@ class CredentialsOut(BaseModel):
     field_proof: dict[str, Any] | None = Field(default=None, alias="fieldProof")
     auto_consents: list[dict[str, Any]] | None = Field(default=None, alias="autoConsents")
     consent_rows: list[dict[str, Any]] | None = Field(default=None, alias="consentRows")
+    # True when the engine typed nothing: the page was already past the account
+    # step. The password in this request was never seen by the employer.
+    recovered: bool | None = None
 
     @model_serializer(mode="wrap")
     def _omit_store(self, handler):
         data = handler(self)
+        if not data.get("recovered"):
+            data.pop("recovered", None)
         if not data.get("outcome"):
             data.pop("outcome", None)
         if not data.get("status"):

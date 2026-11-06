@@ -1,0 +1,117 @@
+# Staging macOS disk images for the loopback Auto-Fill helper.
+# Two thin images, one per architecture. Employees do not install Python.
+#   macos-latest     -> TileArc-AutoFill-Helper-Setup-staging-arm64.dmg (Apple Silicon)
+#   macos-15-intel   -> TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg (Intel)
+# A push to staging adds both disk images to draft tag tilearc-autofill-helper-staging.
+# macos-13 was removed in December 2025. macos-15-intel is the Intel runner.
+# Playwright's driver node is a thin Mach-O, so this workflow does not lipo a universal app.
+name: macOS helper (staging)
+
+on:
+  pull_request:
+    branches: [staging]
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-helper-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    name: Build Setup.dmg (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+            dmg: TileArc-AutoFill-Helper-Setup-staging-arm64.dmg
+            artifact: TileArc-AutoFill-Helper-Setup-staging-macos-arm64
+          - arch: x86_64
+            runner: macos-15-intel
+            dmg: TileArc-AutoFill-Helper-Setup-staging-x86_64.dmg
+            artifact: TileArc-AutoFill-Helper-Setup-staging-macos-x86_64
+    env:
+      TILEARC_MACOS_DMG: ${{ matrix.dmg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build disk image
+        run: bash macos/build.sh
+
+      - name: Smoke test health on 127.0.0.1:9410
+        run: bash macos/smoke.sh
+
+      - name: Record disk image digest
+        if: success()
+        run: |
+          shasum -a 256 "dist/${TILEARC_MACOS_DMG}"
+          echo "arch=${{ matrix.arch }} file=${TILEARC_MACOS_DMG}"
+
+      - name: Collect helper logs
+        if: failure()
+        run: |
+          mkdir -p smoke-logs
+          dir="$HOME/Library/Application Support/TileArc/AutoFill"
+          if [[ -f "$dir/helper.log" ]]; then cp "$dir/helper.log" smoke-logs/; fi
+          if [[ -f "$dir/doctor.json" ]]; then cp "$dir/doctor.json" smoke-logs/; fi
+
+      - name: Upload helper log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tilearc-helper-macos-smoke-log-${{ matrix.arch }}
+          path: smoke-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload staging disk image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.dmg }}
+          if-no-files-found: ignore
+          retention-days: 90
+
+  draft-release:
+    name: Add macOS assets to draft release
+    needs: installer
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/staging' &&
+      github.repository == 'VK-TECH-LABS/Auto-Fill'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Checkout first. download-artifact must follow it: checkout cleans the workspace.
+      # gh still gets -R so it does not depend on discovering a git remote.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging-macos-arm64
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: TileArc-AutoFill-Helper-Setup-staging-macos-x86_64
+          path: dist
+
+      - name: Upload both disk images to draft staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash macos/publish-draft.sh

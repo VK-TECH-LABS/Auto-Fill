@@ -367,6 +367,10 @@ def test_standard_terms_are_checked_and_unusual_statements_stay_consent():
         def check(self) -> None:
             checked.append(self.selector)
 
+        def is_checked(self) -> bool:
+            # The engine verifies the page kept the check (unreadable is not proof).
+            return self.selector in checked
+
     class Page:
         def locator(self, selector: str) -> Locator:
             return Locator(selector)
@@ -523,7 +527,9 @@ def test_register_checks_submission_consent_and_logs_only_the_category(caplog):
                 "label": "I agree to receive promotional SMS",
                 "selector": "#promo",
                 "inputType": "checkbox",
-                "required": True,
+                # Optional: a required unchecked box now stops Create Account
+                # (see test_auth_interactions deny vectors).
+                "required": False,
             },
         ],
         "buttons": [{"name": "Create Account", "selector": "#create", "controlType": "button"}],
@@ -547,6 +553,9 @@ def test_register_checks_submission_consent_and_logs_only_the_category(caplog):
 
         def check(self) -> None:
             checked.append(self.selector)
+
+        def is_checked(self) -> bool:
+            return self.selector in checked
 
         def click(self) -> None:
             clicked.append(self.selector)
@@ -643,6 +652,9 @@ def test_register_checks_standard_terms_and_leaves_other_boxes():
         def check(self) -> None:
             checked.append(self.selector)
 
+        def is_checked(self) -> bool:
+            return self.selector in checked
+
         def click(self) -> None:
             clicked.append(self.selector)
 
@@ -700,10 +712,21 @@ def test_register_checks_standard_terms_and_leaves_other_boxes():
         ats="workday",
         standard_terms=True,
     )
+    # The standard box is checked; the required promo box is not standard, so
+    # Create Account is NOT pressed over it (RC-2, 2026-10-26) and the person
+    # sees the exact statement.
     assert checked == ["#terms"]
-    assert clicked == ["#create"]
-    assert accepted["status"] == "EMAIL_VERIFICATION_REQUIRED"
-    assert accepted["status"] != "READY_FOR_HUMAN_SUBMIT"
+    assert clicked == []
+    assert accepted["ok"] is False
+    assert accepted["reason"] == "site_rejected"
+    assert accepted["status"] == "ACCOUNT_CREATION_REQUIRED"
+    assert accepted["siteErrors"] == ["Consent needs a person: I agree to receive promotional SMS and job alerts"]
+    promo_row = next(row for row in accepted["consentRows"] if "promotional" in row["textExcerpt"])
+    assert promo_row == {
+        "textExcerpt": "I agree to receive promotional SMS and job alerts",
+        "category": "CONSENT",
+        "checked": False,
+    }
     proof = accepted["fieldProof"]
     assert proof["emailFilled"] is True
     assert proof["emailMatches"] is True
@@ -743,6 +766,10 @@ def test_compound_privacy_and_job_alerts_stay_consent():
 
         def check(self) -> None:
             checked.append(self.selector)
+
+        def is_checked(self) -> bool:
+            # The engine verifies the page kept the check (unreadable is not proof).
+            return self.selector in checked
 
     class Page:
         def locator(self, selector: str) -> Locator:

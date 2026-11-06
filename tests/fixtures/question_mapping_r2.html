@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>t60u-req2-question-mapping</title></head>
+<body>
+<h1>Apply: Example Engineer</h1>
+<form id="application" action="/submit" method="post" onsubmit="window.__submitted = true; return false;">
+  <label for="first">First name</label>
+  <input id="first" name="first_name" required>
+  <label for="last">Last name</label>
+  <input id="last" name="last_name" required>
+  <label for="email">Email address</label>
+  <input id="email" name="email" type="email" required>
+  <label for="phone">Phone</label>
+  <input id="phone" name="phone" type="tel">
+
+  <fieldset>
+    <legend>Are you legally authorized to work in the United States?</legend>
+    <input type="radio" id="auth-yes" name="us_auth" value="Yes" required><label for="auth-yes">Yes</label>
+    <input type="radio" id="auth-no" name="us_auth" value="No"><label for="auth-no">No</label>
+  </fieldset>
+
+  <label for="sponsor">Will you now or in the future require visa sponsorship?</label>
+  <select id="sponsor" name="sponsor_future" required>
+    <option value="">Select...</option>
+    <option value="Yes">Yes</option>
+    <option value="No">No</option>
+  </select>
+
+  <div class="field" id="without-field">
+    <div class="question-title" id="without-title">Are you authorized to work in the US without sponsorship? *</div>
+    <div role="group" aria-labelledby="without-title" aria-required="true">
+      <button type="button" id="without-yes" aria-pressed="false">Yes</button>
+      <button type="button" id="without-no" aria-pressed="false">No</button>
+    </div>
+  </div>
+
+  <fieldset>
+    <legend>Are you authorized to work in Canada?</legend>
+    <input type="radio" id="canada-yes" name="canada_auth" value="Yes" required><label for="canada-yes">Yes</label>
+    <input type="radio" id="canada-no" name="canada_auth" value="No"><label for="canada-no">No</label>
+  </fieldset>
+
+  <label for="age">Are you at least 18 years of age?</label>
+  <select id="age" name="age_check" required>
+    <option value="">Select...</option>
+    <option value="Yes">Yes</option>
+    <option value="No">No</option>
+  </select>
+
+  <fieldset>
+    <legend>Do you hold a valid driver's license?</legend>
+    <input type="radio" id="dl-us" name="drivers" value="us" required><label for="dl-us">Yes, a US license</label>
+    <input type="radio" id="dl-intl" name="drivers" value="intl"><label for="dl-intl">Yes, an international license</label>
+    <input type="radio" id="dl-no" name="drivers" value="no"><label for="dl-no">No</label>
+  </fieldset>
+
+  <label for="heard">How did you hear about this role?</label>
+  <input id="heard" name="how_heard" required>
+
+  <label for="prev">Have you previously worked for Example Corp?</label>
+  <select id="prev" name="prev_worked" required>
+    <option value="">Select...</option>
+    <option value="Yes">Yes</option>
+    <option value="No">No</option>
+  </select>
+
+  <label for="paradigm">Which programming paradigm do you enjoy most, and why?</label>
+  <textarea id="paradigm" name="paradigm" required></textarea>
+
+  <label><input type="checkbox" id="bgcheck" name="background_check"> I am willing to undergo a background check</label>
+
+  <button type="submit" id="submit">Submit application</button>
+</form>
+<script>
+  window.__submitted = false;
+  for (const button of document.querySelectorAll("[role=group] button")) {
+    button.addEventListener("click", () => {
+      for (const sibling of button.parentElement.querySelectorAll("button")) {
+        sibling.setAttribute("aria-pressed", sibling === button ? "true" : "false");
+      }
+    });
+  }
+</script>
+</body>
+</html>

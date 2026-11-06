@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Availability</h1>
+<form>
+  <div data-automation-id="formField-shifts" data-field-path="shifts">
+    <label id="shift-q">Which shifts can you work?</label>
+    <label><input type="checkbox" id="shift-day" name="day" value="Day"> Day</label>
+    <label><input type="checkbox" id="shift-night" name="night" value="Night"> Night</label>
+  </div>
+  <fieldset>
+    <legend>Are you authorized to work in the United States?</legend>
+    <label><input type="radio" name="auth" id="auth-yes" value="Yes" required> Yes</label>
+    <label><input type="radio" name="auth" id="auth-no" value="No"> No</label>
+  </fieldset>
+  <div>
+    <input type="checkbox" name="terms" aria-required="true">
+    <label>I agree to the Terms of Service</label>
+  </div>
+  <label><input type="checkbox" id="bg" name="bg"> Willing to undergo a background check</label>
+</form>
+</body>
+</html>

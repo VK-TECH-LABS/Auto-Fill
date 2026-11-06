@@ -15,6 +15,7 @@ The example shipped with this repo is fictional.
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,22 +57,36 @@ class Personal:
     email: str
     phone: str = ""
     address: str = ""
+    address_line2: str = ""
     city: str = ""
     province_state: str = ""
     country: str = ""
     postal_code: str = ""
     preferred_name: str = ""
+    middle_name: str = ""
     linkedin_url: str = ""
     github_url: str = ""
     portfolio_url: str = ""
     website_url: str = ""
+    # Given and family names from the TileArc handoff. Empty means split full_name.
+    first_name: str = ""
+    family_name: str = ""
 
     @property
     def first_token(self) -> str:
+        explicit = self.first_name.strip()
+        if explicit:
+            return explicit
+        # A payload that only sent a family name must not be typed into First name.
+        if self.family_name.strip() and self.full_name.strip() == self.family_name.strip():
+            return ""
         return split_name(self.full_name)[0]
 
     @property
     def last_name(self) -> str:
+        explicit = self.family_name.strip()
+        if explicit:
+            return explicit
         return split_name(self.full_name)[1]
 
     @property
@@ -164,6 +179,8 @@ class Employment:
     start_date: str = ""
     end_date: str = ""
     current: bool = False
+    # Only a location stored on this row. The home address is not a job site.
+    location: str = ""
 
 
 @dataclass
@@ -193,6 +210,16 @@ class ApplicationAnswer:
 
     question: str
     answer: str
+    # TileArc's canonical intent for this saved answer (e.g. SPONSORSHIP_FUTURE),
+    # when known. It is checked against the question text before it is used.
+    intent: str = ""
+    # Employer this answer belongs to. Empty means the host did not name one.
+    # Previously-employed answers are not reused for a different employer.
+    employer: str = ""
+    # True when this fill verified the value. A host-supplied row stays False.
+    from_session: bool = False
+    # Catalogue key. Recruitment SMS is ``recruitment_sms_consent``.
+    key: str = ""
 
 
 @dataclass
@@ -238,7 +265,11 @@ class CandidateProfile:
                 stacklevel=2,
             )
             personal_raw.pop("password", None)
+        given = _text(personal_raw, "first_name")
+        family = _text(personal_raw, "last_name")
         full_name = _text(personal_raw, "full_name")
+        if not full_name:
+            full_name = " ".join(part for part in (given, family) if part).strip()
         email = _text(personal_raw, "email")
         if not full_name:
             raise ProfileError("personal.full_name is required.")
@@ -262,13 +293,17 @@ class CandidateProfile:
             personal=Personal(
                 full_name=full_name,
                 email=email,
+                first_name=given,
+                family_name=family,
                 phone=_text(personal_raw, "phone"),
                 address=_text(personal_raw, "address"),
+                address_line2=_text(personal_raw, "address_line2"),
                 city=_text(personal_raw, "city"),
                 province_state=_text(personal_raw, "province_state"),
                 country=_text(personal_raw, "country"),
                 postal_code=_text(personal_raw, "postal_code"),
                 preferred_name=_text(personal_raw, "preferred_name"),
+                middle_name=_text(personal_raw, "middle_name") or _text(personal_raw, "middleName"),
                 linkedin_url=_text(personal_raw, "linkedin_url"),
                 github_url=_text(personal_raw, "github_url"),
                 portfolio_url=_text(personal_raw, "portfolio_url"),
@@ -318,8 +353,49 @@ class CandidateProfile:
             education_history=_education_list(data.get("education")),
             internships=_internship_list(data.get("internships")),
             projects=_project_list(data.get("projects")),
-            application_answers=_answer_list(data.get("applicationAnswers") or data.get("application_answers")),
+            application_answers=_answer_list(
+                data.get("applicationAnswers") or data.get("application_answers"),
+                _text(data, "candidateId") or _text(data, "candidate_id"),
+            ),
         )
+
+
+def _alias_personal_keys(personal: dict) -> None:
+    """Copy Fillo handoff names onto the keys the profile stores.
+
+    ``firstName`` and ``lastName`` stay separate. They are not joined and
+    then split again. ``state`` is the province field.
+    """
+    aliases = {
+        "firstName": "first_name",
+        "givenName": "first_name",
+        "given_name": "first_name",
+        "lastName": "last_name",
+        "familyName": "last_name",
+        "family_name": "last_name",
+        "surname": "last_name",
+        "fullName": "full_name",
+        "legalName": "full_name",
+        "legal_name": "full_name",
+        "state": "province_state",
+        "province": "province_state",
+        "region": "province_state",
+        "postalCode": "postal_code",
+        "zip": "postal_code",
+        "middleName": "middle_name",
+        "linkedinUrl": "linkedin_url",
+        "linkedInUrl": "linkedin_url",
+        "linkedin": "linkedin_url",
+        "githubUrl": "github_url",
+        "github": "github_url",
+        "portfolioUrl": "portfolio_url",
+        "portfolio": "portfolio_url",
+        "websiteUrl": "website_url",
+        "website": "website_url",
+    }
+    for source, dest in aliases.items():
+        if personal.get(source) not in (None, "") and not personal.get(dest):
+            personal[dest] = personal[source]
 
 
 def _accept_extended_shape(data: dict) -> dict:
@@ -347,6 +423,10 @@ def _accept_extended_shape(data: dict) -> dict:
         alias = {
             "line1": "address",
             "street": "address",
+            "line2": "address_line2",
+            "line_2": "address_line2",
+            "street2": "address_line2",
+            "address2": "address_line2",
             "city": "city",
             "state": "province_state",
             "province": "province_state",
@@ -359,12 +439,49 @@ def _accept_extended_shape(data: dict) -> dict:
         for source, dest in alias.items():
             if address.get(source) and not personal.get(dest):
                 personal[dest] = address[source]
+    links = merged.get("links")
+    if isinstance(links, dict):
+        link_alias = {
+            "linkedin": "linkedin_url",
+            "linkedinUrl": "linkedin_url",
+            "github": "github_url",
+            "githubUrl": "github_url",
+            "portfolio": "portfolio_url",
+            "portfolioUrl": "portfolio_url",
+            "website": "website_url",
+            "websiteUrl": "website_url",
+        }
+        for source, dest in link_alias.items():
+            if links.get(source) not in (None, "") and not personal.get(dest):
+                personal[dest] = links[source]
+    _alias_personal_keys(personal)
     merged["personal"] = personal
 
     compensation = dict(_section(merged, "compensation"))
-    if merged.get("salaryExpectation") not in (None, "") and not compensation.get("salary_expectation"):
-        compensation["salary_expectation"] = merged["salaryExpectation"]
-        merged["compensation"] = compensation
+    # A saved minimum is the floor or the low end of a range. It is not a max.
+    _compensation_aliases = {
+        "salaryExpectation": "salary_expectation",
+        "desiredSalary": "salary_expectation",
+        "desired_salary": "salary_expectation",
+        "minimumSalary": "salary_range_min",
+        "minimum_salary": "salary_range_min",
+        "salaryMin": "salary_range_min",
+        "salary_min": "salary_range_min",
+        "salaryRangeMin": "salary_range_min",
+        "salaryRangeMax": "salary_range_max",
+        "maximumSalary": "salary_range_max",
+        "maximum_salary": "salary_range_max",
+        "salaryMax": "salary_range_max",
+        "salary_max": "salary_range_max",
+    }
+    for source, dest in _compensation_aliases.items():
+        incoming = merged.get(source)
+        if incoming not in (None, "") and not compensation.get(dest):
+            compensation[dest] = incoming
+        nested = compensation.get(source)
+        if nested not in (None, "") and not compensation.get(dest):
+            compensation[dest] = nested
+    merged["compensation"] = compensation
 
     work = dict(_section(merged, "work_authorization"))
     raw_auth = merged.get("workAuthorization")
@@ -394,14 +511,120 @@ def _objects(raw: object, label: str) -> list[dict]:
     return items
 
 
+def _pad_month(value: str) -> str:
+    text = value.strip()
+    if text.isdigit() and 1 <= int(text) <= 12:
+        return f"{int(text):02d}"
+    return ""
+
+
+def _normalize_from_to(value: str) -> str:
+    """``MM/YYYY``, or ``YYYY`` when the payload has no month. Other text stays."""
+    text = value.strip()
+    year_only = re.fullmatch(r"(19|20)\d{2}", text)
+    if year_only:
+        return text
+    parsed = re.fullmatch(r"(\d{1,2})\s*[./-]\s*((?:19|20)\d{2})", text)
+    if parsed:
+        month = _pad_month(parsed.group(1))
+        if month:
+            return f"{month}/{parsed.group(2)}"
+    return text
+
+
+def _first_text(entry: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = _text(entry, key)
+        if value:
+            return value
+    return ""
+
+
+def _date_text(entry: dict, which: str) -> str:
+    """Month and year for one side of a work or education row.
+
+    vinayaka #176 sends ``start_month`` / ``start_year`` (and the end pair) plus
+    ``from`` / ``to``. Resolver rows use ``startMonth`` / ``startYear`` / ``from``
+    / ``to``. Those win when they are present. A current LIVE row that only has
+    ``start_date`` / ``end_date`` (or ``startDate`` / ``endDate``) keeps that
+    string, and the filler reads the month and year from it.
+    """
+    if which == "start":
+        month_keys = ("start_month", "startMonth", "from_month", "fromMonth")
+        year_keys = ("start_year", "startYear", "from_year", "fromYear")
+        explicit_keys = ("from", "fromDate", "from_date")
+        legacy_keys = ("start_date", "startDate")
+    else:
+        month_keys = ("end_month", "endMonth", "to_month", "toMonth")
+        year_keys = ("end_year", "endYear", "to_year", "toYear")
+        explicit_keys = ("to", "toDate", "to_date")
+        legacy_keys = ("end_date", "endDate")
+    month = _pad_month(_first_text(entry, month_keys))
+    year = _first_text(entry, year_keys)
+    if month and re.fullmatch(r"(?:19|20)\d{2}", year):
+        return f"{month}/{year}"
+    if not month and re.fullmatch(r"(?:19|20)\d{2}", year) and not _first_text(entry, explicit_keys):
+        return year
+    explicit = _first_text(entry, explicit_keys)
+    if explicit:
+        return _normalize_from_to(explicit)
+    return _first_text(entry, legacy_keys)
+
+
+def _new_date_shape(entry: dict) -> bool:
+    keys = (
+        "from",
+        "to",
+        "start_month",
+        "startMonth",
+        "start_year",
+        "startYear",
+        "end_month",
+        "endMonth",
+        "end_year",
+        "endYear",
+    )
+    return any(entry.get(key) not in (None, "") for key in keys)
+
+
+def _has_end(entry: dict) -> bool:
+    keys = (
+        "to",
+        "toDate",
+        "to_date",
+        "end_date",
+        "endDate",
+        "end_month",
+        "endMonth",
+        "end_year",
+        "endYear",
+    )
+    return any(entry.get(key) not in (None, "") for key in keys)
+
+
+def _current_job(entry: dict) -> bool:
+    """True when the payload says the job is current.
+
+    An explicit flag wins. On a #176 row, an omitted ``to`` is the same fact.
+    A LIVE row that simply has no end date stays not-current.
+    """
+    for key in ("current", "currentlyWorking", "currently_working", "isCurrent", "present"):
+        if entry.get(key) is True:
+            return True
+        if entry.get(key) is False:
+            return False
+    return _new_date_shape(entry) and not _has_end(entry)
+
+
 def _employment_list(raw: object) -> list[Employment]:
     return [
         Employment(
             company=_text(entry, "company") or _text(entry, "employer"),
             title=_text(entry, "title") or _text(entry, "jobTitle") or _text(entry, "job_title"),
-            start_date=_text(entry, "startDate") or _text(entry, "start_date"),
-            end_date=_text(entry, "endDate") or _text(entry, "end_date"),
-            current=bool(entry.get("current", False)),
+            start_date=_date_text(entry, "start"),
+            end_date=_date_text(entry, "end"),
+            current=_current_job(entry),
+            location=_text(entry, "location"),
         )
         for entry in _objects(raw, "employment")
     ]
@@ -413,8 +636,8 @@ def _education_list(raw: object) -> list[EducationEntry]:
             school=_text(entry, "school") or _text(entry, "institution"),
             degree=_text(entry, "degree"),
             field_of_study=_text(entry, "field") or _text(entry, "fieldOfStudy") or _text(entry, "field_of_study"),
-            start_date=_text(entry, "startDate") or _text(entry, "start_date"),
-            end_date=_text(entry, "endDate") or _text(entry, "end_date"),
+            start_date=_date_text(entry, "start"),
+            end_date=_date_text(entry, "end"),
         )
         for entry in _objects(raw, "education")
     ]
@@ -437,8 +660,51 @@ def _project_list(raw: object) -> list[Project]:
     ]
 
 
-def _answer_list(raw: object) -> list[ApplicationAnswer]:
-    return [
-        ApplicationAnswer(question=_text(entry, "question"), answer=_text(entry, "answer"))
-        for entry in _objects(raw, "applicationAnswers")
-    ]
+def _stored_intent(value: str) -> str:
+    """Keep a host intent. ``SMS_CONSENT`` is the recruitment-SMS alias."""
+    from autofill.sms_consent import canonical_sms_intent
+
+    return canonical_sms_intent(value)[:64]
+
+
+def _answer_row(entry: dict) -> ApplicationAnswer:
+    """One application answer. Recruitment SMS is normalized to the host key."""
+    from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer, canonical_sms_key
+
+    question = _text(entry, "question")
+    intent = _stored_intent(_text(entry, "intent"))
+    host_key = _text(entry, "key").strip()
+    key = canonical_sms_key(host_key) or canonical_sms_key(question)
+    if not key and host_key and " " not in host_key:
+        key = host_key[:64]
+    if intent == SMS_INTENT:
+        key = key or SMS_KEY
+    if key == SMS_KEY and not intent:
+        intent = SMS_INTENT
+    if not question and key:
+        question = key
+    answer = _text(entry, "answer")
+    if key == SMS_KEY or intent == SMS_INTENT:
+        answer = canonical_sms_answer(answer)
+    return ApplicationAnswer(
+        question=question,
+        answer=answer,
+        intent=intent,
+        employer=_text(entry, "employer")[:200],
+        key=key,
+    )
+
+
+def _answer_list(raw: object, owner: str = "") -> list[ApplicationAnswer]:
+    """Approved answers for this candidate.
+
+    A row that names a different ``candidateId`` is dropped. A row with no
+    candidate id stays, which is how older payloads are shaped.
+    """
+    rows: list[ApplicationAnswer] = []
+    for entry in _objects(raw, "applicationAnswers"):
+        tagged = _text(entry, "candidateId") or _text(entry, "candidate_id")
+        if owner and tagged and tagged != owner:
+            continue
+        rows.append(_answer_row(entry))
+    return rows

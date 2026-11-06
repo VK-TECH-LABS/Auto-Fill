@@ -104,6 +104,21 @@ def test_a_review_step_with_a_submit_can_be_ready_and_a_blank_page_cannot():
     assert terminal_kind(empty_review, gaps=[], required_total=0) != "READY"
     blank = _snapshot(heading="Example", page_text="Nothing here.")
     assert terminal_kind(blank, gaps=[], required_total=0) == "NO_FORM"
+    # After Next, the last step can be only Submit application. The heading
+    # does not have to say Review. A Next button on the same page is not ready.
+    submit_only = _snapshot(
+        heading="Check and send",
+        buttons=[ButtonControl(name="Submit application", selector="#final", control_type="submit")],
+    )
+    assert terminal_kind(submit_only, gaps=[], required_total=0) == "READY"
+    still_forward = _snapshot(
+        heading="Check and send",
+        buttons=[
+            ButtonControl(name="Save & Continue", selector="#next", control_type="button"),
+            ButtonControl(name="Submit application", selector="#final", control_type="submit"),
+        ],
+    )
+    assert terminal_kind(still_forward, gaps=[], required_total=0) == "NO_FORM"
     form = _snapshot(
         heading="Application",
         controls=[

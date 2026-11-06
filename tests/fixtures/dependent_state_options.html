@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Address</title></head>
+<body>
+  <h1>Address</h1>
+  <form>
+    <label for="country">Country</label>
+    <select id="country" required>
+      <option value="">Select...</option>
+      <option>United States</option>
+      <option>Canada</option>
+    </select>
+    <label for="state">State</label>
+    <select id="state" required>
+      <option value="">Select...</option>
+    </select>
+  </form>
+  <script>
+    document.getElementById("country").addEventListener("change", () => {
+      const chosen = document.getElementById("country").value;
+      const state = document.getElementById("state");
+      const before = state.innerHTML;
+      setTimeout(() => {
+        if (state.innerHTML !== before && state.options.length > 1) return;
+        state.replaceChildren();
+        function add(value, label) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          state.appendChild(option);
+        }
+        add("", "Select...");
+        if (chosen === "United States") {
+          add("CA", "California");
+          add("IL", "Illinois");
+        } else {
+          add("ON", "Ontario");
+        }
+      }, 350);
+    });
+  </script>
+</body>
+</html>

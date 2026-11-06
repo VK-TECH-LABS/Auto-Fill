@@ -1,0 +1,103 @@
+# Updates .handoff/<developer>--<task>.json on tharun/* and saiteja/* pushes and
+# pull requests, posts a sticky pull request comment, and fails when a pull
+# request touches a file owned by another developer's open task.
+name: Handoff
+
+on:
+  push:
+    branches:
+      - "tharun/**"
+      - "saiteja/**"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+      - closed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: handoff-${{ github.event.pull_request.head.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+      actions: write
+    env:
+      HANDOFF_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+      HANDOFF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || 'staging' }}
+      HANDOFF_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch base branch
+        run: git fetch origin "${HANDOFF_BASE}"
+
+      - name: Update handoff record
+        id: record
+        if: startsWith(env.HANDOFF_BRANCH, 'tharun/') || startsWith(env.HANDOFF_BRANCH, 'saiteja/')
+        run: |
+          set -eu
+          case "${HANDOFF_BRANCH}" in
+            tharun/*|saiteja/*) ;;
+            *)
+              echo "not a developer branch"
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          case "${HANDOFF_BRANCH}" in
+            main|staging)
+              echo "refusing protected branch ${HANDOFF_BRANCH}"
+              exit 1
+              ;;
+          esac
+          python scripts/handoff.py guard-push --branch "${HANDOFF_BRANCH}" --current "${HANDOFF_BRANCH}"
+          line="$(python scripts/handoff.py write-from-git)"
+          printf '%s\n' "$line"
+          path="$(printf '%s\n' "$line" | sed -n 's/^path=//p')"
+          if [ -z "$path" ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -- "$path"
+          if git diff --cached --quiet; then
+            echo "handoff record unchanged"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update handoff record for ${HANDOFF_BRANCH}"
+          git push origin "HEAD:${HANDOFF_BRANCH}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Re-run CI on the handoff commit
+        if: steps.record.outputs.pushed == 'true'
+        run: python scripts/handoff.py dispatch-ci
+
+      - name: Sticky comment and ownership check
+        if: github.event_name == 'pull_request'
+        run: python scripts/handoff.py check-pr
