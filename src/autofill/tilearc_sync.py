@@ -339,6 +339,34 @@ _LINK_KEYS = (
     "websiteUrl",
     "githubUrl",
 )
+_IDENTITY_KEYS = (
+    "first_name",
+    "firstName",
+    "last_name",
+    "lastName",
+    "full_name",
+    "fullName",
+    "email",
+    "phone",
+    "city",
+)
+_ROW_FILL_KEYS = (
+    "location",
+    "city",
+    "description",
+    "summary",
+    "responsibilities",
+    "role_description",
+    "roleDescription",
+    "from",
+    "to",
+    "start_date",
+    "end_date",
+    "start_month",
+    "start_year",
+    "end_month",
+    "end_year",
+)
 
 
 def _overlay_records(body: dict[str, Any], source: dict[str, Any]) -> None:
@@ -363,6 +391,9 @@ def _overlay_records(body: dict[str, Any], source: dict[str, Any]) -> None:
     personal = dict(personal) if isinstance(personal, dict) else {}
     for key in _LINK_KEYS:
         if personal_src.get(key) not in (None, ""):
+            personal[key] = personal_src[key]
+    for key in _IDENTITY_KEYS:
+        if personal_src.get(key) not in (None, "") and personal.get(key) in (None, ""):
             personal[key] = personal_src[key]
     if personal:
         body["personal"] = personal
@@ -404,9 +435,39 @@ def merged_profile_body(posted: dict[str, Any] | None, snapshot: SessionSnapshot
     owner = snapshot.candidate_id
     if owner:
         body["candidateId"] = owner
-    if posted and not body.get("personal") and isinstance(posted.get("personal"), dict):
-        body["personal"] = dict(posted["personal"])
+    _fill_posted_blanks(body, posted)
     return body
+
+
+def _fill_posted_blanks(body: dict[str, Any], posted: dict[str, Any] | None) -> None:
+    """Keep a value the Apply already sent when the session snapshot left it blank."""
+    if not isinstance(posted, dict):
+        return
+    source = posted.get("personal")
+    if isinstance(source, dict):
+        personal = body.get("personal")
+        personal = dict(personal) if isinstance(personal, dict) else {}
+        for key, value in source.items():
+            if value in (None, "", False) or isinstance(value, (dict, list)):
+                continue
+            if personal.get(key) in (None, ""):
+                personal[key] = value
+        if personal:
+            body["personal"] = personal
+    for key in ("employment", "education"):
+        incoming = posted.get(key)
+        rows = body.get(key)
+        if not isinstance(incoming, list) or not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if index >= len(incoming) or not isinstance(row, dict):
+                continue
+            extra = incoming[index]
+            if not isinstance(extra, dict):
+                continue
+            for name in _ROW_FILL_KEYS:
+                if row.get(name) in (None, "") and extra.get(name) not in (None, ""):
+                    row[name] = extra[name]
 
 
 def identity_mismatch(status: int, body: Any) -> bool:

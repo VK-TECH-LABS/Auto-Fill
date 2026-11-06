@@ -242,7 +242,8 @@ def test_profile_basics_are_written_instead_of_asked(monkeypatch):
             created["sessionId"],
             lambda row: row.get("status") == Status.MANUAL_ANSWER_REQUIRED and row.get("question"),
         )
-        assert [row["id"] for row in body["questions"]] == ["q-color"]
+        assert [row["id"] for row in fake.shown[-1]["questions"]] == ["q-color"]
+        assert "questions" not in body
         assert body["question"]["id"] == "q-color"
         written = [item["value"] for item in fake.applied]
         assert "avery.alpha@example.com" in written
@@ -311,7 +312,8 @@ def test_save_continue_uses_separate_first_and_last(monkeypatch):
             created["sessionId"],
             lambda row: row.get("status") == Status.MANUAL_ANSWER_REQUIRED and row.get("question"),
         )
-        assert [row["id"] for row in body["questions"]] == ["q-color"]
+        assert [row["id"] for row in fake.shown[-1]["questions"]] == ["q-color"]
+        assert "questions" not in body
         written = [item["value"] for item in fake.applied]
         assert written == ["Mary Ann", "Smith"]
     finally:

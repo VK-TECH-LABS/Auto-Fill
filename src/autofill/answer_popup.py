@@ -29,7 +29,7 @@ HOST_ID = "tilearc-answer-popup"
 
 _MAX_VALUES = 20
 _MAX_VALUE_CHARS = 2000
-_MAX_ROWS = 20
+_MAX_ROWS = 80
 
 _SHOW_JS = r"""(args) => {
   const KEY = "__tilearcAnswerPopup";
@@ -40,8 +40,18 @@ _SHOW_JS = r"""(args) => {
   if (same && prior.state === "answered" && !args.force) {
     return {shown: true, state: prior.state};
   }
+  const drafts = {};
+  if (same && host.shadowRoot) {
+    for (const section of host.shadowRoot.querySelectorAll("[data-question-id]")) {
+      const qid = section.getAttribute("data-question-id") || "";
+      const area = section.querySelector("textarea");
+      const picked = Array.from(section.querySelectorAll("input:checked")).map((node) => node.value).filter(Boolean);
+      if (area && String(area.value || "").trim()) drafts[qid] = [String(area.value)];
+      else if (picked.length) drafts[qid] = picked;
+    }
+  }
   if (host) host.remove();
-  const questions = Array.isArray(args.questions) ? args.questions.slice(0, 20) : [];
+  const questions = Array.isArray(args.questions) ? args.questions.slice(0, 80) : [];
   const state = {
     nonce: args.nonce,
     questionId: questions.length ? questions[0].id : "",
@@ -139,7 +149,9 @@ _SHOW_JS = r"""(args) => {
       help.textContent = helpText;
       section.appendChild(help);
     }
-    const restored = Array.isArray(question.restored) ? question.restored : [];
+    const restored = (Array.isArray(question.restored) && question.restored.length)
+      ? question.restored
+      : (drafts[question.id] || []);
     if (!args.locked && !args.proceedOnly) {
       const multi = question.type === "multi_select";
       if (question.options && question.options.length) {
@@ -325,7 +337,7 @@ def _rows_for_show(
                 "id": qid,
                 "prompt": str(item.get("prompt") or ""),
                 "type": str(item.get("type") or "text"),
-                "options": [str(option) for option in item.get("options") or []][:40],
+                "options": [str(option) for option in item.get("options") or []][:240],
                 "selector": row_selector,
                 "help": str(item.get("help") or ""),
                 "restored": [str(value) for value in picked][:_MAX_VALUES],

@@ -139,7 +139,10 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         assert shown["selector"] == "#color"
         assert shown["candidate"] == "Avery Alpha"
         assert [row["id"] for row in shown["questions"]] == ["q-color", "q-visa"]
-        assert [row["id"] for row in body["questions"]] == ["q-color", "q-visa"]
+        # The employer card has the prompts. The Jobs-page status does not.
+        assert "questions" not in body
+        assert "prompt" not in body["question"]
+        assert "options" not in body["question"]
         nonce = shown["nonce"]
 
         # A value outside the employer's choices reopens the popup with an error.
@@ -196,8 +199,8 @@ def test_popup_payload_answer_and_continue(monkeypatch):
         server.shutdown()
 
 
-def test_revealed_question_gets_one_extra_card_and_not_a_third(monkeypatch):
-    """A question that was not on the first card gets one more card. A further one does not."""
+def test_revealed_question_stays_on_the_same_card(monkeypatch):
+    """A question that appears later joins the same employer card. It is not dropped."""
     third = dict(
         _VISA,
         questionId="q-extra",
@@ -253,7 +256,7 @@ def test_revealed_question_gets_one_extra_card_and_not_a_third(monkeypatch):
         assert code == 200
         body = _wait_status(port, sid, lambda b: b.get("question", {}).get("id") == "q-visa")
         assert len(fake.shown) == 2
-        assert fake.shown[-1]["nonce"] != first_nonce
+        assert fake.shown[-1]["nonce"] == first_nonce
         assert [row["id"] for row in fake.shown[-1]["questions"]] == ["q-visa"]
         fake.click(["Sponsorship no"])
         code, _answered = _request(port, "POST", f"/v1/sessions/{sid}/answer", {
@@ -262,7 +265,8 @@ def test_revealed_question_gets_one_extra_card_and_not_a_third(monkeypatch):
         assert code == 200, body
         _code, body = _request(port, "GET", f"/v1/sessions/{sid}")
         assert body["question"]["id"] == "q-extra"
-        assert len(fake.shown) == 2  # No third card.
+        assert fake.shown[-1]["nonce"] == first_nonce
+        assert any(row["id"] == "q-extra" for row in fake.shown[-1]["questions"])
     finally:
         helper.close()
         server.shutdown()
