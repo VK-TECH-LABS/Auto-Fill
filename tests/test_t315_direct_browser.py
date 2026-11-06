@@ -141,6 +141,85 @@ def test_profile_accepts_live_and_upcoming_employment_keys():
     assert upcoming.education_history[0].description == "Power systems"
 
 
+def test_vinayaka_178_profile_keeps_only_stored_values():
+    """localHelperSessionBody. Missing keys stay empty. Hyphenated dates parse."""
+    from autofill.dates import parse_month_year
+
+    assert parse_month_year("03-2019") == (3, 2019)
+    assert parse_month_year("Jan-2019") == (1, 2019)
+    assert parse_month_year("January-2019") == (1, 2019)
+    assert parse_month_year("2019") is None
+
+    stored = CandidateProfile.from_dict(
+        {
+            "candidateId": "cand-jahnavi",
+            "personal": {
+                "first_name": "Jahnavi",
+                "last_name": "Torra",
+                "full_name": "Jahnavi Torra",
+                "email": EMAIL,
+                "city": "Burnsville",
+                "province_state": "MN",
+                "linkedin_url": "https://www.linkedin.com/in/jahnavi-torra",
+            },
+            "links": {"website": "https://jahnavi.example"},
+            "employment": [
+                {
+                    "company": "VEM Technologies pvt ltd",
+                    "title": "engineer",
+                    "location": "Hyderabad",
+                    "description": "Firmware bring-up",
+                    "summary": "Firmware bring-up",
+                    "responsibilities": "Firmware bring-up",
+                    "current": True,
+                    "start_date": "2019-03-01",
+                    "start_month": "03",
+                    "start_year": "2019",
+                    "from": "03-2019",
+                },
+                {
+                    "company": "Earlier Co",
+                    "title": "intern",
+                    "from": "Jan-2019",
+                    "to": "11-2020",
+                    "current": False,
+                },
+            ],
+            "education": [
+                {
+                    "school": "State University",
+                    "degree": "B.S.",
+                    "field_of_study": "Electrical Engineering",
+                    "location": "Austin, TX, United States",
+                    "from": "03-2016",
+                    "to": "2019",
+                }
+            ],
+        }
+    )
+    assert stored.personal.phone == ""
+    assert stored.personal.full_name == "Jahnavi Torra"
+    assert stored.personal.website_url == "https://jahnavi.example"
+    current = stored.employment[0]
+    assert current.current is True
+    assert current.start_date == "03/2019"
+    assert current.end_date == ""
+    assert current.location == "Hyderabad"
+    assert current.description == "Firmware bring-up"
+    past = stored.employment[1]
+    assert past.current is False
+    assert past.start_date == "01/2019"
+    assert past.end_date == "11/2020"
+    assert past.location == ""
+    assert past.description == ""
+    school = stored.education_history[0]
+    assert school.field_of_study == "Electrical Engineering"
+    assert school.location == "Austin, TX, United States"
+    assert school.start_date == "03/2016"
+    assert school.end_date == "2019"
+    assert school.description == ""
+
+
 def test_known_basics_are_not_popup_questions():
     profile = _person()
     prompts = [
@@ -490,6 +569,134 @@ def test_workday_current_job_keeps_from_checks_the_box_and_leaves_to_empty(brows
         assert page.locator("#edu-from").input_value() == "08/2016"
         assert page.locator("#edu-to").input_value() == "05/2020"
         assert page.locator("#attend").is_checked() is False
+    finally:
+        page.close()
+
+
+def test_workday_hyphenated_from_to_replaces_the_month_year_placeholder(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <main>
+              <h1>My Experience</h1>
+              <section>
+                <h3>Work Experience 1</h3>
+                <label>Job Title*<input id="title" required></label>
+                <label>Company*<input id="company" required></label>
+                <div data-automation-id="workExperience-0">
+                  <label for="loc">Location</label>
+                  <input id="loc">
+                  <label><input id="current" type="checkbox"> I currently work here</label>
+                  <label for="from">From*</label>
+                  <input id="from" placeholder="MM/YYYY" aria-required="true">
+                  <label for="to">To*</label>
+                  <input id="to" placeholder="MM/YYYY" aria-required="true">
+                  <label for="role">Role Description</label>
+                  <textarea id="role"></textarea>
+                </div>
+              </section>
+              <section>
+                <h3>Education 1</h3>
+                <label>School<input id="school"></label>
+                <label for="edu-loc">Location</label>
+                <input id="edu-loc">
+                <label>Field of Study<input id="study"></label>
+              </section>
+            </main>
+            """
+        )
+        profile = CandidateProfile.from_dict(
+            {
+                "candidateId": "cand-jahnavi",
+                "personal": {
+                    "first_name": "Jahnavi",
+                    "last_name": "Torra",
+                    "full_name": "Jahnavi Torra",
+                    "email": EMAIL,
+                    "city": "Burnsville",
+                },
+                "employment": [
+                    {
+                        "company": "VEM Technologies pvt ltd",
+                        "title": "engineer",
+                        "from": "Jan-2019",
+                        "to": "11-2020",
+                        "current": False,
+                        "summary": "Firmware bring-up",
+                    }
+                ],
+                "education": [
+                    {
+                        "school": "State University",
+                        "degree": "B.S.",
+                        "field_of_study": "Electrical Engineering",
+                        "location": "Austin, TX, United States",
+                    }
+                ],
+            }
+        )
+        _run(page, "https://nidec.wd1.myworkdayjobs.com/en-US/Example/job/Role/apply", profile)
+        assert page.locator("#from").input_value() == "01/2019"
+        assert page.locator("#to").input_value() == "11/2020"
+        assert page.locator("#from").input_value() != "MM/YYYY"
+        assert page.locator("#current").is_checked() is False
+        assert page.locator("#loc").input_value() == ""
+        assert page.locator("#role").input_value() == "Firmware bring-up"
+        assert page.locator("#school").input_value() == "State University"
+        assert page.locator("#study").input_value() == "Electrical Engineering"
+        assert page.locator("#edu-loc").input_value() == "Austin, TX, United States"
+        assert page.locator("#edu-loc").input_value() != "Burnsville"
+    finally:
+        page.close()
+
+
+def test_workday_current_row_uses_hyphenated_from_and_does_not_invent_to(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(
+            """
+            <main>
+              <h1>My Experience</h1>
+              <section>
+                <h3>Work Experience 1</h3>
+                <label>Job Title*<input id="title" required></label>
+                <label>Company*<input id="company" required></label>
+                <label><input id="current" type="checkbox"> I currently work here</label>
+                <label for="from">From*</label>
+                <input id="from" placeholder="MM/YYYY" aria-required="true">
+                <label for="to">To*</label>
+                <input id="to" placeholder="MM/YYYY" aria-required="true">
+                <label for="loc">Location</label>
+                <input id="loc">
+                <label for="role">Role Description</label>
+                <textarea id="role"></textarea>
+              </section>
+            </main>
+            """
+        )
+        profile = CandidateProfile.from_dict(
+            {
+                "candidateId": "cand-jahnavi",
+                "personal": {"first_name": "Jahnavi", "last_name": "Torra", "email": EMAIL},
+                "employment": [
+                    {
+                        "company": "VEM Technologies pvt ltd",
+                        "title": "engineer",
+                        "from": "03-2019",
+                        "current": True,
+                        "responsibilities": "Firmware bring-up",
+                        "location": "Hyderabad",
+                    }
+                ],
+            }
+        )
+        _run(page, "https://nidec.wd1.myworkdayjobs.com/en-US/Example/job/Role/apply", profile)
+        assert page.locator("#from").input_value() == "03/2019"
+        assert page.locator("#to").input_value() == ""
+        assert page.locator("#current").is_checked()
+        assert page.locator("#loc").input_value() == "Hyderabad"
+        assert page.locator("#role").input_value() == "Firmware bring-up"
     finally:
         page.close()
 

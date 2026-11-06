@@ -524,16 +524,23 @@ def _pad_month(value: str) -> str:
 
 
 def _normalize_from_to(value: str) -> str:
-    """``MM/YYYY``, or ``YYYY`` when the payload has no month. Other text stays."""
+    """``MM/YYYY``, or ``YYYY`` when the payload has no month.
+
+    ``03-2019`` and ``Jan-2019`` are the same month and year. A year alone stays
+    a year. A missing month is not invented.
+    """
     text = value.strip()
-    year_only = re.fullmatch(r"(19|20)\d{2}", text)
-    if year_only:
+    if re.fullmatch(r"(?:19|20)\d{2}", text):
         return text
-    parsed = re.fullmatch(r"(\d{1,2})\s*[./-]\s*((?:19|20)\d{2})", text)
+    from autofill.dates import parse_month_year
+
+    # A full day/month/year string is not a from/to month. Leave it unchanged.
+    if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{4}", text):
+        return text
+    parsed = parse_month_year(text)
     if parsed:
-        month = _pad_month(parsed.group(1))
-        if month:
-            return f"{month}/{parsed.group(2)}"
+        month, year = parsed
+        return f"{month:02d}/{year}"
     return text
 
 

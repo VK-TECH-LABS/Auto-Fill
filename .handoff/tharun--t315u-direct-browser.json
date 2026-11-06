@@ -19,8 +19,8 @@
     "tests/test_save_continue.py",
     "tests/test_t315_direct_browser.py"
   ],
-  "tests": "pytest tests/test_t315_direct_browser.py && ruff check src tests scripts && mypy",
-  "blockers": "Vinayaka still hides Companion chrome for the direct-browser path and still adds employment location and role description to the session payload when the Application Profile has them. This helper consumes those keys when they arrive and does not invent them.",
-  "next_action": "Staging manual verification on SmartRecruiters, Ashby, and Workday. Do not mark master complete. Do not claim Tarun acceptance.",
-  "updated_at": "2026-11-06T11:12:27Z"
+  "tests": "pytest tests/test_t315_direct_browser.py tests/test_profile.py && ruff check src tests scripts && mypy",
+  "blockers": "Vinayaka #178 is open and not merged. This helper reads localHelperSessionBody profile and accepts the new keys when present. A missing key stays blank. Companion chrome hiding stays on vinayaka.",
+  "next_action": "Staging manual verification on SmartRecruiters, Ashby, and Workday after #178 lands or with today's LIVE payload. Do not mark master complete. Do not claim Tarun acceptance.",
+  "updated_at": "2026-11-06T11:20:00Z"
 }
