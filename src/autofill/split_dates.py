@@ -70,6 +70,174 @@ _WRITE_PAIR_JS = r"""({ monthSelector, yearSelector, month, year }) => {
 }"""
 
 
+_MONTH_YEAR_RE = re.compile(r"(?<![a-z/])mm\s*/\s*yyyy\b", re.IGNORECASE)
+_DAY_DATE_RE = re.compile(r"mm\s*/\s*dd|dd\s*/\s*mm|\b(?:dd|day)\b", re.IGNORECASE)
+_MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _month_year_control(control: Control) -> bool:
+    """A single From/To box whose placeholder is MM/YYYY, not a full date or a split pair."""
+    if control.hidden or control.kind not in {"text", "combobox"}:
+        return False
+    hint = " ".join(part for part in (control.placeholder, control.label, control.aria_label) if part)
+    if not hint or _DAY_DATE_RE.search(hint):
+        return False
+    return _MONTH_YEAR_RE.search(hint) is not None
+
+
+def _which_side(control: Control) -> str:
+    blob = " ".join(
+        part
+        for part in (control.label, control.aria_label, control.form_automation_id, control.automation_id, control.name)
+        if part
+    ).casefold()
+    if any(token in blob for token in ("end date", "enddate", " to", "todate")) or blob.strip() in {"to", "to*"}:
+        return "end"
+    return "start"
+
+
+def _date_bucket(control: Control) -> str:
+    blob = " ".join(
+        part for part in (control.form_automation_id, control.automation_id, control.element_id, control.name) if part
+    ).casefold()
+    if any(token in blob for token in ("education", "school")):
+        return "education"
+    return "work"
+
+
+def month_year_slots(snapshot: PageSnapshot) -> list[tuple[str, int, str, Control]]:
+    """Page-order From/To boxes. Each start begins the next work or education row."""
+    slots: list[tuple[str, int, str, Control]] = []
+    index = {"work": -1, "education": -1}
+    expect = {"work": "start", "education": "start"}
+    for control in snapshot.controls:
+        if not _month_year_control(control) or not control.selector:
+            continue
+        bucket = _date_bucket(control)
+        which = _which_side(control)
+        if which == "start" or expect[bucket] == "start":
+            index[bucket] += 1
+            which = "start"
+        slots.append((bucket, index[bucket], which, control))
+        expect[bucket] = "end" if which == "start" else "start"
+    return slots
+
+
+def month_year_profile_selectors(snapshot: PageSnapshot, profile: CandidateProfile | None) -> set[str]:
+    """Selectors whose profile row already has that From or To. They are not questions."""
+    if profile is None:
+        return set()
+    covered: set[str] = set()
+    for bucket, index, which, control in month_year_slots(snapshot):
+        rows = profile.employment if bucket == "work" else profile.education_history
+        if index < 0 or index >= len(rows):
+            continue
+        row = rows[index]
+        if bucket == "work" and which == "end" and getattr(row, "current", False):
+            covered.add(control.selector)
+            continue
+        raw = row.start_date if which == "start" else row.end_date
+        if parse_month_year(raw):
+            covered.add(control.selector)
+    return covered
+
+
+_WRITE_MONTH_YEAR_JS = r"""({ selector, text, monthName, year }) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return { ok: false }; }
+  if (!el) return { ok: false };
+  const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  function write(node, value) {
+    if (proto && proto.set) proto.set.call(node, value);
+    else node.value = value;
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  write(el, text);
+  el.dispatchEvent(new Event("blur", { bubbles: true }));
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  function held() {
+    return clean(el.value) === text;
+  }
+  if (held()) return { ok: true, how: "value" };
+  el.focus();
+  const press = el["click"];
+  if (press) press.call(el);
+  function visible(node) {
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const box = node.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  }
+  function buttons() {
+    return Array.from(document.querySelectorAll("button, [role='button']")).filter(visible);
+  }
+  let guard = 0;
+  while (guard < 24) {
+    guard += 1;
+    const shown = buttons();
+    const header = shown.map((node) => clean(node.innerText || node.textContent)).join(" ");
+    if (header.indexOf(String(year)) !== -1) break;
+    const next = shown.find((node) => /next/i.test(node.getAttribute("aria-label") || ""));
+    const prev = shown.find((node) => /prev|previous/i.test(node.getAttribute("aria-label") || ""));
+    const targetYear = Number(year);
+    const headerYear = Number((header.match(/\b(19|20)\d{2}\b/) || [])[0] || 0);
+    const move = headerYear && targetYear && headerYear > targetYear ? prev : next;
+    if (!move) break;
+    const step = move["click"];
+    if (step) step.call(move);
+  }
+  const month = buttons().find((node) => clean(node.innerText || node.textContent) === monthName);
+  if (month) {
+    const choose = month["click"];
+    if (choose) choose.call(month);
+  }
+  return { ok: held(), how: month ? "calendar" : "value" };
+}"""
+
+
+def fill_month_year_inputs(page, profile: CandidateProfile, snapshot: PageSnapshot) -> set[str]:
+    """Write each MM/YYYY From or To from that work or education row.
+
+    The visible box has to keep ``MM/YYYY``. A calendar month button is used
+    when assigning the value does not stick. A date the profile has is returned
+    either way so the card does not ask for it.
+    """
+    handled: set[str] = set()
+    evaluate = getattr(page, "evaluate", None)
+    for bucket, index, which, control in month_year_slots(snapshot):
+        rows = profile.employment if bucket == "work" else profile.education_history
+        if index < 0 or index >= len(rows):
+            continue
+        row = rows[index]
+        if bucket == "work" and which == "end" and getattr(row, "current", False):
+            handled.add(control.selector)
+            continue
+        parsed = parse_month_year(row.start_date if which == "start" else row.end_date)
+        if parsed is None:
+            continue
+        handled.add(control.selector)
+        if evaluate is None:
+            continue
+        month, year = parsed
+        text = f"{month:02d}/{year}"
+        try:
+            evaluate(
+                _WRITE_MONTH_YEAR_JS,
+                {
+                    "selector": control.selector,
+                    "text": text,
+                    "monthName": _MONTH_NAMES[month - 1],
+                    "year": str(year),
+                },
+            )
+        except Exception:
+            continue
+    return handled
+
+
 def fill_split_dates(page, profile: CandidateProfile, snapshot: PageSnapshot) -> set[str]:
     """Write each start/end pair from the matching profile row.
 

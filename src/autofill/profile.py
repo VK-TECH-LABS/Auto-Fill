@@ -15,6 +15,7 @@ The example shipped with this repo is fictional.
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -382,6 +383,15 @@ def _alias_personal_keys(personal: dict) -> None:
         "postalCode": "postal_code",
         "zip": "postal_code",
         "middleName": "middle_name",
+        "linkedinUrl": "linkedin_url",
+        "linkedInUrl": "linkedin_url",
+        "linkedin": "linkedin_url",
+        "githubUrl": "github_url",
+        "github": "github_url",
+        "portfolioUrl": "portfolio_url",
+        "portfolio": "portfolio_url",
+        "websiteUrl": "website_url",
+        "website": "website_url",
     }
     for source, dest in aliases.items():
         if personal.get(source) not in (None, "") and not personal.get(dest):
@@ -429,6 +439,21 @@ def _accept_extended_shape(data: dict) -> dict:
         for source, dest in alias.items():
             if address.get(source) and not personal.get(dest):
                 personal[dest] = address[source]
+    links = merged.get("links")
+    if isinstance(links, dict):
+        link_alias = {
+            "linkedin": "linkedin_url",
+            "linkedinUrl": "linkedin_url",
+            "github": "github_url",
+            "githubUrl": "github_url",
+            "portfolio": "portfolio_url",
+            "portfolioUrl": "portfolio_url",
+            "website": "website_url",
+            "websiteUrl": "website_url",
+        }
+        for source, dest in link_alias.items():
+            if links.get(source) not in (None, "") and not personal.get(dest):
+                personal[dest] = links[source]
     _alias_personal_keys(personal)
     merged["personal"] = personal
 
@@ -486,14 +511,119 @@ def _objects(raw: object, label: str) -> list[dict]:
     return items
 
 
+def _pad_month(value: str) -> str:
+    text = value.strip()
+    if text.isdigit() and 1 <= int(text) <= 12:
+        return f"{int(text):02d}"
+    return ""
+
+
+def _normalize_from_to(value: str) -> str:
+    """``MM/YYYY``, or ``YYYY`` when the payload has no month. Other text stays."""
+    text = value.strip()
+    year_only = re.fullmatch(r"(19|20)\d{2}", text)
+    if year_only:
+        return text
+    parsed = re.fullmatch(r"(\d{1,2})\s*[./-]\s*((?:19|20)\d{2})", text)
+    if parsed:
+        month = _pad_month(parsed.group(1))
+        if month:
+            return f"{month}/{parsed.group(2)}"
+    return text
+
+
+def _first_text(entry: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = _text(entry, key)
+        if value:
+            return value
+    return ""
+
+
+def _date_text(entry: dict, which: str) -> str:
+    """Month and year for one side of a work or education row.
+
+    vinayaka #176 sends ``start_month`` / ``start_year`` (and the end pair) plus
+    ``from`` / ``to``. Resolver rows use ``startMonth`` / ``startYear`` / ``from``
+    / ``to``. Those win when they are present. A current LIVE row that only has
+    ``start_date`` / ``end_date`` (or ``startDate`` / ``endDate``) keeps that
+    string, and the filler reads the month and year from it.
+    """
+    if which == "start":
+        month_keys = ("start_month", "startMonth", "from_month", "fromMonth")
+        year_keys = ("start_year", "startYear", "from_year", "fromYear")
+        explicit_keys = ("from", "fromDate", "from_date")
+        legacy_keys = ("start_date", "startDate")
+    else:
+        month_keys = ("end_month", "endMonth", "to_month", "toMonth")
+        year_keys = ("end_year", "endYear", "to_year", "toYear")
+        explicit_keys = ("to", "toDate", "to_date")
+        legacy_keys = ("end_date", "endDate")
+    month = _pad_month(_first_text(entry, month_keys))
+    year = _first_text(entry, year_keys)
+    if month and re.fullmatch(r"(?:19|20)\d{2}", year):
+        return f"{month}/{year}"
+    if not month and re.fullmatch(r"(?:19|20)\d{2}", year) and not _first_text(entry, explicit_keys):
+        return year
+    explicit = _first_text(entry, explicit_keys)
+    if explicit:
+        return _normalize_from_to(explicit)
+    return _first_text(entry, legacy_keys)
+
+
+def _new_date_shape(entry: dict) -> bool:
+    keys = (
+        "from",
+        "to",
+        "start_month",
+        "startMonth",
+        "start_year",
+        "startYear",
+        "end_month",
+        "endMonth",
+        "end_year",
+        "endYear",
+    )
+    return any(entry.get(key) not in (None, "") for key in keys)
+
+
+def _has_end(entry: dict) -> bool:
+    keys = (
+        "to",
+        "toDate",
+        "to_date",
+        "end_date",
+        "endDate",
+        "end_month",
+        "endMonth",
+        "end_year",
+        "endYear",
+    )
+    return any(entry.get(key) not in (None, "") for key in keys)
+
+
+def _current_job(entry: dict) -> bool:
+    """True when the payload says the job is current.
+
+    An explicit flag wins. On a #176 row, an omitted ``to`` is the same fact.
+    A LIVE row that simply has no end date stays not-current.
+    """
+    for key in ("current", "currentlyWorking", "currently_working", "isCurrent", "present"):
+        if entry.get(key) is True:
+            return True
+        if entry.get(key) is False:
+            return False
+    return _new_date_shape(entry) and not _has_end(entry)
+
+
 def _employment_list(raw: object) -> list[Employment]:
     return [
         Employment(
             company=_text(entry, "company") or _text(entry, "employer"),
             title=_text(entry, "title") or _text(entry, "jobTitle") or _text(entry, "job_title"),
-            start_date=_text(entry, "startDate") or _text(entry, "start_date"),
-            end_date=_text(entry, "endDate") or _text(entry, "end_date"),
-            current=bool(entry.get("current", False)),
+            start_date=_date_text(entry, "start"),
+            end_date=_date_text(entry, "end"),
+            current=_current_job(entry),
             location=_text(entry, "location"),
         )
         for entry in _objects(raw, "employment")
@@ -506,8 +636,8 @@ def _education_list(raw: object) -> list[EducationEntry]:
             school=_text(entry, "school") or _text(entry, "institution"),
             degree=_text(entry, "degree"),
             field_of_study=_text(entry, "field") or _text(entry, "fieldOfStudy") or _text(entry, "field_of_study"),
-            start_date=_text(entry, "startDate") or _text(entry, "start_date"),
-            end_date=_text(entry, "endDate") or _text(entry, "end_date"),
+            start_date=_date_text(entry, "start"),
+            end_date=_date_text(entry, "end"),
         )
         for entry in _objects(raw, "education")
     ]

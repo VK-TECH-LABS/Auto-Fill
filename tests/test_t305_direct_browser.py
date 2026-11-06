@@ -153,8 +153,10 @@ def test_ashby_unknowns_and_invalid_phone_share_one_gap_pass():
     gaps = _with_study_gaps(page, snapshot, profile, required_gaps(page, snapshot, profile))
     texts = " ".join(str(item.get("text") or "") for item in gaps)
     selectors = {str(item.get("selector") or "") for item in gaps}
-    assert {"#li", "#tw", "#gh", "#po", "#onsite", "#phone"} <= selectors
-    assert "LinkedIn" in texts
+    assert {"#onsite", "#phone"} <= selectors
+    assert "#li" not in selectors
+    assert "#tw" not in selectors
+    assert "LinkedIn" not in texts
     assert "onsite" in texts.casefold()
     assert len([item for item in gaps if item.get("selector") == "#phone"]) == 1
     filled = _profile(linkedin_url="https://linkedin.example/in/jahnavi")

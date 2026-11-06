@@ -144,9 +144,12 @@ def test_ashby_titles_above_the_inputs_open_one_question_card(browser):
         assert result.status == Status.MANUAL_ANSWER_REQUIRED
         assert result.stopped_before_submit is True
         texts = " ".join(str(item.get("text") or "") for item in result.open_items).casefold()
-        assert "linkedin" in texts
+        assert "linkedin" not in texts
+        assert "twitter" not in texts
+        assert "github" not in texts
+        assert "portfolio" not in texts
         assert "onsite" in texts
-        assert len(result.open_items) >= 2
+        assert page.locator("#li").input_value() == ""
     finally:
         page.close()
 

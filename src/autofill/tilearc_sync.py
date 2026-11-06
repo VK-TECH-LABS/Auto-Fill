@@ -64,6 +64,7 @@ class SessionSnapshot:
     fingerprint: str
     version: str
     candidate_id: str = ""
+    local_profile: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,6 +75,12 @@ class AnswerReadBack:
     answer: str
     version: str
     updated_at: str
+    values: list[str] = field(default_factory=list)
+    selected_options: list[dict[str, str]] = field(default_factory=list)
+    leaf: dict[str, str] | None = None
+    leaves: list[dict[str, str]] = field(default_factory=list)
+    # True when the body carries #176 selection keys, even if they are empty.
+    selection_shape: bool = False
 
 
 @dataclass
@@ -107,8 +114,36 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def _answer_text(value: Any) -> str:
+    """The stored answer, including a multiselect list or a nested leaf object.
+
+    A string stays a string. A list is the same `` | `` join the helper submits.
+    ``{"parent", "leaf"}`` and ``{"path"}`` are the committed leaf path.
+    """
+    if isinstance(value, list):
+        parts = [_answer_text(item) for item in value]
+        return " | ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        path = _text(value.get("path"))
+        if path:
+            return path
+        parent = _text(value.get("parent"))
+        leaf = _text(value.get("leaf") or value.get("child") or value.get("label") or value.get("value"))
+        if parent and leaf:
+            return f"{parent} > {leaf}"
+        if leaf:
+            return leaf
+        return _text(value.get("answer") or value.get("text"))
+    return _text(value)
+
+
 def _same(left: str, right: str) -> bool:
     return _text(left).casefold() == _text(right).casefold()
+
+
+def _same_answer(submitted: str, read: str) -> bool:
+    """Exact match after a list or nested leaf is flattened to the submitted text."""
+    return _same(submitted, read)
 
 
 def parse_session_body(body: Any, *, candidate_id: str) -> SessionSnapshot | None:
@@ -123,6 +158,9 @@ def parse_session_body(body: Any, *, candidate_id: str) -> SessionSnapshot | Non
         return None
     if not isinstance(candidate_profile, dict):
         candidate_profile = {}
+    local_profile = body.get("localProfile")
+    if not isinstance(local_profile, dict):
+        local_profile = {}
     owner = _text(body.get("candidateId")) or candidate_id
     if owner and candidate_id and owner != candidate_id:
         return None
@@ -132,15 +170,48 @@ def parse_session_body(body: Any, *, candidate_id: str) -> SessionSnapshot | Non
         fingerprint=fingerprint,
         version=version,
         candidate_id=owner or candidate_id,
+        local_profile=local_profile,
     )
+
+
+def _option_row(raw: Any) -> dict[str, str] | None:
+    """One #176 option or leaf: ``id``, ``label``, and ``path``."""
+    if not isinstance(raw, dict):
+        return None
+    row = {
+        "id": _text(raw.get("id")),
+        "label": _text(raw.get("label")),
+        "path": _text(raw.get("path")),
+    }
+    if not any(row.values()):
+        return None
+    return row
+
+
+def _option_rows(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    return [row for item in raw if (row := _option_row(item)) is not None]
+
+
+def _value_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [_answer_text(item) for item in raw if _answer_text(item)]
+    text = _answer_text(raw)
+    return [text] if text else []
 
 
 def _read_back(raw: Any) -> AnswerReadBack | None:
     if not isinstance(raw, dict):
         return None
     candidate_id = _text(raw.get("candidateId"))
-    answer = _text(raw.get("answer"))
-    if not candidate_id or not answer:
+    answer = _answer_text(raw.get("answer"))
+    values = _value_list(raw.get("values")) if "values" in raw else []
+    selected = _option_rows(raw.get("selectedOptions")) if "selectedOptions" in raw else []
+    leaf = _option_row(raw.get("leaf")) if "leaf" in raw else None
+    leaves = _option_rows(raw.get("leaves")) if "leaves" in raw else []
+    selection_shape = any(key in raw for key in ("values", "selectedOptions", "leaf", "leaves"))
+    if not candidate_id or not (answer or values or leaf or leaves or selected):
         return None
     return AnswerReadBack(
         candidate_id=candidate_id,
@@ -149,6 +220,11 @@ def _read_back(raw: Any) -> AnswerReadBack | None:
         answer=answer,
         version=_text(raw.get("version")),
         updated_at=_text(raw.get("updatedAt")),
+        values=values,
+        selected_options=selected,
+        leaf=leaf,
+        leaves=leaves,
+        selection_shape=selection_shape,
     )
 
 
@@ -197,18 +273,110 @@ def parse_read_body(body: Any) -> AnswerAck | None:
     )
 
 
-def ack_is_trusted(ack: AnswerAck | None, *, candidate_id: str, submitted: str) -> bool:
-    """True only when verified and the read-back is this candidate's submitted answer."""
+def _joined(values: list[str]) -> str:
+    cleaned = [value.strip() for value in values if value.strip()]
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return " | ".join(cleaned)
+
+
+def _committed_ids(read_back: AnswerReadBack) -> set[str]:
+    found: set[str] = set()
+    rows = list(read_back.selected_options) + list(read_back.leaves)
+    if read_back.leaf is not None:
+        rows.append(read_back.leaf)
+    for row in rows:
+        ident = _text(row.get("id"))
+        if ident:
+            found.add(ident.casefold())
+    return found
+
+
+def ack_is_trusted(
+    ack: AnswerAck | None,
+    *,
+    candidate_id: str,
+    submitted: str,
+    choice: bool = False,
+    values: list[str] | None = None,
+    leaf_id: str = "",
+) -> bool:
+    """True only when verified and the read-back is this candidate's submitted answer.
+
+    A #176 selection is committed by ``values`` or ``leaf.id``. The typed
+    ``answer`` string does not verify that selection. A LIVE read-back that has
+    no selection keys still matches the submitted answer text.
+    """
     if ack is None or not ack.verified or ack.read_back is None:
         return False
-    if not candidate_id or ack.read_back.candidate_id != candidate_id:
+    read_back = ack.read_back
+    if not candidate_id or read_back.candidate_id != candidate_id:
         return False
-    return _same(ack.read_back.answer, submitted)
+    if choice and read_back.selection_shape:
+        submitted_values = list(values or [])
+        if submitted_values and _same(_joined(read_back.values), _joined(submitted_values)):
+            return True
+        if read_back.values and _same(_joined(read_back.values), submitted):
+            return True
+        wanted = {_text(leaf_id).casefold()} if _text(leaf_id) else set()
+        for row in values or []:
+            text = _text(row)
+            if text:
+                wanted.add(text.casefold())
+        if wanted and wanted & _committed_ids(read_back):
+            return True
+        return False
+    return _same_answer(submitted, read_back.answer)
+
+
+_LINK_KEYS = (
+    "linkedin_url",
+    "portfolio_url",
+    "website_url",
+    "github_url",
+    "linkedinUrl",
+    "portfolioUrl",
+    "websiteUrl",
+    "githubUrl",
+)
+
+
+def _overlay_records(body: dict[str, Any], source: dict[str, Any]) -> None:
+    """Copy work, education, and stored links. Blank keys are not written."""
+    for key in ("employment", "education"):
+        rows = source.get(key)
+        if isinstance(rows, list) and rows:
+            body[key] = rows
+    links = source.get("links")
+    if isinstance(links, dict):
+        current = body.get("links")
+        merged = dict(current) if isinstance(current, dict) else {}
+        for name, value in links.items():
+            if value not in (None, ""):
+                merged[name] = value
+        if merged:
+            body["links"] = merged
+    personal_src = source.get("personal")
+    if not isinstance(personal_src, dict):
+        return
+    personal = body.get("personal")
+    personal = dict(personal) if isinstance(personal, dict) else {}
+    for key in _LINK_KEYS:
+        if personal_src.get(key) not in (None, ""):
+            personal[key] = personal_src[key]
+    if personal:
+        body["personal"] = personal
 
 
 def merged_profile_body(posted: dict[str, Any] | None, snapshot: SessionSnapshot) -> dict[str, Any]:
-    """Latest profile. ``candidateProfile`` names replace a blank or stale legal name."""
+    """Latest profile. ``candidateProfile`` names replace a blank or stale legal name.
+
+    ``localProfile`` and ``candidateProfile`` work and education rows carry the
+    #176 dates when the session sent them. A link is copied only when stored.
+    """
     body = dict(snapshot.profile)
+    _overlay_records(body, snapshot.local_profile)
+    _overlay_records(body, snapshot.candidate_profile)
     personal = body.get("personal")
     personal = dict(personal) if isinstance(personal, dict) else {}
     cand = snapshot.candidate_profile.get("personal")
@@ -357,6 +525,10 @@ class TilearcClient:
         answer: str,
         key: str = "",
         standard_terms_authorized: bool | None = None,
+        values: list[str] | None = None,
+        selected_options: list[dict[str, str]] | None = None,
+        leaf: dict[str, str] | None = None,
+        leaves: list[dict[str, str]] | None = None,
     ) -> AnswerAck | None:
         payload: dict[str, Any] = {
             "phase": "confirm",
@@ -365,6 +537,14 @@ class TilearcClient:
             "question": question,
             "answer": answer,
         }
+        if values:
+            payload["values"] = list(values)
+        if selected_options:
+            payload["selectedOptions"] = list(selected_options)
+        if leaf:
+            payload["leaf"] = dict(leaf)
+        if leaves:
+            payload["leaves"] = list(leaves)
         if key:
             payload["key"] = key
         if standard_terms_authorized is not None:
