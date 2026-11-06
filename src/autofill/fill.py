@@ -595,7 +595,14 @@ def _fill_checkbox_group(
     values: list[str] = []
     if mapped.action == "fill" and mapped.text.strip():
         raw = mapped.text.strip()
-        values = [part.strip() for part in raw.split(",") if part.strip()] if "," in raw else [raw]
+        if " | " in raw:
+            values = [part.strip() for part in raw.split(" | ") if part.strip()]
+        else:
+            values = [raw]
+            if "," in raw:
+                parts = [part.strip() for part in raw.split(",") if part.strip()]
+                if match_all_options(parts, options):
+                    values = parts
     chosen = match_all_options(values, options) if values else None
     if chosen is None:
         reason = mapped.reason or "No option matched this group."
@@ -875,6 +882,29 @@ def _clear_blank_profile_row(page, control: Control, mapped: MappedField) -> boo
         return False
 
 
+def _reveal_overflow(page) -> None:
+    """Bring controls below the fold into the document before the scan.
+
+    A long application keeps every checkbox and radio in the DOM. Scrolling
+    them once mounts rows that wait for a viewport. The view returns to the top
+    so the employer card stays centered. This does not click Next or Submit.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        evaluate(
+            """() => {
+              const root = document.scrollingElement || document.documentElement;
+              const height = root ? root.scrollHeight : 0;
+              window.scrollTo(0, height);
+              window.scrollTo(0, 0);
+            }"""
+        )
+    except Exception:
+        return
+
+
 def fill_one_page(
     page,
     profile: CandidateProfile,
@@ -927,10 +957,13 @@ def fill_one_page(
         )
         snapshot = extract_page(page)
         note_page_country(page, snapshot)
-        from autofill.split_dates import fill_month_year_inputs, fill_split_dates
+        from autofill.split_dates import fill_current_boxes, fill_month_year_inputs, fill_split_dates
 
+        _reveal_overflow(page)
+        snapshot = extract_page(page)
         handled_dates = fill_split_dates(page, profile, snapshot)
         handled_dates.update(fill_month_year_inputs(page, profile, snapshot))
+        handled_dates.update(fill_current_boxes(page, profile, snapshot))
         cursor = MapCursor(page_heading=snapshot.heading)
         from autofill.stepfill import _clusters
 

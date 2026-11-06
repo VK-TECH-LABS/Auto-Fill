@@ -1251,6 +1251,31 @@ def _profile_text(
         if row is None:
             return ""
         return row.location.strip()
+    if key == "employment_description":
+        row = _row(profile.employment, cursor, "employment_description")
+        if row is None:
+            return ""
+        return row.description.strip()
+    if key == "employment_current":
+        row = _row(profile.employment, cursor, "employment_current")
+        if row is None:
+            return ""
+        return "yes" if row.current else "no"
+    if key == "education_location":
+        row = _row(profile.education_history, cursor, "education_location")
+        if row is None:
+            return ""
+        return row.location.strip()
+    if key == "education_description":
+        row = _row(profile.education_history, cursor, "education_description")
+        if row is None:
+            return ""
+        return row.description.strip()
+    if key == "education_current":
+        row = _row(profile.education_history, cursor, "education_current")
+        if row is None:
+            return ""
+        return "yes" if row.current else "no"
     if key == "current_company":
         row = _row(profile.employment, cursor, "employer")
         if profile.employment:
@@ -1720,33 +1745,101 @@ def is_previous_worker(control: Control) -> bool:
     return bool(_PREVIOUS_WORKER_RE.search(normalize(_previous_worker_text(control))))
 
 
-def _is_work_experience_location(control: Control) -> bool:
-    """A Work Experience row's Location box. It is not the home address.
-
-    ``workExperience-16--location`` is one. ``Current location`` on My
-    Information is not, and neither is a relocation question.
-    """
-    blob = normalize(
+def _section_blob(control: Control) -> str:
+    return normalize(
         " ".join(
             part
             for part in (
                 control.element_id,
                 control.name,
                 control.automation_id,
+                control.form_automation_id,
                 control.selector,
                 control.label,
+                control.aria_label,
                 control.nearby,
                 control.group,
+                control.prompt,
             )
             if part
         )
     )
+
+
+def _is_work_experience_location(control: Control) -> bool:
+    """A Work Experience row's Location box. It is not the home address.
+
+    ``workExperience-16--location`` is one. A Location field under a Work
+    Experience heading is one. ``Current location`` on My Information is not,
+    and neither is a relocation question.
+    """
+    blob = _section_blob(control)
     compact = re.sub(r"[^a-z0-9]", "", blob)
-    if "workexperience" not in compact:
-        return False
     if "relocat" in blob:
         return False
-    return "location" in compact or normalize(control.label or "") == "location"
+    label = normalize(control.label or control.aria_label or "")
+    in_work = "workexperience" in compact or "work experience" in blob
+    if not in_work:
+        return False
+    if label in {"current location", "your location"}:
+        return False
+    return "location" in compact or label in {"location", "city", "office location", "job location"}
+
+
+def _is_education_location(control: Control) -> bool:
+    blob = _section_blob(control)
+    compact = re.sub(r"[^a-z0-9]", "", blob)
+    if "relocat" in blob:
+        return False
+    in_school = any(token in compact for token in ("education", "school")) or "education" in blob
+    if not in_school:
+        return False
+    label = normalize(control.label or control.aria_label or "")
+    return label in {"location", "city", "campus"} or (in_school and label == "location")
+
+
+def _is_role_description(control: Control) -> bool:
+    """The responsibilities box on a work row. A cover letter is not one."""
+    if control.kind not in {"textarea", "text"}:
+        return False
+    label = normalize(control.label or control.aria_label or control.placeholder or "")
+    if not label or "cover letter" in label:
+        return False
+    return bool(
+        re.search(
+            r"\b(role description|job description|position description|responsibilities|role summary|duties)\b",
+            label,
+        )
+    )
+
+
+def _is_education_description(control: Control) -> bool:
+    if control.kind not in {"textarea", "text"}:
+        return False
+    blob = _section_blob(control)
+    if not any(token in blob for token in ("education", "school", "degree")):
+        return False
+    label = normalize(control.label or control.aria_label or "")
+    return bool(re.search(r"\b(description|activities|summary|coursework)\b", label))
+
+
+def _is_current_work_box(control: Control) -> bool:
+    if control.kind != "checkbox":
+        return False
+    blob = normalize(" ".join(part for part in (control.label, control.aria_label, control.prompt) if part))
+    return bool(
+        re.search(
+            r"\b(i currently work here|currently work here|i currently work|currently working here)\b",
+            blob,
+        )
+    )
+
+
+def _is_current_education_box(control: Control) -> bool:
+    if control.kind != "checkbox":
+        return False
+    blob = normalize(" ".join(part for part in (control.label, control.aria_label, control.prompt) if part))
+    return bool(re.search(r"\b(i currently attend|currently attending|currently enrolled)\b", blob))
 
 
 def _is_yes_no_prompt(control: Control) -> bool:
@@ -1784,8 +1877,21 @@ def _automation_name_key(control: Control) -> str | None:
         return "github_url"
     if "portfolio" in compact:
         return "portfolio_url"
-    if "website" in compact:
+    if "website" in compact and "relocat" not in compact:
         return "website_url"
+    textish = control.kind in {"text", "textarea", "combobox"} or control.input_type in {"email", "tel", "text", "url"}
+    if not textish:
+        return None
+    if any(token in compact for token in ("emailconfirm", "confirmemail", "confirmemailaddress")):
+        return "email"
+    if "email" in compact and "confirm" not in compact and "newsletter" not in compact:
+        return "email"
+    if any(token in compact for token in ("phonecountry", "callingcode", "dialcode", "countrycode")):
+        return None
+    if any(token in compact for token in ("phonenumber", "phone", "mobile", "telephone")):
+        return "phone"
+    if compact in {"city", "town"} or compact.endswith("city") or compact.endswith("town"):
+        return "city"
     return None
 
 
@@ -1834,8 +1940,18 @@ def _match_rule(control: Control) -> str | None:
             return None
         return "country"
     label = normalize(control.label or control.aria_label or control.placeholder)
+    if _is_current_work_box(control):
+        return "employment_current"
+    if _is_current_education_box(control):
+        return "education_current"
+    if _is_role_description(control):
+        return "employment_description"
+    if _is_education_description(control):
+        return "education_description"
     if _is_work_experience_location(control):
         return "employment_location"
+    if _is_education_location(control):
+        return "education_location"
     if label in {"current location", "location", "your location"} and "relocat" not in label:
         return "location"
     if (
@@ -2175,6 +2291,9 @@ def map_field(
         selector=control.selector,
         automation_id=control.automation_id,
         form_automation_id=control.form_automation_id,
+        nearby=control.nearby,
+        group=control.group,
+        prompt=control.prompt,
         national_phone=control.national_phone,
         phone_adjacent=control.phone_adjacent
         or normalize(control.nearby) in {"phone", "mobile", "telephone", "mobile phone"},
