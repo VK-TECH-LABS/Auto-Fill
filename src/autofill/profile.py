@@ -227,6 +227,15 @@ class ApplicationAnswer:
     key: str = ""
 
 
+def _how_heard_question(text: str) -> bool:
+    """Hear About wording. There is no HOW_HEARD intent on the LIVE payload."""
+    folded = text.casefold()
+    return any(
+        phrase in folded
+        for phrase in ("how did you hear", "how you heard", "how heard", "how did you find", "where did you hear")
+    )
+
+
 @dataclass
 class CandidateProfile:
     personal: Personal
@@ -239,6 +248,8 @@ class CandidateProfile:
     documents: Documents = field(default_factory=Documents)
     skills: list[str] = field(default_factory=list)
     candidate_id: str = ""
+    # Top-level create-body ``sourceUrl`` only. The apply URL is not a source.
+    source_url: str = ""
     employment: list[Employment] = field(default_factory=list)
     education_history: list[EducationEntry] = field(default_factory=list)
     internships: list[Internship] = field(default_factory=list)
@@ -294,7 +305,7 @@ class CandidateProfile:
         if not isinstance(skills_raw, list) or not all(isinstance(item, str) for item in skills_raw):
             raise ProfileError("skills must be a list of strings.")
 
-        return cls(
+        built = cls(
             personal=Personal(
                 full_name=full_name,
                 email=email,
@@ -363,6 +374,13 @@ class CandidateProfile:
                 _text(data, "candidateId") or _text(data, "candidate_id"),
             ),
         )
+        if not built.screening.how_heard:
+            for item in built.application_answers:
+                heard = _how_heard_question(item.question) or item.key == "how_heard"
+                if heard and item.answer.strip():
+                    built.screening.how_heard = item.answer.strip()
+                    break
+        return built
 
 
 def _alias_personal_keys(personal: dict) -> None:
@@ -739,8 +757,57 @@ def _stored_intent(value: str) -> str:
     return canonical_sms_intent(value)[:64]
 
 
+def _label_of(raw: object) -> str:
+    if isinstance(raw, dict):
+        return _text(raw, "label") or _text(raw, "value") or _text(raw, "name")
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def _label_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    labels: list[str] = []
+    for item in raw:
+        label = _label_of(item)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _selection_text(entry: dict) -> str:
+    """The committed choice. A taxonomy path is ``Parent > Leaf``.
+
+    ``leaves`` are in commit order. ``leaf`` is the one committed leaf.
+    ``values`` are the selected labels. ``answer`` is the saved text, often
+    those labels joined with `` | ``. A parent label alone is not preferred
+    over the leaf.
+    """
+    leaves = _label_list(entry.get("leaves"))
+    leaf = _label_of(entry.get("leaf"))
+    values = _label_list(entry.get("values"))
+    answer = _text(entry, "answer")
+    if len(leaves) >= 2:
+        return " > ".join(leaves)
+    if leaf:
+        if len(values) >= 2 and values[-1].casefold() == leaf.casefold():
+            return " > ".join(values)
+        if " > " in answer and leaf.casefold() in answer.casefold():
+            return answer
+        return leaf
+    if leaves:
+        return leaves[-1]
+    if " > " in answer:
+        return answer
+    return answer
+
+
 def _answer_row(entry: dict) -> ApplicationAnswer:
-    """One application answer. Recruitment SMS is normalized to the host key."""
+    """One application answer. Recruitment SMS is normalized to the host key.
+
+    Hear About has no intent. The leaf path is the answer the dropdown commits.
+    """
     from autofill.sms_consent import SMS_INTENT, SMS_KEY, canonical_sms_answer, canonical_sms_key
 
     question = _text(entry, "question")
@@ -755,9 +822,9 @@ def _answer_row(entry: dict) -> ApplicationAnswer:
         intent = SMS_INTENT
     if not question and key:
         question = key
-    answer = _text(entry, "answer")
+    answer = _selection_text(entry)
     if key == SMS_KEY or intent == SMS_INTENT:
-        answer = canonical_sms_answer(answer)
+        answer = canonical_sms_answer(answer or _text(entry, "answer"))
     return ApplicationAnswer(
         question=question,
         answer=answer,

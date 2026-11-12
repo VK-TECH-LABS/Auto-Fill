@@ -882,6 +882,30 @@ def _clear_blank_profile_row(page, control: Control, mapped: MappedField) -> boo
         return False
 
 
+def _how_heard_from_source(page, control: Control, profile) -> MappedField | None:
+    """Match ``sourceUrl``'s host to one employer option. No match stays unanswered."""
+    url = str(getattr(profile, "source_url", "") or "").strip()
+    if not url or control.kind not in {"combobox", "select", "radio"} or not control.selector:
+        return None
+    from autofill.combobox import list_combobox_options, match_source_host
+
+    if control.kind == "combobox":
+        labels = list_combobox_options(page, control.selector)
+    else:
+        labels = [option.label for option in control.options if option.label]
+    chosen = match_source_host(url, labels)
+    if not chosen:
+        return None
+    return MappedField(
+        key="how_heard",
+        action="select",
+        text=chosen,
+        option_label=chosen,
+        field_class="APPROVED_QUESTION",
+        confidence="high",
+    )
+
+
 def _reveal_overflow(page) -> None:
     """Bring controls below the fold into the document before the scan.
 
@@ -1043,6 +1067,11 @@ def fill_one_page(
                 job=job,
                 cursor=cursor,
             )
+            has_source = bool(str(getattr(profile, "source_url", "") or ""))
+            if mapped.action == "unanswered" and mapped.key == "how_heard" and has_source:
+                sourced = _how_heard_from_source(page, control, profile)
+                if sourced is not None:
+                    mapped = sourced
             if _clear_blank_profile_row(page, control, mapped):
                 fields.append(
                     _outcome(
