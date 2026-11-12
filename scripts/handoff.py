@@ -600,15 +600,23 @@ def cmd_write_from_git(root: Path) -> int:
         print(f"refusing to write a handoff record for {branch}", file=sys.stderr)
         return 1
     files = git_changed_files(base)
-    pr = ""
     token = os.environ.get("GITHUB_TOKEN", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if token and repository:
+        # A record commit pushed by the bot becomes the pull request head, and
+        # GitHub does not run pull_request checks for it, so the required checks
+        # never appear. Once a pull request is open, its file list is the
+        # ownership claim (collect_open_tasks), so stop writing records.
         try:
             pr = GitHubClient(token, repository).open_pr_url(branch)
         except GitHubError as exc:
-            print(f"::warning::could not look up the pull request: {exc}", file=sys.stderr)
-    path = write_record(root, branch, commit, files, pr, ownership)
+            print(f"::warning::could not look up the pull request, not writing a record: {exc}", file=sys.stderr)
+            print("skip=1")
+            return 0
+        if pr:
+            print(f"skip=1 open pull request {pr}")
+            return 0
+    path = write_record(root, branch, commit, files, "", ownership)
     if path is None:
         print("skip=1")
         return 0
