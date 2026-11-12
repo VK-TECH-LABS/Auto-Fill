@@ -17,7 +17,11 @@ WORKDIR /app
 COPY LICENSE NOTICE README.md pyproject.toml ./
 COPY src ./src
 
-RUN pip install --no-cache-dir . \
+# Playwright's bundled node needs libatomic1, which slim-bookworm does not ship.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir . \
     && python -m playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright \
     && rm -rf /root/.cache/pip \
