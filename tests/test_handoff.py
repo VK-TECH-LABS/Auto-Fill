@@ -436,3 +436,35 @@ def test_render_comment_has_machine_readable_record():
     assert payload["record"]["branch"] == "tharun/auth"
     assert payload["integration_branch"] == "staging"
     assert payload["conflicts"] == []
+
+
+def test_write_from_git_skips_branch_with_open_pull_request(tmp_path: Path, monkeypatch, capsys):
+    import scripts.handoff as handoff
+
+    (tmp_path / ".handoff").mkdir()
+    (tmp_path / ".handoff" / "ownership.json").write_text(
+        (ROOT / ".handoff" / "ownership.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    monkeypatch.setenv("HANDOFF_BRANCH", "saiteja/demo")
+    monkeypatch.setenv("HANDOFF_COMMIT", "abc123")
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(handoff, "git_changed_files", lambda base: ["src/autofill/fill.py"])
+    record = tmp_path / ".handoff" / record_filename("saiteja", "demo")
+
+    monkeypatch.setattr(handoff.GitHubClient, "open_pr_url", lambda self, branch: "https://x/pull/1")
+    assert handoff.cmd_write_from_git(tmp_path) == 0
+    assert "path=" not in capsys.readouterr().out
+    assert not record.exists()
+
+    def boom(self, branch):
+        raise handoff.GitHubError(500, {})
+
+    monkeypatch.setattr(handoff.GitHubClient, "open_pr_url", boom)
+    assert handoff.cmd_write_from_git(tmp_path) == 0
+    assert not record.exists()
+
+    monkeypatch.setattr(handoff.GitHubClient, "open_pr_url", lambda self, branch: "")
+    assert handoff.cmd_write_from_git(tmp_path) == 0
+    assert "path=.handoff/" in capsys.readouterr().out
+    assert record.exists()
