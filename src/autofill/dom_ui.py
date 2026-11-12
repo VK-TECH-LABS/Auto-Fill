@@ -886,6 +886,8 @@ _COMMITTED_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
         || autoId === "searchbox"
         || autoId === "monikersearchbox"
         || autoId === "promptsearchbox";
+      // An open prompt is a highlight or a search, not a committed leaf.
+      if (el.getAttribute("aria-expanded") === "true") return false;
       // A Workday prompt keeps the filter in the search box. That text is not
       // the choice. The pill, or a Greenhouse single-value, is the commit.
       if (!promptSearch) {

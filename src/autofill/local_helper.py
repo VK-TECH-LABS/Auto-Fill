@@ -413,6 +413,7 @@ def _profile_digest(profile: CandidateProfile | None) -> tuple:
         personal.github_url,
         personal.portfolio_url,
         personal.website_url,
+        profile.source_url,
     )
     work = tuple(
         (row.company, row.title, row.start_date, row.end_date, row.current, row.location, row.description)
@@ -3147,6 +3148,11 @@ class _Handler(BaseHTTPRequestHandler):
             tilearc = _tilearc_client(payload.get("tilearcApi"), self.headers, binding)
             resume_ref = parse_resume_claim(payload.get("resume"))
             profile = CandidateProfile.from_dict(_with_binding_owner(profile_raw, binding))
+            # The apply URL is not how the candidate heard about the job.
+            # ``sourceUrl`` is the optional match listing URL, omitted when blank.
+            source_url = str(payload.get("sourceUrl") or "").strip()
+            if source_url.startswith(("http://", "https://")):
+                profile.source_url = source_url
             if resume_ref is None:
                 job = self.server.helper.submit(
                     url,

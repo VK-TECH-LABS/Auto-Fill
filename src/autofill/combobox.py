@@ -485,7 +485,7 @@ _COMMIT_JS = r"""
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
     buttonOk = fold(el.innerText || el.textContent) === wanted;
   }
-  return { error, blocking, hiddenOk, shownOk, pillOk, ariaOk, tracksValue, inputOk, buttonOk };
+  return { error, blocking, hiddenOk, shownOk, pillOk, ariaOk, tracksValue, inputOk, buttonOk, openMenu };
 }
 """
 
@@ -508,6 +508,9 @@ def _combobox_committed(page, selector: str, label: str, *, accept_input: bool =
     except Exception:
         return False
     if not isinstance(state, dict):
+        return False
+    # An open menu, a highlight, or a typed search is not a committed leaf.
+    if state.get("openMenu"):
         return False
     # A visible choice is the commit. The search box can stay aria-invalid,
     # and a stale "required" message can stay, after that choice is painted.
@@ -645,6 +648,27 @@ def _await_menu(page, selector: str, timeout_ms: int) -> list[Option]:
         _pause(page, 50)
         found = _read_options(page, selector)
         if found:
+            return found
+    return found
+
+
+def _await_replaced(page, selector: str, before: list[Option], timeout_ms: int) -> list[Option]:
+    """Read until the menu is a different list, or ``timeout_ms`` passes.
+
+    A parent click leaves the old rows on screen until the children load.
+    Returning that first list marks the parent as a leaf and never commits
+    the child.
+    """
+    found = _read_options(page, selector)
+    if _menu_replaced(before, found):
+        return found
+    if timeout_ms <= 0 or getattr(page, "wait_for_timeout", None) is None:
+        return found
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        _pause(page, 50)
+        found = _read_options(page, selector)
+        if _menu_replaced(before, found):
             return found
     return found
 
@@ -966,7 +990,7 @@ def _probe_row(page, selector: str, option: Option, before: list[Option]) -> tup
     except Exception:
         return "leaf", []
     _pause(page, 50)
-    after = _await_menu(page, selector, 800)
+    after = _await_replaced(page, selector, before, 800)
     if not after:
         after = _read_options(page, selector, allow_single=True)
     if _menu_replaced(before, after):
@@ -1223,26 +1247,39 @@ def _has_pill_slot(page, selector: str) -> bool:
         return False
 
 
+def _menu_is_open(page) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        return bool(evaluate(_MENU_OPEN_JS))
+    except Exception:
+        return False
+
+
 def _committed_choice(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
+    if _menu_is_open(page):
+        return False
     if _combobox_committed(page, selector, match.label, accept_input=accept_input):
         return True
     if _combobox_committed(page, selector, desired, accept_input=accept_input):
         return True
     shown = _selected_text(page, selector)
-    return _labels_match(desired, shown) or _labels_match(match.label, shown)
+    leaf = _path_parts(desired)[-1] if _path_parts(desired) else desired
+    # The parent category on a closed control is not the leaf.
+    if match.folder and _labels_match(match.label, shown) and not _labels_match(leaf, shown):
+        return False
+    return _labels_match(leaf, shown) or _labels_match(match.label, shown)
 
 
 def _kept_after_close(page, selector: str, match: Option, desired: str, *, accept_input: bool) -> bool:
     """The choice is on the field after the menu closes.
 
     Escape drops a highlight that was never written. A pill or closed value
-    that is still there is the commit.
+    that is still there is the commit. An open menu is not.
     """
-    if not _commit_held(page, selector, match, desired, accept_input=accept_input):
-        return False
-    clear_satisfied_invalid(page, selector)
     try:
-        dismiss_combobox(page)
+        close_open_menu(page)
     except Exception:
         pass
     _pause(page, 40)
@@ -1357,7 +1394,7 @@ def _follow_path(page, selector: str, parts: list[str], found: list[Option]) -> 
         clicked = match
         if last:
             return clicked
-        after = _await_menu(page, selector, 800)
+        after = _await_replaced(page, selector, before, 800)
         if not _menu_replaced(before, after):
             return None
         menu = after
@@ -1399,7 +1436,7 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
         except Exception:
             continue
         _pause(page, 50)
-        children = _await_menu(page, selector, 800)
+        children = _await_replaced(page, selector, opened or found, 800)
         parent_label = (current.label or folder.label).strip()
         leaf = child_for_answer(desired, parent_label, children)
         if leaf is None and leaf_name and not _labels_match(leaf_name, parent_label):
@@ -1748,6 +1785,49 @@ def _menu_replaced(before: list[Option], after: list[Option]) -> bool:
     return bool(after_labels - labels(before))
 
 
+def match_source_host(url: str, labels: list[str]) -> str:
+    """One employer option whose leaf names this listing host.
+
+    ``sourceUrl`` is the match listing URL. Several matches, or none, stay
+    blank. The apply URL is not passed here, and the first option is not used.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(str(url or "").strip()).hostname or "").lower().removeprefix("www.")
+    stem = host.split(".")[0] if host else ""
+    if len(stem) < 4:
+        return ""
+    generic = {
+        "jobs",
+        "careers",
+        "apply",
+        "workday",
+        "myworkdayjobs",
+        "smartrecruiters",
+        "ashbyhq",
+        "greenhouse",
+        "lever",
+        "icims",
+        "taleo",
+        "oraclecloud",
+    }
+    if stem in generic:
+        return ""
+    hits: list[str] = []
+    for label in labels:
+        text = str(label or "").strip()
+        if not text:
+            continue
+        leaf = text.split(">")[-1].strip().casefold()
+        if leaf == stem or leaf.replace(" ", "") == stem:
+            hits.append(text)
+    leaves = {item.split(">")[-1].strip().casefold() for item in hits}
+    if len(leaves) != 1:
+        return ""
+    paths = [item for item in hits if ">" in item]
+    return paths[0] if paths else hits[0]
+
+
 def select_combobox(page, selector: str, desired: str) -> Option | None:
     """Open ``selector``, choose ``desired``, and keep it only when the widget commits.
 
@@ -1764,9 +1844,13 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
     _OPENED_CHILDREN.set(())
     focus_field(page, selector)
     shown = _selected_text(page, selector)
-    if _labels_match(desired, shown) or any(_labels_match(part, shown) for part in _path_parts(desired)[-1:]):
-        clear_satisfied_invalid(page, selector)
-        return Option(value=shown, label=shown, selector=selector)
+    leaf_name = _path_parts(desired)[-1] if _path_parts(desired) else desired
+    if shown and (_labels_match(leaf_name, shown) or _labels_match(desired, shown)):
+        # A pill already on the closed control is the commit. An open menu's
+        # highlight uses the same words and is not.
+        if _combobox_committed(page, selector, shown, accept_input=False):
+            clear_satisfied_invalid(page, selector)
+            return Option(value=shown, label=shown, selector=selector)
     if _is_school_field(page, selector):
         return search_school(page, selector, desired)
     if _is_study_field(page, selector):
@@ -1837,7 +1921,8 @@ def select_combobox(page, selector: str, desired: str) -> Option | None:
         _pause(page, 50)
         # A promptOption is not flagged as a leaf. A click that replaces the
         # menu is still a folder, whether or not the row looked like a leaf.
-        after = _read_options(page, selector)
+        # Wait for the child list. The parent rows are still showing until then.
+        after = _await_replaced(page, selector, before, 800)
         if _menu_replaced(before, after):
             match.folder = True
             match.leaf = False
