@@ -104,6 +104,8 @@ _SHOW_JS = r"""(args) => {
     who.textContent = "Answering for " + args.candidate;
     card.appendChild(who);
   }
+  const STATE_ONLY =
+    /^(?:minimized|maximized|expanded|collapsed|\d+ items? selected|no items? selected|select one)$/i;
   function helpFor(question) {
     if (question.help) return question.help;
     try {
@@ -127,7 +129,10 @@ _SHOW_JS = r"""(args) => {
         }
       }
       const text = parts.map((part) => part.replace(/\s+/g, " ").trim()).filter(Boolean)
-        .filter((part) => part !== question.prompt).join("\n");
+        .filter((part) => part !== question.prompt)
+        // Widget state a screen reader announces ("Minimized", "1 item selected") is not a hint.
+        .filter((part) => !STATE_ONLY.test(part))
+        .join("\n");
       return text.slice(0, 400);
     } catch (e) { return ""; }
   }

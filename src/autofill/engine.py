@@ -1073,13 +1073,14 @@ def autofill_application(
         try:
             page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
         except NavigationStalled:
-            session.mark(Status.NAVIGATION_STALLED)
+            stall_status, stall_messages = _stall_outcome(page)
+            session.mark(stall_status)
             return _result(
                 session,
-                status=Status.NAVIGATION_STALLED,
+                status=stall_status,
                 ats=ats_name,
                 login_status="NOT_REQUIRED",
-                messages=["navigation_stalled"],
+                messages=stall_messages,
             )
         snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name)
         if stopped is not None:
@@ -1227,17 +1228,18 @@ def autofill_application(
                 page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
             except NavigationStalled:
                 detected, filled, skipped = _counts(fields)
-                session.mark(Status.NAVIGATION_STALLED)
+                stall_status, stall_messages = _stall_outcome(page)
+                session.mark(stall_status)
                 return _result(
                     session,
-                    status=Status.NAVIGATION_STALLED,
+                    status=stall_status,
                     ats=ats_name,
                     login_status=login_status,
                     fields_detected=detected,
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["navigation_stalled"],
+                    messages=stall_messages,
                     submit_controls=submit_controls,
                 )
             if snapshot.captcha_present:
@@ -1276,17 +1278,18 @@ def autofill_application(
             if visible in seen:
                 if turned:
                     detected, filled, skipped = _counts(fields)
-                    session.mark(Status.NAVIGATION_STALLED)
+                    stall_status, stall_messages = _stall_outcome(page)
+                    session.mark(stall_status)
                     return _result(
                         session,
-                        status=Status.NAVIGATION_STALLED,
+                        status=stall_status,
                         ats=ats_name,
                         login_status=login_status,
                         fields_detected=detected,
                         fields_filled=filled,
                         fields_skipped=skipped,
                         manual_actions=manual,
-                        messages=["navigation_stalled"],
+                        messages=stall_messages,
                         submit_controls=submit_controls,
                     )
                 break
@@ -1484,17 +1487,18 @@ def autofill_application(
             except NavigationStalled:
                 _forward_block(opts, nxt, current_sig)
                 detected, filled, skipped = _counts(fields)
-                session.mark(Status.NAVIGATION_STALLED)
+                stall_status, stall_messages = _stall_outcome(page)
+                session.mark(stall_status)
                 return _result(
                     session,
-                    status=Status.NAVIGATION_STALLED,
+                    status=stall_status,
                     ats=ats_name,
                     login_status=login_status,
                     fields_detected=detected,
                     fields_filled=filled,
                     fields_skipped=skipped,
                     manual_actions=manual,
-                    messages=["navigation_stalled"],
+                    messages=stall_messages,
                     submit_controls=submit_controls,
                 )
             moved = navigation_changed(current_sig, page, snapshot)
@@ -2110,6 +2114,25 @@ def _same_route(page, before: tuple) -> bool:
     return bool(before) and before[0] == route
 
 
+
+def _stall_outcome(page) -> tuple[str, list[str]]:
+    """Why the page did not move. Employer validation errors are named, not hidden.
+
+    When the page shows required-field or invalid-field errors, the stop is
+    MANUAL_ANSWER_REQUIRED with those messages, so the card asks for what is
+    actually missing. Only a page with no error is NAVIGATION_STALLED.
+    """
+    try:
+        current = extract_page(page)
+        alert = validation_message(current)
+        named = invalid_field_messages(page)
+    except Exception:
+        return Status.NAVIGATION_STALLED, ["navigation_stalled"]
+    messages = [item for item in [alert, *named] if item]
+    if messages:
+        return Status.MANUAL_ANSWER_REQUIRED, messages
+    return Status.NAVIGATION_STALLED, ["navigation_stalled"]
+
 def _activate_forward(page, button, session, opts: AutofillOptions, started: float, state: dict, snapshot):
     """Click Next and require the page to move. A dead click is not repeated.
 
@@ -2306,16 +2329,18 @@ def _run_resolver_pages(
         try:
             page, snapshot = _follow_entry(page, snapshot, session, opts, run_started, inspect_state)
         except NavigationStalled:
-            session.mark(Status.NAVIGATION_STALLED)
-            return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
+            stall_status, stall_messages = _stall_outcome(page)
+            session.mark(stall_status)
+            return finish(stall_status, stall_messages)
         snapshot, stopped = _pane_stop(page, snapshot, session, opts, ats_name, login_status=login_status)
         if stopped is not None:
             return stopped
         visible = tuple(control.selector for control in snapshot.controls if not control.hidden)
         if visible in seen:
             if turned:
-                session.mark(Status.NAVIGATION_STALLED)
-                return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
+                stall_status, stall_messages = _stall_outcome(page)
+                session.mark(stall_status)
+                return finish(stall_status, stall_messages)
             break
         seen.add(visible)
         _remember_submit(snapshot, submit_controls)
@@ -2445,8 +2470,9 @@ def _run_resolver_pages(
                 break
             except NavigationStalled:
                 _forward_block(opts, nxt, current_sig)
-                session.mark(Status.NAVIGATION_STALLED)
-                return finish(Status.NAVIGATION_STALLED, ["navigation_stalled"])
+                stall_status, stall_messages = _stall_outcome(page)
+                session.mark(stall_status)
+                return finish(stall_status, stall_messages)
             if snapshot.captcha_present:
                 session.mark("FAILED")
                 return finish(

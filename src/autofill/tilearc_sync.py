@@ -22,6 +22,8 @@ STAGING_ORIGIN = "https://vinayaka-app-staging-staging.up.railway.app"
 _SESSION = "/api/autofill/sessions/{session_id}"
 _STATUS = "/api/autofill/sessions/{session_id}/local-status"
 _ANSWER = "/api/autofill/sessions/{session_id}/local-answer"
+# A save writes the row and reads it back on Railway. Five seconds dropped real saves.
+_HTTP_TIMEOUT_SECONDS = 20
 
 
 class IdentityMismatch(Exception):
@@ -254,10 +256,22 @@ def parse_confirm_body(body: Any) -> AnswerAck | None:
 
 
 def parse_read_body(body: Any) -> AnswerAck | None:
-    """GET local-answer. Accepts the confirm wrapper or a bare read-back row."""
+    """GET local-answer. Accepts the confirm wrapper, TileArc's ``{found, readBack}``, or a bare row.
+
+    ``found: true`` with a read-back for the same candidate is the stored row.
+    ``found: false`` is not stored.
+    """
     wrapped = parse_confirm_body(body)
     if wrapped is not None:
         return wrapped
+    if isinstance(body, dict) and "found" in body:
+        if body.get("found") is not True or not isinstance(body.get("readBack"), dict):
+            return None
+        inner = dict(body["readBack"])
+        inner.setdefault("candidateId", body.get("candidateId"))
+        if _text(inner.get("candidateId")) != _text(body.get("candidateId")):
+            return None
+        body = inner
     row = _read_back(body)
     if row is None:
         return None
@@ -748,7 +762,7 @@ def _urllib_call(
         headers["Cookie"] = cookie
     request = Request(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=5) as response:
+        with urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
             raw = response.read(1_048_576)
             status = int(getattr(response, "status", 200) or 200)
     except HTTPError as exc:

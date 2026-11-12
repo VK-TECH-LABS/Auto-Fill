@@ -806,9 +806,15 @@ _MENU_OPEN_JS = r"""() => {
     const box = node.getBoundingClientRect();
     return box.width > 0 && box.height > 0;
   }
+  // A selected-items pill list (phone code, a chosen leaf) is role=listbox too. It is not a menu.
+  function pillList(node) {
+    return !!(node.closest && node.closest(
+      "[data-automation-id='selectedItemList'], [data-automation-id*='selectedItem']"
+    ));
+  }
   const options = document.querySelectorAll("[data-automation-id='promptOption'], [role='listbox']");
   for (const node of options) {
-    if (shown(node)) return true;
+    if (!pillList(node) && shown(node)) return true;
   }
   // A stale aria-expanded with no painted row is a closed menu.
   const expanded = document.querySelector("[aria-expanded='true']");
@@ -1311,7 +1317,7 @@ def _kept_after_close(page, selector: str, match: Option, desired: str, *, accep
     except Exception:
         pass
     _pause(page, 40)
-    if _committed_choice(page, selector, match, desired, accept_input=accept_input):
+    if _commit_held(page, selector, match, desired, accept_input=accept_input):
         clear_satisfied_invalid(page, selector)
         return True
     return False
@@ -1490,9 +1496,10 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
         shown = _selected_text(page, selector)
         if shown and _labels_match(leaf.label, shown):
             return leaf
-        # A pill widget ignores the search text. A plain input that kept the
-        # leaf after the menu closed is committed.
-        if _committed_choice(
+        # Workday paints the pill a few frames after the leaf click. Wait for
+        # it before treating the leaf as lost. A pill widget ignores the search
+        # text; a plain input that kept the leaf after the menu closed is committed.
+        if _commit_held(
             page,
             selector,
             leaf,

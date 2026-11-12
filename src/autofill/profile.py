@@ -229,11 +229,18 @@ class ApplicationAnswer:
 
 def _how_heard_question(text: str) -> bool:
     """Hear About wording. There is no HOW_HEARD intent on the LIVE payload."""
+    from autofill.answers import _HOW_HEARD
+
     folded = text.casefold()
-    return any(
-        phrase in folded
-        for phrase in ("how did you hear", "how you heard", "how heard", "how did you find", "where did you hear")
-    )
+    return any(phrase in folded for phrase in _HOW_HEARD)
+
+
+def _how_heard_path(answer: str) -> str:
+    """Hear About is one leaf. ``Job Board | LinkedIn`` is the path ``Job Board > LinkedIn``."""
+    parts = [part.strip() for part in answer.split("|") if part.strip()]
+    if len(parts) >= 2:
+        return " > ".join(parts)
+    return answer.strip()
 
 
 @dataclass
@@ -378,7 +385,7 @@ class CandidateProfile:
             for item in built.application_answers:
                 heard = _how_heard_question(item.question) or item.key == "how_heard"
                 if heard and item.answer.strip():
-                    built.screening.how_heard = item.answer.strip()
+                    built.screening.how_heard = _how_heard_path(item.answer)
                     break
         return built
 
