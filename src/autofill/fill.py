@@ -1067,7 +1067,8 @@ def fill_one_page(
                 job=job,
                 cursor=cursor,
             )
-            if mapped.action == "unanswered" and mapped.key == "how_heard" and getattr(profile, "source_url", ""):
+            has_source = bool(str(getattr(profile, "source_url", "") or ""))
+            if mapped.action == "unanswered" and mapped.key == "how_heard" and has_source:
                 sourced = _how_heard_from_source(page, control, profile)
                 if sourced is not None:
                     mapped = sourced
