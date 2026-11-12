@@ -5594,8 +5594,13 @@ def _split_date_gaps(
         bucket = str(group["bucket"])
         index = int(group["index"])
         which = str(group["which"])
-        text = date_prompt(profile, bucket, index, which)
-        field_key = date_field_key(bucket, index, which)
+        if which == "single":
+            # Not a work or education date: ask it by its own label, as MM/DD/YYYY.
+            text = str(anchor.label or anchor.prompt or "Date").strip() or "Date"
+            field_key = ""
+        else:
+            text = date_prompt(profile, bucket, index, which)
+            field_key = date_field_key(bucket, index, which)
         digest = _question_digest(text, anchor) or None
         gaps.append(
             {

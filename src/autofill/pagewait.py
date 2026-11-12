@@ -1242,7 +1242,8 @@ _INVALID_FIELDS_JS = r"""() => {
     if (name || text) out.push(text ? name + ": " + text : name);
   }
   const notes = document.querySelectorAll(
-    "[role=alert], .jv-form-field-error, .field-error, .error-message, [class*=error-message], .error"
+    "[role=alert], .jv-form-field-error, .field-error, .error-message, [class*=error-message], .error, " +
+    "[data-automation-id='errorMessage'], [data-automation-id='errorWidget']"
   );
   for (const note of notes) {
     if (!vis(note) || out.length >= 5) continue;
