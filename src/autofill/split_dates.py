@@ -41,32 +41,55 @@ def _bucket(row_key: str) -> str:
     return "work"
 
 
+_DEEP_QUERY_JS = r"""
+  function afQuery(selector) {
+    if (!selector) return null;
+    const stack = [document];
+    const seen = new Set();
+    while (stack.length) {
+      const root = stack.pop();
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      try {
+        const found = root.querySelector(selector);
+        if (found) return found;
+      } catch (error) {
+        return null;
+      }
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll("*")); } catch (error) { nodes = []; }
+      for (const node of nodes) {
+        if (node.shadowRoot) stack.push(node.shadowRoot);
+      }
+    }
+    return null;
+  }
+  function writeValue(node, value) {
+    if (!node) return;
+    const tracker = node._valueTracker;
+    if (tracker && tracker.setValue) tracker.setValue("");
+    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    if (proto && proto.set) proto.set.call(node, value);
+    else node.value = value;
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+"""
+
 _WRITE_PAIR_JS = r"""({ monthSelector, yearSelector, month, year }) => {
-  function setValue(selector, value) {
-    let el = null;
-    try { el = document.querySelector(selector); } catch (error) { return null; }
-    if (!el) return null;
-    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
-    if (proto && proto.set) proto.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return el;
-  }
-  const monthEl = setValue(monthSelector, month);
-  const yearEl = setValue(yearSelector, year);
+""" + _DEEP_QUERY_JS + r"""
+  const monthEl = afQuery(monthSelector);
+  const yearEl = afQuery(yearSelector);
   if (!monthEl || !yearEl) return false;
+  writeValue(monthEl, month);
+  writeValue(yearEl, year);
   // A year edit can clear the month. Put the month back without another year edit.
-  if (String(monthEl.value || "") !== String(month)) {
-    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
-    if (proto && proto.set) proto.set.call(monthEl, month);
-    else monthEl.value = month;
-    monthEl.dispatchEvent(new Event("input", { bubbles: true }));
-  }
+  if (String(monthEl.value || "") !== String(month)) writeValue(monthEl, month);
   const field = monthEl.closest("[data-automation-id^='formField']") || monthEl.parentElement;
   const text = field ? String(field.innerText || field.textContent || "") : "";
   const wanted = "current value is " + month + "/" + year;
-  return text.toLowerCase().indexOf(wanted.toLowerCase()) !== -1;
+  if (text.toLowerCase().indexOf(wanted.toLowerCase()) !== -1) return true;
+  return String(monthEl.value || "") === String(month) && String(yearEl.value || "") === String(year);
 }"""
 
 
@@ -98,7 +121,17 @@ def _which_side(control: Control) -> str:
 
 def _date_bucket(control: Control) -> str:
     blob = " ".join(
-        part for part in (control.form_automation_id, control.automation_id, control.element_id, control.name) if part
+        part
+        for part in (
+            control.form_automation_id,
+            control.automation_id,
+            control.element_id,
+            control.name,
+            control.nearby,
+            control.group,
+            control.label,
+        )
+        if part
     ).casefold()
     if any(token in blob for token in ("education", "school")):
         return "education"
@@ -133,7 +166,7 @@ def month_year_profile_selectors(snapshot: PageSnapshot, profile: CandidateProfi
         if index < 0 or index >= len(rows):
             continue
         row = rows[index]
-        if bucket == "work" and which == "end" and getattr(row, "current", False):
+        if which == "end" and getattr(row, "current", False):
             covered.add(control.selector)
             continue
         raw = row.start_date if which == "start" else row.end_date
@@ -143,28 +176,19 @@ def month_year_profile_selectors(snapshot: PageSnapshot, profile: CandidateProfi
 
 
 _WRITE_MONTH_YEAR_JS = r"""({ selector, text, monthName, year }) => {
-  let el = null;
-  try { el = document.querySelector(selector); } catch (error) { return { ok: false }; }
+""" + _DEEP_QUERY_JS + r"""
+  const el = afQuery(selector);
   if (!el) return { ok: false };
-  const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
-  function write(node, value) {
-    if (proto && proto.set) proto.set.call(node, value);
-    else node.value = value;
-    node.dispatchEvent(new Event("input", { bubbles: true }));
-    node.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-  write(el, text);
-  el.dispatchEvent(new Event("blur", { bubbles: true }));
   function clean(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
   }
   function held() {
     return clean(el.value) === text;
   }
+  writeValue(el, text);
+  el.dispatchEvent(new Event("blur", { bubbles: true }));
   if (held()) return { ok: true, how: "value" };
   el.focus();
-  const press = el["click"];
-  if (press) press.call(el);
   function visible(node) {
     const style = window.getComputedStyle(node);
     if (style.display === "none" || style.visibility === "hidden") return false;
@@ -173,6 +197,19 @@ _WRITE_MONTH_YEAR_JS = r"""({ selector, text, monthName, year }) => {
   }
   function buttons() {
     return Array.from(document.querySelectorAll("button, [role='button']")).filter(visible);
+  }
+  const field = el.closest("[data-automation-id^='formField']") || el.parentElement || el;
+  const local = Array.from(field.querySelectorAll("button, [role='button']"));
+  const opener = local.find((node) => {
+    const label = (node.getAttribute("aria-label") || "") + " " + (node.getAttribute("data-automation-id") || "");
+    return /calendar|dateicon|date-icon|select date/i.test(label);
+  });
+  if (opener) {
+    const open = opener["click"];
+    if (open) open.call(opener);
+  } else {
+    const press = el["click"];
+    if (press) press.call(el);
   }
   let guard = 0;
   while (guard < 24) {
@@ -194,6 +231,7 @@ _WRITE_MONTH_YEAR_JS = r"""({ selector, text, monthName, year }) => {
     const choose = month["click"];
     if (choose) choose.call(month);
   }
+  if (!held()) writeValue(el, text);
   return { ok: held(), how: month ? "calendar" : "value" };
 }"""
 
@@ -212,19 +250,19 @@ def fill_month_year_inputs(page, profile: CandidateProfile, snapshot: PageSnapsh
         if index < 0 or index >= len(rows):
             continue
         row = rows[index]
-        if bucket == "work" and which == "end" and getattr(row, "current", False):
+        if which == "end" and getattr(row, "current", False):
             handled.add(control.selector)
             continue
         parsed = parse_month_year(row.start_date if which == "start" else row.end_date)
         if parsed is None:
             continue
-        handled.add(control.selector)
         if evaluate is None:
             continue
         month, year = parsed
         text = f"{month:02d}/{year}"
+        wrote = False
         try:
-            evaluate(
+            report = evaluate(
                 _WRITE_MONTH_YEAR_JS,
                 {
                     "selector": control.selector,
@@ -233,8 +271,76 @@ def fill_month_year_inputs(page, profile: CandidateProfile, snapshot: PageSnapsh
                     "year": str(year),
                 },
             )
+            wrote = bool(isinstance(report, dict) and report.get("ok"))
         except Exception:
+            wrote = False
+        if wrote:
+            handled.add(control.selector)
+    return handled
+
+
+_CURRENT_WORK_RE = re.compile(
+    r"\b(?:i currently work here|currently work here|i currently work|currently working here)\b",
+    re.IGNORECASE,
+)
+_CURRENT_EDU_RE = re.compile(
+    r"\b(?:i currently attend|currently attending|currently enrolled)\b",
+    re.IGNORECASE,
+)
+_CHECK_BOX_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  if (el.checked) return true;
+  const press = el["click"];
+  if (press) press.call(el);
+  if (el.checked) return true;
+  const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "checked");
+  if (proto && proto.set) proto.set.call(el, true);
+  else el.checked = true;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return !!el.checked;
+}"""
+
+
+def _checkbox_blob(control: Control) -> str:
+    return " ".join(part for part in (control.label, control.aria_label, control.prompt, control.group) if part)
+
+
+def fill_current_boxes(page, profile: CandidateProfile, snapshot: PageSnapshot) -> set[str]:
+    """Check "I currently work here" when that row is current. Do not invent a To date.
+
+    A box for a past row stays unchecked and is not asked. Education uses the
+    same rule when the form asks about current enrollment.
+    """
+    handled: set[str] = set()
+    work: list[Control] = []
+    school: list[Control] = []
+    for control in snapshot.controls:
+        if control.hidden or control.kind != "checkbox" or not control.selector:
             continue
+        blob = _checkbox_blob(control)
+        if _CURRENT_WORK_RE.search(blob):
+            work.append(control)
+        elif _CURRENT_EDU_RE.search(blob):
+            school.append(control)
+    evaluate = getattr(page, "evaluate", None)
+
+    def apply(boxes: list[Control], rows: list) -> None:
+        for index, control in enumerate(boxes):
+            if index >= len(rows):
+                continue
+            handled.add(control.selector)
+            if not getattr(rows[index], "current", False) or evaluate is None:
+                continue
+            try:
+                evaluate(_CHECK_BOX_JS, control.selector)
+            except Exception:
+                continue
+
+    apply(work, list(profile.employment))
+    apply(school, list(profile.education_history))
     return handled
 
 
@@ -273,7 +379,7 @@ def fill_split_dates(page, profile: CandidateProfile, snapshot: PageSnapshot) ->
         if index < 0 or index >= len(rows):
             continue
         row = rows[index]
-        if bucket == "work" and which == "end" and getattr(row, "current", False):
+        if which == "end" and getattr(row, "current", False):
             continue
         raw = row.start_date if which == "start" else row.end_date
         parsed_date = parse_month_year(raw)

@@ -14,13 +14,15 @@ page is left alone when the posted profile did not change. Confirmed
 answers stay on that candidate and are merged into the next Apply for the
 same candidate when the posted profile does not already contain them.
 
-When a fill stops on ``MANUAL_ANSWER_REQUIRED``, ``GET /v1/sessions/{id}``
-includes ``question`` (``id``, ``prompt``, ``type``, ``options``, ``popup``)
-and ``questions`` for every required gap already on that page. Profile basics
-already on the Application Profile (name, email, city, and the same kind of
-field) are written from that profile and are not put on the card. The helper
-shows one centered Save & Continue card for the remaining set
-(:mod:`autofill.answer_popup`). A valid click records each row on this
+When a fill stops on ``MANUAL_ANSWER_REQUIRED``, the helper shows one centered
+Save & Continue card on the employer tab for the remaining required gaps
+(:mod:`autofill.answer_popup`). While that card is showing, ``GET /v1/sessions/{id}``
+includes ``question.id`` and ``question.popup`` only. The prompt and the choice
+list stay on the employer card, so the Jobs page does not ask them. If the card
+cannot be drawn, the status still includes ``question`` (``prompt``, ``type``,
+``options``) and ``questions`` for that fallback. Profile basics already on the
+Application Profile (name, email, city, and the same kind of field) are written
+from that profile and are not put on the card. A valid click records each row on this
 candidate first (``answerSave.candidateId`` and ``learnedApplicationAnswers``).
 Only after that confirmation does it fill the employer control and, when the
 page is complete, continue. The card closes on success. The same card reopens
@@ -413,11 +415,20 @@ def _profile_digest(profile: CandidateProfile | None) -> tuple:
         personal.website_url,
     )
     work = tuple(
-        (row.company, row.title, row.start_date, row.end_date, row.current, row.location)
+        (row.company, row.title, row.start_date, row.end_date, row.current, row.location, row.description)
         for row in profile.employment
     )
     education = tuple(
-        (row.school, row.degree, row.field_of_study, row.start_date, row.end_date)
+        (
+            row.school,
+            row.degree,
+            row.field_of_study,
+            row.start_date,
+            row.end_date,
+            row.current,
+            row.location,
+            row.description,
+        )
         for row in profile.education_history
     )
     answers = tuple(
@@ -528,6 +539,55 @@ def _tilearc_client(raw: Any, headers: Any = None, binding: dict[str, str] | Non
         return None
 
 
+def _profile_as_posted(profile: CandidateProfile) -> dict[str, Any]:
+    """The basics already on this Apply, so a thinner session snapshot cannot wipe them."""
+    personal = profile.personal
+    return {
+        "candidateId": profile.candidate_id,
+        "personal": {
+            "first_name": personal.first_name,
+            "last_name": personal.family_name,
+            "full_name": personal.full_name,
+            "email": personal.email,
+            "phone": personal.phone,
+            "city": personal.city,
+            "province_state": personal.province_state,
+            "country": personal.country,
+            "postal_code": personal.postal_code,
+            "address": personal.address,
+            "linkedin_url": personal.linkedin_url,
+            "github_url": personal.github_url,
+            "portfolio_url": personal.portfolio_url,
+            "website_url": personal.website_url,
+        },
+        "employment": [
+            {
+                "company": row.company,
+                "title": row.title,
+                "start_date": row.start_date,
+                "end_date": row.end_date,
+                "current": row.current,
+                "location": row.location,
+                "description": row.description,
+            }
+            for row in profile.employment
+        ],
+        "education": [
+            {
+                "school": row.school,
+                "degree": row.degree,
+                "field": row.field_of_study,
+                "start_date": row.start_date,
+                "end_date": row.end_date,
+                "current": row.current,
+                "location": row.location,
+                "description": row.description,
+            }
+            for row in profile.education_history
+        ],
+    }
+
+
 def _refresh_posted_profile(
     profile: CandidateProfile,
     binding: dict[str, str],
@@ -543,7 +603,7 @@ def _refresh_posted_profile(
             candidate_id=binding.get("candidateId") or "",
             fingerprint=binding.get("profileFingerprint") or "",
             version="",
-            posted=None,
+            posted=_profile_as_posted(profile),
         )
     except TilearcAuthExpired:
         raise AnswerRejected(401, _sign_in_expired_body()) from None
@@ -587,7 +647,7 @@ def _refresh_open_profile(job: LocalJob) -> None:
             candidate_id=_job_candidate(job),
             fingerprint=job.binding.get("profileFingerprint") or "",
             version=job.profile_version,
-            posted=None,
+            posted=_profile_as_posted(job.profile) if job.profile is not None else None,
         )
     except TilearcAuthExpired:
         job.error = "sign_in_expired"
@@ -1051,18 +1111,22 @@ class LocalJob:
             body["fill"] = dict(self.result)
             body["fill"]["stopped_before_submit"] = stopped_before_submit
         if status == Status.MANUAL_ANSWER_REQUIRED and self.question is not None:
-            body["question"] = {
-                "id": self.question["id"],
-                "prompt": self.question["prompt"],
-                "type": self.question["type"],
-                "options": list(self.question["options"]),
-            }
-            if self.question.get("fieldKey"):
-                body["question"]["fieldKey"] = self.question["fieldKey"]
+            # The employer-window card is the only question UI on this path.
+            # Prompt text and choices stay off the status the Jobs page reads,
+            # so Hear About and the same kind of question are not drawn there.
+            # The id and popup state stay so Save & Continue can still resume.
+            # When the card cannot be drawn, the existing panel payload remains.
+            body["question"] = {"id": self.question["id"]}
+            if not _employer_popup_active(self):
+                body["question"]["prompt"] = self.question["prompt"]
+                body["question"]["type"] = self.question["type"]
+                body["question"]["options"] = list(self.question["options"])
+                if self.question.get("fieldKey"):
+                    body["question"]["fieldKey"] = self.question["fieldKey"]
             popup = _popup_view(self)
             if popup is not None:
                 body["question"]["popup"] = popup
-        if status == Status.MANUAL_ANSWER_REQUIRED:
+        if status == Status.MANUAL_ANSWER_REQUIRED and not _employer_popup_active(self):
             listed = _status_questions(self)
             if listed:
                 body["questions"] = listed
@@ -2439,12 +2503,9 @@ class LocalHelper:
         if known and not new_ids and popup is not None and popup.get("state") == "saving" and not error:
             return
         if known and new_ids:
-            if job.extra_shown:
-                return
+            # Same card and the same nonce. Newly revealed questions join it.
+            # Unanswered rows stay, so a later page set is not dropped.
             job.extra_shown = True
-            rows = [row for row in rows if row["id"] in new_ids]
-            ids = [row["id"] for row in rows]
-            popup = None
         elif known and not new_ids and popup is not None and popup.get("state") != "unavailable":
             ids = list(popup.get("questionIds") or known)
             rows = _rows_for_ids(job, ids) or rows
@@ -3423,6 +3484,18 @@ def pending_question(
     return view
 
 
+def _employer_popup_active(job: LocalJob) -> bool:
+    """True while the employer tab is showing the one question card.
+
+    The Jobs-page panel must not receive the prompts in that case. A card that
+    could not be drawn leaves the existing panel payload in place.
+    """
+    popup = job.popup if isinstance(job.popup, dict) else None
+    if popup is None:
+        return False
+    return str(popup.get("state") or "") in {"shown", "answered", "saving", "confirmed"}
+
+
 def _popup_view(job: LocalJob) -> dict[str, Any] | None:
     """Public popup state. ``values`` only after the employee clicked Save & Continue."""
     popup = job.popup
@@ -3584,8 +3657,8 @@ def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str
         return ""
     text = re.sub(r"[*✱＊]", " ", str(item.get("text") or item.get("prompt") or "").casefold())
     text = re.sub(r"\([^)]*required[^)]*\)", " ", text)
-    text = re.sub(r"\bis required\b", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\b(is required|required|please enter|enter your)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
     # A salary confirm stays manual. Confirm email is the profile email.
     if str(item.get("challenge") or "") == "confirm" and "email" not in text:
         return ""
@@ -3596,7 +3669,7 @@ def _profile_basic_value(profile: CandidateProfile, item: dict[str, Any]) -> str
             getter = _BASIC_FIELDS["email"]
         elif text in {"email", "email address"} or text.startswith("email "):
             getter = _BASIC_FIELDS["email"]
-        elif text in {"city", "current city"} or "place of residence" in text:
+        elif text in {"city", "current city", "town"} or text.startswith("city ") or "place of residence" in text:
             getter = _BASIC_FIELDS["city"]
         elif "first name" in text or "given name" in text:
             getter = _BASIC_FIELDS["first_name"]

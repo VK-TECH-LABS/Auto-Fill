@@ -4611,6 +4611,28 @@ def _button_requires_selected_state(page, selector: str) -> bool:
         return False
 
 
+_PROFILE_BASIC_KEYS = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "full_name",
+        "legal_name",
+        "preferred_name",
+        "email",
+        "phone",
+        "city",
+        "address",
+        "state",
+        "postal_code",
+        "country",
+        "linkedin_url",
+        "github_url",
+        "portfolio_url",
+        "website_url",
+    }
+)
+
+
 def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
     """Every required visible control that is still empty is a manual question.
 
@@ -4665,7 +4687,16 @@ def _note_unfilled_required(outcome: ResolvedPage, page=None) -> None:
             continue
         if digest:
             seen.add(digest)
-        _manual(outcome, IntentMatch(None, "unknown", "none", text), blocking=True, control=control)
+        from autofill.mapping import match_field_key
+
+        key = match_field_key(control)
+        _manual(
+            outcome,
+            IntentMatch(None, "unknown", "none", text),
+            blocking=True,
+            control=control,
+            field_key=key if key in _PROFILE_BASIC_KEYS else None,
+        )
     _drop_emitted_options(outcome)
     if page is not None:
         ensure_blocker_options(page, outcome.manual_questions)

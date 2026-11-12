@@ -75,7 +75,29 @@ _FOCUS_JS = """(selector) => {
 }"""
 
 _TYPE_JS = """async ({ selector, text, append }) => {
-  const el = document.querySelector(selector);
+  function afQuery(sel) {
+    if (!sel) return null;
+    const stack = [document];
+    const seen = new Set();
+    while (stack.length) {
+      const root = stack.pop();
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      try {
+        const found = root.querySelector(sel);
+        if (found) return found;
+      } catch (error) {
+        return null;
+      }
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll("*")); } catch (error) { nodes = []; }
+      for (const node of nodes) {
+        if (node.shadowRoot) stack.push(node.shadowRoot);
+      }
+    }
+    return null;
+  }
+  const el = afQuery(selector);
   if (!el || !window.__afUI) return false;
   return await window.__afUI.typeVisible(el, text, !!append);
 }"""

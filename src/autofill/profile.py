@@ -181,6 +181,8 @@ class Employment:
     current: bool = False
     # Only a location stored on this row. The home address is not a job site.
     location: str = ""
+    # Role text stored on this row. Empty stays empty.
+    description: str = ""
 
 
 @dataclass
@@ -190,6 +192,9 @@ class EducationEntry:
     field_of_study: str = ""
     start_date: str = ""
     end_date: str = ""
+    current: bool = False
+    location: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -519,16 +524,23 @@ def _pad_month(value: str) -> str:
 
 
 def _normalize_from_to(value: str) -> str:
-    """``MM/YYYY``, or ``YYYY`` when the payload has no month. Other text stays."""
+    """``MM/YYYY``, or ``YYYY`` when the payload has no month.
+
+    ``03-2019`` and ``Jan-2019`` are the same month and year. A year alone stays
+    a year. A missing month is not invented.
+    """
     text = value.strip()
-    year_only = re.fullmatch(r"(19|20)\d{2}", text)
-    if year_only:
+    if re.fullmatch(r"(?:19|20)\d{2}", text):
         return text
-    parsed = re.fullmatch(r"(\d{1,2})\s*[./-]\s*((?:19|20)\d{2})", text)
+    from autofill.dates import parse_month_year
+
+    # A full day/month/year string is not a from/to month. Leave it unchanged.
+    if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{4}", text):
+        return text
+    parsed = parse_month_year(text)
     if parsed:
-        month = _pad_month(parsed.group(1))
-        if month:
-            return f"{month}/{parsed.group(2)}"
+        month, year = parsed
+        return f"{month:02d}/{year}"
     return text
 
 
@@ -616,6 +628,45 @@ def _current_job(entry: dict) -> bool:
     return _new_date_shape(entry) and not _has_end(entry)
 
 
+_LOCATION_KEYS = (
+    "location",
+    "city",
+    "job_location",
+    "jobLocation",
+    "work_location",
+    "workLocation",
+)
+_DESCRIPTION_KEYS = (
+    "role_description",
+    "roleDescription",
+    "role_summary",
+    "roleSummary",
+    "description",
+    "summary",
+    "responsibilities",
+    "responsibility",
+    "duties",
+)
+
+
+def _location_text(entry: dict) -> str:
+    """Job or school location. A stored city is that place, not the home address."""
+    return _first_text(entry, _LOCATION_KEYS)
+
+
+def _description_text(entry: dict) -> str:
+    return _first_text(entry, _DESCRIPTION_KEYS)
+
+
+def _explicit_flag(entry: dict, keys: tuple[str, ...]) -> bool | None:
+    for key in keys:
+        if entry.get(key) is True:
+            return True
+        if entry.get(key) is False:
+            return False
+    return None
+
+
 def _employment_list(raw: object) -> list[Employment]:
     return [
         Employment(
@@ -624,10 +675,28 @@ def _employment_list(raw: object) -> list[Employment]:
             start_date=_date_text(entry, "start"),
             end_date=_date_text(entry, "end"),
             current=_current_job(entry),
-            location=_text(entry, "location"),
+            location=_location_text(entry),
+            description=_description_text(entry),
         )
         for entry in _objects(raw, "employment")
     ]
+
+
+def _education_current(entry: dict) -> bool:
+    """Explicit only. An omitted graduation date is not 'currently attending'."""
+    flag = _explicit_flag(
+        entry,
+        (
+            "current",
+            "currentlyAttending",
+            "currently_attending",
+            "currentlyEnrolled",
+            "currently_enrolled",
+            "isCurrent",
+            "present",
+        ),
+    )
+    return flag is True
 
 
 def _education_list(raw: object) -> list[EducationEntry]:
@@ -638,6 +707,9 @@ def _education_list(raw: object) -> list[EducationEntry]:
             field_of_study=_text(entry, "field") or _text(entry, "fieldOfStudy") or _text(entry, "field_of_study"),
             start_date=_date_text(entry, "start"),
             end_date=_date_text(entry, "end"),
+            current=_education_current(entry),
+            location=_location_text(entry),
+            description=_description_text(entry),
         )
         for entry in _objects(raw, "education")
     ]

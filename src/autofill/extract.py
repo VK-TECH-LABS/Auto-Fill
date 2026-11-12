@@ -80,8 +80,10 @@ EXTRACT_JS = r"""
     const folded = cleanPrompt(text).toLowerCase().replace(/[()]/g, " ").replace(/\s+/g, " ").trim();
     const pattern = new RegExp(
       "^(?:first name|given name(?: s)?|forename|last name|family name|surname|middle name|" +
-      "middle initial|preferred name|full name|legal name|email(?: address)?|phone(?: number)?|" +
-      "mobile(?: number)?|linkedin(?: profile)?(?: url)?|git ?hub(?: url)?|portfolio(?: url)?|" +
+      "middle initial|preferred name|full name|legal name|email(?: address)?|" +
+      "confirm(?: your)? email(?: address)?|re-?enter(?: your)? email(?: address)?|" +
+      "phone(?: number)?|mobile(?: number)?|city|town|" +
+      "linkedin(?: profile)?(?: url)?|git ?hub(?: url)?|portfolio(?: url)?|" +
       "website(?: / portfolio)?(?: url)?|twitter(?: url)?)$"
     );
     return pattern.test(folded);
@@ -243,8 +245,11 @@ EXTRACT_JS = r"""
     const type = (el.getAttribute("type") || "").toLowerCase();
     const auto = (el.getAttribute("autocomplete") || "").toLowerCase();
     if (type === "tel" || auto === "tel" || auto === "tel-national" || auto.indexOf("tel") === 0) return true;
+    const host = el.getRootNode && el.getRootNode().host;
+    const hostId = host ? ((host.id || "") + " " + (host.getAttribute("name") || "")) : "";
     const id = (
-      (el.id || "") + " " + (el.getAttribute("name") || "") + " " + (el.getAttribute("data-automation-id") || "")
+      (el.id || "") + " " + (el.getAttribute("name") || "") + " " +
+      (el.getAttribute("data-automation-id") || "") + " " + hostId
     ).toLowerCase();
     return /phone|mobile|telephone/.test(id);
   }
@@ -430,6 +435,18 @@ EXTRACT_JS = r"""
         if (joined && joined !== option && !isEmployeeNote(joined)) return joined;
       }
       if (node === stop) break;
+    }
+    const entry = el.closest && el.closest(
+      ".ashby-application-form-field-entry, [data-field-path], fieldset"
+    );
+    if (entry) {
+      const title = entry.querySelector(
+        ".ashby-application-form-question-title, legend, [class*='question-title']"
+      );
+      if (title && !title.contains(el)) {
+        const text = questionPrompt(textOf(title));
+        if (text && text !== option && !isSectionHeading(title, text)) return text;
+      }
     }
     node = el.parentElement;
     for (let depth = 0; node && node !== stop && depth < 5; depth += 1, node = node.parentElement) {
@@ -680,6 +697,48 @@ EXTRACT_JS = r"""
     return text;
   }
 
+  function shadowHostLabel(el) {
+    // A design-system input keeps its <input> in an open shadow root. The
+    // question is the light-DOM label on the host, not a label inside the root.
+    const rootNode = el.getRootNode && el.getRootNode();
+    const host = rootNode && rootNode.host;
+    if (!host) return "";
+    const doc = host.ownerDocument || document;
+    if (host.id) {
+      const explicit = doc.querySelector("label[for='" + CSS.escape(host.id) + "']");
+      if (explicit) return textOf(explicit);
+    }
+    const aria = (host.getAttribute("aria-label") || host.getAttribute("label") || "").trim();
+    if (aria && !isGenericPrompt(aria)) return aria;
+    let prev = host.previousElementSibling;
+    while (prev) {
+      if (isHidden(prev)) {
+        prev = prev.previousElementSibling;
+        continue;
+      }
+      const tag = prev.tagName ? prev.tagName.toLowerCase() : "";
+      if (tag === "label" || tag === "legend") {
+        const text = textOf(prev);
+        if (text) return text;
+      }
+      const cls = (prev.getAttribute("class") || "").toLowerCase();
+      const raw = textOf(prev);
+      const title = cleanPrompt(raw);
+      if (
+        title &&
+        title.length <= 120 &&
+        !isSectionHeading(prev, title) &&
+        !isGenericPrompt(title) &&
+        (cls.indexOf("label") !== -1 || /[*✱＊]/.test(raw) || knownFieldTitle(raw))
+      ) {
+        return title;
+      }
+      if (prev.querySelector && prev.querySelector("input, select, textarea, button")) break;
+      prev = prev.previousElementSibling;
+    }
+    return "";
+  }
+
   function labelFor(root, el) {
     const bits = [];
     if (el.id) {
@@ -697,6 +756,10 @@ EXTRACT_JS = r"""
     }
     const aria = el.getAttribute("aria-label");
     if (aria && !isGenericPrompt(aria)) bits.push(aria.trim());
+    if (!bits.length) {
+      const hosted = shadowHostLabel(el);
+      if (hosted) bits.push(hosted);
+    }
     if (!bits.length) {
       const option = optionText(el);
       if (option) bits.push(option);
@@ -1009,6 +1072,7 @@ EXTRACT_JS = r"""
         continue;
       }
 
+      const host = el.getRootNode && el.getRootNode().host;
       const selector = selectorFor(el);
       if (!selector) continue;
       const role = (el.getAttribute("role") || "").toLowerCase();
@@ -1061,16 +1125,27 @@ EXTRACT_JS = r"""
       const block = el.closest("section, fieldset") || el.parentElement;
       const headingNode = block ? block.querySelector("h1, h2, h3, legend") : null;
 
+      let controlName = el.getAttribute("name") || "";
+      let controlId = el.id || "";
+      if (host) {
+        if (!controlName) controlName = host.getAttribute("name") || "";
+        if (!controlId) controlId = host.id || "";
+      }
+      const hostRequired = !!(
+        host &&
+        (host.required || host.getAttribute("aria-required") === "true" || host.hasAttribute("required"))
+      );
       controls.push({
         kind,
-        name: el.getAttribute("name") || "",
-        elementId: el.id || "",
+        name: controlName,
+        elementId: controlId,
         label: accountStatement(root, el) || labelFor(root, el),
         placeholder: el.getAttribute("placeholder") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         autocomplete: el.getAttribute("autocomplete") || "",
           required:
             !!el.required ||
+            hostRequired ||
             el.getAttribute("aria-required") === "true" ||
             (kind === "checkbox" && controlMarkedRequired(el)) ||
             (
