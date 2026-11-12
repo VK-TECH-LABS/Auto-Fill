@@ -16,5 +16,5 @@
   "tests": "pytest tests/test_candidate_sync.py tests/test_save_continue.py tests/test_t315_direct_browser.py",
   "blockers": "",
   "next_action": "",
-  "updated_at": "2026-11-12T15:19:11Z"
+  "updated_at": "2026-11-12T15:19:16Z"
 }
