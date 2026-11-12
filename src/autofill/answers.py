@@ -43,7 +43,14 @@ def jurisdiction(text: str) -> frozenset[str]:
     return _jurisdiction(text)
 
 
-_HOW_HEARD = ("how did you hear", "how did you find", "where did you hear", "referral source")
+_HOW_HEARD = (
+    "how did you hear",
+    "how you heard",
+    "how heard",
+    "how did you find",
+    "where did you hear",
+    "referral source",
+)
 
 # Words that carry no meaning for the containment check.
 _FILLER = frozenset(
