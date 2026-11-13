@@ -392,7 +392,11 @@ def test_consent_blocks_ready_and_marketing_stays_unchecked(browser):
             selector="#auth",
             required=True,
         )
-        assert map_field(factual, _profile()).action == "check"
+        # A country-less work-authorization box uses the profile fact only when
+        # the address country is the United States.
+        authorized = _profile()
+        authorized.personal.country = "United States"
+        assert map_field(factual, authorized).action == "check"
         privacy = next(
             control
             for control in snapshot.controls
@@ -525,8 +529,28 @@ def test_prepared_resume_attaches_when_the_control_appears(browser):
                 resume_prepared=True,
             ),
         )
-        assert attached.resume_verified_now is True
-        assert attached.status != Status.RESUME_UPLOAD_REQUIRED
+        assert attached.resume_verified_now is False
+        assert attached.status == Status.RESUME_UPLOAD_REQUIRED
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
+        page.locator("#resume").set_input_files(
+            {"name": "notes.pdf", "mimeType": "application/pdf", "buffer": PDF}
+        )
+        continued = autofill_application(
+            url,
+            _profile(),
+            None,
+            AutofillOptions(
+                page=page,
+                session_id="sess-resume",
+                candidate_id="ref-a",
+                resume_name="notes.pdf",
+                resume_mime="application/pdf",
+                resume_bytes=PDF,
+                resume_prepared=True,
+            ),
+        )
+        assert continued.resume_verified_now is True
+        assert continued.status != Status.RESUME_UPLOAD_REQUIRED
         assert page.locator("#resume").evaluate("el => el.files.length") == 1
     finally:
         page.close()

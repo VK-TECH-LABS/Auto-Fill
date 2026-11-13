@@ -1,0 +1,20 @@
+{
+  "task": "first-page-progress",
+  "developer": "tharun",
+  "branch": "tharun/first-page-progress",
+  "latest_commit": "1fc91006b3210b099f34862e338642ef589725ec",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/64",
+  "files_touched": [
+    "docs/HTTP_SERVICE.md",
+    "src/autofill/dom_ui.py",
+    "src/autofill/engine.py",
+    "src/autofill/follow.py",
+    "src/autofill/pagewait.py",
+    "src/autofill/safeguards.py",
+    "tests/test_first_page_progress.py"
+  ],
+  "tests": "pytest tests/test_first_page_progress.py tests/test_job_entry.py tests/test_page_type.py tests/test_site_unavailable_ready.py tests/test_safeguards.py",
+  "blockers": "",
+  "next_action": "Review the staging PR. Confirm cookie dismiss, posting Apply, and job_expired on the three first-page cases.",
+  "updated_at": "2026-10-25T11:21:36Z"
+}

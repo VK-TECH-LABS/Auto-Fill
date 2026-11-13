@@ -1,0 +1,18 @@
+---
+description: Read and claim handoff records before editing Auto-Fill. Never push to another developer's branch.
+alwaysApply: true
+---
+
+# Handoff and branches
+
+Railway is the active host. `staging` is the integration branch. `main` is production. Open pull requests against `staging` only.
+
+Before editing:
+
+- Read `.handoff/ownership.json` and every open `.handoff/*.json` record.
+- Claim work on your own branch as `.handoff/<developer>--<task>.json` (`task`, `developer`, `branch`, `latest_commit`, `pr`, `files_touched`, `tests`, `blockers`, `next_action`, `updated_at`). Tharun uses `tharun/<task>`. Sai Teja (`Gollapally123`) uses `saiteja/<task>`.
+- If another developer's open task already lists a file you need, stop. Do not use the `handoff-override` label unless that developer agreed.
+
+Never push or force-push to the other developer's branch, to `main`, or to `staging`. Rebase on the latest `staging` before merge. Resolve conflicts file by file. Never take a blanket ours or theirs.
+
+Do not enable real account creation or final job submission. `HUMAN_SUBMIT_ONLY` stays true. Tests stay on local fixtures.

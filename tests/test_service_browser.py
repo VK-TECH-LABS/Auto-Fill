@@ -79,6 +79,7 @@ def test_http_service_fills_local_form_and_stops_before_submit(fixture_origin: s
         assert body["stopped_before_submit"] is True
         assert "Submit application" in body["submitControls"]
         assert email not in started.text
+        assert _eval(runner, session_id, _ATTACH_RESUME) == 1
         continued = client.post(
             f"/v1/sessions/{session_id}/continue",
             headers=AUTH,
@@ -162,6 +163,16 @@ _FORM_VALUES = """() => ({
   city: document.querySelector('#city').value
 })"""
 
+_ATTACH_RESUME = """() => {
+  const input = document.querySelector('#resume');
+  const file = new File([new Uint8Array([37, 80, 68, 70, 45])], 'notes.pdf', {type: 'application/pdf'});
+  const transfer = new DataTransfer();
+  transfer.items.add(file);
+  input.files = transfer.files;
+  input.dispatchEvent(new Event('change', {bubbles: true}));
+  return input.files.length;
+}"""
+
 
 def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_origin: str):
     """A second session must not start another Playwright driver while the first browser is open."""
@@ -214,6 +225,8 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
         assert runner._driver._browser is not None
 
         continued: dict[str, dict] = {}
+        assert _eval(runner, session_a, _ATTACH_RESUME) == 1
+        assert _eval(runner, session_b, _ATTACH_RESUME) == 1
 
         def continue_one(key: str, session_id: str, candidate_id: str) -> None:
             try:

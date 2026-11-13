@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <main id="stage"></main>
+  <script>
+    window.__clicked = [];
+    window.__step = 1;
+    function render() {
+      const stage = document.getElementById("stage");
+      const step = window.__step;
+      stage.innerHTML = "<h1>Step " + step + "</h1><label>Note <input id='note-" + step
+        + "' type='text' value='kept'></label><button id='forward' type='button'>Next</button>";
+      document.getElementById("forward").addEventListener("click", () => {
+        window.__clicked.push("Next");
+        window.__step += 1;
+        render();
+      });
+    }
+    render();
+  </script>
+</body>
+</html>

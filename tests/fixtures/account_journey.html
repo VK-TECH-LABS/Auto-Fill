@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Synthetic employer</title></head>
+<body>
+<main id="stage"></main>
+<script>
+/* Synthetic employer: Create Account (or Sign In) -> Personal -> Experience -> Review.
+   Mode comes from ?mode=signin|register|exists. Submit reports to /submitted so a test can prove it was never clicked. */
+var mode = new URLSearchParams(location.search).get("mode") || "register";
+var step = mode === "signin" ? "signin" : "register";
+function stage() { return document.getElementById("stage"); }
+function strong(p) { return p.length >= 8 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p); }
+function render() {
+  var s = stage();
+  if (step === "register") {
+    s.innerHTML = "<h1>Create Account</h1>" +
+      "<label for='email'>Email Address</label><input id='email' type='email' autocomplete='email'>" +
+      "<label for='password'>Password</label><input id='password' type='password' autocomplete='new-password' aria-describedby='policy'>" +
+      "<p id='policy'>Password requirements: a lowercase character, a special character, an alphabetic character, an uppercase character, minimum 8 characters, a numeric character.</p>" +
+      "<label for='verify'>Verify New Password</label><input id='verify' type='password' aria-label='Verify New Password' autocomplete='new-password'>" +
+      "<div id='error' role='alert'></div>" +
+      "<button type='button' id='create'>Create Account</button>";
+    document.getElementById("create").onclick = function () {
+      var p = document.getElementById("password").value;
+      if (!strong(p) || p !== document.getElementById("verify").value) { document.getElementById("error").textContent = "Password does not meet the requirements."; return; }
+      if (mode === "exists") { document.getElementById("error").textContent = "An account with this email already exists."; return; }
+      step = "personal"; render();
+    };
+  } else if (step === "signin") {
+    s.innerHTML = "<h1>Sign In</h1>" +
+      "<label for='email'>Email Address</label><input id='email' type='email' autocomplete='username'>" +
+      "<label for='password'>Password</label><input id='password' type='password'>" +
+      "<div id='error' role='alert'></div>" +
+      "<button type='button' id='go' data-automation-id='signInSubmitButton'>Sign In</button>";
+    document.getElementById("go").onclick = function () {
+      if (document.getElementById("password").value !== "Saved-Login-7!") { document.getElementById("error").textContent = "Wrong email or password."; return; }
+      step = "personal"; render();
+    };
+  } else if (step === "personal") {
+    s.innerHTML = "<h1>My Information</h1><label for='first'>First Name</label><input id='first' name='firstName' type='text'>" +
+      "<label for='last'>Last Name</label><input id='last' name='lastName' type='text'>" +
+      "<button type='button' id='next'>Next</button>";
+    document.getElementById("next").onclick = function () { step = "experience"; render(); };
+  } else if (step === "experience") {
+    s.innerHTML = "<h1>My Experience</h1><label for='company'>Most recent employer</label><input id='company' name='company' type='text'>" +
+      "<button type='button' id='next'>Save and Continue</button>";
+    document.getElementById("next").onclick = function () { step = "review"; render(); };
+  } else {
+    s.innerHTML = "<h1>Review</h1><p>Review your application before you submit.</p><button type='submit' id='submit'>Submit</button>";
+    document.getElementById("submit").onclick = function () { fetch("/submitted"); };
+  }
+}
+render();
+</script>
+</body>
+</html>

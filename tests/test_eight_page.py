@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from autofill import AutofillOptions, Credentials, MemoryCredentialProvider, Status, autofill_application
+from autofill.credentials import credential_scope
 from autofill.profile import CandidateProfile
 from autofill.resolver import ResolverBinding
 
@@ -20,7 +21,6 @@ FIXTURE = Path(__file__).parent / "fixtures" / "eight_page_application.html"
 PASSWORD = "synthetic-password-candidate-a"
 TOKEN = "synthetic-resolver-token-0123456789abcdef"
 URL = "https://boards.greenhouse.io/example/jobs/1"
-DOMAIN = "boards.greenhouse.io"
 CANARY = "CanaryNameShouldNotFill"
 
 ANSWERS = {
@@ -182,7 +182,11 @@ def _profile() -> CandidateProfile:
 
 def _provider() -> MemoryCredentialProvider:
     store = MemoryCredentialProvider()
-    store.put("ref-a", DOMAIN, Credentials(site=DOMAIN, email="avery.example@example.com", password=PASSWORD))
+    store.put(
+        "ref-a",
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="avery.example@example.com", password=PASSWORD),
+    )
     return store
 
 
@@ -302,6 +306,13 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
         assert {"intent": None, "text": "What is your favorite prime number?"} in second.manual_questions
         assert page.locator("#prime").input_value() == ""
         assert page.locator("#resume").input_value() == ""
+        page.locator("#resume").set_input_files(
+            {
+                "name": "notes.pdf",
+                "mimeType": "application/pdf",
+                "buffer": b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n",
+            }
+        )
         third = autofill_application(
             URL,
             _profile(),

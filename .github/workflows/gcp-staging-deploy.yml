@@ -1,0 +1,115 @@
+# paused: Railway is active host, Oct 2026
+name: Auto-Fill Engine Staging CI/CD (GCP Cloud Run)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: autofill-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GCP_PROJECT_ID: vk-tilearc-staging
+  GCP_REGION: us-east4
+  ARTIFACT_REGISTRY: us-east4-docker.pkg.dev/vk-tilearc-staging/tilearc-docker
+
+jobs:
+  pytest-gates:
+    name: Python 3.12 Unit & Safety Gate Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install package & test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run pytest suite (HUMAN_SUBMIT_ONLY, Barr create-account, Workday)
+        run: pytest -q
+
+  deploy-staging:
+    name: Build Playwright Image & Deploy to Cloud Run
+    needs: pytest-gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check GCP Workload Identity Federation configuration
+        id: wif_check
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        run: |
+          if [ -z "${WIF_PROVIDER}" ]; then
+            echo "::notice title=GCP WIF Not Configured Yet::Skipping Cloud Run deploy until GCP_WIF_PROVIDER / GCP_WORKLOAD_IDENTITY_PROVIDER repository variable is populated."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.wif_check.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via Workload Identity Federation
+        if: steps.wif_check.outputs.enabled == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ steps.wif_check.outputs.provider }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA || 'sa-github-deployer@vk-tilearc-staging.iam.gserviceaccount.com' }}
+
+      - name: Set up Cloud SDK & Docker Auth
+        if: steps.wif_check.outputs.enabled == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        if: steps.wif_check.outputs.enabled == 'true'
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & Push autofill-engine Docker image
+        if: steps.wif_check.outputs.enabled == 'true'
+        run: |
+          docker build -f Dockerfile \
+            -t ${{ env.ARTIFACT_REGISTRY }}/autofill-engine:${{ github.sha }} \
+            -t ${{ env.ARTIFACT_REGISTRY }}/autofill-engine:staging-latest .
+          docker push ${{ env.ARTIFACT_REGISTRY }}/autofill-engine:${{ github.sha }}
+          docker push ${{ env.ARTIFACT_REGISTRY }}/autofill-engine:staging-latest
+
+      - name: Deploy autofill-engine to Cloud Run (max-instances=1, 2 vCPU / 4 GiB)
+        if: steps.wif_check.outputs.enabled == 'true'
+        run: |
+          gcloud run deploy autofill-engine \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --image="${{ env.ARTIFACT_REGISTRY }}/autofill-engine:${{ github.sha }}" \
+            --cpu=2 \
+            --memory=4Gi \
+            --min-instances=0 \
+            --max-instances=1 \
+            --concurrency=16 \
+            --session-affinity \
+            --quiet
+
+      - name: Verify /health & /health/ready
+        if: steps.wif_check.outputs.enabled == 'true'
+        run: |
+          SERVICE_URL=$(gcloud run services describe autofill-engine \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --format="value(status.url)")
+          curl -fsS "${SERVICE_URL}/health"
+          curl -fsS "${SERVICE_URL}/health/ready"

@@ -1,0 +1,157 @@
+{
+  "chrome_version": "Google Chrome 156.0.8078.47",
+  "probes": [
+    {
+      "mode": "headed_daily",
+      "chrome_version": "Google Chrome 156.0.8078.47",
+      "executable": "/usr/bin/google-chrome-stable",
+      "headless": false,
+      "user_data_dir": "",
+      "default_profile": true,
+      "port": 39941,
+      "cdp_open": false,
+      "listen_hosts": [],
+      "browser": "",
+      "webSocketDebuggerUrl": "",
+      "devtools_active_port": "",
+      "stderr_excerpt": "DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.",
+      "daily_profile_attach": false,
+      "note": "Daily-profile debugging was not available. Chrome logged that a non-default data directory is required."
+    },
+    {
+      "mode": "explicit_default",
+      "chrome_version": "Google Chrome 156.0.8078.47",
+      "executable": "/usr/bin/google-chrome-stable",
+      "headless": true,
+      "user_data_dir": "/home/ubuntu/.config/google-chrome",
+      "default_profile": true,
+      "port": 45831,
+      "cdp_open": false,
+      "listen_hosts": [],
+      "browser": "",
+      "webSocketDebuggerUrl": "",
+      "devtools_active_port": "",
+      "stderr_excerpt": "DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.",
+      "daily_profile_attach": false,
+      "note": "Daily-profile debugging was not available. Chrome logged that a non-default data directory is required."
+    },
+    {
+      "mode": "headless_omitted",
+      "chrome_version": "Google Chrome 156.0.8078.47",
+      "executable": "/usr/bin/google-chrome-stable",
+      "headless": true,
+      "user_data_dir": "",
+      "default_profile": true,
+      "port": 52175,
+      "cdp_open": true,
+      "listen_hosts": [
+        "127.0.0.1"
+      ],
+      "browser": "Chrome/156.0.8078.47",
+      "webSocketDebuggerUrl": "ws://127.0.0.1:52175/devtools/browser/6ba6d026-cedd-4867-addf-4594cd5e5cd4",
+      "devtools_active_port": "",
+      "stderr_excerpt": "DevTools listening on ws://127.0.0.1:52175/devtools/browser/6ba6d026-cedd-4867-addf-4594cd5e5cd4",
+      "daily_profile_attach": false,
+      "note": "Headless Chrome without --user-data-dir opened CDP. Headless uses a temporary data directory, not the employee's daily profile. This is not silent attach to an already-open daily Chrome."
+    },
+    {
+      "mode": "dedicated",
+      "chrome_version": "Google Chrome 156.0.8078.47",
+      "executable": "/usr/bin/google-chrome-stable",
+      "headless": true,
+      "user_data_dir": "/workspace/tools/local-cdp-poc/evidence/work/dedicated/dedicated-profile",
+      "default_profile": false,
+      "port": 50525,
+      "cdp_open": true,
+      "listen_hosts": [
+        "127.0.0.1"
+      ],
+      "browser": "Chrome/156.0.8078.47",
+      "webSocketDebuggerUrl": "ws://127.0.0.1:50525/devtools/browser/045e00f9-4c51-42dd-a2b5-d91ae1d9bdbc",
+      "devtools_active_port": "",
+      "stderr_excerpt": "DevTools listening on ws://127.0.0.1:50525/devtools/browser/045e00f9-4c51-42dd-a2b5-d91ae1d9bdbc",
+      "daily_profile_attach": false,
+      "note": "A non-default --user-data-dir accepted the debugging port."
+    }
+  ],
+  "branded_extension": {
+    "mode": "branded_load_extension",
+    "chrome_version": "Google Chrome 156.0.8078.47",
+    "executable": "/usr/bin/google-chrome-stable",
+    "load_extension_ignored": true,
+    "stderr_excerpt": "[9202:9202:1027/210430.694588:WARNING:chrome/browser/extensions/extension_service.cc:423] --load-extension is not allowed in Google Chrome, ignoring.",
+    "note": "Branded Google Chrome ignored --load-extension. An employee must install an unpacked extension from chrome://extensions. That is a consent step, not a silent attach."
+  },
+  "extension_debugger": {
+    "mode": "extension_debugger",
+    "chrome_version": "Google Chrome for Testing 156.0.8078.4",
+    "executable": "/home/ubuntu/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome",
+    "remote_debugging_port": false,
+    "reports": [
+      {
+        "attached": true,
+        "error": "",
+        "cookie": "t172_visible=same-tab",
+        "href": "http://127.0.0.1:35311/t172-local-tab.html",
+        "via": "chrome.debugger"
+      }
+    ],
+    "attached": true,
+    "cookie": "t172_visible=same-tab",
+    "cookie_visible": true,
+    "stderr_excerpt": "[9495:9511:1027/210435.146827:ERROR:dbus/bus.cc:405] Failed to connect to the bus: Could not parse server address: Unknown address type (examples of valid types are \"tcp\" and on UNIX \"unix\") | [9495:9511:1027/210435.167520:ERROR:dbus/bus.cc:405] Failed to connect to the bus: Failed to connect to socket /run/dbus/system_bus_socket: Connection refused | [9495:9495:1027/210435.167588:ERROR:dbus/object_proxy.cc:572] Failed to call method: org.freedesktop.DBus.NameHasOwner: object_path= /org/freedesk",
+    "note": "chrome.debugger attached inside the browser and read the visible tab's cookie. No remote-debugging port was passed. Branded Chrome still requires a manual install."
+  },
+  "inspect_consent": {
+    "mode": "inspect_consent_cold",
+    "chrome_version": "Google Chrome 156.0.8078.47",
+    "devtools_active_port_present": false,
+    "devtools_active_port": "",
+    "stderr_excerpt": "[9669:9697:1027/210435.916178:ERROR:dbus/bus.cc:405] Failed to connect to the bus: Could not parse server address: Unknown address type (examples of valid types are \"tcp\" and on UNIX \"unix\") | [9669:9669:1027/210435.929585:ERROR:dbus/object_proxy.cc:572] Failed to call method: org.freedesktop.DBus.NameHasOwner: object_path= /org/freedesktop/DBus: unknown error type: | [9669:9697:1027/210435.929661:ERROR:dbus/bus.cc:405] Failed to connect to the bus: Could not parse server address: Unknown addres",
+    "note": "Chrome was opened on chrome://inspect/#remote-debugging with no debugging flag and no Allow click. DevToolsActivePort was not written, so nothing could attach. Chrome 144+ still requires the person to enable remote debugging and approve each connection."
+  },
+  "dedicated_fill": {
+    "mode": "dedicated_fill",
+    "chrome_version": "Google Chrome 156.0.8078.47",
+    "headless": false,
+    "endpoint": "http://127.0.0.1:54077",
+    "listen_hosts": [
+      "127.0.0.1"
+    ],
+    "browser": "Chrome/156.0.8078.47",
+    "webSocketDebuggerUrl_host_ok": true,
+    "user_data_dir_is_default": false,
+    "created_new_context_for_fill": false,
+    "context_count": 1,
+    "target_id": "4F5DC6455095CA0E0DAC83355EE418CC",
+    "target_id_after_reconnect": "4F5DC6455095CA0E0DAC83355EE418CC",
+    "same_target": true,
+    "chrome_alive_after_disconnect": true,
+    "cookie_before": "t172_visible=same-tab",
+    "cookie_after_fill": "t172_visible=same-tab",
+    "cookie_preserved": true,
+    "values": {
+      "first": "Casey",
+      "last": "Example",
+      "email": "casey.example@example.com"
+    },
+    "submitted": false,
+    "fill": {
+      "status": "READY_FOR_HUMAN_SUBMIT",
+      "fields_detected": 3,
+      "fields_filled": 3,
+      "fields_skipped": 0,
+      "stopped_before_submit": true,
+      "submit_controls": [
+        "Submit application"
+      ]
+    },
+    "screenshot": "tools/local-cdp-poc/evidence/dedicated-fill.png",
+    "inspect_surface": {
+      "opened": true,
+      "url": "chrome://inspect/#remote-debugging",
+      "text": "DevTools\nDevices\nPages\nExtensions\nApps\nShared workers\nService workers\nShared storage worklets\nRemote debugging\nOther\nRemote debugging\nAllow remote debugging for this browser instance\n\nTurning on this setting allows external apps to request full control of this browser. This includes read access to your saved data, cookies and site data, and the ability to navigate to any URL.\n\nOnly web developers should turn on this feature, and only use it with trusted apps.\n\nLearn about connecting to Chrome DevTools for agents"
+    }
+  },
+  "profile_directories_committed": false
+}

@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Tell us about yourself</title></head>
+<body>
+  <h1>Tell us about yourself</h1>
+  <p style="position:absolute;left:-9999px">Just a moment...</p>
+  <p>Just a moment while the form finishes.</p>
+  <div id="px-captcha" class="px-captcha" style="width:120px;height:40px"></div>
+  <form id="personal" onsubmit="return false">
+    <p>We sent you a code so we can notify you about this application.</p>
+    <label for="first">First Name</label>
+    <input id="first" name="firstName" required autocomplete="given-name">
+    <label for="last">Last Name</label>
+    <input id="last" name="lastName" required autocomplete="family-name">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" required autocomplete="email">
+    <label for="cc">Country code</label>
+    <input id="cc" name="countryCode" aria-label="Country code" maxlength="4" value="+1">
+    <label for="mobile">Mobile Number</label>
+    <input id="mobile" name="mobile" type="tel" required autocomplete="tel">
+    <button type="button" id="continue">Continue</button>
+  </form>
+  <div id="experience" hidden>
+    <h1>Experience</h1>
+    <label for="title">Job title</label>
+    <input id="title" name="title">
+    <button type="submit" id="submit">Submit application</button>
+  </div>
+  <script>
+    window.__continued = false;
+    window.__submitted = false;
+    window.__values = null;
+    document.getElementById("continue").addEventListener("click", () => {
+      window.__continued = true;
+      window.__values = {
+        first: document.getElementById("first").value,
+        last: document.getElementById("last").value,
+        email: document.getElementById("email").value,
+        mobile: document.getElementById("mobile").value,
+        cc: document.getElementById("cc").value,
+      };
+      document.getElementById("personal").remove();
+      document.getElementById("experience").hidden = false;
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__submitted = true;
+    });
+  </script>
+</body>
+</html>

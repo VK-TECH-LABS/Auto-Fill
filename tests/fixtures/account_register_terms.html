@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Create your candidate account | Example Careers</title></head>
+<body>
+<!-- Synthetic non-Workday candidate account page (generic ATS shape). The terms box is a
+     controlled input hidden under a styled span, like many career-site themes; the site
+     rejects Create Account until its own state says the box was accepted. No real data. -->
+<h1>Create account</h1>
+<form id="register" onsubmit="return false" novalidate>
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="email" required>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="new-password" required>
+  <label for="verify">Confirm password</label>
+  <input id="verify" name="verify" type="password" aria-label="Confirm password" autocomplete="new-password" required>
+  <div class="check" style="position:relative;display:inline-block">
+    <input id="terms" type="checkbox" required style="opacity:0;position:absolute;left:0;top:0;width:18px;height:18px;margin:0">
+    <span class="skin" style="position:absolute;left:0;top:0;width:18px;height:18px;border:1px solid #333;background:#fff"></span>
+    <label for="terms" id="terms-label" style="margin-left:26px">__TERMS__</label>
+  </div>
+  <div>
+    <label><input id="news" type="checkbox"> Send me job alerts and marketing emails.</label>
+  </div>
+  <button type="button" id="create">Create Account</button>
+</form>
+<div id="error" role="alert" hidden></div>
+<script>
+window.__accepted = false;
+window.__created = 0;
+window.__rejected = 0;
+var box = document.getElementById("terms");
+box.addEventListener("change", function () { window.__accepted = box.checked; });
+document.getElementById("create").addEventListener("click", function () {
+  var err = document.getElementById("error");
+  if (!window.__accepted) {
+    window.__rejected += 1;
+    err.hidden = false;
+    err.textContent = "Please accept the terms to continue.";
+    return;
+  }
+  window.__created += 1;
+  document.getElementById("register").remove();
+  err.hidden = true;
+  var note = document.createElement("p");
+  note.id = "done";
+  note.textContent = "Check your inbox to verify your email.";
+  document.body.appendChild(note);
+});
+</script>
+</body>
+</html>
