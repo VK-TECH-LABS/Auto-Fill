@@ -214,8 +214,9 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
 
         values_a = _eval(runner, session_a, _FORM_VALUES)
         values_b = _eval(runner, session_b, _FORM_VALUES)
-        assert values_a == {"first": "Casey", "email": "casey.example@example.com", "city": "Casey City"}
-        assert values_b == {"first": "Blair", "email": "blair.example@example.com", "city": "Blair City"}
+        # City is optional on the sample form, so it stays blank for both candidates.
+        assert values_a == {"first": "Casey", "email": "casey.example@example.com", "city": ""}
+        assert values_b == {"first": "Blair", "email": "blair.example@example.com", "city": ""}
         _eval(runner, session_a, "(owner) => localStorage.setItem('autofill_owner', owner)", "candidate-a")
         _eval(runner, session_b, "(owner) => localStorage.setItem('autofill_owner', owner)", "candidate-b")
         assert _eval(runner, session_a, "() => localStorage.getItem('autofill_owner')") == "candidate-a"
@@ -260,12 +261,12 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
         assert _eval(runner, session_a, _FORM_VALUES) == {
             "first": "Casey",
             "email": "casey.example@example.com",
-            "city": "Casey City",
+            "city": "",
         }
         assert _eval(runner, session_b, _FORM_VALUES) == {
             "first": "Blair",
             "email": "blair.example@example.com",
-            "city": "Blair City",
+            "city": "",
         }
 
         deleted = client.delete(f"/v1/sessions/{session_a}", headers=AUTH)
@@ -298,7 +299,7 @@ def test_two_open_sessions_stay_isolated_and_a_third_works_after_delete(fixture_
         assert _eval(runner, session_c, _FORM_VALUES) == {
             "first": "Drew",
             "email": "drew.example@example.com",
-            "city": "Drew City",
+            "city": "",
         }
 
 

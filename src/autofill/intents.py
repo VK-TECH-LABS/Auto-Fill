@@ -92,6 +92,9 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future require visa sponsorship"),
     ("SPONSORSHIP_NOW_OR_FUTURE", "now or will you in the future require sponsorship"),
     ("SPONSORSHIP_NOW_OR_FUTURE", "now or will you in the future require visa sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future need assistance with a work visa"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future need visa sponsorship"),
+    ("SPONSORSHIP_NOW_OR_FUTURE", "now or in the future need sponsorship"),
     ("SPONSORSHIP_FUTURE", "require sponsorship in the future"),
     ("SPONSORSHIP_FUTURE", "require visa sponsorship in the future"),
     ("SPONSORSHIP_FUTURE", "sponsorship in the future"),
@@ -117,6 +120,8 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("TRAVEL_PERCENT", "percentage of time are you willing to travel"),
     ("TRAVEL_PERCENT", "percentage of the time are you willing to travel"),
     ("TRAVEL_PERCENT", "willing to travel"),
+    ("TRAVEL_PERCENT", "open to travel"),
+    ("TRAVEL_PERCENT", "able to travel"),
     ("TRAVEL_PERCENT", "travel percentage"),
     ("TRAVEL_PERCENT", "percent travel"),
     ("TRAVEL_PERCENT", "how much travel"),
@@ -153,6 +158,8 @@ _SYNONYMS: tuple[tuple[str, str], ...] = (
     ("EMPLOYMENT_TYPE", "full time or part time"),
     ("START_DATE", "earliest start date"),
     ("START_DATE", "when can you start"),
+    ("START_DATE", "earliest you would be available to start"),
+    ("START_DATE", "available to start"),
     ("START_DATE", "start date"),
     ("START_DATE", "date available"),
     ("PREVIOUSLY_EMPLOYED", "previously been employed"),
@@ -458,6 +465,8 @@ def sanitize_question(text: str, *, limit: int = 300) -> str:
     cleaned = _PHONE_RE.sub(" ", cleaned)
     cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # The page's required mark ("Question? *") is not part of the question.
+    cleaned = re.sub(r"\s*\*+$", "", cleaned)
     if len(cleaned) > limit:
         cleaned = cleaned[:limit].rstrip()
     return cleaned

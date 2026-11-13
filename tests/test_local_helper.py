@@ -1294,8 +1294,8 @@ def test_stage_rejects_non_pdf_oversize_and_unbound(monkeypatch):
         big = b"%PDF-" + b"0" * MAX_RESUME_BYTES
         try:
             assert _stage(port, big)[0] == 400
-        except urllib.error.URLError:
-            pass  # refused before the body was read; the socket closed mid-upload
+        except (urllib.error.URLError, ConnectionError):
+            pass  # refused before the body was read; the socket closed mid-upload (Windows: WinError 10053)
         assert helper.staged_count() == 0
         code, body = _request(port, "POST", "/v1/sessions", {
             "applicationUrl": _URL,
@@ -1436,8 +1436,11 @@ _RESUME_FORM = b"""<!doctype html><html><body><h1>Apply</h1>
 
 
 @pytest.mark.skipif(os.environ.get("T172_RUN_CHROME_POC") != "1", reason="Set T172_RUN_CHROME_POC=1 to launch Chrome")
-def test_real_chrome_attaches_the_selected_resume_and_does_not_submit(monkeypatch):
-    """Headless Chromium, real engine: the held file lands in the resume input."""
+def test_real_chrome_leaves_the_resume_to_the_employee_and_does_not_submit(monkeypatch):
+    """Headless Chromium, real engine: a held resume is never pushed onto the file input.
+
+    Resume upload is employee-only (engine._maybe_reattach). The run stops for the person.
+    """
     from playwright.sync_api import sync_playwright
 
     from autofill.local_attach import LocalResume, fill_visible_tab
@@ -1458,10 +1461,10 @@ def test_real_chrome_attaches_the_selected_resume_and_does_not_submit(monkeypatc
                 resume = LocalResume(name="Casey_Example_Resume.pdf", mime="application/pdf", data=_PDF)
                 result = fill_visible_tab(page, url, profile, resume=resume)
                 seen = page.evaluate(read)
-                assert seen == {"name": "Casey_Example_Resume.pdf", "size": len(_PDF), "submitted": False}
-                assert result.status == Status.READY_FOR_HUMAN_SUBMIT
+                assert seen == {"name": None, "size": 0, "submitted": False}
+                assert result.status == Status.RESUME_UPLOAD_REQUIRED
                 assert result.stopped_before_submit is True
-                assert resume.uploaded is True
+                assert resume.uploaded is False
                 # Without a resume the control stays a human checkpoint.
                 page.goto(url)
                 result = fill_visible_tab(page, url, profile)

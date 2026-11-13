@@ -57,7 +57,7 @@ COOKIE_THEN_APPLY = """<!DOCTYPE html>
       window.__clicked.push("Apply");
       document.querySelector("main").innerHTML =
         "<h1>Application</h1>" +
-        "<label>Email <input id='email' type='email' name='email'></label>" +
+        "<label>Email <input id='email' type='email' name='email' required></label>" +
         "<button id='submit' type='submit'>Submit application</button>";
       document.getElementById("submit").addEventListener("click", (ev) => {
         ev.preventDefault();
@@ -94,7 +94,7 @@ HEADER_APPLY = """<!DOCTYPE html>
       window.__clicked.push("Apply");
       document.querySelector("main").innerHTML =
         "<h1>Application</h1>" +
-        "<label>Email <input id='email' type='email' name='email'></label>" +
+        "<label>Email <input id='email' type='email' name='email' required></label>" +
         "<button id='submit' type='submit'>Submit application</button>";
       document.getElementById("submit").addEventListener("click", (ev) => {
         ev.preventDefault();

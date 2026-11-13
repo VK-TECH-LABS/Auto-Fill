@@ -389,7 +389,7 @@ def browser():
         pytest.skip(f"Chromium is not installed: {exc}")
 
 
-def test_optional_links_are_not_asked_and_known_links_are_filled(browser):
+def test_optional_links_are_not_asked_or_filled_when_the_page_marks_required(browser):
     page = browser.new_page()
     try:
         page.set_content(
@@ -408,8 +408,9 @@ def test_optional_links_are_not_asked_and_known_links_are_filled(browser):
             None,
             AutofillOptions(page=page, candidate_id="cand-t240", session_id="t240-links"),
         )
-        assert "jahnavi-torra" in page.locator("#li").input_value()
-        assert "jahnavi.example/portfolio" in page.locator("#pf").input_value()
+        # The page marks a required field, so optional links stay blank even with profile data.
+        assert page.locator("#li").input_value() == ""
+        assert page.locator("#pf").input_value() == ""
         assert page.locator("#tw").input_value() == ""
         assert page.locator("#gh").input_value() == ""
         texts = " ".join(str(item.get("text") or "") for item in result.open_items).casefold()

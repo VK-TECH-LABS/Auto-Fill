@@ -1147,6 +1147,7 @@ EXTRACT_JS = r"""
             !!el.required ||
             hostRequired ||
             el.getAttribute("aria-required") === "true" ||
+            pageRaisedRequired(el) ||
             (kind === "checkbox" && controlMarkedRequired(el)) ||
             (
               (promptWidget ||
@@ -1154,7 +1155,9 @@ EXTRACT_JS = r"""
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
                 classToken.indexOf("autocomplete") !== -1 ||
                 kind === "text" ||
-                kind === "textarea") &&
+                kind === "textarea" ||
+                kind === "select" ||
+                kind === "radio") &&
               controlMarkedRequired(el)
             ),
         hidden: isHidden(el),
@@ -1379,6 +1382,34 @@ EXTRACT_JS = r"""
       if (prev && prev.tagName && prev.tagName.toLowerCase() === "label") return prev;
     }
     return fieldQuestionNode(el);
+  }
+
+  function pageRaisedRequired(el) {
+    // After Save & Continue the page names the mandatory fields it rejected:
+    // aria-invalid on a blank control, or a "required" error in its field.
+    if (!el) return false;
+    const blank = !((el.value || "").trim()) && !el.checked;
+    const saysRequired = new RegExp(
+      "\\b(required|mandatory|must have a value|cannot be (blank|empty)|" +
+        "please (enter|select|choose|provide|complete|answer))\\b",
+      "i"
+    );
+    const said = (text) => saysRequired.test(text || "");
+    const described = (el.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+    for (const id of described) {
+      const node = document.getElementById(id);
+      if (node && !isHidden(node) && said(node.textContent)) return true;
+    }
+    if (blank && el.getAttribute("aria-invalid") === "true") return true;
+    const field = el.closest && el.closest(
+      "[data-automation-id^='formField'], [data-field-path], .ashby-application-form-field-entry"
+    );
+    if (!field) return false;
+    const errors = field.querySelectorAll("[data-automation-id='errorMessage'], [role='alert'], .error, .field-error");
+    for (const node of errors) {
+      if (!isHidden(node) && said(node.textContent)) return true;
+    }
+    return false;
   }
 
   function controlMarkedRequired(el) {
