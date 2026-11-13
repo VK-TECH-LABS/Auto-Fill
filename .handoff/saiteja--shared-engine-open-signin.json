@@ -1,0 +1,18 @@
+{
+  "task": "shared-engine-open-signin",
+  "developer": "saiteja",
+  "branch": "saiteja/shared-engine-open-signin",
+  "latest_commit": "890c4c14f16fdcdb0d52917f0a3be55f942e8b0c",
+  "pr": "",
+  "files_touched": [
+    "src/autofill/combobox.py",
+    "src/autofill/fill.py",
+    "src/autofill/local_helper.py",
+    "src/autofill/mapping.py",
+    "tests/test_ashby_autocomplete_shape.py"
+  ],
+  "tests": "pytest tests/test_ashby_autocomplete_shape.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-11-13T14:39:31Z"
+}
