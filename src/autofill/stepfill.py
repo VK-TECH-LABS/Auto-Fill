@@ -249,11 +249,13 @@ def fill_resolved_page(
     active = flags or FillFlags()
     if resume_uploaded:
         settle_form(page)
-    snapshot = extract_page(page)
+    snapshot = reveal_required(page, extract_page(page))
     from autofill.mapping import note_page_country
 
     note_page_country(page, snapshot)
     outcome = ResolvedPage(snapshot=snapshot)
+    if unmarked_final_page(snapshot):
+        outcome.manual_actions.append(UNMARKED_PAGE_NOTE)
     clusters = _clusters(snapshot)
     requests: list[_Ask] = []
     for kind, controls in clusters:
@@ -428,44 +430,78 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
     return required_only(snapshot, ordered)
 
 
-_IDENTITY_AUTOCOMPLETE = frozenset({"name", "given-name", "family-name", "email", "tel", "tel-national"})
-_IDENTITY_LABELS = frozenset(
-    {
-        "name",
-        "full name",
-        "legal name",
-        "first name",
-        "given name",
-        "last name",
-        "family name",
-        "surname",
-        "email",
-        "email address",
-        "e mail",
-        "phone",
-        "phone number",
-        "mobile",
-        "mobile number",
-        "mobile phone",
-    }
+def _is_resume_input(control: Control) -> bool:
+    """The resume file box. It is only reported for a person to attach; never uploaded or filled."""
+    if control.kind != "file" and control.input_type != "file":
+        return False
+    blob = normalize(" ".join(str(x or "") for x in (control.label, control.name, control.aria_label)))
+    return any(word in blob.split() for word in ("resume", "cv")) or "curriculum vitae" in blob
+
+
+_PROBE_KINDS = frozenset({"text", "email", "tel", "textarea", "select", "combobox", "number", "url", "date"})
+_PROBE_LIMIT = 40
+UNMARKED_PAGE_NOTE = (
+    "This page does not say which fields are required. Auto-Fill filled none of its fields; "
+    "fill what the employer needs before you press Submit."
 )
 
 
-def _is_identity(control: Control) -> bool:
-    """Name, email, phone, or the resume: no employer can process an application without them.
+def page_marks_required(snapshot: PageSnapshot) -> bool:
+    return any(_marked(c) for c in snapshot.controls if not c.hidden and not c.disabled)
 
-    The resume is only reported for a person to attach; it is never uploaded here.
+
+def _probe_targets(snapshot: PageSnapshot) -> list[Control]:
+    out: list[Control] = []
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or control.read_only or not control.selector:
+            continue
+        if control.kind not in _PROBE_KINDS and control.input_type not in _PROBE_KINDS:
+            continue
+        if control.input_type == "password":
+            continue
+        out.append(control)
+    return out[:_PROBE_LIMIT]
+
+
+def reveal_required(page, snapshot: PageSnapshot) -> PageSnapshot:
+    """Ask an unmarked page which fields it requires, without typing anything.
+
+    Many forms only show "This field is required" once a field is touched.
+    Each blank field is focused and left; the page's own errors then mark the
+    mandatory ones (read by the extractor). A page that marks fields already
+    is returned unchanged. Nothing is typed, chosen, or submitted.
     """
-    if control.kind == "file" or control.input_type == "file":
-        blob = normalize(" ".join(str(x or "") for x in (control.label, control.name, control.aria_label)))
-        return any(word in blob.split() for word in ("resume", "cv")) or "curriculum vitae" in blob
-    if control.kind not in {"text", "email", "tel"} and control.input_type not in {"text", "email", "tel"}:
+    if page is None or page_marks_required(snapshot):
+        return snapshot
+    targets = _probe_targets(snapshot)
+    if not targets:
+        return snapshot
+    for control in targets:
+        try:
+            box = page.locator(control.selector).first
+            if (box.input_value(timeout=500) or "").strip():
+                continue
+            box.focus(timeout=1000)
+            box.blur(timeout=1000)
+        except Exception:
+            continue
+    try:
+        page.wait_for_timeout(150)
+        return extract_page(page)
+    except Exception:
+        return snapshot
+
+
+def unmarked_final_page(snapshot: PageSnapshot) -> bool:
+    """A last page that names no required field and still has blank fields for a person."""
+    from autofill.pagewait import has_final_submit
+
+    if page_marks_required(snapshot) or not _probe_targets(snapshot):
         return False
-    tokens = set((control.autocomplete or "").lower().split())
-    if tokens & _IDENTITY_AUTOCOMPLETE:
-        return True
-    label = normalize(str(control.label or control.aria_label or control.placeholder or "").replace("*", " "))
-    return label in _IDENTITY_LABELS
+    try:
+        return has_final_submit(snapshot)
+    except Exception:
+        return False
 
 
 def _marked(control: Control) -> bool:
@@ -480,9 +516,11 @@ def mandatory_selectors(snapshot: PageSnapshot) -> set[str]:
     Continue, read by the extractor), or when it shares its question with a
     marked control (a radio group, the month and year parts of one date).
     Unmarked controls are optional and are never filled, asked, or retried.
-    A page that marks nothing is uncertain: only name, email, and phone are
-    treated as mandatory, and Save & Continue reveals the rest as errors,
-    which the next scan marks. Conditional fields are re-read on every scan.
+    A page that marks nothing is first asked through :func:`reveal_required`;
+    if it still marks nothing, no field is filled (the resume box is only
+    reported), Save & Continue reveals the rest as errors that the next scan
+    marks, and a final page tells the person. Conditional fields are re-read
+    on every scan.
     """
     visible = [c for c in snapshot.controls if not c.hidden and not c.disabled]
     marked = [c for c in visible if _marked(c)]
@@ -495,7 +533,7 @@ def mandatory_selectors(snapshot: PageSnapshot) -> set[str]:
         own = {key for key in (control.group and "g:" + control.group, control.name and "n:" + control.name) if key}
         if control.form_automation_id.startswith("formField"):
             own.add("f:" + control.form_automation_id)
-        if _marked(control) or own & keys or (not marked and _is_identity(control)):
+        if _marked(control) or own & keys or (not marked and _is_resume_input(control)):
             chosen.add(control.selector)
     return chosen
 

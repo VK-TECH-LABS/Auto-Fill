@@ -358,7 +358,7 @@ def test_resolver_401_expired_and_mismatch_stop_clean(browser, resolver):
     server, url = resolver
     page = browser.new_page()
     try:
-        page.set_content("<h1>Contact</h1><label for='email'>Email</label><input id='email' type='email'>")
+        page.set_content("<h1>Contact</h1><label for='email'>Email</label><input id='email' type='email' required>")
         server.mode = "401"
         denied = autofill_application(
             URL,

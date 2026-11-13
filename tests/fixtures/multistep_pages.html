@@ -9,7 +9,7 @@
     function render() {
       const stage = document.getElementById("stage");
       if (index === 0) {
-        stage.innerHTML = "<h1>Personal</h1><label>Email <input id='email' type='email' name='email'></label><button id='forward' type='button'>Next</button>";
+        stage.innerHTML = "<h1>Personal</h1><label>Email <input id='email' type='email' name='email' required></label><button id='forward' type='button'>Next</button>";
       } else if (index === 1) {
         stage.innerHTML = "<h1>Experience</h1><label>Company <input id='company' type='text' name='company'></label><button id='forward' type='button'>Save &amp; Continue</button>";
       } else {

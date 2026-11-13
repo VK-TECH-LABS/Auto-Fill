@@ -162,29 +162,73 @@ def test_required_only_flow_reaches_review_and_never_submits(browser, url):
         page.close()
 
 
-def test_an_unmarked_page_fills_identity_only_and_never_submits(browser):
+_UNMARKED_SUBMIT_ONLY = """
+<h1>Apply</h1>
+<form onsubmit="return false">
+  <label for="fn">First Name</label><input id="fn">
+  <label for="em">Email</label><input id="em" type="email" autocomplete="email">
+  <label for="li">LinkedIn</label><input id="li">
+  <label for="city">City</label><input id="city">
+  <button type="submit" id="submit">Submit</button>
+</form>
+<script>window.__submitClicks = 0;
+  document.getElementById("submit").addEventListener("click", () => { window.__submitClicks += 1; });
+</script>
+"""
+
+# Validates on blur, like most React/Angular forms: no asterisk, but touching a
+# blank mandatory field shows "This field is required."
+_BLUR_VALIDATED = """
+<h1>Apply</h1>
+<form onsubmit="return false">
+  <div class="field-group"><label for="fn">First Name</label>
+    <input id="fn" data-must="1" aria-describedby="fn-err">
+    <div id="fn-err" class="error" hidden>This field is required.</div></div>
+  <div class="field-group"><label for="em">Email</label>
+    <input id="em" type="email" data-must="1" aria-describedby="em-err">
+    <div id="em-err" class="error" hidden>This field is required.</div></div>
+  <div class="field-group"><label for="li">LinkedIn</label><input id="li"></div>
+  <div class="field-group"><label for="city">City</label><input id="city"></div>
+  <button type="submit" id="submit">Submit</button>
+</form>
+<script>window.__submitClicks = 0;
+  document.getElementById("submit").addEventListener("click", () => { window.__submitClicks += 1; });
+  for (const el of document.querySelectorAll("[data-must]")) {
+    el.addEventListener("blur", () => {
+      const err = document.getElementById(el.id + "-err");
+      const blank = !el.value.trim();
+      err.hidden = !blank;
+      if (blank) el.setAttribute("aria-invalid", "true"); else el.removeAttribute("aria-invalid");
+    });
+  }
+</script>
+"""
+
+
+def test_an_unmarked_final_page_fills_nothing_and_tells_the_person(browser):
     page = browser.new_page()
     try:
-        page.set_content(
-            """
-            <h1>Apply</h1>
-            <form onsubmit="return false">
-              <label for="fn">First Name</label><input id="fn">
-              <label for="em">Email</label><input id="em" type="email" autocomplete="email">
-              <label for="li">LinkedIn</label><input id="li">
-              <label for="city">City</label><input id="city">
-              <button type="submit" id="submit">Submit</button>
-            </form>
-            <script>window.__submitClicks = 0;
-              document.getElementById("submit").addEventListener("click", () => { window.__submitClicks += 1; });
-            </script>
-            """
-        )
-        _run(page, "https://careers.unseen-employer.example/apply/2", 9)
+        page.set_content(_UNMARKED_SUBMIT_ONLY)
+        result = _run(page, "https://careers.unseen-employer.example/apply/2", 9)
+        for box in ("#fn", "#em", "#li", "#city"):
+            assert page.locator(box).input_value() == "", box
+        assert any("does not say which fields are required" in item for item in result.manual_actions)
+        assert result.status != "FILLED"
+        assert page.evaluate("window.__submitClicks") == 0
+    finally:
+        page.close()
+
+
+def test_blur_validation_reveals_the_mandatory_fields_without_typing(browser):
+    page = browser.new_page()
+    try:
+        page.set_content(_BLUR_VALIDATED)
+        result = _run(page, "https://careers.unseen-employer.example/apply/3", 10)
         assert page.locator("#fn").input_value() == "Avery"
         assert page.locator("#em").input_value() == "avery.alpha@example.com"
         assert page.locator("#li").input_value() == ""
         assert page.locator("#city").input_value() == ""
+        assert not any("does not say which fields are required" in item for item in result.manual_actions)
         assert page.evaluate("window.__submitClicks") == 0
     finally:
         page.close()

@@ -997,7 +997,11 @@ def fill_one_page(
         from autofill.split_dates import fill_current_boxes, fill_month_year_inputs, fill_split_dates
 
         _reveal_overflow(page)
-        snapshot = extract_page(page)
+        from autofill.stepfill import UNMARKED_PAGE_NOTE, reveal_required, unmarked_final_page
+
+        snapshot = reveal_required(page, extract_page(page))
+        if unmarked_final_page(snapshot):
+            manual.append(UNMARKED_PAGE_NOTE)
         from autofill.stepfill import _clusters, required_view
 
         # Optional From/To dates are not typed. "I currently work here" is

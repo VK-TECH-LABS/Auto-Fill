@@ -55,16 +55,16 @@ def test_a_radio_group_with_one_required_member_is_kept():
     assert not any("#p1" in group for group in kept)
 
 
-def test_a_page_that_marks_nothing_required_fills_only_identity_fields():
-    # No "fill everything" fallback: an unmarked page is uncertain, so only
-    # name, email, and phone are treated as mandatory until the page raises errors.
+def test_a_page_that_marks_nothing_required_fills_nothing():
+    # No fallback and no identity exception: an unmarked page names no mandatory
+    # field, so nothing is filled until the page itself raises a required error.
     snapshot = _snapshot(
         Control(kind="text", label="First Name", selector="#first"),
         Control(kind="text", label="Email", autocomplete="email", selector="#email"),
         Control(kind="text", label="LinkedIn", selector="#linkedin"),
         Control(kind="combobox", label="How did you hear about us?", selector="#source"),
     )
-    assert _labels(snapshot) == ["First Name", "Email"]
+    assert _labels(snapshot) == []
 
 
 def test_split_date_parts_and_radio_siblings_follow_their_marked_question():

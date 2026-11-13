@@ -362,7 +362,7 @@ def test_invisible_recaptcha_badge_does_not_stop(browser):
     try:
         page.set_content(
             "<h1>Contact</h1>"
-            "<label for='email'>Email</label><input id='email' type='email'>"
+            "<label for='email'>Email</label><input id='email' type='email' required>"
             "<div class='grecaptcha-badge'>"
             "<iframe src='/recaptcha/enterprise/anchor' title='badge'></iframe>"
             "</div>"
@@ -539,7 +539,7 @@ def test_preferred_first_name_stays_blank_without_preferred_name(browser, resolv
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='first'>First name</label><input id='first'>"
+            "<label for='first'>First name</label><input id='first' required>"
             "<label for='preferred'>Preferred First Name</label><input id='preferred'>"
             "</form>"
         )

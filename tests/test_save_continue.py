@@ -602,8 +602,9 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         body = wait(lambda b: (b.get("question") or {}).get("popup", {}).get("state") == "shown", sid)
         question = body["question"]
         # #97's stem keeps the legend's required mark. The question is the same sentence.
-        assert question["prompt"].replace("*", "").strip() == "Are you willing to work rotating night shifts?", body
-        assert question["options"] == ["Yes", "No"]
+        # While the card is on the employer tab, the status carries only the id and
+        # popup state; the question and its choices are read from the card below.
+        assert set(question) == {"id", "popup"}, body
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
             page = [p for c in browser.contexts for p in c.pages if "t172-local-tab" in p.url][0]
@@ -612,6 +613,8 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
             assert "Are you willing to work rotating night shifts?" in text
             assert "Shifts rotate every two weeks." in text
             assert "Avery Alpha" in text
+            assert host.get_by_label("Yes", exact=True).count() == 1
+            assert host.get_by_label("No", exact=True).count() == 1
             _shadow_click(page, "Yes")
         body = wait(
             lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
@@ -629,12 +632,13 @@ def test_real_chrome_save_and_continue_across_two_pages(monkeypatch, tmp_path):
         body = wait(lambda b: (b.get("question") or {}).get("id") not in (None, question["id"])
                     and b["question"].get("popup", {}).get("state") == "shown", sid)
         second = body["question"]
-        assert second["prompt"].replace("*", "").strip() == "Which forklift brand have you operated most?", body
+        assert set(second) == {"id", "popup"}, body
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{server.helper._session.debug_port}")
             page = [p for c in browser.contexts for p in c.pages if "t172-local-tab" in p.url][0]
             assert page.evaluate("() => !!document.getElementById('page2')") is True
             host = page.locator("#tilearc-answer-popup")
+            assert "Which forklift brand have you operated most?" in host.locator(".card").inner_text()
             host.locator("textarea").fill("Toyota")
             host.get_by_role("button", name="Save & Continue").click()
         body = wait(
