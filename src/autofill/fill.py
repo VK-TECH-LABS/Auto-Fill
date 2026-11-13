@@ -339,6 +339,17 @@ def _apply_mapped(page, control: Control, mapped: MappedField, *, overwrite: boo
                 action="unanswered",
                 detail="A choice button is not a text field.",
             )
+        if mapped.action == "fill" and control.kind == "combobox" and mapped.key != "city" and (mapped.text or ""):
+            # An autocomplete commits a row, not typed text. Typing alone is
+            # cleared on blur ("did not stay"), so the row is chosen and verified.
+            from autofill.combobox import select_combobox
+
+            chosen = select_combobox(target, control.selector, mapped.text or "")
+            if chosen is None:
+                return _outcome(control, mapped, action="unanswered", detail="No matching option in this list.")
+            remember_confirmed(control, chosen.label, field_key=mapped.key or "")
+            refresh_preview(page)
+            return _outcome(control, mapped, detail=chosen.label)
         if mapped.action == "fill":
             if mapped.key == "city" and control.kind in {"text", "textarea", "combobox"}:
                 from autofill.stepfill import commit_city_text
@@ -567,7 +578,7 @@ def _fill_checkbox_group(
     second radio grouper. Custom checkboxes stay unclicked.
     """
     from autofill.intents import match_all_options
-    from autofill.mapping import map_field, question_stem
+    from autofill.mapping import is_honeypot, map_field, question_stem
     from autofill.stepfill import _checkbox_label
 
     visible = [
@@ -586,7 +597,9 @@ def _fill_checkbox_group(
         label=stem,
         prompt=visible[0].prompt,
         group=visible[0].group,
-        name=visible[0].name,
+        # A checkbox's name can be one option's value ("Company website"). The
+        # question is the group, so an option name must not make it a honeypot.
+        name="" if is_honeypot(Control(kind="text", name=visible[0].name)) else visible[0].name,
     )
     mapped = map_field(synthetic, profile, job=job, cursor=cursor)
     options = [

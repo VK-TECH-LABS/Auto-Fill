@@ -932,8 +932,12 @@ _OPTIONAL_LABEL_RE = re.compile(r"\(\s*optional\s*\)", re.IGNORECASE)
 def is_honeypot(control: Control) -> bool:
     """Hidden text inputs and common trap labels are left blank."""
     blob = haystack(control)
-    compact = blob.replace(" ", "")
-    if "companywebsite" in compact or "company website" in blob:
+    # "Company website" is a trap only on a text box. On a checkbox or radio it
+    # is a real choice ("How did you hear about us? Company website").
+    own = " ".join(
+        str(part) for part in (control.label, control.name, control.element_id, control.placeholder) if part
+    ).casefold()
+    if control.kind in {"text", "textarea"} and ("companywebsite" in own.replace(" ", "") or "company website" in own):
         return True
     honeypot_tokens = ("honeypot", "leave blank", "leave this field blank", "do not fill", "bot field")
     if any(token in blob for token in honeypot_tokens):
