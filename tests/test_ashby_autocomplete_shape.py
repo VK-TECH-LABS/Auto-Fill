@@ -77,7 +77,10 @@ _PAGE = """
       if (event.key === "ArrowDown") draw(auth, AUTH);
       if (event.key === "Escape") close(auth);
     });
-    auth.addEventListener("input", () => draw(auth, AUTH.filter((l) => l.toLowerCase().includes(auth.value.toLowerCase()))));
+    auth.addEventListener("input", () => {
+      const query = auth.value.toLowerCase();
+      draw(auth, AUTH.filter((label) => label.toLowerCase().includes(query)));
+    });
     auth.addEventListener("blur", () => setTimeout(() => close(auth), 0));
     const loc = document.getElementById("loc");
     loc.addEventListener("input", () => {
