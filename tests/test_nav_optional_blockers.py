@@ -228,7 +228,8 @@ def test_jobvite_flow_reveal_then_next_twice_stops_before_submit(browser, resolv
         assert page.locator("#em").input_value() == "test.candidate@example.com"
         result = _continue_until(page, resolver, "#step3", calls=2)
         assert page.locator("#step3").is_visible(), result.messages
-        assert result.next_clicks >= 2
+        # Optional fields no longer hold the first run, so it may already click NEXT twice.
+        assert first.next_clicks + result.next_clicks >= 2
         assert page.evaluate("window.__submitClicks") == 0
         assert "Submit Application" in result.submit_controls
     finally:

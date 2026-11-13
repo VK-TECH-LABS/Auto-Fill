@@ -1441,9 +1441,9 @@ def test_missing_resume_still_fills_and_lists_questions(browser, resolver):
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='name'>Full name</label>"
-            "<input id='name' name='name' autocomplete='name'>"
+            "<input id='name' name='name' autocomplete='name' required>"
             "<label for='email'>Email</label>"
-            "<input id='email' type='email' autocomplete='email'>"
+            "<input id='email' type='email' autocomplete='email' required>"
             "<label for='resume'>Resume</label>"
             "<input id='resume' type='file' required>"
             "<div class='ashby-application-form-field-entry'>"

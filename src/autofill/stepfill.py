@@ -425,7 +425,25 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
             ordered.append(("multi", items))
         elif len(items) == 1:
             ordered.append(("one", items))
-    return ordered
+    return required_only(snapshot, ordered)
+
+
+def _cluster_required(controls: list[Control]) -> bool:
+    return any(item.required or account_checkbox_required(item) for item in controls)
+
+
+def required_only(snapshot: PageSnapshot, clusters: list[tuple[str, list[Control]]]) -> list[tuple[str, list[Control]]]:
+    """Keep only mandatory clusters when the page marks which fields are mandatory.
+
+    Optional fields are never filled, asked, retried, or allowed to block. A
+    page that marks no field required (some ATS mark none) keeps every cluster,
+    because there is no way to tell mandatory from optional on it. A
+    conditional field that becomes mandatory is picked up on the next scan.
+    """
+    visible = [c for c in snapshot.controls if not c.hidden and not c.disabled]
+    if not any(c.required for c in visible if c.kind not in {"password"} and c.input_type != "password"):
+        return clusters
+    return [(kind, controls) for kind, controls in clusters if _cluster_required(controls)]
 
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
@@ -1211,8 +1229,9 @@ def _open_missing_education(page, response, flags: FillFlags, outcome: ResolvedP
 
 
 def _write_phone_device(page, outcome: ResolvedPage) -> None:
-    """Phone Device Type is Mobile unless the page already shows a choice."""
-    from autofill.mapping import _is_phone_device
+    """Phone Device Type is the mobile option unless the page already shows a choice."""
+    from autofill.combobox import attach_listbox_options
+    from autofill.mapping import _is_phone_device, phone_device_label
 
     if page is None:
         return
@@ -1226,11 +1245,16 @@ def _write_phone_device(page, outcome: ResolvedPage) -> None:
         if control.selector and control_committed(page, control.selector):
             _drop_manual_selector(outcome, control.selector)
             continue
+        try:
+            attach_listbox_options(page, control)
+        except Exception:
+            pass
+        device = phone_device_label(control.options)
         mapped = MappedField(
             key="phone_device",
             action="select",
-            text="Mobile",
-            option_label="Mobile",
+            text=device,
+            option_label=device,
             field_class="PROFILE_FIELD",
             confidence="high",
         )

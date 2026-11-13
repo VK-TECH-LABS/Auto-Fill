@@ -580,14 +580,14 @@ def test_school_search_uses_key_events_and_school_not_found(browser):
 
 _EXPERIENCE = """
 <h1>My Experience</h1>
-<label for="resume">Resume</label>
-<input id="resume" type="file">
+<label for="resume">Resume<abbr>*</abbr></label>
+<input id="resume" type="file" aria-required="true">
 <button type="button" id="add-work">Add</button>
 <div id="work" hidden>
-  <label for="company">Company</label>
-  <input id="company">
-  <label for="title">Job Title</label>
-  <input id="title">
+  <label for="company">Company<abbr>*</abbr></label>
+  <input id="company" aria-required="true">
+  <label for="title">Job Title<abbr>*</abbr></label>
+  <input id="title" aria-required="true">
 </div>
 <div data-automation-id="formField-school">
   <label for="school">School or University<abbr>*</abbr></label>

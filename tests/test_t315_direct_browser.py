@@ -354,8 +354,9 @@ def test_smartrecruiters_basics_are_filled_and_not_asked(browser):
         phone = page.locator("#phone").input_value()
         assert "612" in phone and "0148" in phone
         assert "+1" not in phone
-        assert "jahnavi-torra" in page.locator("#linkedin").input_value()
-        assert "jahnavi.example" in page.locator("#website").input_value()
+        # LinkedIn and Website are optional on a page that marks required fields.
+        assert page.locator("#linkedin").input_value() == ""
+        assert page.locator("#website").input_value() == ""
         asked = " ".join(str(item.get("text") or "") for item in result.open_items).casefold()
         for label in ("first name", "last name", "email", "confirm your email", "city", "phone", "linkedin", "website"):
             assert label not in asked
@@ -564,8 +565,9 @@ def test_workday_current_job_keeps_from_checks_the_box_and_leaves_to_empty(brows
         assert page.locator("#from").input_value() == "02/2020"
         assert page.locator("#to").input_value() == ""
         assert page.locator("#current").is_checked()
-        assert page.locator("#loc").input_value() == "Hyderabad"
-        assert page.locator("#role").input_value() == "Firmware bring-up"
+        # Location and Role Description are optional.
+        assert page.locator("#loc").input_value() == ""
+        assert page.locator("#role").input_value() == ""
         assert page.locator("#edu-from").input_value() == "08/2016"
         assert page.locator("#edu-to").input_value() == "05/2020"
         assert page.locator("#attend").is_checked() is False
@@ -598,7 +600,7 @@ def test_workday_hyphenated_from_to_replaces_the_month_year_placeholder(browser)
               </section>
               <section>
                 <h3>Education 1</h3>
-                <label>School<input id="school"></label>
+                <label>School*<input id="school" required></label>
                 <label for="edu-loc">Location</label>
                 <input id="edu-loc">
                 <label>Field of Study<input id="study"></label>
@@ -642,11 +644,11 @@ def test_workday_hyphenated_from_to_replaces_the_month_year_placeholder(browser)
         assert page.locator("#from").input_value() != "MM/YYYY"
         assert page.locator("#current").is_checked() is False
         assert page.locator("#loc").input_value() == ""
-        assert page.locator("#role").input_value() == "Firmware bring-up"
+        # Role Description, Field of Study and education Location are optional.
+        assert page.locator("#role").input_value() == ""
         assert page.locator("#school").input_value() == "State University"
-        assert page.locator("#study").input_value() == "Electrical Engineering"
-        assert page.locator("#edu-loc").input_value() == "Austin, TX, United States"
-        assert page.locator("#edu-loc").input_value() != "Burnsville"
+        assert page.locator("#study").input_value() == ""
+        assert page.locator("#edu-loc").input_value() == ""
     finally:
         page.close()
 
@@ -695,8 +697,9 @@ def test_workday_current_row_uses_hyphenated_from_and_does_not_invent_to(browser
         assert page.locator("#from").input_value() == "03/2019"
         assert page.locator("#to").input_value() == ""
         assert page.locator("#current").is_checked()
-        assert page.locator("#loc").input_value() == "Hyderabad"
-        assert page.locator("#role").input_value() == "Firmware bring-up"
+        # Location and Role Description are optional.
+        assert page.locator("#loc").input_value() == ""
+        assert page.locator("#role").input_value() == ""
     finally:
         page.close()
 
@@ -725,7 +728,8 @@ def test_workday_past_job_fills_to_and_leaves_current_unchecked(browser):
         assert page.locator("#from").input_value() == "02/2020"
         assert page.locator("#to").input_value() == "11/2022"
         assert page.locator("#current").is_checked() is False
-        assert page.locator("#role").input_value() == "Board test"
+        # Role Description is optional.
+        assert page.locator("#role").input_value() == ""
         assert page.locator("#loc").input_value() == ""
     finally:
         page.close()

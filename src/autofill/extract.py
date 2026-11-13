@@ -1154,7 +1154,9 @@ EXTRACT_JS = r"""
                 (el.getAttribute("aria-autocomplete") || "").toLowerCase() === "list" ||
                 classToken.indexOf("autocomplete") !== -1 ||
                 kind === "text" ||
-                kind === "textarea") &&
+                kind === "textarea" ||
+                kind === "select" ||
+                kind === "radio") &&
               controlMarkedRequired(el)
             ),
         hidden: isHidden(el),

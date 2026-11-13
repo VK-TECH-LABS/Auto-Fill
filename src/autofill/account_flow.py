@@ -304,7 +304,37 @@ def _field_proof(
 
 
 def _statement(control: Control) -> str:
-    return " ".join((control.label or control.prompt or control.group or control.aria_label or "").split())[:160]
+    for text in (control.label, control.prompt, control.group, control.aria_label, control.nearby):
+        cleaned = " ".join(str(text or "").replace("*", " ").split())
+        if len(cleaned) >= 3:
+            return cleaned[:160]
+    return ""
+
+
+_STATEMENT_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  // The declaration a bare "*" checkbox sits under, such as HPE's
+  // "I declare that I have read the Recruitment Notice ...".
+  for (let node = el.parentElement, depth = 0; node && depth < 5; node = node.parentElement, depth += 1) {
+    if (node.querySelectorAll("input[type='checkbox'], [role='checkbox']").length > 1) break;
+    const text = (node.innerText || node.textContent || "").replace(/[*\s]+/g, " ").trim();
+    if (text.length >= 20) return text.slice(0, 400);
+  }
+  return "";
+}"""
+
+
+def _consent_statement(page, control: Control) -> str:
+    """What the box declares, so the person sees exactly what they confirm."""
+    statement = _statement(control)
+    if statement:
+        return statement
+    try:
+        return " ".join(str(page.evaluate(_STATEMENT_JS, control.selector) or "").split())[:400]
+    except Exception:
+        return ""
 
 
 _CONSENT_PREFIX = "Consent needs a person: "
@@ -355,7 +385,7 @@ def _accept_account_terms(page, snapshot: PageSnapshot, *, accept: bool) -> tupl
             checked = already
         if required and not checked:
             _logger.info("auto_consent category=CONSENT result=manual")
-            pending.append(_statement(control) or "Required checkbox")
+            pending.append(_consent_statement(page, control) or "Required checkbox")
         rows.append({"textExcerpt": _statement(control), "category": category, "checked": checked})
     return rows, pending
 
