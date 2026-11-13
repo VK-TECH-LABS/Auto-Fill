@@ -332,8 +332,14 @@ _PAUSE_NOTICES = {
     Status.EMAIL_VERIFICATION_REQUIRED: (
         "Open the verification email, then click Proceed. Sign-in continues in this window."
     ),
-    Status.LOGIN_REQUIRED: "Finish sign-in on this page, then click Proceed.",
-    Status.LOGIN_FAILED: "The sign-in did not stick. Fix it on this page, then click Proceed.",
+    Status.LOGIN_REQUIRED: (
+        "No saved sign-in for this candidate on this employer, so nothing was typed. "
+        "Sign in or create the account on this page, then click Proceed."
+    ),
+    Status.LOGIN_FAILED: (
+        "The employer did not accept this candidate's saved sign-in (wrong email or password, "
+        "or the account is locked). It was not retried. Sign in or reset the password here, then click Proceed."
+    ),
     Status.ACCOUNT_CREATION_REQUIRED: "Finish the account step on this page, then click Proceed.",
     Status.NAVIGATION_STALLED: "The page did not move. Fix what the employer is asking, then click Proceed.",
 }

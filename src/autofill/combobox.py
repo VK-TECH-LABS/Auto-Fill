@@ -659,6 +659,20 @@ def _filter_terms(desired: str) -> list[str]:
     return [desired]
 
 
+def _await_stable_menu(page, selector: str, timeout_ms: int) -> list[Option]:
+    """Read the menu until two reads in a row agree. Async search results arrive in waves."""
+    found = _await_menu(page, selector, timeout_ms)
+    if not found or getattr(page, "wait_for_timeout", None) is None:
+        return found
+    for _attempt in range(6):
+        _pause(page, 150)
+        again = _read_options(page, selector)
+        if [item.label for item in again] == [item.label for item in found]:
+            return again
+        found = again
+    return found
+
+
 def _await_menu(page, selector: str, timeout_ms: int) -> list[Option]:
     """Read the open menu until options appear or ``timeout_ms`` passes."""
     found = _read_options(page, selector)
@@ -746,8 +760,30 @@ def _open_for_options(page, selector: str) -> list[Option]:
     if found:
         return found
     if _click_fallback_opener(page, selector):
-        return _await_menu(page, selector, 1500)
-    return found
+        found = _await_menu(page, selector, 1500)
+        if found:
+            return found
+    return _keyboard_open(page, selector)
+
+
+def _keyboard_open(page, selector: str) -> list[Option]:
+    """Open an autocomplete that ignores clicks (Ashby, downshift, react-select) with ArrowDown.
+
+    ArrowDown only moves the highlight; nothing is committed until Enter or a
+    row click, and the caller's close step drops the highlight.
+    """
+    locator = getattr(page, "locator", None)
+    if locator is None:
+        return []
+    try:
+        field = locator(selector).first
+        inner = field.locator("input:not([type='hidden']), textarea")
+        target = inner.first if inner.count() else field
+        target.focus(timeout=2000)
+        target.press("ArrowDown")
+    except Exception:
+        return []
+    return _await_menu(page, selector, 1500)
 
 
 def _type_filter(page, selector: str, text: str, *, school: bool = False) -> None:
@@ -1166,6 +1202,30 @@ def _same_option(left: Option, right: Option) -> bool:
     return wanted in {_fold(left.label), _fold(left.value)}
 
 
+_HIGHLIGHTED_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return false; }
+  if (!el) return false;
+  const input = el.matches("input, textarea") ? el : el.querySelector("input, textarea") || el;
+  if (input.getAttribute("aria-activedescendant")) return true;
+  return Array.from(document.querySelectorAll("[role='option'][aria-selected='true']")).some((node) => {
+    const box = node.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  });
+}"""
+
+
+def _row_highlighted(page, selector: str) -> bool:
+    """True when the open list has a highlighted row Enter would commit."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return True
+    try:
+        return bool(evaluate(_HIGHLIGHTED_JS, selector))
+    except Exception:
+        return True
+
+
 def _keyboard_commit(page, selector: str, desired: str, match: Option | None = None) -> None:
     """Type the option and confirm it.
 
@@ -1182,9 +1242,43 @@ def _keyboard_commit(page, selector: str, desired: str, match: Option | None = N
             target = inner.first
         target.fill("")
         target.press_sequentially(desired, delay=type_char_delay())
-        found = _await_menu(page, selector, 800)
-        if match is not None and found and _same_option(found[0], match):
-            target.press("ArrowDown")
+        found = _await_stable_menu(page, selector, 800)
+        if found:
+            wanted = match or Option(value=desired, label=desired)
+
+            def same(item: Option) -> bool:
+                return _same_option(item, wanted) or _labels_match(desired, item.label)
+
+            row = next((item for item in found if same(item)), None)
+            if row is None or not row.selector:
+                return
+            if match is None:
+                # Click the matching row by its text first. Enter would commit
+                # whichever row is highlighted, and an async list can reorder.
+                # (With ``match`` the caller already clicked this row.)
+                _choose_listed(page, row.selector, row.label)
+                if _commit_held(page, selector, row, row.label, accept_input=False):
+                    return
+                # A plain autocomplete (no pill) holds its choice in the input.
+                # Text we typed is not a commit, so the menu must also have closed.
+                if not _has_pill_slot(page, selector) and not _menu_is_open(page):
+                    try:
+                        held = str(target.input_value() or "")
+                    except Exception:
+                        held = ""
+                    if _labels_match(row.label, held):
+                        return
+            again = _read_options(page, selector)
+            highlighted = _row_highlighted(page, selector)
+            if highlighted and not (again and same(again[0])):
+                return
+            # Enter confirms the typed label (react-select, Greenhouse) or the
+            # top row, which was just re-read as this option.
+            if not again:
+                target.fill("")
+                target.press_sequentially(desired, delay=type_char_delay())
+            elif match is not None and not highlighted:
+                target.press("ArrowDown")
         # Enter confirms the row. It must not activate the form's submit button.
         target.evaluate(
             """(el) => {
@@ -1199,6 +1293,27 @@ def _keyboard_commit(page, selector: str, desired: str, match: Option | None = N
     except Exception:
         return
     _pause(page, 100)
+    _clear_wrong_commit(page, selector, desired)
+
+
+def _clear_wrong_commit(page, selector: str, desired: str) -> None:
+    """A different option on the field is worse than an empty one. Clear it."""
+    shown = _selected_text(page, selector)
+    if not shown:
+        try:
+            shown = str(page.locator(selector).first.input_value() or "")
+        except Exception:
+            shown = ""
+    if not shown.strip() or _labels_match(desired, shown):
+        return
+    try:
+        target = page.locator(selector).first
+        target.focus()
+        target.press("Control+A")
+        target.press("Backspace")
+        target.press("Escape")
+    except Exception:
+        return
 
 
 _BLOCK_SUBMIT_JS = """
@@ -2158,8 +2273,49 @@ def _open_listbox(page, selector: str) -> bool:
     return click_element(page, selector)
 
 
+_ROW_BY_TEXT_JS = r"""({ selector, name }) => {
+  const fold = (text) => String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const want = fold(name);
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { el = null; }
+  if (!want || (el && fold(el.innerText || el.textContent) === want)) return selector;
+  // An async list reorders rows in place. Find the row that now shows this text.
+  const shown = (node) => {
+    const box = node.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  };
+  const rows = Array.from(document.querySelectorAll(
+    "[role='option'], [data-automation-id='promptOption'], [role='listbox'] li"
+  )).filter((node) => shown(node) && fold(node.innerText || node.textContent) === want);
+  if (rows.length !== 1) return "";
+  rows[0].setAttribute("data-autofill-pick", "1");
+  for (const other of document.querySelectorAll("[data-autofill-pick]")) {
+    if (other !== rows[0]) other.removeAttribute("data-autofill-pick");
+  }
+  return "[data-autofill-pick='1']";
+}"""
+
+
+def _current_row(page, selector: str, name: str) -> str:
+    """The selector of the row showing ``name`` right now, or "" when it is gone."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not name:
+        return selector
+    try:
+        return str(evaluate(_ROW_BY_TEXT_JS, {"selector": selector, "name": name}) or "")
+    except Exception:
+        return selector
+
+
 def _choose_listed(page, selector: str, name: str) -> bool:
-    """Choose one menu row. A final Submit label is refused."""
+    """Choose one menu row. A final Submit label is refused.
+
+    The row is re-checked by its text just before the click, so a list that
+    reordered after it was read never commits a different row.
+    """
+    selector = _current_row(page, selector, name)
+    if not selector:
+        return False
     if click_element(page, selector, name):
         return True
     try:
