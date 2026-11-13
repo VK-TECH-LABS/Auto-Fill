@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from autofill import local_attach
 from autofill.local_attach import (
     ENV_FLAG,
     ChromeProcess,
@@ -99,6 +100,7 @@ def test_windows_chrome_search_includes_program_files(monkeypatch, tmp_path):
     monkeypatch.setenv("PROGRAMFILES(X86)", str(tmp_path / "x86"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
     monkeypatch.delenv("CHROME_BIN", raising=False)
+    monkeypatch.setattr(local_attach, "_registry_chrome_paths", lambda: [])  # ignore this machine's real Chrome
     paths = [str(path) for path in chrome_search_paths()]
     assert str(exe) in paths
     assert find_chrome() == str(exe)

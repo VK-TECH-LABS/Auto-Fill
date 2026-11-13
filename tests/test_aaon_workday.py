@@ -374,18 +374,18 @@ def test_previous_worker_radio_is_no_when_aaon_is_not_in_employment(browser, mon
 
 _CLEARED = """
 <h1>My Information</h1>
-<label for="line1">Address</label>
-<input id="line1">
-<label for="city">City</label>
-<input id="city">
-<label for="postal">Postal Code</label>
-<input id="postal">
-<label for="phone">Phone Number</label>
-<input id="phone" type="tel">
-<label for="state">State</label>
-<select id="state" disabled><option value="">Select</option></select>
-<label for="country">Country</label>
-<select id="country">
+<label for="line1">Address<abbr>*</abbr></label>
+<input id="line1" aria-required="true">
+<label for="city">City<abbr>*</abbr></label>
+<input id="city" aria-required="true">
+<label for="postal">Postal Code<abbr>*</abbr></label>
+<input id="postal" aria-required="true">
+<label for="phone">Phone Number<abbr>*</abbr></label>
+<input id="phone" type="tel" aria-required="true">
+<label for="state">State<abbr>*</abbr></label>
+<select id="state" disabled aria-required="true"><option value="">Select</option></select>
+<label for="country">Country<abbr>*</abbr></label>
+<select id="country" aria-required="true">
   <option value="">Select</option>
   <option>United States of America</option>
 </select>
@@ -467,14 +467,14 @@ def test_middle_name_and_county_stay_blank_when_the_profile_has_no_middle_name(b
         page.set_content(
             """
             <h1>My Information</h1>
-            <label for="first">First Name</label><input id="first">
+            <label for="first">First Name*</label><input id="first" required>
             <label for="middle">Middle Name</label><input id="middle" name="legalName--middleName">
-            <label for="last">Last Name</label><input id="last">
+            <label for="last">Last Name*</label><input id="last" required>
             <div data-automation-id="formField-regionSubdivision1">
               <label for="county">County</label>
               <input id="county" name="address--regionSubdivision1">
             </div>
-            <label for="line1">Address</label><input id="line1">
+            <label for="line1">Address Line 1*</label><input id="line1" required>
             """
         )
         fill_resolved_page(
@@ -755,10 +755,10 @@ def test_hear_about_drills_a_type_2_category_and_ignores_the_phone_pill(browser)
 _PREVIOUS_NOTE = """
 <h1>My Information</h1>
 <div data-automation-id="formField-candidateIsPreviousWorker">
-  <label id="prev-legend">Have you previously been employed by AAON?<br>
+  <label id="prev-legend">Have you previously been employed by AAON?<abbr>*</abbr><br>
     Current Employees: Please apply via your internal Workday account.</label>
-  <div role="radiogroup" aria-labelledby="prev-legend">
-    <input id="prev-yes" type="radio" name="candidateIsPreviousWorker" value="true">
+  <div role="radiogroup" aria-labelledby="prev-legend" aria-required="true">
+    <input id="prev-yes" type="radio" name="candidateIsPreviousWorker" value="true" required>
     <label for="prev-yes">Yes</label>
     <input id="prev-no" type="radio" name="candidateIsPreviousWorker" value="false">
     <label for="prev-no">No</label>
@@ -878,18 +878,18 @@ _MULTI_ADD = """
   <h4 id="Work-Experience-section">Work Experience</h4>
   <button type="button" data-automation-id="add-button">Add</button>
   <div id="work" hidden>
-    <label for="company">Company</label>
-    <input id="company">
-    <label for="title">Job Title</label>
-    <input id="title">
+    <label for="company">Company<abbr>*</abbr></label>
+    <input id="company" aria-required="true">
+    <label for="title">Job Title<abbr>*</abbr></label>
+    <input id="title" aria-required="true">
   </div>
 </div>
 <div role="group" aria-labelledby="Education-section">
   <h4 id="Education-section">Education</h4>
   <button type="button" data-automation-id="add-button">Add</button>
   <div id="edu" hidden>
-    <label for="school">School</label>
-    <input id="school">
+    <label for="school">School<abbr>*</abbr></label>
+    <input id="school" aria-required="true">
   </div>
 </div>
 <div role="group" aria-labelledby="Languages-section">
@@ -1109,10 +1109,10 @@ _DELAYED_ADD = """
     window.setTimeout(() => {
       workN += 1;
       const box = document.createElement("div");
-      box.innerHTML = '<label for="company-' + workN + '">Company</label>'
-        + '<input id="company-' + workN + '">'
-        + '<label for="title-' + workN + '">Job Title</label>'
-        + '<input id="title-' + workN + '">';
+      box.innerHTML = '<label for="company-' + workN + '">Company<abbr>*</abbr></label>'
+        + '<input id="company-' + workN + '" aria-required="true">'
+        + '<label for="title-' + workN + '">Job Title<abbr>*</abbr></label>'
+        + '<input id="title-' + workN + '" aria-required="true">';
       document.getElementById("work-rows").appendChild(box);
     }, 400);
   });
@@ -1121,7 +1121,8 @@ _DELAYED_ADD = """
     window.setTimeout(() => {
       eduN += 1;
       const box = document.createElement("div");
-      box.innerHTML = '<label for="school-' + eduN + '">School</label><input id="school-' + eduN + '">';
+      box.innerHTML = '<label for="school-' + eduN + '">School<abbr>*</abbr></label>'
+        + '<input id="school-' + eduN + '" aria-required="true">';
       document.getElementById("edu-rows").appendChild(box);
     }, 400);
   });
@@ -1169,19 +1170,19 @@ _SPLIT_DATES = """
 <main>
 <h1>My Experience</h1>
 <div data-automation-id="formField-startDate" id="start-field">
-  <label>From</label>
+  <label>From<abbr>*</abbr></label>
   <input id="workExperience-1--startDate-dateSectionMonth-input"
-    data-automation-id="dateSectionMonth-input" aria-label="Month">
+    data-automation-id="dateSectionMonth-input" aria-label="Month" aria-required="true">
   <input id="workExperience-1--startDate-dateSectionYear-input"
-    data-automation-id="dateSectionYear-input" aria-label="Year">
+    data-automation-id="dateSectionYear-input" aria-label="Year" aria-required="true">
   <div id="start-readout"></div>
 </div>
 <div data-automation-id="formField-endDate" id="end-field">
-  <label>To</label>
+  <label>To<abbr>*</abbr></label>
   <input id="workExperience-1--endDate-dateSectionMonth-input"
-    data-automation-id="dateSectionMonth-input" aria-label="Month">
+    data-automation-id="dateSectionMonth-input" aria-label="Month" aria-required="true">
   <input id="workExperience-1--endDate-dateSectionYear-input"
-    data-automation-id="dateSectionYear-input" aria-label="Year">
+    data-automation-id="dateSectionYear-input" aria-label="Year" aria-required="true">
   <div id="end-readout"></div>
 </div>
 <script>
@@ -1531,12 +1532,12 @@ def test_empty_job_title_and_location_are_not_copied(browser):
         page.set_content(
             """
             <h1>My Experience</h1>
-            <label for="title-1">Job Title</label><input id="title-1" value="engineer">
-            <label for="company-1">Company</label><input id="company-1">
+            <label for="title-1">Job Title*</label><input id="title-1" value="engineer" required>
+            <label for="company-1">Company*</label><input id="company-1" required>
             <label for="loc-1">Location</label>
             <input id="loc-1" name="workExperience-1--location" value="New York, New York, US">
-            <label for="title-2">Job Title</label><input id="title-2" value="engineer">
-            <label for="company-2">Company</label><input id="company-2">
+            <label for="title-2">Job Title*</label><input id="title-2" value="engineer" required>
+            <label for="company-2">Company*</label><input id="company-2" required>
             <label for="loc-2">Location</label>
             <input id="loc-2" name="workExperience-2--location" value="New York, New York, US">
             """
@@ -1560,8 +1561,9 @@ def test_empty_job_title_and_location_are_not_copied(browser):
         assert page.locator("#title-1").input_value() == "engineer"
         assert page.locator("#company-2").input_value() == "VEM Technologies pvt ltd"
         assert page.locator("#title-2").input_value() == ""
-        assert page.locator("#loc-1").input_value() == ""
-        assert page.locator("#loc-2").input_value() == ""
+        # Location is optional: Auto-Fill neither types nor clears it.
+        assert page.locator("#loc-1").input_value() == "New York, New York, US"
+        assert page.locator("#loc-2").input_value() == "New York, New York, US"
     finally:
         page.close()
 
@@ -1640,9 +1642,9 @@ def test_field_of_study_search_and_unmatched_flag(browser):
     html = """
     <h1>My Experience</h1>
     <div data-automation-id="formField-fieldOfStudy">
-      <label for="study">Field of Study</label>
+      <label for="study">Field of Study<abbr>*</abbr></label>
       <div data-automation-id="multiSelectContainer">
-        <input id="study" data-automation-id="searchBox" role="combobox" aria-label="Search">
+        <input id="study" data-automation-id="searchBox" role="combobox" aria-label="Search" aria-required="true">
         <span id="picked" data-automation-id="selectedItem" hidden></span>
       </div>
     </div>

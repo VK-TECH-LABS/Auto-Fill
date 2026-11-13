@@ -998,11 +998,16 @@ def fill_one_page(
 
         _reveal_overflow(page)
         snapshot = extract_page(page)
-        handled_dates = fill_split_dates(page, profile, snapshot)
-        handled_dates.update(fill_month_year_inputs(page, profile, snapshot))
-        handled_dates.update(fill_current_boxes(page, profile, snapshot))
+        from autofill.stepfill import _clusters, required_view
+
+        # Optional From/To dates are not typed. "I currently work here" is
+        # checked only when a mandatory date was there to satisfy.
+        mandatory = required_view(snapshot)
+        handled_dates = fill_split_dates(page, profile, mandatory)
+        handled_dates.update(fill_month_year_inputs(page, profile, mandatory))
+        if handled_dates:
+            handled_dates.update(fill_current_boxes(page, profile, snapshot))
         cursor = MapCursor(page_heading=snapshot.heading)
-        from autofill.stepfill import _clusters
 
         begin_sms_pass()
         for kind, group in _clusters(snapshot):

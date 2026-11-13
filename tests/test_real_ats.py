@@ -97,14 +97,14 @@ def test_unknown_radio_answer_matches_by_question_hash(browser, resolver):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='color'>What is your favorite color?</label>"
-            "<input id='color'>"
-            "<label for='prime'>What is your favorite prime number?</label>"
-            "<input id='prime'>"
+            "<label for='color'>What is your favorite color?*</label>"
+            "<input id='color' required>"
+            "<label for='prime'>What is your favorite prime number?*</label>"
+            "<input id='prime' required>"
             "<div class='application-question'>"
-            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<div class='application-label'>Are you a Singapore citizen?*</div>"
             "<ul>"
-            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='Yes' required> Yes</label></li>"
             "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
             "</ul></div>"
             "</form>"
@@ -136,12 +136,12 @@ def test_keyless_saved_answer_is_not_applied_to_the_first_open_question(browser,
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='color'>What is your favorite color?</label>"
-            "<input id='color'>"
+            "<label for='color'>What is your favorite color?*</label>"
+            "<input id='color' required>"
             "<div class='application-question'>"
-            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<div class='application-label'>Are you a Singapore citizen?*</div>"
             "<ul>"
-            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='Yes' required> Yes</label></li>"
             "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
             "</ul></div></form>"
         )
@@ -180,12 +180,12 @@ def test_echoed_question_hash_fills_the_matching_unknown_question(browser, resol
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='color'>What is your favorite color?</label>"
-            "<input id='color'>"
+            "<label for='color'>What is your favorite color?*</label>"
+            "<input id='color' required>"
             "<div class='application-question'>"
-            "<div class='application-label'>Are you a Singapore citizen?</div>"
+            "<div class='application-label'>Are you a Singapore citizen?*</div>"
             "<ul>"
-            "<li><label><input type='radio' name='citizen' value='Yes'> Yes</label></li>"
+            "<li><label><input type='radio' name='citizen' value='Yes' required> Yes</label></li>"
             "<li><label><input type='radio' name='citizen' value='No'> No</label></li>"
             "</ul></div></form>"
         )
@@ -512,22 +512,20 @@ def test_referral_is_not_filled_from_employment(browser, resolver):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='employer'>Employer</label><input id='employer' name='employer'>"
+            "<label for='employer'>Employer*</label><input id='employer' name='employer' required>"
             "<label for='referral'>If an employee referred you, please list their name</label>"
             "<input id='referral' name='referral'>"
             "</form>"
         )
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         questions = list(server.calls[0].get("questions", []))
-        referral = next(item for item in questions if "referred you" in str(item.get("text")))
-        assert referral.get("intent") == "REFERRAL"
+        # The referral question is optional: never sent, asked, or filled.
+        assert not any("referred you" in str(item.get("text")) for item in questions)
         requested = [key for call in server.calls for key in call.get("fields", [])]
         assert "employment[]" in requested
         assert page.locator("#employer").input_value() == "Example Works"
         assert page.locator("#referral").input_value() == ""
-        manual = [item for item in result.manual_questions if item.get("intent") == "REFERRAL"]
-        assert manual
-        assert "referred you" in str(manual[0].get("text"))
+        assert not [item for item in result.manual_questions if item.get("intent") == "REFERRAL"]
         assert "Example Works" not in page.locator("#referral").input_value()
     finally:
         page.close()
@@ -548,7 +546,7 @@ def test_preferred_first_name_stays_blank_without_preferred_name(browser, resolv
         result, _timings = _run(page, "https://boards.greenhouse.io/example/jobs/1", resolver=_binding(url))
         requested = [key for call in server.calls for key in call.get("fields", [])]
         assert "firstName" in requested
-        assert "preferredName" in requested
+        assert "preferredName" not in requested  # Preferred First Name is optional.
         assert page.locator("#first").input_value() == "River"
         assert page.locator("#preferred").input_value() == ""
         assert "Preferred First Name" not in [item.get("text") for item in result.manual_questions]
@@ -564,31 +562,31 @@ def test_select2_demographics_are_listed_and_not_filled(browser, resolver):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='gender'>Gender</label>"
-            "<select id='gender'><option value=''>Select</option>"
+            "<label for='gender'>Gender*</label>"
+            "<select id='gender' required><option value=''>Select</option>"
             "<option>Decline to self-identify</option></select>"
             "<div class='field'>"
-            "<label>Are you Hispanic/Latino?</label>"
-            "<select id='hispanic-native' aria-hidden='true' style='display:none'>"
+            "<label>Are you Hispanic/Latino?*</label>"
+            "<select id='hispanic-native' aria-hidden='true' style='display:none' required>"
             "<option value=''>Select...</option><option>Yes</option><option>No</option></select>"
             "<span class='select2'><span class='selection'>"
-            "<span id='hispanic-box' role='combobox' tabindex='0'>Select...</span>"
+            "<span id='hispanic-box' role='combobox' aria-required='true' tabindex='0'>Select...</span>"
             "</span></span></div>"
-            "<label for='race'>Race</label>"
-            "<select id='race'><option value=''>Select</option><option>Decline</option></select>"
+            "<label for='race'>Race*</label>"
+            "<select id='race' required><option value=''>Select</option><option>Decline</option></select>"
             "<div class='field'>"
-            "<label>Veteran status</label>"
-            "<select id='veteran-native' aria-hidden='true' style='display:none'>"
+            "<label>Veteran status*</label>"
+            "<select id='veteran-native' aria-hidden='true' style='display:none' required>"
             "<option value=''>Select...</option><option>I am not a protected veteran</option></select>"
             "<span class='select2'><span class='selection'>"
-            "<span id='veteran-box' role='combobox' tabindex='0'>Select...</span>"
+            "<span id='veteran-box' role='combobox' aria-required='true' tabindex='0'>Select...</span>"
             "</span></span></div>"
             "<div class='field'>"
-            "<label>Disability status</label>"
-            "<select id='disability-native' aria-hidden='true' style='display:none'>"
+            "<label>Disability status*</label>"
+            "<select id='disability-native' aria-hidden='true' style='display:none' required>"
             "<option value=''>Select...</option><option>I do not wish to answer</option></select>"
             "<span class='select2'><span class='selection'>"
-            "<span id='disability-box' role='combobox' tabindex='0'>Select...</span>"
+            "<span id='disability-box' role='combobox' aria-required='true' tabindex='0'>Select...</span>"
             "</span></span></div>"
             "</form>"
         )
@@ -634,10 +632,10 @@ def _sponsorship_select(commit_on_enter: bool) -> str:
     )
     return (
         "<h1>Application</h1><form><div class='field'>"
-        f"<label for='sponsor'>{_SPONSOR}</label>"
+        f"<label for='sponsor'>{_SPONSOR}*</label>"
         "<div class='select'><div class='select__control'>"
         "<div class='select__single-value' id='sponsor-shown' hidden></div>"
-        "<input id='sponsor' class='select__input' role='combobox' aria-controls='sponsor-list'>"
+        "<input id='sponsor' class='select__input' role='combobox' aria-required='true' aria-controls='sponsor-list'>"
         "</div>"
         "<input type='hidden' id='sponsor-hidden' name='sponsorship'>"
         "<div class='field-error' id='sponsor-error' hidden></div></div>"
@@ -712,7 +710,7 @@ def test_lever_location_portal_uses_keyboard_when_the_click_does_not_commit(brow
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='location-input'>Current location</label>"
-            "<input id='location-input' name='location' type='text' autocomplete='off'>"
+            "<input id='location-input' name='location' type='text' autocomplete='off' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "</form>"
             "<script>"
@@ -769,7 +767,7 @@ def _suggestion_page(places: list[str], *, commit_click: bool) -> str:
     return (
         "<h1>Application</h1><form>"
         "<label for='location-input'>Current location</label>"
-        "<input id='location-input' name='location' type='text' autocomplete='off'>"
+        "<input id='location-input' name='location' type='text' autocomplete='off' required>"
         "<input id='selected-location' type='hidden' name='selectedLocation'>"
         "</form><script>"
         "const input = document.getElementById('location-input');"
@@ -878,7 +876,7 @@ def test_lever_location_free_text_when_no_suggestions_appear(browser, resolver, 
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='location-input'>Current location</label>"
-            "<input id='location-input' name='location' type='text' autocomplete='off'>"
+            "<input id='location-input' name='location' type='text' autocomplete='off' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "</form>"
         )
@@ -899,24 +897,25 @@ def test_closed_greenhouse_selects_are_sent_to_the_resolver(browser, resolver):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='prime'>What is your favorite prime number?</label><input id='prime'>"
-            "<label for='color'>What is your favorite color?</label><input id='color'>"
-            "<label for='team'>Which team do you prefer?</label><input id='team'>"
-            "<label for='notes'>Any notes for the hiring team?</label><input id='notes'>"
+            "<label for='prime'>What is your favorite prime number?*</label><input id='prime' required>"
+            "<label for='color'>What is your favorite color?*</label><input id='color' required>"
+            "<label for='team'>Which team do you prefer?*</label><input id='team' required>"
+            "<label for='notes'>Any notes for the hiring team?*</label><input id='notes' required>"
             "<div class='field'>"
             "<div class='label'><label>"
-            "Will you now or in the future require sponsorship for a visa to remain in your current location?"
+            "Will you now or in the future require sponsorship for a visa to remain in your current location?*"
             "</label></div>"
             "<div class='select'><div class='css-container'><div class='select__control'>"
             "<div class='select__value-container'>"
             "<div class='select__placeholder'>Select...</div>"
             "<div class='select__input-container'>"
-            "<input id='sponsor' class='select__input' autocomplete='off' aria-autocomplete='list'>"
+            "<input id='sponsor' class='select__input' autocomplete='off' aria-autocomplete='list'"
+            " aria-required='true'>"
             "</div></div></div></div></div></div>"
             "<div class='field'>"
-            "<div class='label'><label>Are you Hispanic/Latino?</label></div>"
+            "<div class='label'><label>Are you Hispanic/Latino?*</label></div>"
             "<div class='select'><div class='css-container'>"
-            "<div class='select__control' id='hisp-box' role='combobox'>"
+            "<div class='select__control' id='hisp-box' role='combobox' aria-required='true'>"
             "<div class='select__value-container'>"
             "<div class='select__placeholder'>Select...</div>"
             "<input id='hispanic' class='select__input' aria-hidden='true' tabindex='-1'>"
@@ -1158,11 +1157,11 @@ def test_lever_checkbox_group_and_current_location(browser, resolver):
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='current-location'>Current location</label>"
-            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='current-location' name='location' type='text' autocomplete='off' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "<ul id='loc-list' role='listbox' hidden></ul>"
             "<div class='application-question'>"
-            "<div class='application-label'>Which languages do you speak?</div>"
+            "<div class='application-label'>Which languages do you speak?<span class='required'>*</span></div>"
             "<ul>"
             "<li><label><input type='checkbox' name='languages' value='English'> English</label></li>"
             "<li><label><input type='checkbox' name='languages' value='Spanish'> Spanish</label></li>"
@@ -1239,7 +1238,7 @@ def test_lever_location_without_a_match_stays_manual(browser, resolver, caplog):
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='current-location'>Current location</label>"
-            "<input id='current-location' type='text'>"
+            "<input id='current-location' type='text' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "<ul id='loc-list' role='listbox' hidden></ul></form>"
             "<script>"
@@ -1289,7 +1288,7 @@ def test_lever_dropdown_location_uses_address_state(browser, resolver):
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='current-location'>Current location</label>"
-            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='current-location' name='location' type='text' autocomplete='off' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "<div id='location-results' hidden>"
             "<div class='dropdown-location' id='location-0'>Austin, TX, USA</div>"
@@ -1346,7 +1345,7 @@ def test_lever_location_retries_a_late_list_and_ignores_city_case(browser, resol
         page.set_content(
             "<h1>Application</h1><form>"
             "<label for='current-location'>Current location</label>"
-            "<input id='current-location' name='location' type='text' autocomplete='off'>"
+            "<input id='current-location' name='location' type='text' autocomplete='off' required>"
             "<input id='selected-location' type='hidden' name='selectedLocation'>"
             "<div id='location-results' hidden>"
             "<div class='dropdown-location' id='location-0'>austin, tx, usa</div>"
@@ -1497,13 +1496,14 @@ def test_radio_and_checkbox_questions_use_the_group_label(browser, resolver):
         page.set_content(
             "<h1>Application</h1><form>"
             "<div class='application-question'>"
-            "<div class='application-label' id='consent-q'>Do you consent to a background check?</div>"
+            "<div class='application-label' id='consent-q'>"
+            "Do you consent to a background check?<span class='required'>*</span></div>"
             "<ul aria-labelledby='consent-q'>"
             "<li><label><input type='radio' name='consent' value='yes'> Yes, I consent</label></li>"
             "<li><label><input type='radio' name='consent' value='no'> No</label></li>"
             "</ul></div>"
             "<div class='application-question'>"
-            "<div class='application-label'>Which languages do you speak?</div>"
+            "<div class='application-label'>Which languages do you speak?<span class='required'>*</span></div>"
             "<ul>"
             "<li><label><input type='checkbox' name='languages' value='English'> English</label></li>"
             "<li><label><input type='checkbox' name='languages' value='Spanish'> Spanish</label></li>"
@@ -1948,7 +1948,7 @@ def test_missing_grant_filename_uses_resume_pdf_not_the_placeholder(browser, res
 _LEVER_AUSTINS = (
     "<h1>Application</h1><form>"
     "<label for='current-location'>Current location</label>"
-    "<input id='current-location' name='location' type='text' autocomplete='off'>"
+    "<input id='current-location' name='location' type='text' autocomplete='off' required>"
     "<input id='selected-location' type='hidden' name='selectedLocation'>"
     "<div id='location-results' hidden>"
     "<div class='dropdown-location' id='location-0'>Austin, TX, USA</div>"

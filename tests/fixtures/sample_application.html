@@ -9,17 +9,17 @@
     <h1>Example Corp application</h1>
     <p>Fictional form used to test autofill. Nothing here is a real employer.</p>
 
-    <label for="first">First name</label>
-    <input id="first" name="first_name" autocomplete="given-name">
+    <label for="first">First name *</label>
+    <input id="first" name="first_name" autocomplete="given-name" required>
 
-    <label for="last">Last name</label>
-    <input id="last" name="last_name" autocomplete="family-name">
+    <label for="last">Last name *</label>
+    <input id="last" name="last_name" autocomplete="family-name" required>
 
-    <label for="email">Email address</label>
-    <input id="email" name="email" type="email" autocomplete="email">
+    <label for="email">Email address *</label>
+    <input id="email" name="email" type="email" autocomplete="email" required>
 
-    <label for="phone">Phone</label>
-    <input id="phone" name="phone" type="tel" autocomplete="tel">
+    <label for="phone">Phone *</label>
+    <input id="phone" name="phone" type="tel" autocomplete="tel" required>
 
     <label for="city">City</label>
     <input id="city" name="city" autocomplete="address-level2">
@@ -51,8 +51,8 @@
     <label for="cover">Cover letter</label>
     <textarea id="cover" name="cover_letter"></textarea>
 
-    <label for="resume">Resume</label>
-    <input id="resume" name="resume" type="file" accept=".pdf">
+    <label for="resume">Resume *</label>
+    <input id="resume" name="resume" type="file" accept=".pdf" required>
 
     <label for="pronouns">Pronouns</label>
     <input id="pronouns" name="pronouns">

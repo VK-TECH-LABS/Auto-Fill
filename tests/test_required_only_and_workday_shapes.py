@@ -17,7 +17,7 @@ from autofill.combobox import select_combobox
 from autofill.intents import classify_question
 from autofill.mapping import _degree_option, phone_device_label
 from autofill.models import Control, Option, PageSnapshot
-from autofill.stepfill import _clusters
+from autofill.stepfill import _clusters, required_view
 
 
 def _snapshot(*controls: Control) -> PageSnapshot:
@@ -55,12 +55,26 @@ def test_a_radio_group_with_one_required_member_is_kept():
     assert not any("#p1" in group for group in kept)
 
 
-def test_a_page_that_marks_nothing_required_keeps_every_field():
+def test_a_page_that_marks_nothing_required_fills_only_identity_fields():
+    # No "fill everything" fallback: an unmarked page is uncertain, so only
+    # name, email, and phone are treated as mandatory until the page raises errors.
     snapshot = _snapshot(
         Control(kind="text", label="First Name", selector="#first"),
+        Control(kind="text", label="Email", autocomplete="email", selector="#email"),
         Control(kind="text", label="LinkedIn", selector="#linkedin"),
+        Control(kind="combobox", label="How did you hear about us?", selector="#source"),
     )
-    assert _labels(snapshot) == ["First Name", "LinkedIn"]
+    assert _labels(snapshot) == ["First Name", "Email"]
+
+
+def test_split_date_parts_and_radio_siblings_follow_their_marked_question():
+    snapshot = _snapshot(
+        Control(kind="text", label="Month", form_automation_id="formField-startDate", required=True, selector="#m"),
+        Control(kind="text", label="Year", form_automation_id="formField-startDate", selector="#y"),
+        Control(kind="text", label="Month", form_automation_id="formField-endDate", selector="#em"),
+    )
+    view = required_view(snapshot)
+    assert [c.selector for c in view.controls] == ["#m", "#y"]
 
 
 @pytest.mark.parametrize(

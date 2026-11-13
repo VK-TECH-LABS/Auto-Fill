@@ -1294,8 +1294,8 @@ def test_stage_rejects_non_pdf_oversize_and_unbound(monkeypatch):
         big = b"%PDF-" + b"0" * MAX_RESUME_BYTES
         try:
             assert _stage(port, big)[0] == 400
-        except urllib.error.URLError:
-            pass  # refused before the body was read; the socket closed mid-upload
+        except (urllib.error.URLError, ConnectionError):
+            pass  # refused before the body was read; the socket closed mid-upload (Windows: WinError 10053)
         assert helper.staged_count() == 0
         code, body = _request(port, "POST", "/v1/sessions", {
             "applicationUrl": _URL,

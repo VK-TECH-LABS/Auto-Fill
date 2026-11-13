@@ -298,7 +298,7 @@ def test_full_application_stops_for_a_person(browser, caplog):
         assert page.locator("#intern-org").input_value() == "Sample Studio"
         assert page.locator("#school").input_value() == "Example University"
         assert page.locator("#degree").input_value() == "Bachelor's Degree"
-        assert page.locator("#major").input_value() == "Computer Science"
+        assert page.locator("#major").input_value() == ""  # Field of study is optional here.
         assert page.locator("#auth").input_value() == "Yes"
         assert page.locator("#sponsor-no").is_checked()
         assert page.locator("#hear").input_value() == "Online job board"
@@ -503,7 +503,7 @@ def test_parallel_results_do_not_share_session_ids(browser):
             "<input id='a' autocomplete='family-name'>"
         )
         page_b.set_content(
-            "<h1>My Information</h1><label for='b'>City</label><input id='b' autocomplete='address-level2'>"
+            "<h1>My Information</h1><label for='b'>City *</label><input id='b' autocomplete='address-level2' required>"
         )
         left = autofill_application(
             URL,

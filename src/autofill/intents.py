@@ -465,6 +465,8 @@ def sanitize_question(text: str, *, limit: int = 300) -> str:
     cleaned = _PHONE_RE.sub(" ", cleaned)
     cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # The page's required mark ("Question? *") is not part of the question.
+    cleaned = re.sub(r"\s*\*+$", "", cleaned)
     if len(cleaned) > limit:
         cleaned = cleaned[:limit].rstrip()
     return cleaned

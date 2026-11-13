@@ -568,8 +568,9 @@ def test_workday_current_job_keeps_from_checks_the_box_and_leaves_to_empty(brows
         # Location and Role Description are optional.
         assert page.locator("#loc").input_value() == ""
         assert page.locator("#role").input_value() == ""
-        assert page.locator("#edu-from").input_value() == "08/2016"
-        assert page.locator("#edu-to").input_value() == "05/2020"
+        # Workday's education From/To are optional on this form, so they stay blank.
+        assert page.locator("#edu-from").input_value() == ""
+        assert page.locator("#edu-to").input_value() == ""
         assert page.locator("#attend").is_checked() is False
     finally:
         page.close()

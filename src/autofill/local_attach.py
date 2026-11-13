@@ -105,6 +105,8 @@ def stable_chrome_user_data_dir() -> Path:
     override = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
     if override:
         return Path(override)
+    if sys.platform == "win32":
+        return _windows_user_data_dirs()[0]
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
     return config_home() / "google-chrome"
@@ -808,6 +810,44 @@ def clear_employer_cookies(context: Any, url: str) -> int:
         except Exception:
             return len(drop)
     return len(drop)
+
+
+_OWNERS_FILE = "autofill-employer-owners.json"
+
+
+def claim_employer_host(user_data_dir: Path | None, url: str, candidate_id: str) -> bool:
+    """Record this candidate as the owner of the employer's browser session.
+
+    True when another candidate (or an unknown one, from before this record
+    existed or before a helper restart) owned it, so its cookies must be
+    cleared before this candidate's fill. Only a hash of the candidate id is
+    kept, in the dedicated Apply profile, never the daily Chrome profile.
+    """
+    import hashlib
+
+    from autofill.ats import site_domain
+
+    host = site_domain(url)
+    if not host or not candidate_id or user_data_dir is None:
+        return False
+    owner = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:16]
+    path = Path(user_data_dir) / _OWNERS_FILE
+    try:
+        owners = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(owners, dict):
+            owners = {}
+    except (OSError, ValueError):
+        owners = {}
+    previous = owners.get(host)
+    if previous == owner:
+        return False
+    owners[host] = owner
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(owners, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+    return True
 
 
 def launch_dedicated_chrome(
@@ -1550,9 +1590,13 @@ class DedicatedApplySession:
         previous = self._last_candidate_id
         changed = bool(previous and candidate_id and previous != candidate_id)
         tab = self.ensure(application_url)
-        if changed and getattr(tab, "context", None) is not None:
-            clear_employer_cookies(tab.context, application_url)
-            if self._last_employer_url:
+        # Another candidate's employer session must never carry over, also
+        # after a helper restart or on an employer used several jobs ago.
+        owner_changed = claim_employer_host(getattr(self, "user_data_dir", None), application_url, candidate_id)
+        if (changed or owner_changed) and getattr(tab, "context", None) is not None:
+            if clear_employer_cookies(tab.context, application_url):
+                changed = True
+            if changed and self._last_employer_url:
                 clear_employer_cookies(tab.context, self._last_employer_url)
         if candidate_id:
             self._last_candidate_id = candidate_id

@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from autofill.adapters import adapter_for
@@ -428,22 +428,88 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
     return required_only(snapshot, ordered)
 
 
-def _cluster_required(controls: list[Control]) -> bool:
-    return any(item.required or account_checkbox_required(item) for item in controls)
+_IDENTITY_AUTOCOMPLETE = frozenset({"name", "given-name", "family-name", "email", "tel", "tel-national"})
+_IDENTITY_LABELS = frozenset(
+    {
+        "name",
+        "full name",
+        "legal name",
+        "first name",
+        "given name",
+        "last name",
+        "family name",
+        "surname",
+        "email",
+        "email address",
+        "e mail",
+        "phone",
+        "phone number",
+        "mobile",
+        "mobile number",
+        "mobile phone",
+    }
+)
+
+
+def _is_identity(control: Control) -> bool:
+    """Name, email, phone, or the resume: no employer can process an application without them.
+
+    The resume is only reported for a person to attach; it is never uploaded here.
+    """
+    if control.kind == "file" or control.input_type == "file":
+        blob = normalize(" ".join(str(x or "") for x in (control.label, control.name, control.aria_label)))
+        return any(word in blob.split() for word in ("resume", "cv")) or "curriculum vitae" in blob
+    if control.kind not in {"text", "email", "tel"} and control.input_type not in {"text", "email", "tel"}:
+        return False
+    tokens = set((control.autocomplete or "").lower().split())
+    if tokens & _IDENTITY_AUTOCOMPLETE:
+        return True
+    label = normalize(str(control.label or control.aria_label or control.placeholder or "").replace("*", " "))
+    return label in _IDENTITY_LABELS
+
+
+def _marked(control: Control) -> bool:
+    return bool(control.required or account_checkbox_required(control))
+
+
+def mandatory_selectors(snapshot: PageSnapshot) -> set[str]:
+    """Selectors of every mandatory control on this scan. Every fill path uses this one rule.
+
+    A control is mandatory when the page marks it (required, aria-required, an
+    asterisk, or a validation error the page raised on it after Save &
+    Continue, read by the extractor), or when it shares its question with a
+    marked control (a radio group, the month and year parts of one date).
+    Unmarked controls are optional and are never filled, asked, or retried.
+    A page that marks nothing is uncertain: only name, email, and phone are
+    treated as mandatory, and Save & Continue reveals the rest as errors,
+    which the next scan marks. Conditional fields are re-read on every scan.
+    """
+    visible = [c for c in snapshot.controls if not c.hidden and not c.disabled]
+    marked = [c for c in visible if _marked(c)]
+    keys = {key for c in marked for key in (c.group and "g:" + c.group, c.name and "n:" + c.name) if key}
+    keys |= {"f:" + c.form_automation_id for c in marked if c.form_automation_id.startswith("formField")}
+    chosen: set[str] = set()
+    for control in visible:
+        if not control.selector:
+            continue
+        own = {key for key in (control.group and "g:" + control.group, control.name and "n:" + control.name) if key}
+        if control.form_automation_id.startswith("formField"):
+            own.add("f:" + control.form_automation_id)
+        if _marked(control) or own & keys or (not marked and _is_identity(control)):
+            chosen.add(control.selector)
+    return chosen
+
+
+def required_view(snapshot: PageSnapshot) -> PageSnapshot:
+    """The same scan with only mandatory controls, for passes that walk ``snapshot.controls``."""
+    keep = mandatory_selectors(snapshot)
+    return replace(snapshot, controls=[c for c in snapshot.controls if c.selector in keep])
 
 
 def required_only(snapshot: PageSnapshot, clusters: list[tuple[str, list[Control]]]) -> list[tuple[str, list[Control]]]:
-    """Keep only mandatory clusters when the page marks which fields are mandatory.
-
-    Optional fields are never filled, asked, retried, or allowed to block. A
-    page that marks no field required (some ATS mark none) keeps every cluster,
-    because there is no way to tell mandatory from optional on it. A
-    conditional field that becomes mandatory is picked up on the next scan.
-    """
-    visible = [c for c in snapshot.controls if not c.hidden and not c.disabled]
-    if not any(c.required for c in visible if c.kind not in {"password"} and c.input_type != "password"):
-        return clusters
-    return [(kind, controls) for kind, controls in clusters if _cluster_required(controls)]
+    """Keep only clusters that hold a mandatory control. See :func:`mandatory_selectors`."""
+    keep = mandatory_selectors(snapshot)
+    return [(kind, controls) for kind, controls in clusters if any(c.selector in keep for c in controls)]
 
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
@@ -5648,7 +5714,7 @@ def unmatched_study_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile
     """A Field of Study the profile names and the prompt did not commit.
 
     Workday leaves the box blank when the search does not pick a row. That is
-    a missing profile value, including when the label is not marked required.
+    a missing profile value. Only a mandatory Field of Study is asked.
     """
     if profile is None or page is None:
         return []
@@ -5669,9 +5735,12 @@ def unmatched_study_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile
     from autofill.combobox import _labels_match, selected_pill_text
 
     gaps: list[dict[str, Any]] = []
+    mandatory = mandatory_selectors(snapshot)
     for control in snapshot.controls:
         if control.hidden or not control.selector or not _is_study_control(control):
             continue
+        if control.selector not in mandatory:
+            continue  # An optional Field of Study is never asked.
         pill = selected_pill_text(page, control.selector)
         if pill and (_labels_match(wanted, pill) or wanted.casefold() in pill.casefold()):
             continue
