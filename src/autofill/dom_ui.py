@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from autofill.adapters import page_step
+from autofill.safeguards import PRESS_CHOICE_JS
 
 _JS_PATH = Path(__file__).with_name("dom_ui.js")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -48,6 +49,7 @@ STAGE_PERCENT = {
     "RESUME": 85,
     "REVIEW": 95,
     "READY": 100,
+    "CLOSED": 0,
 }
 STAGE_TITLES = {
     "OPENING": "Opening",
@@ -63,6 +65,7 @@ STAGE_TITLES = {
     "RESUME": "Resume",
     "REVIEW": "Review",
     "READY": "Ready",
+    "CLOSED": "Job closed",
 }
 
 _FOCUS_JS = """(selector) => {
@@ -72,7 +75,29 @@ _FOCUS_JS = """(selector) => {
 }"""
 
 _TYPE_JS = """async ({ selector, text, append }) => {
-  const el = document.querySelector(selector);
+  function afQuery(sel) {
+    if (!sel) return null;
+    const stack = [document];
+    const seen = new Set();
+    while (stack.length) {
+      const root = stack.pop();
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      try {
+        const found = root.querySelector(sel);
+        if (found) return found;
+      } catch (error) {
+        return null;
+      }
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll("*")); } catch (error) { nodes = []; }
+      for (const node of nodes) {
+        if (node.shadowRoot) stack.push(node.shadowRoot);
+      }
+    }
+    return null;
+  }
+  const el = afQuery(selector);
   if (!el || !window.__afUI) return false;
   return await window.__afUI.typeVisible(el, text, !!append);
 }"""
@@ -104,7 +129,7 @@ _COMBOBOX_JS = r"""(selector) => {
   return !!(el.closest && el.closest("[class*='select__control']"));
 }"""
 
-_CHOOSE_JS = """({ selector, expected, multi }) => {
+_CHOOSE_JS = ("""({ selector, expected, multi }) => {
   const root = document.querySelector(selector);
   if (!root) return false;
   const wanted = multi && Array.isArray(expected) ? expected : [expected];
@@ -119,36 +144,37 @@ _CHOOSE_JS = """({ selector, expected, multi }) => {
   }
   if (root.tagName === "SELECT") {
     const match = Array.from(root.options).find((option) => {
+      if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
       const label = String(option.label || option.text || "").trim();
       return label === wanted[0] || String(option.value || "").trim() === wanted[0];
     });
     if (!match) return false;
-    root.value = match.value;
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+    if (desc && desc.set) desc.set.call(root, match.value);
+    else root.value = match.value;
     paint(root);
-    return true;
+    return String(root.value) === String(match.value);
   }
   const name = root.name || "";
   const kind = root.type === "checkbox" ? "checkbox" : "radio";
   const group = name
     ? Array.from(document.querySelectorAll("input")).filter((node) => node.type === kind && node.name === name)
     : [root];
+  const press = __PRESS__;
   if (root.type === "checkbox" && !multi) {
     const word = String(wanted[0] || "").trim();
     const on = word === "Yes" || word === "True" || word === "true";
-    root.checked = on;
-    paint(root);
-    return true;
+    return press(root, on);
   }
   let hits = 0;
   for (const word of wanted) {
     const match = group.find((node) => String(node.value || "").trim() === word || labelOf(node) === word);
     if (!match) return false;
-    match.checked = true;
-    paint(match);
+    if (!press(match, true)) return false;
     hits += 1;
   }
   return hits === wanted.length && hits > 0;
-}"""
+}""").replace("__PRESS__", PRESS_CHOICE_JS)
 
 _VERIFY_JS = """({ selector, expected, multi, fieldKey }) => {
   const root = document.querySelector(selector);
@@ -269,6 +295,7 @@ class RunState:
         self.token: contextvars.Token | None = None
         self.preview: Callable[[Any], None] | None = None
         self.preview_at = 0.0
+        self.listbox_choices: list[dict[str, str]] = []
 
 
 _RUN: contextvars.ContextVar[RunState | None] = contextvars.ContextVar("af_run", default=None)
@@ -360,6 +387,50 @@ def install(page: Any) -> None:
 
 def current_run() -> RunState | None:
     return _RUN.get()
+
+
+def note_listbox_choice(record: dict[str, str]) -> None:
+    """Remember one listbox commit for this fill. The values are Yes or No."""
+    state = _RUN.get()
+    if state is None or not isinstance(record, dict):
+        return
+    state.listbox_choices.append(
+        {
+            "selector": str(record.get("selector") or ""),
+            "label": str(record.get("label") or ""),
+            "intended": str(record.get("intended") or ""),
+            "clicked": str(record.get("clicked") or ""),
+            "shown": str(record.get("shown") or ""),
+        }
+    )
+
+
+def listbox_choice_for(selector: str) -> dict[str, str] | None:
+    """The latest listbox record for ``selector`` during this fill."""
+    state = _RUN.get()
+    if state is None or not selector:
+        return None
+    for record in reversed(state.listbox_choices):
+        if record.get("selector") == selector:
+            return record
+    return None
+
+
+def latest_listbox_choices() -> list[dict[str, str]]:
+    """One record per listbox, the latest write for that button."""
+    state = _RUN.get()
+    if state is None:
+        return []
+    found: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for record in state.listbox_choices:
+        selector = str(record.get("selector") or "")
+        if not selector:
+            continue
+        if selector not in found:
+            order.append(selector)
+        found[selector] = record
+    return [found[selector] for selector in order]
 
 
 def begin_run(
@@ -603,7 +674,150 @@ def answer_type_name(kind: str, input_type: str = "", *, multi: bool = False, op
     return "text"
 
 
-_COMMITTED_JS = r"""(selector) => {
+# Text of the pill Workday already committed on a prompt. The search box
+# stays empty and aria-invalid. The pill may sit outside multiSelectContainer,
+# as a selectedItemList with no selectedItem id. An open promptOption menu
+# is not this value.
+_PILL_FN_JS = r"""
+  function autofillPillText(el) {
+    if (!el || !el.closest) return "";
+    function clean(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function junk(text) {
+      const folded = clean(text).toLowerCase().replace(/[.…]+$/g, "").trim();
+      if (!folded) return true;
+      if (folded === "search" || folded === "remove" || folded === "clear") return true;
+      if (/^(?:select one|choose one|please select one)$/.test(folded)) return true;
+      return /^(select|choose|please select|please choose|start typing)$/.test(folded);
+    }
+    function hiddenNode(node) {
+      if (!node || node.hidden) return true;
+      const style = window.getComputedStyle(node);
+      return style.display === "none" || style.visibility === "hidden";
+    }
+    function itemText(node) {
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll(
+        "button, input, textarea, [data-automation-id='DELETE_charm'], " +
+        "[data-automation-id='promptIcon'], [data-automation-id='clearButton']"
+      ).forEach((child) => child.remove());
+      return clean(clone.textContent);
+    }
+    const prompt = el.closest("[data-automation-id='multiSelectContainer']")
+      || el.closest("[data-automation-id='multiselectInputContainer']");
+    const field = el.closest("[data-automation-id^='formField']");
+    const roots = [];
+    function addRoot(node) {
+      if (node && node.querySelectorAll && roots.indexOf(node) === -1) roots.push(node);
+    }
+    function adjacentList(container) {
+      // A pill sibling of this prompt. Stop at the next prompt so Country
+      // Phone Code's list is not How Did You Hear's value.
+      function walk(start, step) {
+        let sibling = start;
+        while (sibling) {
+          const auto = ((sibling.getAttribute && sibling.getAttribute("data-automation-id")) || "").toLowerCase();
+          if (
+            auto === "multiselectcontainer" ||
+            auto === "multiselectinputcontainer" ||
+            auto.indexOf("formfield") === 0
+          ) {
+            return null;
+          }
+          if (sibling.querySelector && sibling.querySelector(
+            "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+          )) {
+            return null;
+          }
+          if (auto === "selecteditemlist") return sibling;
+          if (sibling.querySelector && sibling.querySelector("[data-automation-id='selectedItemList']")) {
+            return sibling;
+          }
+          sibling = sibling[step];
+        }
+        return null;
+      }
+      return walk(container.nextElementSibling, "nextElementSibling")
+        || walk(container.previousElementSibling, "previousElementSibling");
+    }
+    if (prompt) addRoot(prompt);
+    if (prompt) {
+      const beside = adjacentList(prompt);
+      if (beside) addRoot(beside);
+    }
+    if (field) {
+      const prompts = field.querySelectorAll("[data-automation-id='multiSelectContainer']");
+      if (prompts.length <= 1) addRoot(field);
+    }
+    if (!roots.length) addRoot(field || prompt || el.parentElement);
+    const found = [];
+    function add(text) {
+      if (junk(text) || found.indexOf(text) !== -1) return;
+      found.push(text);
+    }
+    function readLists(root) {
+      const lists = [];
+      const rootAuto = ((root.getAttribute && root.getAttribute("data-automation-id")) || "").toLowerCase();
+      if (rootAuto === "selecteditemlist") lists.push(root);
+      root.querySelectorAll("[data-automation-id='selectedItemList']").forEach((list) => lists.push(list));
+      lists.forEach((list) => {
+        if (hiddenNode(list)) return;
+        const items = list.querySelectorAll(
+          "[data-automation-id='selectedItem'], li, [role='option']"
+        );
+        const nodes = items.length ? Array.from(items) : [list];
+        nodes.forEach((node) => {
+          if (hiddenNode(node)) return;
+          add(itemText(node));
+        });
+      });
+    }
+    roots.forEach(readLists);
+    if (!found.length) {
+      roots.forEach((root) => {
+        root.querySelectorAll(
+          "[data-automation-id='selectedItem'], [data-automation-id='promptSelectionLabel'], " +
+          "[data-automation-id='selectedItemText']"
+        ).forEach((node) => {
+          if (hiddenNode(node)) return;
+          if (node.closest("[role='option'], [data-automation-id='promptOption']")) return;
+          add(itemText(node));
+        });
+      });
+    }
+    return found.join(", ");
+  }
+"""
+
+
+_PILL_TEXT_EVAL_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  return autofillPillText(el);
+}
+"""
+
+
+def prompt_pill_text(page: Any, selector: str) -> str:
+    """The committed prompt pill for ``selector``, or empty when none is showing.
+
+    A search box value is not the pill. A menu row that is still open is not
+    the pill. The text is whatever Workday painted, not the answer we wanted.
+    """
+    if not selector:
+        return ""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return ""
+    try:
+        return str(evaluate(_PILL_TEXT_EVAL_JS, selector) or "").strip()
+    except Exception:
+        return ""
+
+
+_COMMITTED_JS = "(selector) => {\n" + _PILL_FN_JS + r"""
   function committed(el) {
   if (!el) return false;
   const type = String(el.getAttribute("type") || el.type || "").toLowerCase();
@@ -612,12 +826,17 @@ _COMMITTED_JS = r"""(selector) => {
   function placeholder(text) {
     const folded = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (!folded) return true;
-    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|[-–—]+)$/.test(folded);
+    if (/^(?:select one|choose one|please select one)\.{0,3}$/.test(folded)) return true;
+    return /^(select\.{0,3}|choose\.{0,3}|please select|please choose|start typing\.{0,3}|[-–—]+)$/.test(folded);
+  }
+  function rootOf(node) {
+    const root = node && typeof node.getRootNode === "function" ? node.getRootNode() : document;
+    return root && typeof root.querySelectorAll === "function" ? root : document;
   }
   if (type === "radio") {
     const name = el.getAttribute("name") || "";
     if (!name) return !!el.checked;
-    const nodes = document.querySelectorAll("input[type='radio']");
+    const nodes = rootOf(el).querySelectorAll("input[type='radio']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
     }
@@ -627,9 +846,20 @@ _COMMITTED_JS = r"""(selector) => {
     if (el.checked) return true;
     const name = el.getAttribute("name") || "";
     if (!name) return false;
-    const nodes = document.querySelectorAll("input[type='checkbox']");
+    const nodes = rootOf(el).querySelectorAll("input[type='checkbox']");
     for (const node of nodes) {
       if (node.getAttribute("name") === name && node.checked) return true;
+    }
+    return false;
+  }
+  if (role === "radio" || role === "checkbox" || role === "switch") {
+    if (el.getAttribute("aria-checked") === "true" || el.checked === true) return true;
+    const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]");
+    if (role === "radio" && group) {
+      const peers = group.querySelectorAll("[role='radio']");
+      for (const peer of peers) {
+        if (peer.getAttribute("aria-checked") === "true") return true;
+      }
     }
     return false;
   }
@@ -643,17 +873,46 @@ _COMMITTED_JS = r"""(selector) => {
   if (type === "file") return !!(el.files && el.files.length);
   if (tag === "BUTTON" || role === "button" || role === "listbox" || role === "combobox") {
     const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
-    if (popup === "listbox" || role === "listbox") {
+    if ((popup === "listbox" || role === "listbox") && tag !== "INPUT" && tag !== "TEXTAREA") {
       const shown = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
       return shown.length > 0 && !placeholder(shown);
     }
     if (role === "combobox" || tag === "INPUT" || tag === "TEXTAREA") {
-      const typed = String(el.value || "").trim();
-      if (typed && !placeholder(typed)) return true;
-      const root = el.closest(".select__control") || el.parentElement;
-      const choice = root ? root.querySelector(".select__single-value, .select__multi-value") : null;
-      const shown = choice ? String(choice.textContent || "").replace(/\s+/g, " ").trim() : "";
-      return shown.length > 0 && !placeholder(shown);
+      const autoId = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+      const promptHost = el.closest(
+        "[data-automation-id='multiSelectContainer'], [data-automation-id='multiselectInputContainer']"
+      );
+      const promptSearch = !!promptHost
+        || autoId === "searchbox"
+        || autoId === "monikersearchbox"
+        || autoId === "promptsearchbox";
+      // An open prompt is a highlight or a search, not a committed leaf.
+      if (el.getAttribute("aria-expanded") === "true") return false;
+      // A Workday prompt keeps the filter in the search box. That text is not
+      // the choice. The pill, or a Greenhouse single-value, is the commit.
+      if (!promptSearch) {
+        const typed = String(el.value || "").trim();
+        if (typed && !placeholder(typed)) return true;
+      }
+      // The pill can sit outside the search wrapper, including a selectedItemList
+      // that is a sibling of multiSelectContainer. aria-invalid does not clear it.
+      const pill = autofillPillText(el);
+      if (pill && !placeholder(pill)) return true;
+      // Greenhouse react-select keeps the input empty and shows the choice
+      // in .select__single-value inside .select__control. A hidden or menu
+      // row is not that choice. Workday pills stay on autofillPillText.
+      const scope = el.closest(".select__control") || el.closest(".select");
+      if (scope) {
+        const values = scope.querySelectorAll(".select__single-value, .select__multi-value");
+        for (const node of values) {
+          if (node.hidden || node.closest("[role='listbox'], [role='option']")) continue;
+          const style = window.getComputedStyle(node);
+          if (style.display === "none" || style.visibility === "hidden") continue;
+          const text = String(node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+          if (text && !placeholder(text)) return true;
+        }
+      }
+      return false;
     }
     function selected(node) {
       if (!node) return false;
@@ -675,6 +934,8 @@ _COMMITTED_JS = r"""(selector) => {
     }
     return selected(el);
   }
+  const pill = autofillPillText(el);
+  if (pill && !placeholder(pill)) return true;
   const value = "value" in el ? el.value : el.textContent;
   return String(value || "").trim().length > 0;
   }
@@ -687,7 +948,25 @@ _COMMITTED_JS = r"""(selector) => {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 || rect.height > 0;
   }
-  const nodes = Array.from(document.querySelectorAll(selector));
+  function collect(selector) {
+    const found = [];
+    function walk(node) {
+      if (!node || typeof node.querySelectorAll !== "function") return;
+      let matches;
+      try {
+        matches = node.querySelectorAll(selector);
+      } catch (error) {
+        return;
+      }
+      for (const match of matches) found.push(match);
+      for (const child of node.querySelectorAll("*")) {
+        if (child.shadowRoot) walk(child.shadowRoot);
+      }
+    }
+    walk(document);
+    return found;
+  }
+  const nodes = collect(selector);
   if (!nodes.length) return false;
   const visible = nodes.filter(shown);
   const pool = visible.length ? visible : nodes;
@@ -864,12 +1143,50 @@ def canonical_blocker_kind(kind: object) -> str:
     return name
 
 
+_NOT_A_QUESTION = frozenset({"CAPTCHA", "LOGIN", "ACCOUNT", "VERIFICATION", "NO_FORM", "RESUME"})
+
+
+def page_question_views(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """One public row per gap, in page order. Login and resume stops are not rows."""
+    views: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if canonical_blocker_kind(item.get("kind")) in _NOT_A_QUESTION:
+            continue
+        qid = str(
+            item.get("questionId") or item.get("questionHash") or item.get("fieldKey") or item.get("id") or ""
+        ).strip()
+        prompt = str(item.get("text") or item.get("prompt") or "").strip()
+        if not qid or not prompt or qid in seen:
+            continue
+        seen.add(qid)
+        options: list[str] = []
+        for option in item.get("options") or []:
+            if isinstance(option, dict):
+                label = str(option.get("label") or option.get("value") or "").strip()
+            else:
+                label = str(option).strip()
+            if label and label not in options:
+                options.append(label)
+        views.append(
+            {
+                "id": qid,
+                "prompt": prompt,
+                "type": str(item.get("answerType") or item.get("type") or "text"),
+                "options": options,
+            }
+        )
+    return views
+
+
 def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if item is None:
         return None
     question_id = item.get("questionId") or None
     question_hash = item.get("questionHash") or question_id
-    return {
+    published: dict[str, Any] = {
         "kind": canonical_blocker_kind(item.get("kind") or "QUESTION"),
         "questionId": question_id,
         "questionHash": question_hash,
@@ -879,6 +1196,21 @@ def public_blocking(item: dict[str, Any] | None) -> dict[str, Any] | None:
         "options": [str(option) for option in item.get("options") or []],
         "required": bool(item.get("required")),
     }
+    challenge = str(item.get("challenge") or "")
+    if challenge:
+        # Confirm/complete hint. Salary amounts are not part of this object.
+        published["challenge"] = challenge
+        published["confidence"] = str(item.get("confidence") or "LOW")
+        related = [str(name) for name in item.get("relatedFields") or [] if str(name).strip()]
+        if related:
+            published["relatedFields"] = related
+        shape = str(item.get("salaryShape") or "")
+        if shape:
+            published["salaryShape"] = shape
+        reason = str(item.get("reason") or "")
+        if reason:
+            published["reason"] = reason
+    return published
 
 
 def _apply_status_stage(state: RunState, status: str) -> None:
@@ -1013,6 +1345,87 @@ def focus_field(page: Any, selector: str) -> bool:
     return moved
 
 
+def await_aria_checked(page: Any, selector: str) -> bool:
+    """True when ``aria-checked`` becomes true. A click that paints on the next frame counts."""
+    if not selector:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    script = """(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      return !!el && el.getAttribute("aria-checked") === "true";
+    }"""
+    for _attempt in range(8):
+        try:
+            if evaluate(script, selector) is True:
+                return True
+        except Exception:
+            return False
+        wait = getattr(page, "wait_for_timeout", None)
+        if wait is None:
+            return False
+        try:
+            wait(40)
+        except Exception:
+            return False
+    return False
+
+
+_PRIMARY_EMAIL_JS = r"""({ selector, email }) => {
+  let self = null;
+  try { self = document.querySelector(selector); } catch (error) { return ""; }
+  const wanted = String(email || "").trim().toLowerCase();
+  const nodes = document.querySelectorAll("input, textarea");
+  for (const node of nodes) {
+    if (node === self) continue;
+    const type = String(node.getAttribute("type") || node.type || "").toLowerCase();
+    if (type === "hidden" || type === "password" || type === "checkbox" || type === "radio") continue;
+    let label = "";
+    if (node.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+      if (explicit) label = explicit.innerText || explicit.textContent || "";
+    }
+    const text = [
+      node.id || "",
+      node.getAttribute("name") || "",
+      node.getAttribute("aria-label") || "",
+      node.getAttribute("placeholder") || "",
+      label,
+    ].join(" ").toLowerCase();
+    if (text.indexOf("email") === -1) continue;
+    if (/confirm|re-?enter|retype|verify|repeat/.test(text)) continue;
+    const current = String(node.value || "").trim();
+    if (current && current.toLowerCase() !== wanted) return "";
+    if (current) return "";
+    if (node.id) return "#" + CSS.escape(node.id);
+  }
+  return "";
+}"""
+
+
+def prime_primary_email(page: Any, selector: str, email: str) -> None:
+    """Write this candidate's email into an empty Email box before Confirm email.
+
+    Confirm email compares itself to Email on blur. Filling confirm first
+    clears it. A box that already holds a different address is left alone.
+    """
+    text = str(email or "").strip()
+    if not selector or not text:
+        return
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return
+    try:
+        primary = str(evaluate(_PRIMARY_EMAIL_JS, {"selector": selector, "email": text}) or "")
+    except Exception:
+        return
+    if not primary or primary == selector:
+        return
+    type_visible(page, primary, text)
+
+
 def type_visible(page: Any, selector: str, text: str) -> bool:
     """Scroll the field to center, then type it. Returns false when the page cannot type."""
     if not selector:
@@ -1082,6 +1495,141 @@ def _choice(answer_type: str) -> bool:
     return answer_type in {"single_select", "multi_select", "boolean"}
 
 
+def _is_native_select(page: Any, selector: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    try:
+        return bool(
+            evaluate(
+                """(selector) => {
+                  const el = document.querySelector(selector);
+                  return !!el && el.tagName === "SELECT";
+                }""",
+                selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+_SELECT_NATIVE_JS = r"""
+({ selector, label, value }) => {
+  const el = document.querySelector(selector);
+  if (!el || el.tagName !== "SELECT") return false;
+  function fold(item) {
+    return String(item || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  const wanted = [label, value].map(fold).filter(Boolean);
+  if (!wanted.length) return false;
+  const match = Array.from(el.options).find((option) => {
+    if (option.disabled || option.getAttribute("aria-disabled") === "true") return false;
+    const text = String(option.label || option.text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const stored = String(option.value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return wanted.indexOf(text) !== -1 || wanted.indexOf(stored) !== -1;
+  });
+  if (!match) return false;
+  const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
+  if (desc && desc.set) desc.set.call(el, match.value);
+  else el.value = match.value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return String(el.value) === String(match.value);
+}
+"""
+
+
+def _selected_option(page: Any, selector: str) -> dict[str, str] | None:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
+    try:
+        raw = evaluate(
+            """(selector) => {
+              const el = document.querySelector(selector);
+              if (!el || el.tagName !== "SELECT") return null;
+              const option = el.options[el.selectedIndex];
+              if (!option) return null;
+              if (option.disabled || option.getAttribute("aria-disabled") === "true") return null;
+              return {
+                value: String(option.value || ""),
+                label: String(option.label || option.text || "").replace(/\\s+/g, " ").trim()
+              };
+            }""",
+            selector,
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {"value": str(raw.get("value") or ""), "label": str(raw.get("label") or "")}
+
+
+def _selection_matches(chosen: dict[str, str], label: str, value: str) -> bool:
+    wanted = {item.strip().casefold() for item in (label, value) if item.strip()}
+    if not wanted:
+        return False
+    have = {chosen.get("label", "").strip().casefold(), chosen.get("value", "").strip().casefold()}
+    have.discard("")
+    return bool(wanted & have)
+
+
+def choose_native_select(page: Any, selector: str, *, label: str = "", value: str = "") -> bool:
+    """Choose one enabled ``<select>`` option. The answer path and the fill path both use this.
+
+    Playwright's ``select_option`` runs first. A controlled select that ignores
+    that write is set through ``HTMLSelectElement``'s value setter. A disabled
+    option is not chosen.
+    """
+    expected_label = str(label or "").strip()
+    expected_value = str(value or "").strip()
+    if not selector or not (expected_label or expected_value):
+        return False
+    attempts: list[dict[str, str]] = []
+    if expected_value:
+        attempts.append({"value": expected_value})
+    if expected_label:
+        attempts.append({"label": expected_label})
+    if expected_label and expected_label != expected_value:
+        attempts.append({"value": expected_label})
+    if expected_value and expected_value != expected_label:
+        attempts.append({"label": expected_value})
+    seen: set[tuple[str, str]] = set()
+    locator_factory = getattr(page, "locator", None)
+    if locator_factory is not None:
+        target = page.locator(selector)
+        for attempt in attempts:
+            key = next(iter(attempt.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                target.select_option(**attempt)
+            except Exception:
+                continue
+            chosen = _selected_option(page, selector)
+            if chosen and _selection_matches(chosen, expected_label, expected_value):
+                return True
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return False
+    try:
+        applied = bool(
+            evaluate(
+                _SELECT_NATIVE_JS,
+                {"selector": selector, "label": expected_label, "value": expected_value},
+            )
+        )
+    except Exception:
+        return False
+    if not applied:
+        return False
+    chosen = _selected_option(page, selector)
+    if chosen is None:
+        return True
+    return _selection_matches(chosen, expected_label, expected_value)
+
+
 _BUTTON_CHOICE_JS = r"""({ selector, expected }) => {
   const root = document.querySelector(selector);
   if (!root) return "";
@@ -1129,6 +1677,27 @@ def _button_choice_selector(page: Any, selector: str, value: str) -> str:
     return str(found or "")
 
 
+def _is_listbox_button(page: Any, selector: str) -> bool:
+    """A Workday choice button, such as Phone Device Type. Not a search input."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return False
+    script = r"""(selector) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return false; }
+      if (!el) return false;
+      const tag = String(el.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return false;
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      const popup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+      return popup === "listbox" || role === "listbox";
+    }"""
+    try:
+        return bool(evaluate(script, selector))
+    except Exception:
+        return False
+
+
 def _looks_like_combobox(page: Any, selector: str) -> bool:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
@@ -1137,6 +1706,77 @@ def _looks_like_combobox(page: Any, selector: str) -> bool:
         return bool(evaluate(_COMBOBOX_JS, selector))
     except Exception:
         return False
+
+
+_DATE_PART_JS = r"""(selector) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return ""; }
+  if (!el) return "";
+  const auto = String(el.getAttribute("data-automation-id") || "").toLowerCase();
+  const id = String(el.id || "").toLowerCase();
+  const blob = auto + " " + id;
+  if (blob.indexOf("datesectionmonth") !== -1) return "month";
+  if (blob.indexOf("datesectionyear") !== -1) return "year";
+  return "";
+}"""
+
+
+_COMMIT_DATE_PART_JS = r"""({ selector, value }) => {
+  let el = null;
+  try { el = document.querySelector(selector); } catch (error) { return { ok: false }; }
+  if (!el) return { ok: false };
+  const field = (el.closest && el.closest("[data-automation-id^='formField']")) || el.parentElement;
+  function kind(node) {
+    if (!node) return "";
+    const blob = (
+      String(node.getAttribute("data-automation-id") || "") + " " + String(node.id || "")
+    ).toLowerCase();
+    if (blob.indexOf("datesectionmonth") !== -1) return "month";
+    if (blob.indexOf("datesectionyear") !== -1) return "year";
+    return "";
+  }
+  const inputs = field ? Array.from(field.querySelectorAll("input")) : [];
+  const sibling = inputs.find((node) => node !== el && kind(node));
+  const kept = sibling ? String(sibling.value || "") : "";
+  function write(node, next, notify) {
+    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    if (proto && proto.set) proto.set.call(node, next);
+    else node.value = next;
+    if (!notify) return;
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  write(el, value, true);
+  if (sibling && kept && String(sibling.value || "") !== kept) write(sibling, kept, false);
+  return {
+    ok: String(el.value || "") === String(value),
+    sibling: sibling ? String(sibling.value || "") : kept,
+  };
+}"""
+
+
+def _date_part_kind(page: Any, selector: str) -> str:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not selector:
+        return ""
+    try:
+        return str(evaluate(_DATE_PART_JS, selector) or "")
+    except Exception:
+        return ""
+
+
+def _commit_date_part(page: Any, selector: str, value: str) -> dict[str, Any]:
+    """Write one month or year box and put back the other part if the widget clears it."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return {"filled": False, "reason": "not_committed"}
+    try:
+        report = evaluate(_COMMIT_DATE_PART_JS, {"selector": selector, "value": value}) or {}
+    except Exception:
+        return {"filled": False, "reason": "not_committed"}
+    if not report.get("ok"):
+        return {"filled": False, "reason": "not_committed"}
+    return {"filled": True}
 
 
 def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
@@ -1153,6 +1793,19 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         return {"filled": False, "reason": "empty"}
     if target.get("check"):
         return _check_box(page, selector)
+    if _date_part_kind(page, selector):
+        return _commit_date_part(page, selector, values[0])
+    from autofill.combobox import is_school_target, search_school
+
+    if is_school_target(page, selector, target):
+        try:
+            picked = search_school(page, selector, values[0])
+        except Exception:
+            picked = None
+        if picked is None or not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
     install(page)
     focus_field(page, selector)
     button = _button_choice_selector(page, selector, values[0])
@@ -1167,11 +1820,46 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
             return {"filled": False, "reason": "not_committed"}
         clear_highlight(page, selector)
         return {"filled": True}
+    if _is_city_target(target) and not _choice(answer_type):
+        from autofill.stepfill import commit_city_text
+
+        try:
+            report = commit_city_text(page, selector, values[0])
+        except Exception:
+            report = {"filled": False, "reason": "not_committed"}
+        if report.get("filled"):
+            clear_highlight(page, selector)
+            return {"filled": True}
+        missed: dict[str, Any] = {"filled": False, "reason": str(report.get("reason") or "not_committed")}
+        options = [str(item) for item in report.get("options") or [] if str(item).strip()]
+        if options:
+            missed["options"] = options
+        return missed
     if _looks_like_combobox(page, selector):
         from autofill.combobox import select_combobox
 
         try:
             picked = select_combobox(page, selector, values[0])
+        except Exception:
+            picked = None
+        if picked is None:
+            from autofill.combobox import take_opened_children
+
+            options = take_opened_children()
+            nested: dict[str, Any] = {"filled": False, "reason": "not_committed"}
+            if options:
+                nested["options"] = options
+            return nested
+        if not control_committed(page, selector):
+            return {"filled": False, "reason": "not_committed"}
+        clear_highlight(page, selector)
+        return {"filled": True}
+    if _is_listbox_button(page, selector):
+        from autofill.combobox import select_listbox_button
+
+        question = str(target.get("text") or target.get("label") or "")
+        try:
+            picked = select_listbox_button(page, selector, values[0], question=question)
         except Exception:
             picked = None
         if picked is None:
@@ -1181,18 +1869,31 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
         clear_highlight(page, selector)
         return {"filled": True}
     if _choice(answer_type):
-        evaluate = getattr(page, "evaluate", None)
-        if evaluate is None:
-            return {"filled": False, "reason": "not_committed"}
-        try:
-            multi = answer_type == "multi_select"
-            expected: str | list[str] = values if multi else values[0]
-            chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
-        except Exception:
-            chosen = False
+        if _is_native_select(page, selector):
+            chosen = choose_native_select(page, selector, label=values[0], value=values[0])
+        else:
+            native = _commit_native_choices(
+                page, selector, values, multi=answer_type == "multi_select"
+            )
+            if native is not None:
+                chosen = native
+            elif _commit_aria_radio(page, selector, values[0]):
+                chosen = True
+            else:
+                evaluate = getattr(page, "evaluate", None)
+                if evaluate is None:
+                    return {"filled": False, "reason": "not_committed"}
+                try:
+                    multi = answer_type == "multi_select"
+                    expected: str | list[str] = values if multi else values[0]
+                    chosen = bool(evaluate(_CHOOSE_JS, {"selector": selector, "expected": expected, "multi": multi}))
+                except Exception:
+                    chosen = False
         if not chosen:
             return {"filled": False, "reason": "not_committed"}
     else:
+        if _is_confirm_email_target(target):
+            prime_primary_email(page, selector, values[0])
         if not type_visible(page, selector, values[0]):
             return {"filled": False, "reason": "not_committed"}
     if not _committed(
@@ -1209,14 +1910,178 @@ def commit_visible(page: Any, target: dict[str, Any]) -> dict[str, Any]:
     return {"filled": True}
 
 
-def _check_box(page: Any, selector: str) -> dict[str, Any]:
-    """Check one checkbox through the locator. This does not click a button."""
-    locator = getattr(page, "locator", None)
-    if locator is None:
-        return {"filled": False, "reason": "not_committed"}
+_NATIVE_CHOICE_SELECTORS_JS = r"""({ selector, labels, multi }) => {
+  let root = null;
+  try {
+    root = document.querySelector(selector);
+  } catch (error) {
+    return null;
+  }
+  if (!root || root.tagName !== "INPUT") return null;
+  const type = String(root.type || root.getAttribute("type") || "").toLowerCase();
+  if (type !== "checkbox" && type !== "radio") return null;
+  function labelOf(node) {
+    function clean(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+    function short(value) {
+      const text = clean(value);
+      if (!text || text.length > 40) return "";
+      if (text.toLowerCase().indexOf("current employees:") === 0) return "";
+      return text;
+    }
+    if (node.id) {
+      const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+      if (explicit && !explicit.querySelector("input, select, textarea, [role='radio']")) {
+        const text = short(explicit.innerText || explicit.textContent);
+        if (text) return text;
+      }
+    }
+    const next = node.nextElementSibling;
+    if (next && String(next.tagName || "").toUpperCase() === "LABEL") {
+      const text = short(next.innerText || next.textContent);
+      if (text) return text;
+    }
+    const role = String(node.getAttribute("role") || "").toLowerCase();
+    if (role === "radio") {
+      const own = short(node.getAttribute("aria-label") || node.innerText || node.textContent);
+      if (own) return own;
+    }
+    const wrap = node.closest("label");
+    if (wrap) {
+      const nested = wrap.querySelectorAll("input[type='radio'], [role='radio']");
+      if (nested.length <= 1) {
+        const text = short(wrap.innerText || wrap.textContent);
+        if (text) return text;
+      }
+    }
+    return clean(node.getAttribute("aria-label") || node.value || "");
+  }
+  function css(node) {
+    if (node.id) return "#" + CSS.escape(node.id);
+    const name = node.getAttribute("name") || "";
+    if (!name) return selector;
+    return "input[type='" + type + "'][name='" + CSS.escape(name) + "'][value='" + CSS.escape(node.value || "") + "']";
+  }
+  const name = root.getAttribute("name") || "";
+  const group = name
+    ? Array.from(document.querySelectorAll("input")).filter((node) => (
+        node.type === type && node.getAttribute("name") === name
+      ))
+    : [root];
+  const wanted = (labels || []).map((item) => String(item || "").trim()).filter(Boolean);
+  if (type === "checkbox" && !multi) {
+    const word = wanted[0] || "";
+    const off = /^(no|false|unchecked)$/i.test(word);
+    return [{ selector: css(root), on: !off }];
+  }
+  const found = [];
+  for (const word of wanted) {
+    const match = group.find((node) => labelOf(node) === word || String(node.value || "").trim() === word);
+    if (!match) return [];
+    found.push({ selector: css(match), on: true });
+  }
+  return found;
+}"""
+
+
+def _commit_native_choices(page: Any, selector: str, values: list[str], *, multi: bool) -> bool | None:
+    """Commit native checkbox or radio options. None when this control is not one."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return None
     try:
-        page.locator(selector).check()
+        found = evaluate(_NATIVE_CHOICE_SELECTORS_JS, {"selector": selector, "labels": values, "multi": multi})
     except Exception:
+        return None
+    if found is None:
+        return None
+    if not isinstance(found, list) or not found:
+        return False
+    from autofill.safeguards import commit_native_choice
+
+    for item in found:
+        if not isinstance(item, dict):
+            return False
+        target = str(item.get("selector") or "")
+        if not target or not commit_native_choice(page, target, on=bool(item.get("on", True))):
+            return False
+    return True
+
+
+def _commit_aria_radio(page: Any, selector: str, value: str) -> bool:
+    """Select one factual ``role=radio`` option. False when this is not that widget."""
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None or not value.strip():
+        return False
+    script = r"""({ selector, label }) => {
+      let el = null;
+      try { el = document.querySelector(selector); } catch (error) { return ""; }
+      if (!el) return "";
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      const group = el.closest("[role='radiogroup'], fieldset, [data-field-path]") || el.parentElement;
+      if (!group) return "";
+      const radios = Array.from(group.querySelectorAll("[role='radio']"));
+      if (role !== "radio" && !radios.length) return "";
+      const wanted = String(label || "").replace(/\s+/g, " ").trim().toLowerCase();
+      function short(value) {
+        const text = String(value || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length > 40) return "";
+        return text.toLowerCase();
+      }
+      const match = radios.find((node) => {
+        const own = short(node.getAttribute("aria-label") || node.innerText || node.textContent);
+        if (own === wanted) return true;
+        if (node.id) {
+          const explicit = document.querySelector("label[for='" + CSS.escape(node.id) + "']");
+          if (explicit && short(explicit.innerText || explicit.textContent) === wanted) return true;
+        }
+        const next = node.nextElementSibling;
+        if (next && short(next.innerText || next.textContent) === wanted) return true;
+        return false;
+      });
+      if (!match) return "";
+      if (match.id) return "#" + CSS.escape(match.id);
+      return selector;
+    }"""
+    try:
+        target = str(evaluate(script, {"selector": selector, "label": value}) or "")
+    except Exception:
+        return False
+    if not target:
+        return False
+    from autofill.safeguards import press_aria_radio
+
+    if press_aria_radio(page, target):
+        return True
+    return await_aria_checked(page, target)
+
+
+def _is_city_target(target: dict[str, Any]) -> bool:
+    """A City answer. Current location stays on the suggestion-id path."""
+    key = str(target.get("fieldKey") or "").strip()
+    if key in {"city", "address.city"}:
+        return True
+    text = str(target.get("text") or target.get("label") or "").strip().casefold()
+    return text in {"city", "town"}
+
+
+def _is_confirm_email_target(target: dict[str, Any]) -> bool:
+    from autofill.mapping import is_confirm_email
+    from autofill.models import Control
+
+    key = str(target.get("fieldKey") or "").strip()
+    if key and key not in {"email"} and "email" not in key:
+        return False
+    text = str(target.get("text") or target.get("label") or "")
+    return is_confirm_email(Control(kind="text", label=text, name=text))
+
+
+def _check_box(page: Any, selector: str) -> dict[str, Any]:
+    """Check one native checkbox and reread it. This does not click a button."""
+    from autofill.safeguards import commit_native_choice
+
+    if not commit_native_choice(page, selector, on=True):
         return {"filled": False, "reason": "not_committed"}
     if not control_committed(page, selector):
         return {"filled": False, "reason": "not_committed"}

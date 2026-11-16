@@ -1,0 +1,15 @@
+{
+  "task": "handoff-pr-head",
+  "developer": "saiteja",
+  "branch": "saiteja/handoff-pr-head",
+  "latest_commit": "2de309dccef82b8a876ed94ab6f505dac6748825",
+  "pr": "",
+  "files_touched": [
+    "scripts/handoff.py",
+    "tests/test_handoff.py"
+  ],
+  "tests": "pytest tests/test_handoff.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-11-12T17:15:29Z"
+}

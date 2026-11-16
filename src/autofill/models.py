@@ -12,6 +12,12 @@ class Option:
     value: str
     label: str
     selector: str = ""
+    # Workday prompt categories are not leaves. A row without this flag is a
+    # folder the menu drills into; the selectable value is the nested leaf.
+    leaf: bool = True
+    # True when the row has a chevron and opens a nested list. A flat
+    # promptOption that commits on click is not a folder.
+    folder: bool = False
 
 
 @dataclass
@@ -40,6 +46,10 @@ class Control:
     automation_id: str = ""
     max_length: int | None = None
     phone_adjacent: bool = False
+    # True when this phone box sits beside a separate calling-code control.
+    national_phone: bool = False
+    # Owning Workday ``formField-*`` id. A search box's own id is often just searchBox.
+    form_automation_id: str = ""
     frame_url: str = ""
 
 
@@ -109,6 +119,8 @@ class MappedField:
     reason: str = ""
     field_class: str = ""
     confidence: str = "high"
+    related_fields: tuple[str, ...] = ()
+    challenge: str = ""
 
 
 @dataclass

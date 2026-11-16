@@ -18,6 +18,7 @@ from autofill import (
 )
 from autofill.adapters import ADAPTERS, page_step
 from autofill.ats import detect_ats
+from autofill.credentials import credential_scope
 from autofill.dates import format_for_control
 from autofill.engine import autofill_application as engine_entry
 from autofill.mapping import map_field
@@ -78,8 +79,8 @@ def provider() -> MemoryCredentialProvider:
     store = MemoryCredentialProvider()
     store.put(
         "candidate-a",
-        DOMAIN,
-        Credentials(site=DOMAIN, email="avery.example@example.com", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), email="avery.example@example.com", password=PASSWORD),
     )
     return store
 
@@ -138,13 +139,17 @@ def test_dates_and_country_aliases_and_unknown_questions():
     assert low.action == "unanswered"
 
 
-def test_salary_and_work_auth_are_not_invented():
+def test_unknown_salary_defaults_and_work_auth_is_not_invented():
     empty = CandidateProfile.from_dict(
         {"personal": {"full_name": "Avery Example", "email": "avery.example@example.com"}}
     )
     salary = map_field(Control(kind="text", label="Desired salary"), empty)
-    assert salary.action == "unanswered"
-    assert salary.text == ""
+    assert salary.action == "fill"
+    assert salary.text == "90000"
+    ranged = map_field(Control(kind="text", label="Desired salary range"), empty)
+    assert ranged.action == "unanswered"
+    assert ranged.text == ""
+    assert ranged.text != "90000-90000"
     auth = map_field(
         Control(
             kind="select",
@@ -200,7 +205,10 @@ def test_credential_lookup_is_scoped():
     assert store.get_credentials(other, "candidate-a") is None
     wrong_person = SiteContext(url=URL, domain=DOMAIN, candidate_id="candidate-b")
     assert store.get_credentials(wrong_person, "candidate-b") is None
-    found = store.get_credentials(SiteContext(url=URL, domain=DOMAIN, candidate_id="candidate-a"), "candidate-a")
+    found = store.get_credentials(
+        SiteContext(url=URL, domain=credential_scope(URL), candidate_id="candidate-a"),
+        "candidate-a",
+    )
     assert found is not None
     assert "password" not in repr(found)
     assert PASSWORD not in repr(found)
@@ -290,7 +298,7 @@ def test_full_application_stops_for_a_person(browser, caplog):
         assert page.locator("#intern-org").input_value() == "Sample Studio"
         assert page.locator("#school").input_value() == "Example University"
         assert page.locator("#degree").input_value() == "Bachelor's Degree"
-        assert page.locator("#major").input_value() == "Computer Science"
+        assert page.locator("#major").input_value() == ""  # Field of study is optional here.
         assert page.locator("#auth").input_value() == "Yes"
         assert page.locator("#sponsor-no").is_checked()
         assert page.locator("#hear").input_value() == "Online job board"
@@ -353,7 +361,7 @@ def test_login_variants(browser):
     <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password">
     <button type="button" id="go">Sign in</button>
     <section id="app" hidden><h1>Personal information</h1>
-      <label for="last">Last name</label><input id="last" autocomplete="family-name">
+      <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
       <button type="submit" id="submit">Submit application</button>
     </section>
     <script>
@@ -375,8 +383,8 @@ def test_login_variants(browser):
     user_provider = MemoryCredentialProvider()
     user_provider.put(
         "candidate-a",
-        DOMAIN,
-        Credentials(site=DOMAIN, username="avery-example", password=PASSWORD),
+        credential_scope(URL),
+        Credentials(site=credential_scope(URL), username="avery-example", password=PASSWORD),
     )
     page = browser.new_page()
     try:
@@ -393,7 +401,7 @@ def test_login_variants(browser):
 
     email_first = """
     <section id="login"><h1>Sign in</h1>
-      <label for="email">Email</label><input id="email" type="email" autocomplete="username">
+      <label for="email">Email</label><input id="email" type="email" autocomplete="username" required>
       <button type="button" id="continue">Continue</button>
       <div id="pwbox" hidden>
         <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password">
@@ -402,7 +410,7 @@ def test_login_variants(browser):
       <p id="login-error" role="alert" hidden>Invalid credentials</p>
     </section>
     <section id="app" hidden><h1>Personal information</h1>
-      <label for="last">Last name</label><input id="last" autocomplete="family-name">
+      <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
     </section>
     <script>
       document.getElementById("continue").onclick = () => { document.getElementById("pwbox").hidden = false; };
@@ -434,8 +442,8 @@ def test_login_variants(browser):
         bad = MemoryCredentialProvider()
         bad.put(
             "candidate-a",
-            DOMAIN,
-            Credentials(site=DOMAIN, email="avery.example@example.com", password="wrong-password"),
+            credential_scope(URL),
+            Credentials(site=credential_scope(URL), email="avery.example@example.com", password="wrong-password"),
         )
         result = autofill_application(
             URL, profile, bad, AutofillOptions(candidate_id="candidate-a", page=page, session_id="bad-login")
@@ -466,7 +474,7 @@ def test_already_authenticated_skips_login(browser):
         page.set_content(
             """
             <h1>My Information</h1>
-            <label for="last">Last name</label><input id="last" autocomplete="family-name">
+            <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
             <button type="submit" id="submit">Submit application</button>
             <script>window.__n=0; document.getElementById("submit").onclick=()=>{window.__n+=1};</script>
             """
@@ -492,10 +500,10 @@ def test_parallel_results_do_not_share_session_ids(browser):
     try:
         page_a.set_content(
             "<h1>My Information</h1><label for='a'>Last name</label>"
-            "<input id='a' autocomplete='family-name'>"
+            "<input id='a' autocomplete='family-name' required>"
         )
         page_b.set_content(
-            "<h1>My Information</h1><label for='b'>City</label><input id='b' autocomplete='address-level2'>"
+            "<h1>My Information</h1><label for='b'>City *</label><input id='b' autocomplete='address-level2' required>"
         )
         left = autofill_application(
             URL,
@@ -562,7 +570,7 @@ def test_public_api_stops_on_captcha_without_solving(browser):
         page.set_content(
             """
             <h1>Sign in</h1>
-            <label for="email">Email</label><input id="email" type="email">
+            <label for="email">Email</label><input id="email" type="email" required>
             <div class="g-recaptcha" data-sitekey="not-a-real-sitekey">
               <iframe title="recaptcha" src="/recaptcha/api2/anchor" style="width:304px;height:78px;border:0"></iframe>
             </div>

@@ -25,6 +25,7 @@ from autofill.dom_ui import (
     empty_progress,
     fit_choice_values,
     match_open_item,
+    page_question_views,
     progress_percent,
     public_blocking,
     workflow_percent,
@@ -36,7 +37,7 @@ from autofill.redact import install_redaction, redaction_filter
 from autofill.resolver import ResolverBinding
 from autofill.resume_manual import ResumeRejected, max_resume_bytes, mime_for, validate_resume
 from autofill.safeguards import HUMAN_SUBMIT_ONLY, HumanSubmissionRequired
-from autofill.service.auth import require_configured_token, tokens_match
+from autofill.service.auth import accepted_tokens, tokens_match_any
 from autofill.service.context import (
     ContextError,
     build_binding,
@@ -74,6 +75,7 @@ from autofill.service.schemas import (
     ManualQuestionOut,
     ProgressOut,
     RunStatusOut,
+    StopQuestionOut,
     SuggestIn,
     SuggestOptionOut,
     SuggestOut,
@@ -289,6 +291,28 @@ def _shot_headers(session: ServiceSession, *, host: str = "", retry: bool = Fals
     return headers
 
 
+def _application_visible(session: ServiceSession, runner: FillRunner) -> bool:
+    """True when the live page shows a job form and not a real challenge."""
+    probe = getattr(runner, "application_visible", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe(session.session_id))
+    except PageUnavailable as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail="Page is navigating.",
+                headers=_shot_headers(session, retry=True),
+            ) from None
+        _mark_browser_crash(session)
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail="The page crashed.",
+            headers=_shot_headers(session),
+        ) from None
+
+
 def _probe_challenge(session: ServiceSession, runner: FillRunner) -> str:
     probe = getattr(runner, "probe_challenge", None)
     if probe is None:
@@ -369,11 +393,37 @@ def _account_proof(report: dict) -> dict[str, Any]:
     return extra
 
 
+_ACCOUNT_STEP_STATUSES = frozenset({Status.ACCOUNT_CREATION_REQUIRED, Status.LOGIN_REQUIRED, Status.LOGIN_FAILED})
+# A just-registered account stays "verify first" while the run is still on an
+# account step. Any other status (application form, review, failure) clears it.
+_VERIFY_PENDING_STATUSES = _ACCOUNT_STEP_STATUSES | {Status.EMAIL_VERIFICATION_REQUIRED}
+
+
 def _finish_account_action(session: ServiceSession, report: dict, resume_run) -> CredentialsOut:
     """Store the classification. A paused session waits for /resume."""
     if report.get("autoConsents"):
         session.auto_consents = list(report["autoConsents"])
     proof = _account_proof(report)
+    recovered = None
+    if (
+        not report.get("ok")
+        and report.get("reason") == "not_at_account_step"
+        and report.get("applicationVisible")
+        and session.status in _ACCOUNT_STEP_STATUSES
+    ):
+        # Stuck account step: the session still says ACCOUNT_*/LOGIN_* but the
+        # employer page already shows the application form (an earlier press
+        # worked, e.g. Aptiv 2026-10-27 after a false 422). Treat it as done and
+        # resume, instead of answering 409 not_at_account_step on every Continue.
+        outcome_now = "registered" if session.status == Status.ACCOUNT_CREATION_REQUIRED else "signed_in"
+        logger.info(
+            "session=%s account_recovered=true previous=%s outcome=%s",
+            session.session_id,
+            session.status,
+            outcome_now,
+        )
+        report = {"ok": True, "outcome": outcome_now, "status": "", "siteErrors": [], "account": None}
+        recovered = True
     if not report.get("ok"):
         reason = str(report.get("reason") or "not_at_account_step")
         if reason in {"site_rejected", "account_exists"}:
@@ -413,12 +463,39 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             if proof.get("field_proof"):
                 detail["fieldProof"] = proof["field_proof"]
             raise HTTPException(status_code=409, detail=detail)
+        if reason == "password_policy":
+            # The secret was stored before the click. Drop it. The reason token
+            # is the only thing the caller sees.
+            session.credentials.clear()
+            raise HTTPException(status_code=422, detail={"reason": "password_policy"})
         raise HTTPException(status_code=409, detail="No page is open for this session.")
     if report.get("account"):
         session.account = report["account"]
     outcome = str(report.get("outcome") or "pending")
     if report.get("status"):
         session.status = str(report["status"])
+    if report.get("verifyBeforeSignIn") and _is_070(session):
+        # The site created the account and went back to Sign In. Do not sign in
+        # with the new password before the verification email: Workday answers
+        # "wrong email or password or your account might be locked" and may lock
+        # it. Continue (humanResolved) signs in once after the person verifies.
+        session.status = Status.EMAIL_VERIFICATION_REQUIRED
+        session.pending_resume = False
+        # R4 (t182u, KLA 2026-10-27): keep the run "verify first" so a Continue
+        # without an explicit verified confirmation never types this password.
+        session.verify_pending = True
+        _sync_checkpoint(session)
+        return CredentialsOut(
+            sessionId=session.session_id,
+            outcome="registered",
+            status=_public_status(session),
+            **proof,
+        )
+    if outcome == "registered" and recovered is None and _is_070(session):
+        # RC-V1: the site took Create Account but no form or Sign In showed yet.
+        # The resume run must not type this new password into a Sign In pane
+        # before the verification email is opened (engine._verify_first).
+        session.verify_pending = True
     if session.paused:
         session.pending_resume = outcome in {"signed_in", "registered", "verification_required"}
         _sync_checkpoint(session)
@@ -426,13 +503,18 @@ def _finish_account_action(session: ServiceSession, report: dict, resume_run) ->
             sessionId=session.session_id,
             outcome=outcome,
             status=_public_status(session),
+            recovered=recovered,
             **proof,
         )
     if outcome in {"signed_in", "registered", "verification_required"}:
         accepted = resume_run()
-        if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED:
+        if accepted.status == Status.EMAIL_VERIFICATION_REQUIRED and outcome != "registered":
+            # A registered account that stops on the verify card is still "registered":
+            # the caller keeps (saves) its password, and the status says verify first.
             outcome = "verification_required"
-        return CredentialsOut(sessionId=session.session_id, outcome=outcome, status=accepted.status, **proof)
+        return CredentialsOut(
+            sessionId=session.session_id, outcome=outcome, status=accepted.status, recovered=recovered, **proof
+        )
     _sync_checkpoint(session)
     return CredentialsOut(
         sessionId=session.session_id,
@@ -489,6 +571,21 @@ URL, a browser page, or client-side JavaScript.
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _stop_questions(session: ServiceSession) -> list[StopQuestionOut]:
+    """The page set already collected. Empty unless this stop is waiting on a question."""
+    if _public_status(session) != Status.MANUAL_ANSWER_REQUIRED:
+        return []
+    return [StopQuestionOut.model_validate(row) for row in page_question_views(session.open_items)]
+
+
+def _same_page_set(prior_sig: tuple | None, prior_ids: list[str], outcome: ApplicationResult) -> bool:
+    """True when the follow-up is the rest of the set already shown for this page."""
+    if outcome.status != Status.MANUAL_ANSWER_REQUIRED or prior_sig is None or outcome.page_signature != prior_sig:
+        return False
+    remaining = [row["id"] for row in page_question_views(outcome.open_items)]
+    return bool(remaining) and set(remaining) <= set(prior_ids)
+
+
 def _questions_out(session: ServiceSession) -> list[ManualQuestionOut]:
     source = session.result.manual_questions if session.result is not None else session.manual_questions
     return [ManualQuestionOut(intent=item.get("intent"), text=item.get("text") or "") for item in source]
@@ -513,6 +610,18 @@ def _timings_out(session: ServiceSession) -> TimingsOut:
     )
 
 
+def _learned_sms(session: ServiceSession) -> list[dict]:
+    from autofill.sms_consent import learned_application_answers
+
+    return learned_application_answers(session.profile, session.candidate_id)
+
+
+def _sms_authorized(session: ServiceSession) -> bool:
+    from autofill.sms_consent import sms_authorized
+
+    return sms_authorized(session.profile, session.candidate_id)
+
+
 def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut:
     result = session.result
     body = RunStatusOut(
@@ -526,6 +635,7 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         timings=_timings_out(session),
         humanOutcome=session.human_outcome,
         paused=session.paused,
+        questions=_stop_questions(session),
         pageType=session.page_type or "UNKNOWN",
         entryClicks=session.entry_clicks,
         nextClicks=session.next_clicks,
@@ -537,10 +647,14 @@ def _status_out(session: ServiceSession, *, final: bool = False) -> RunStatusOut
         ),
         startedAt=session.started_at,
         autoConsents=list(session.auto_consents) or None,
+        learnedApplicationAnswers=_learned_sms(session) or None,
     )
     # A run still inside the worker reports live progress. The response from that
     # run is built before the busy flag drops, so ``final`` uses the result.
-    if result is None or (session.busy and not final):
+    # Status is published before ``busy`` clears. A poll in that window must
+    # still carry the blocker for the result that just finished.
+    result_current = result is not None and result.status == session.status
+    if result is None or (session.busy and not final and not result_current):
         progress = dict(session.progress or empty_progress())
     else:
         progress = dict(result.progress or session.progress or empty_progress())
@@ -618,6 +732,10 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
         session.phase = "loaded"
     if result.account is not None:
         session.account = result.account
+    if result.status == Status.LOGIN_FAILED:
+        # The site refused these credentials. Never type them again on their
+        # own; a new /credentials call or the person in the live view decides.
+        session.credentials.clear()
     for key in result.completed_keys:
         if key and key not in session.completed_keys:
             session.completed_keys.append(key)
@@ -640,6 +758,13 @@ def _accept_result(session: ServiceSession, result: ApplicationResult) -> RunSta
     if isinstance(result.blocking, dict):
         result.blocking = _canonicalize_blocker(result.blocking)
     session.open_items = [_canonicalize_blocker(item) for item in result.open_items]
+    if result.status == Status.MANUAL_ANSWER_REQUIRED:
+        session.page_set_ids = [row["id"] for row in page_question_views(session.open_items)]
+        if result.page_signature is not None:
+            session.page_signature = result.page_signature
+    else:
+        session.page_set_ids = []
+        session.page_signature = None
     session.paused = session.pause_gate.paused
     if result.timings:
         for key, value in result.timings.items():
@@ -972,6 +1097,37 @@ def _note_navigation(session: ServiceSession):
     return note
 
 
+def _note_nav_block(session: ServiceSession):
+    """Keep the Next that already ran on its signature. The tuple has no answer text."""
+
+    def note(block: tuple) -> None:
+        if isinstance(block, tuple) and len(block) == 3:
+            session.nav_block = block
+
+    return note
+
+
+def _page_alive(runner, session_id: str) -> bool:
+    """True when the runner still has a page. A runner without the probe is treated as closed."""
+    probe = getattr(runner, "page_alive", None)
+    if probe is None:
+        return False
+    try:
+        return bool(probe(session_id))
+    except Exception:
+        return False
+
+
+def _drop_stalled_page(session: ServiceSession, runner) -> None:
+    """Close a dead stalled page and forget its Next block. A live page stays."""
+    if _page_alive(runner, session.session_id):
+        return
+    runner.discard(session.session_id)
+    session.nav_block = None
+    session.preview_jpeg = None
+    session.preview_host = ""
+
+
 def _paint_frame(session: ServiceSession):
     """Store a JPEG as soon as the page can be captured. A crash propagates."""
 
@@ -1032,9 +1188,12 @@ def _request_for(
         on_paint=_paint_frame(session),
         on_phase=_set_phase(session),
         on_navigation=_note_navigation(session),
+        on_nav_block=_note_nav_block(session),
+        nav_block=session.nav_block,
         on_confirmed=session.remember_confirmed_value,
         confirmed_values=session.confirmed_values,
         standard_terms_authorized=session.standard_terms_authorized,
+        verify_pending=session.verify_pending,
     )
 
 
@@ -1094,6 +1253,14 @@ def _follow_verified_resume(
     threading.Thread(target=follow, name=f"resume-follow-{session.session_id[:8]}", daemon=True).start()
 
 
+def _verify_card(session: ServiceSession) -> bool:
+    """The session stopped on the employer verify card (protocol 0.7.0 only)."""
+    if not _is_070(session) or session.status != Status.EMAIL_VERIFICATION_REQUIRED:
+        return False
+    account = session.account if isinstance(session.account, dict) else None
+    return bool(account and account.get("verifyBeforeSignIn"))
+
+
 def _run(
     session: ServiceSession,
     store: ServiceSessionStore,
@@ -1103,6 +1270,7 @@ def _run(
     resume_uploaded: bool,
     human_resolved: bool = False,
     answers_updated: bool = False,
+    verified: bool = False,
 ) -> RunStatusOut:
     try:
         session = store.begin_run(session.session_id)
@@ -1114,6 +1282,20 @@ def _run(
     # calls keep that confirmation instead of asking again.
     session.resume_uploaded = session.resume_uploaded or resume_uploaded
     session.human_resolved = session.human_resolved or human_resolved
+    if human_resolved and verified:
+        # The person confirmed they opened the verification email (Continue with
+        # verified=true). Sign In may now use the registered login once.
+        if session.verify_pending:
+            logger.info("session=%s verify_pending=cleared reason=human_verified", session.session_id)
+        session.verify_pending = False
+    elif human_resolved and session.verify_pending:
+        # R4 (t182u, KLA 2026-10-27): Continue alone is not proof of verification.
+        # It cleared this flag and the engine typed a password registered seconds
+        # earlier into Sign In (wrong_or_locked). The run now re-checks the page:
+        # a Sign In pane parks on the verify card again (nothing typed); a page the
+        # person already signed into in the live view goes on to the application,
+        # which clears the flag below.
+        logger.info("session=%s verify_pending=kept reason=continue_without_verified", session.session_id)
     previous = session.status
     # Later runs add to these totals. A resume upload must not zero the clicks
     # from the run that opened the form.
@@ -1135,6 +1317,12 @@ def _run(
                 )
             )
             accepted = _accept_result(session, result)
+            if session.status not in _VERIFY_PENDING_STATUSES:
+                session.verify_pending = False
+            elif _verify_card(session):
+                # The run parked on the verify card (verify first, or an "unverified"
+                # Sign In banner). Stay verify first until the person confirms.
+                session.verify_pending = True
         except HTTPException:
             session.status = previous
             raise
@@ -1207,6 +1395,7 @@ def _start_in_background(session, store, runner, limits) -> RunStatusOut:
 def create_app(
     *,
     token: str,
+    previous_token: str | None = None,
     runner: FillRunner | None = None,
     run_browser: bool = True,
     max_sessions: int = 32,
@@ -1221,8 +1410,11 @@ def create_app(
     dead_end_browser_seconds: float = 120,
     one_session_per_owner: bool = True,
 ) -> FastAPI:
-    """Build the service. ``token`` is the bearer secret and is not stored in the schema."""
-    expected = require_configured_token(token)
+    """Build the service. ``token`` is the bearer secret and is not stored in the schema.
+
+    ``previous_token`` (optional) is also accepted during a token rotation.
+    """
+    expected = accepted_tokens(token, previous_token)
     install_redaction()
     store = ServiceSessionStore(max_sessions=max_sessions)
     store.idle_ttl_seconds = idle_ttl_seconds
@@ -1274,7 +1466,7 @@ def create_app(
         presented = ""
         if credentials is not None and credentials.scheme.lower() == "bearer":
             presented = credentials.credentials
-        if not tokens_match(presented, expected):
+        if not tokens_match_any(presented, expected):
             raise HTTPException(
                 status_code=401,
                 detail="Unauthorized",
@@ -1315,6 +1507,7 @@ def create_app(
         return JSONResponse(status_code=422, content={"detail": detail})
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
+    @app.get("/health/ready", response_model=HealthOut, tags=["health"])
     @app.get("/v1/health", response_model=HealthOut, tags=["health"])
     def health() -> HealthOut:
         return HealthOut()
@@ -1413,6 +1606,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=f"Cannot start a session in status {session.status}.")
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
+        if session.status == Status.NAVIGATION_STALLED:
+            _drop_stalled_page(session, active_runner)
         return _start_in_background(session, store, active_runner, limits)
 
     @router.post("/sessions/{session_id}/retry", response_model=RunStatusOut, tags=["sessions"])
@@ -1427,9 +1622,12 @@ def create_app(
         messages = session.result.messages if session.result is not None else []
         if session.status == Status.FAILED_RETRYABLE and ("browser_crash" in messages or "browser_crashed" in messages):
             _allow_browser_restart(session)
-        active_runner.discard(session.session_id)
-        session.preview_jpeg = None
-        session.preview_host = ""
+        if session.status == Status.NAVIGATION_STALLED:
+            _drop_stalled_page(session, active_runner)
+        else:
+            active_runner.discard(session.session_id)
+            session.preview_jpeg = None
+            session.preview_host = ""
         return _run(
             session,
             store,
@@ -1445,6 +1643,18 @@ def create_app(
         _reject_expired(session)
         return _status_out(session)
 
+    def _continue_run(session: ServiceSession, body: ContinueIn) -> RunStatusOut:
+        """A person pressed Continue. ``verified`` is their "I opened the verification email" (R4)."""
+        return _run(
+            session,
+            store,
+            active_runner,
+            limits,
+            resume_uploaded=False,
+            human_resolved=True,
+            verified=body.verified,
+        )
+
     @router.post("/sessions/{session_id}/continue", response_model=RunStatusOut, tags=["sessions"])
     def continue_session(session_id: str, body: ContinueIn) -> RunStatusOut:
         session = _session_or_404(session_id)
@@ -1453,7 +1663,10 @@ def create_app(
         if body.human_resolved:
             if session.status == Status.FAILED_RETRYABLE:
                 _allow_browser_restart(session)
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
+            if session.status == Status.NAVIGATION_STALLED:
+                _drop_stalled_page(session, active_runner)
+                return _continue_run(session, body)
             if _is_070(session) and session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
                 found = _probe_challenge(session, active_runner)
                 if found in {"captcha", "verification"}:
@@ -1462,9 +1675,9 @@ def create_app(
                     raise HTTPException(status_code=409, detail={"reason": reason})
             if session.status == Status.MANUAL_ANSWER_REQUIRED and session.stuck_manual:
                 session.stuck_manual = False
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
             if _consent_stop(session):
-                return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+                return _continue_run(session, body)
             allowed = {
                 Status.LOGIN_REQUIRED,
                 Status.CAPTCHA_REQUIRED,
@@ -1473,9 +1686,18 @@ def create_app(
             }
             if _is_070(session):
                 allowed.add(Status.EMAIL_VERIFICATION_REQUIRED)
+                # After a refused sign-in the person signs in in the live view
+                # (or verifies the account) and presses Continue, as the
+                # Companion copy says. The refused password was dropped, so the
+                # run only checks the page; it never retypes it.
+                allowed.add(Status.LOGIN_FAILED)
+                # The person may have created the account in the live view. The run
+                # checks the page again and stops on the Create Account form if it is
+                # still there. Continue never types an account or skips that check.
+                allowed.add(Status.ACCOUNT_CREATION_REQUIRED)
             if session.status not in allowed:
                 raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
-            return _run(session, store, active_runner, limits, resume_uploaded=False, human_resolved=True)
+            return _continue_run(session, body)
         if session.status == Status.FAILED_RETRYABLE:
             _allow_browser_restart(session)
             return _run(session, store, active_runner, limits, resume_uploaded=False)
@@ -1509,15 +1731,51 @@ def create_app(
 
     @router.post("/sessions/{session_id}/resume", response_model=RunStatusOut, tags=["sessions"])
     def resume_session(session_id: str) -> RunStatusOut:
-        """Release a paused fill. This does not start a run that has already stopped."""
+        """Release a paused fill. A visible application form is filled again.
+
+        A challenge that is still on the page is left stopped. A Create Account
+        form that is still showing is left stopped. This does not submit the
+        application, solve a challenge, or create an account.
+        """
         session = _session_or_404(session_id)
         _reject_expired(session)
         session.pause_gate.resume()
         session.paused = False
         logger.info("session=%s action=resume", session.session_id)
-        if _is_070(session) and session.pending_resume and not session.busy:
+        if session.busy:
+            return _status_out(session)
+        if _is_070(session) and session.pending_resume:
             session.pending_resume = False
             return _run(session, store, active_runner, limits, resume_uploaded=session.resume_uploaded)
+        if session.status in {Status.CAPTCHA_REQUIRED, Status.EMAIL_VERIFICATION_REQUIRED}:
+            found = _probe_challenge(session, active_runner)
+            if found != "clear":
+                return _status_out(session)
+            return _run(
+                session,
+                store,
+                active_runner,
+                limits,
+                resume_uploaded=session.resume_uploaded,
+                human_resolved=True,
+            )
+        # The person signed in or opened the form in the live view. Fill it.
+        # A Create Account form that is still showing is not an application, so
+        # resume does not register an account.
+        if session.status in {
+            Status.LOGIN_REQUIRED,
+            Status.NO_FORM_FOUND,
+            Status.JOB_DESCRIPTION,
+            Status.ACCOUNT_CREATION_REQUIRED,
+        } and _application_visible(session, active_runner):
+            return _run(
+                session,
+                store,
+                active_runner,
+                limits,
+                resume_uploaded=session.resume_uploaded,
+                human_resolved=True,
+            )
         return _status_out(session)
 
     @router.post(
@@ -1563,7 +1821,25 @@ def create_app(
             if not recorded:
                 store.release_answer(session.session_id)
 
-    def _answer_once(session: ServiceSession, body: AnswerIn) -> AnswerOut:
+    def _answer_once(session: ServiceSession, body: AnswerIn, *, finish: bool = True) -> AnswerOut:
+        if finish and body.answers:
+            last: AnswerOut | None = None
+            rows = list(body.answers)
+            for index, row in enumerate(rows):
+                one = AnswerIn(
+                    questionId=row.question_id,
+                    questionHash=row.question_hash,
+                    fieldKey=row.field_key,
+                    value=row.value,
+                    values=list(row.values),
+                    confirm=row.confirm,
+                )
+                last = _answer_once(session, one, finish=index == len(rows) - 1)
+                if not last.filled:
+                    return last
+            if last is None:
+                raise HTTPException(status_code=422, detail={"reason": "needs_option"})
+            return last
         if session.status in {Status.LOGIN_REQUIRED, Status.CAPTCHA_REQUIRED}:
             logger.info("session=%s action=answer result=rejected", session.session_id)
             raise HTTPException(status_code=409, detail={"reason": "not_at_human_stop"})
@@ -1663,6 +1939,16 @@ def create_app(
                 reason=str(filled.get("reason") or "not_committed"),
                 ms=elapsed_ms(started),
             )
+        from autofill.sms_consent import remember_human_sms
+
+        remember_human_sms(
+            session.profile,
+            question=str(item.get("text") or ""),
+            value=str(canonical[0] if canonical else ""),
+            intent=str(item.get("intent") or ""),
+            kind=kind_name,
+            candidate_id=session.candidate_id,
+        )
         remembered = body.field_key.strip() or str(item.get("fieldKey") or "")
         if remembered and remembered not in session.completed_keys:
             session.completed_keys.append(remembered)
@@ -1674,6 +1960,12 @@ def create_app(
             session.held_selectors.add(selector)
         session.pause_gate.resume()
         session.paused = False
+        if not finish:
+            return _answer_filled(session, item, body, started)
+        prior_next = session.next_clicks
+        prior_pages = session.pages_advanced
+        prior_sig = session.page_signature
+        prior_ids = list(session.page_set_ids)
         advance = getattr(active_runner, "advance_after_answer", None)
         if advance is not None:
             try:
@@ -1690,7 +1982,15 @@ def create_app(
                 _mark_browser_crash(session)
                 raise HTTPException(status_code=exc.status_code, detail={"reason": "element_not_found"}) from None
             if outcome is not None:
+                same = _same_page_set(prior_sig, prior_ids, outcome)
+                if not same:
+                    session.nav_base_entry = session.entry_clicks
+                    session.nav_base_next = prior_next
+                    session.nav_base_pages = prior_pages
                 _accept_result(session, outcome)
+                if same:
+                    session.next_clicks = prior_next
+                    session.pages_advanced = prior_pages
                 _keep_place_options(session, item, filled)
                 return _answer_filled(session, item, body, started)
         if session.status in {Status.MANUAL_ANSWER_REQUIRED, Status.RESUME_UPLOAD_REQUIRED}:
@@ -1746,6 +2046,7 @@ def create_app(
                     "password": body.password,
                     "confirm": body.confirm_password or body.password,
                     "standardTerms": session.standard_terms_authorized,
+                    "recruitmentSmsAuthorized": _sms_authorized(session),
                 },
             )
         except PageUnavailable as exc:

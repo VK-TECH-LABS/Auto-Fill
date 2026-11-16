@@ -1,0 +1,26 @@
+{
+  "task": "t315u-direct-browser",
+  "developer": "tharun",
+  "branch": "cursor/t315u-direct-browser-fill-cb52",
+  "latest_commit": "9fd13bbcc0d3a55f0d22271adaaf8a60eecebcaf",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/125",
+  "files_touched": [
+    "src/autofill/answer_popup.py",
+    "src/autofill/dom_ui.py",
+    "src/autofill/extract.py",
+    "src/autofill/fill.py",
+    "src/autofill/local_helper.py",
+    "src/autofill/mapping.py",
+    "src/autofill/profile.py",
+    "src/autofill/split_dates.py",
+    "src/autofill/stepfill.py",
+    "src/autofill/tilearc_sync.py",
+    "tests/test_candidate_sync.py",
+    "tests/test_save_continue.py",
+    "tests/test_t315_direct_browser.py"
+  ],
+  "tests": "pytest tests/test_t315_direct_browser.py tests/test_profile.py && ruff check src tests scripts && mypy",
+  "blockers": "Vinayaka #178 is open and not merged. This helper reads localHelperSessionBody profile and accepts the new keys when present. A missing key stays blank. Companion chrome hiding stays on vinayaka.",
+  "next_action": "Staging manual verification on SmartRecruiters, Ashby, and Workday after #178 lands or with today's LIVE payload. Do not mark master complete. Do not claim Tarun acceptance.",
+  "updated_at": "2026-11-06T11:20:00Z"
+}

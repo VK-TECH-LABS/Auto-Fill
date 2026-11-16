@@ -15,8 +15,7 @@ from fastapi.testclient import TestClient
 from tests.helpers import empty_credentials as _empty_credentials
 from tests.helpers import job_context as _job_object
 
-from autofill.ats import site_domain
-from autofill.credentials import SiteContext
+from autofill.credentials import SiteContext, credential_scope
 from autofill.engine import ApplicationResult, Status
 from autofill.safeguards import HumanSubmissionRequired
 from autofill.service.app import create_app
@@ -74,7 +73,7 @@ class RecordingRunner:
 
     def run(self, request: FillRequest) -> ApplicationResult:
         self.calls.append((request.session_id, request.resume_uploaded))
-        domain = site_domain(request.application_url)
+        domain = credential_scope(request.application_url)
         creds = request.credentials.get_credentials(
             SiteContext(url=request.application_url, domain=domain, candidate_id=request.candidate_id),
             request.candidate_id,
@@ -177,6 +176,9 @@ def test_auth_rejects_missing_and_wrong_tokens(client: TestClient):
         "features": ["standardTerms"],
     }
     assert health.json() == expected_health
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json() == expected_health
     versioned = client.get("/v1/health")
     assert versioned.status_code == 200
     assert versioned.json() == expected_health
@@ -206,6 +208,59 @@ def test_create_start_and_status(client: TestClient, runner: RecordingRunner):
     again = client.get(f"/v1/sessions/{created['sessionId']}/status", headers=AUTH)
     assert again.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
     assert again.json()["stopped_before_submit"] is True
+
+
+def test_status_keeps_the_question_blocker_while_the_run_is_still_busy(client: TestClient):
+    """Status is published before busy clears. The blocker must survive that window."""
+    created = _create(client)
+    session = client.app.state.store.get(created["sessionId"])
+    assert session is not None
+    session.busy = True
+    session.progress = {
+        "stage": "OPENING",
+        "requiredTotal": 0,
+        "requiredDone": 0,
+        "percent": 5,
+        "currentLabel": "Opening",
+    }
+    session.result = ApplicationResult(
+        status=Status.MANUAL_ANSWER_REQUIRED,
+        ats=None,
+        current_step="FILL_PAGE",
+        login_status="NOT_REQUIRED",
+        blocking={
+            "kind": "QUESTION",
+            "questionId": None,
+            "questionHash": "color-hash",
+            "text": "What is your favorite color?",
+            "fieldKey": None,
+            "answerType": "text",
+            "options": [],
+            "required": True,
+        },
+        progress={
+            "stage": "QUESTIONS",
+            "requiredTotal": 3,
+            "requiredDone": 2,
+            "percent": 66,
+            "currentLabel": "Questions",
+        },
+    )
+    session.status = Status.MANUAL_ANSWER_REQUIRED
+    shown = client.get(f"/v1/sessions/{created['sessionId']}/status", headers=AUTH)
+    assert shown.status_code == 200, shown.text
+    body = shown.json()
+    assert body["blocking"]["kind"] == "QUESTION"
+    assert "favorite color" in body["blocking"]["text"].lower()
+    assert body["progress"]["requiredDone"] == 2
+    assert body["progress"]["requiredTotal"] == 3
+    # A new run is STARTED while the previous result is still stored. Do not
+    # publish that old blocker as if it belonged to the run in progress.
+    session.status = Status.STARTED
+    opening = client.get(f"/v1/sessions/{created['sessionId']}/status", headers=AUTH)
+    assert opening.status_code == 200, opening.text
+    assert opening.json()["status"] == Status.STARTED
+    assert opening.json()["blocking"] is None
 
 
 def test_start_accepts_standard_terms_authorized(client: TestClient):
@@ -619,6 +674,48 @@ def test_library_imports_without_a_host_checkout():
     assert refused.returncode == 2
     assert "AUTOFILL_SERVICE_TOKEN" in refused.stderr
     assert "postgres://" not in refused.stderr
+
+
+def test_live_stalled_page_retries_without_discard_or_goto(client: TestClient, runner: RecordingRunner):
+    runner.gotos = []
+    runner.page_alive = lambda _session_id: True  # type: ignore[method-assign]
+    runner.mode = "stalled"
+    created = _create(client)
+    session_id = created["sessionId"]
+    started = client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    assert started.status_code == 200
+    assert started.json()["status"] == Status.NAVIGATION_STALLED
+    store = client.app.state.store
+    session = store.get(session_id)
+    assert session is not None
+    session.nav_block = ("#next", "Next", ("page-1",))
+    session.browser_restarts = 0
+    runner.mode = "resume"
+    retried = client.post(f"/v1/sessions/{session_id}/retry", headers=AUTH)
+    assert retried.status_code == 200, retried.text
+    assert session_id not in runner.discarded
+    assert runner.gotos == []
+    assert session.nav_block == ("#next", "Next", ("page-1",))
+    assert session.browser_restarts == 0
+
+
+def test_navigation_stalled_continue_with_human_resolved(client: TestClient, runner: RecordingRunner):
+    runner.page_alive = lambda _session_id: True  # type: ignore[method-assign]
+    runner.mode = "stalled"
+    created = _create(client)
+    session_id = created["sessionId"]
+    client.post(f"/v1/sessions/{session_id}/start", headers=AUTH, json={})
+    runner.mode = "resume"
+    runner.discarded.clear()
+    continued = client.post(
+        f"/v1/sessions/{session_id}/continue",
+        headers=AUTH,
+        json={"humanResolved": True},
+    )
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["status"] == Status.RESUME_UPLOAD_REQUIRED
+    assert session_id not in runner.discarded
+    assert client.app.state.store.get(session_id).browser_restarts == 0
 
 
 def test_navigation_stalled_is_retryable_without_a_crash_budget(client: TestClient, runner: RecordingRunner):

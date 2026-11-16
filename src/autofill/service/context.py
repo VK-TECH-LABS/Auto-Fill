@@ -5,6 +5,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from autofill.ats import site_domain
+from autofill.credentials import credential_scope
 from autofill.models import JobContext
 from autofill.profile import ApplicationAnswer, CandidateProfile, ProfileError
 from autofill.resolver import ResolverBinding, ResolverCallError, assert_token_not_in_url
@@ -42,22 +43,47 @@ def validate_application_url(url: str) -> str:
     return cleaned
 
 
+def _answer_merge_key(item: ApplicationAnswer) -> str:
+    """Recruitment SMS rows share one key. Other rows merge on question text."""
+    from autofill.sms_consent import SMS_KEY, is_sms_answer_row
+
+    if is_sms_answer_row(item):
+        return SMS_KEY
+    return item.question.casefold().strip()
+
+
 def apply_approved_answers(profile: CandidateProfile, answers: list[ApprovedAnswerIn]) -> None:
     """Approved answers override the same question. Other profile answers stay."""
     merged: dict[str, ApplicationAnswer] = {}
     order: list[str] = []
     for existing in profile.application_answers:
-        key = existing.question.casefold().strip()
+        key = _answer_merge_key(existing)
         if not key:
             continue
         if key not in merged:
             order.append(key)
-        merged[key] = ApplicationAnswer(question=existing.question, answer=existing.answer)
+        merged[key] = ApplicationAnswer(
+            question=existing.question,
+            answer=existing.answer,
+            intent=existing.intent,
+            employer=existing.employer,
+            key=existing.key,
+            from_session=existing.from_session,
+        )
     for approved in answers:
-        key = approved.question.casefold().strip()
+        row = ApplicationAnswer(
+            question=approved.question.strip(),
+            answer=approved.answer.strip(),
+            intent=approved.intent,
+            employer=approved.employer,
+            key=approved.key,
+        )
+        key = _answer_merge_key(row)
+        if not key:
+            continue
         if key not in merged:
             order.append(key)
-        merged[key] = ApplicationAnswer(question=approved.question.strip(), answer=approved.answer.strip())
+        merged[key] = row
     profile.application_answers = [merged[key] for key in order]
 
 
@@ -91,17 +117,22 @@ def build_profile(body: CreateSessionIn) -> tuple[CandidateProfile, JobContext, 
 
 
 def credential_domain(application_url: str, site: str) -> str:
-    """Domain for this session. A different site is rejected."""
+    """Tenant scope for this session. A different site is rejected.
+
+    Callers may send the hostname. The stored key is ``credential_scope``
+    (candidate + employer), not the bare host when several employers share it.
+    """
     expected = site_domain(application_url)
     if not expected:
         raise ContextError("This session has no site domain to scope credentials to.")
+    scope = credential_scope(application_url)
     raw = site.strip()
     if not raw:
-        return expected
+        return scope
     presented = site_domain(raw) or raw.lower()
-    if presented != expected:
+    if presented not in {expected, scope}:
         raise ContextError("Credentials must be for this session's application site.", status_code=409)
-    return expected
+    return scope
 
 
 def placeholder_profile(candidate_ref: str) -> CandidateProfile:

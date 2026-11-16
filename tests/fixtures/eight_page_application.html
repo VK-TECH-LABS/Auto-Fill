@@ -17,20 +17,20 @@
         <button type="button" id="sign-in">Sign in</button>
       </div>
       <div id="identity-fields" hidden>
-        <label for="first">First name</label>
-        <input id="first" name="first_name" autocomplete="given-name">
-        <label for="last">Last name</label>
-        <input id="last" name="last_name" autocomplete="family-name">
+        <label for="first">First name *</label>
+        <input id="first" name="first_name" autocomplete="given-name" required>
+        <label for="last">Last name *</label>
+        <input id="last" name="last_name" autocomplete="family-name" required>
         <button type="button" id="identity-next">Next</button>
       </div>
     </section>
 
     <section id="step-contact" hidden>
       <h1>Contact</h1>
-      <label for="email">Email</label>
-      <input id="email" name="email" type="email" autocomplete="email">
-      <label for="phone">Phone</label>
-      <input id="phone" name="phone" type="tel" autocomplete="tel">
+      <label for="email">Email *</label>
+      <input id="email" name="email" type="email" autocomplete="email" required>
+      <label for="phone">Phone *</label>
+      <input id="phone" name="phone" type="tel" autocomplete="tel" required>
       <p id="phone-error" class="field-error" role="alert" hidden>invalid phone</p>
       <label for="website">Website</label>
       <input id="website" name="website" type="url" autocomplete="url">
@@ -42,19 +42,19 @@
 
     <section id="step-address" hidden>
       <h1>Address</h1>
-      <label for="street">Street address</label>
-      <input id="street" name="street" autocomplete="street-address">
-      <label for="state">State</label>
-      <select id="state" name="state">
+      <label for="street">Street address *</label>
+      <input id="street" name="street" autocomplete="street-address" required>
+      <label for="state">State *</label>
+      <select id="state" name="state" required>
         <option value="">Select...</option>
         <option value="california">California</option>
         <option value="new-york">New York</option>
       </select>
       <p id="state-error" class="field-error" role="alert" hidden>select one</p>
-      <label for="postal">Postal code</label>
-      <input id="postal" name="postal" autocomplete="postal-code">
-      <label for="country">Country</label>
-      <select id="country" name="country">
+      <label for="postal">Postal code *</label>
+      <input id="postal" name="postal" autocomplete="postal-code" required>
+      <label for="country">Country *</label>
+      <select id="country" name="country" required>
         <option value="">Select...</option>
         <option>Canada</option>
         <option>United States</option>
@@ -64,12 +64,12 @@
 
     <section id="step-employment" hidden>
       <h1>Employment</h1>
-      <label for="employer">Employer</label>
-      <input id="employer" name="employer">
-      <label for="job-title">Job title</label>
-      <input id="job-title" name="job_title">
-      <label for="start-date">Start date</label>
-      <input id="start-date" name="start_date">
+      <label for="employer">Employer *</label>
+      <input id="employer" name="employer" required>
+      <label for="job-title">Job title *</label>
+      <input id="job-title" name="job_title" required>
+      <label for="start-date">Start date *</label>
+      <input id="start-date" name="start_date" required>
       <p id="date-error" class="field-error" role="alert" hidden>valid date</p>
       <label for="years">Years of experience</label>
       <input id="years" name="years" type="number">
@@ -82,47 +82,47 @@
 
     <section id="step-education" hidden>
       <h1>Education</h1>
-      <label for="school">School</label>
-      <input id="school" name="school">
-      <label for="degree">Degree</label>
-      <input id="degree" name="degree">
+      <label for="school">School *</label>
+      <input id="school" name="school" required>
+      <label for="degree">Degree *</label>
+      <input id="degree" name="degree" required>
       <label for="major">Field of study</label>
       <input id="major" name="major">
-      <label for="end-date">End date</label>
-      <input id="end-date" name="end_date" type="date">
+      <label for="end-date">End date *</label>
+      <input id="end-date" name="end_date" type="date" required>
       <button type="button" id="education-next">Next</button>
     </section>
 
     <section id="step-questions" hidden>
       <h1>Questions</h1>
       <fieldset>
-        <legend>Are you legally authorized to work in the United States?</legend>
-        <label><input type="radio" name="auth" id="auth-yes" value="Yes"> Yes</label>
+        <legend>Are you legally authorized to work in the United States? *</legend>
+        <label><input type="radio" name="auth" id="auth-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="auth" id="auth-no" value="No"> No</label>
       </fieldset>
       <fieldset>
-        <legend>Do you now require visa sponsorship?</legend>
-        <label><input type="radio" name="sponsor-now" id="sponsor-now-yes" value="Yes"> Yes</label>
+        <legend>Do you now require visa sponsorship? *</legend>
+        <label><input type="radio" name="sponsor-now" id="sponsor-now-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="sponsor-now" id="sponsor-now-no" value="No"> No</label>
       </fieldset>
-      <label for="sponsor-future">Will you require sponsorship in the future?</label>
-      <select id="sponsor-future" name="sponsor_future">
+      <label for="sponsor-future">Will you require sponsorship in the future? *</label>
+      <select id="sponsor-future" name="sponsor_future" required>
         <option value="">Select...</option>
         <option>Yes</option>
         <option>No</option>
       </select>
       <fieldset>
-        <legend>Are you 18 or older?</legend>
-        <label><input type="radio" name="age" id="age-yes" value="Yes"> Yes</label>
+        <legend>Are you 18 or older? *</legend>
+        <label><input type="radio" name="age" id="age-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="age" id="age-no" value="No"> No</label>
       </fieldset>
       <fieldset>
-        <legend>Are you willing to relocate?</legend>
-        <label><input type="radio" name="relocate" id="relocate-yes" value="Yes"> Yes</label>
+        <legend>Are you willing to relocate? *</legend>
+        <label><input type="radio" name="relocate" id="relocate-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="relocate" id="relocate-no" value="No"> No</label>
       </fieldset>
-      <label for="travel">What percentage of the time are you willing to travel?</label>
-      <select id="travel" name="travel">
+      <label for="travel">What percentage of the time are you willing to travel? *</label>
+      <select id="travel" name="travel" required>
         <option value="">Select...</option>
         <option>0%</option>
         <option>25%</option>
@@ -131,31 +131,31 @@
         <option>100%</option>
       </select>
       <fieldset>
-        <legend>Which shifts are you available to work?</legend>
-        <label><input type="checkbox" id="shift-day" value="Day"> Day</label>
+        <legend>Which shifts are you available to work? *</legend>
+        <label><input type="checkbox" id="shift-day" value="Day" aria-required="true"> Day</label>
         <label><input type="checkbox" id="shift-night" value="Night"> Night</label>
         <label><input type="checkbox" id="shift-weekend" value="Weekend"> Weekend</label>
       </fieldset>
-      <label for="clearance">Do you hold an active security clearance?</label>
-      <select id="clearance" name="clearance">
+      <label for="clearance">Do you hold an active security clearance? *</label>
+      <select id="clearance" name="clearance" required>
         <option value="">Select...</option>
         <option>Yes</option>
         <option>No</option>
       </select>
       <fieldset>
-        <legend>Do you hold a PE license?</legend>
-        <label><input type="radio" name="pe" id="pe-yes" value="Yes"> Yes</label>
+        <legend>Do you hold a PE license? *</legend>
+        <label><input type="radio" name="pe" id="pe-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="pe" id="pe-no" value="No"> No</label>
       </fieldset>
       <fieldset>
-        <legend>Do you have a valid driver's license?</legend>
-        <label><input type="radio" name="driver" id="driver-yes" value="Yes"> Yes</label>
+        <legend>Do you have a valid driver's license? *</legend>
+        <label><input type="radio" name="driver" id="driver-yes" value="Yes" required> Yes</label>
         <label><input type="radio" name="driver" id="driver-no" value="No"> No</label>
       </fieldset>
-      <label for="salary">What is your salary expectation?</label>
-      <input id="salary" name="salary">
-      <label for="employment-type">Employment type</label>
-      <input id="employment-type" role="combobox" aria-controls="employment-type-list" aria-label="Employment type">
+      <label for="salary">What is your salary expectation? *</label>
+      <input id="salary" name="salary" required>
+      <label for="employment-type">Employment type *</label>
+      <input id="employment-type" aria-required="true" role="combobox" aria-controls="employment-type-list" aria-label="Employment type">
       <ul id="employment-type-list" role="listbox">
         <li id="opt-full" role="option" data-value="Full-time">Full-time</li>
         <li id="opt-part" role="option" data-value="Part-time">Part-time</li>
@@ -168,8 +168,8 @@
 
     <section id="step-resume" hidden>
       <h1>Resume</h1>
-      <label for="resume">Resume</label>
-      <input id="resume" name="resume" type="file">
+      <label for="resume">Resume *</label>
+      <input id="resume" name="resume" type="file" required>
       <button type="button" id="resume-next">Next</button>
     </section>
 

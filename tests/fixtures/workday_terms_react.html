@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Analyst | Example Workday Careers</title></head>
+<body>
+<!-- Synthetic Workday Create Account modal (shape of a real tenant seen on staging, 2026-10-26).
+     The terms box is a controlled input: like React, the form keeps its own "accepted" state and
+     ignores a script that sets input.checked. Create Account is an aria-hidden button under a
+     nameless click_filter. No real data. -->
+<main>
+  <div data-automation-id="authPage">
+    <h3 data-automation-id="headingText">Create Account</h3>
+    <form onsubmit="return false" novalidate>
+      <div data-automation-id="formField-email">
+        <label for="input-4">Email Address<abbr title="required">*</abbr></label>
+        <input id="input-4" type="text" aria-required="true" autocomplete="email">
+      </div>
+      <div data-automation-id="formField-password">
+        <label for="input-5">Password<abbr title="required">*</abbr></label>
+        <input id="input-5" type="password" aria-required="true">
+      </div>
+      <div data-automation-id="formField-verifyPassword">
+        <label for="input-6">Verify New Password<abbr title="required">*</abbr></label>
+        <input id="input-6" type="password" aria-required="true">
+      </div>
+      <p>By creating an external account with Example Technologies Incorporated (ETI) you are agreeing to the
+        Terms and Conditions Example Technologies Incorporated (ETI) exercises as use of its Career site.</p>
+      <div data-automation-id="formField-createAccountCheckbox">
+        <input id="input-7" type="checkbox" data-automation-id="createAccountCheckbox" aria-required="true">
+        <label for="input-7">I understand and acknowledge the terms of use for Example Technologies Incorporated (ETI).</label>
+        <p id="terms-error" data-automation-id="errorMessage" role="alert" hidden></p>
+      </div>
+      <div style="position: relative">
+        <div role="button" tabindex="0" data-automation-id="click_filter"
+             style="position:absolute;inset:0;cursor:pointer"></div>
+        <button type="submit" tabindex="-1" aria-hidden="true" data-automation-id="createAccountSubmitButton">Create Account</button>
+      </div>
+    </form>
+    <p>Already have an account? <button type="button" data-automation-id="signInLink">Sign In</button></p>
+  </div>
+</main>
+<div id="done" hidden></div>
+<script>
+// Controlled-checkbox model: a value tracker on the instance, as React installs one.
+window.__accepted = false;
+window.__created = 0;
+window.__rejected = 0;
+var box = document.getElementById("input-7");
+var native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+var tracked = false;
+Object.defineProperty(box, "checked", {
+  configurable: true,
+  get: function () { return native.get.call(this); },
+  set: function (value) { tracked = !!value; native.set.call(this, value); }
+});
+function sync() {
+  var now = native.get.call(box);
+  if (now === tracked) return;  // a script write already updated the tracker: ignored
+  tracked = now;
+  window.__accepted = now;
+  if (now) document.getElementById("terms-error").hidden = true;
+}
+box.addEventListener("click", sync);
+box.addEventListener("change", sync);
+document.querySelector("[data-automation-id='click_filter']").addEventListener("click", function () {
+  if (!window.__accepted) {
+    window.__rejected += 1;
+    var err = document.getElementById("terms-error");
+    err.textContent = "Error: Please check the box to continue";
+    err.hidden = false;
+    return;
+  }
+  window.__created += 1;
+  document.querySelector("[data-automation-id='authPage']").remove();
+  var done = document.getElementById("done");
+  done.hidden = false;
+  done.textContent = "Check your inbox to verify your email.";
+});
+</script>
+</body>
+</html>

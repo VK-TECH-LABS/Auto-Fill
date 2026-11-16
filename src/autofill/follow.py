@@ -22,12 +22,27 @@ from autofill.dom_ui import (
     stage_for,
     workflow_percent,
 )
-from autofill.engine import Status
+from autofill.engine import REVEAL_ATTEMPTS, Status
 from autofill.extract import extract_page
 from autofill.fill import apply_mapped
-from autofill.mapping import MapCursor, is_honeypot, map_field
+from autofill.mapping import (
+    MapCursor,
+    acknowledgement_kind,
+    attestation_manual,
+    is_consent_choice,
+    is_demographic_control,
+    is_honeypot,
+    map_field,
+)
 from autofill.models import Control, JobContext, PageSnapshot
-from autofill.pagewait import classify_page, current_page_type, site_error_messages, terminal_kind
+from autofill.pagewait import (
+    classify_page,
+    current_page_type,
+    navigation_changed,
+    navigation_signature,
+    site_error_messages,
+    terminal_kind,
+)
 from autofill.profile import CandidateProfile
 from autofill.stepfill import inspect_required
 
@@ -41,6 +56,7 @@ class PageMark:
     url: str
     step: str
     selectors: frozenset[str]
+    signature: tuple = ()
 
 
 @dataclass
@@ -56,6 +72,7 @@ class FollowUp:
     messages: list[str] = field(default_factory=list)
     mark: PageMark | None = None
     typed: list[str] = field(default_factory=list)
+    account: dict | None = None
 
 
 def read_page_mark(page) -> tuple[PageMark, PageSnapshot]:
@@ -65,10 +82,56 @@ def read_page_mark(page) -> tuple[PageMark, PageSnapshot]:
     info = detect_ats(url)
     step = page_step(info.name if info else None, snapshot.heading, url)
     selectors = frozenset(control.selector for control in snapshot.controls if control.selector and not control.hidden)
-    return PageMark(url, step, selectors), snapshot
+    return PageMark(url, step, selectors, navigation_signature(page, snapshot)), snapshot
 
 
 def follow_answer(
+    page,
+    *,
+    profile: CandidateProfile,
+    job: JobContext | None,
+    held: set[str],
+    prior: list[dict],
+    previous: PageMark | None,
+    cover_letter_text: str | None = None,
+    cover_letter_path: str | None = None,
+    previous_stage: str = "",
+) -> FollowUp:
+    """Scan this page, then at most a few reveals, and return one gap set."""
+    outcome = _follow_once(
+        page,
+        profile=profile,
+        job=job,
+        held=held,
+        prior=prior,
+        previous=previous,
+        cover_letter_text=cover_letter_text,
+        cover_letter_path=cover_letter_path,
+        previous_stage=previous_stage,
+    )
+    attempt = 1
+    while (
+        attempt < REVEAL_ATTEMPTS
+        and outcome.typed
+        and not outcome.changed
+        and outcome.mark is not None
+    ):
+        outcome = _follow_once(
+            page,
+            profile=profile,
+            job=job,
+            held=held,
+            prior=prior,
+            previous=outcome.mark,
+            cover_letter_text=cover_letter_text,
+            cover_letter_path=cover_letter_path,
+            previous_stage=previous_stage,
+        )
+        attempt += 1
+    return outcome
+
+
+def _follow_once(
     page,
     *,
     profile: CandidateProfile,
@@ -98,7 +161,7 @@ def follow_answer(
                 previous_stage=previous_stage,
             ),
         )
-    if _page_changed(previous, mark):
+    if _follow_page_changed(previous, page, snapshot, mark):
         return FollowUp(changed=True, status="", mark=mark)
     typed: list[str] = []
     fresh = mark.selectors - previous.selectors if previous is not None else frozenset()
@@ -122,6 +185,7 @@ def follow_answer(
         from autofill.extract import extract_page
 
         gaps, total, done = inspect_required(page, extract_page(page), profile, prior)
+    account: dict | None = None
     if gaps:
         status = Status.MANUAL_ANSWER_REQUIRED
         present_blocking(page, gaps[0])
@@ -137,14 +201,18 @@ def follow_answer(
             status = Status.READY_FOR_HUMAN_SUBMIT
             present_blocking(page, None)
             messages = ["Every required field on this page is filled. A person clicks Submit."]
-        elif decision == "ACCOUNT":
-            status = Status.ACCOUNT_CREATION_REQUIRED
+        elif decision in {"ACCOUNT", "LOGIN"}:
+            from autofill.login import stop_account
+
+            info = detect_ats(_page_url(page))
+            wanted = Status.ACCOUNT_CREATION_REQUIRED if decision == "ACCOUNT" else Status.LOGIN_REQUIRED
+            # A Create Account form is never a Sign In stop, even with a Sign In link beside it.
+            status, account = stop_account(snapshot, _page_url(page), info.name if info else None, wanted)
             present_blocking(page, None)
-            messages = ["Create an employer account. Nothing was typed."]
-        elif decision == "LOGIN":
-            status = Status.LOGIN_REQUIRED
-            present_blocking(page, None)
-            messages = ["Sign-in is required before the application form. Nothing was typed."]
+            if status == Status.ACCOUNT_CREATION_REQUIRED:
+                messages = ["Create an employer account. Nothing was typed."]
+            else:
+                messages = ["Sign-in is required before the application form. Nothing was typed."]
         elif decision == "JOB":
             status = Status.JOB_DESCRIPTION
             present_blocking(page, None)
@@ -153,6 +221,10 @@ def follow_answer(
                 "This page is a job description. Auto-Fill did not find an application form.",
                 reason,
             ]
+        elif decision == "JOB_CLOSED":
+            status = Status.FAILED_FINAL
+            present_blocking(page, None)
+            messages = ["job_expired"]
         elif decision == "SITE_ERROR":
             status = Status.FAILED_RETRYABLE
             present_blocking(page, None)
@@ -193,6 +265,7 @@ def follow_answer(
         blocking=public_blocking(gaps[0]) if gaps else None,
         manual_questions=_public_questions(gaps),
         messages=messages,
+        account=account,
         mark=mark,
         typed=typed,
     )
@@ -203,6 +276,27 @@ def _page_url(page) -> str:
         return str(getattr(page, "url", "") or "")
     except Exception:
         return ""
+
+
+def _follow_page_changed(previous: PageMark | None, page, snapshot: PageSnapshot, mark: PageMark) -> bool:
+    """A new route, heading, or replaced field set. A revealed control is not one.
+
+    ``PageMark`` stays the progress record. New controls are filled by
+    ``_fill_new`` so a committed field is not typed again.
+    """
+    if previous is None:
+        return False
+    before = previous.signature
+    if before:
+        after = navigation_signature(page, snapshot)
+        if len(before) < 3 or len(after) < 3:
+            return navigation_changed(before, page, snapshot)
+        if before[0] != after[0] or before[2] != after[2]:
+            return True
+        old_fields = set(before[1])
+        new_fields = set(after[1])
+        return bool(old_fields) and len(old_fields & new_fields) * 2 < len(old_fields)
+    return _page_changed(previous, mark)
 
 
 def _page_changed(previous: PageMark | None, mark: PageMark) -> bool:
@@ -239,6 +333,14 @@ def _progress(
     if not label or stage != heading_stage:
         label = STAGE_TITLES.get(stage, STAGE_TITLES["QUESTIONS"])
     percent = progress_percent(stage, total, done)
+    if current_page_type() == "JOB_CLOSED":
+        return {
+            "stage": "CLOSED",
+            "requiredTotal": total,
+            "requiredDone": done,
+            "percent": 0,
+            "currentLabel": "Job closed",
+        }
     if status in {
         "JOB_DESCRIPTION",
         "ACCOUNT_CREATION_REQUIRED",
@@ -294,12 +396,21 @@ def _fill_new(
             job=job,
             cursor=cursor,
         )
-        if mapped.action not in _WRITE:
+        if _leave_for_person(control, mapped) or mapped.action not in _WRITE:
             continue
         outcome = apply_mapped(page, control, mapped)
         if outcome.action in _WRITE and outcome.detail != "already set":
             typed.append(control.selector)
     return typed
+
+
+def _leave_for_person(control: Control, mapped) -> bool:
+    """A reveal must not auto-answer a row a normal scan would pause on."""
+    if getattr(mapped, "challenge", "") == "confirm":
+        return True
+    if is_demographic_control(control) or is_consent_choice(control) or attestation_manual(control):
+        return True
+    return acknowledgement_kind(control) in {"consent", "marketing"}
 
 
 def _should_fill(page, control: Control, fresh: frozenset[str], held: set[str]) -> bool:

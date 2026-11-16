@@ -45,17 +45,49 @@
       ? window.HTMLTextAreaElement.prototype
       : window.HTMLInputElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    if (desc && desc.set) {
-      desc.set.call(el, value);
-    } else {
-      el.value = value;
+    const next = value == null ? "" : String(value);
+    const previous = String(el.value || "");
+    const tracker = el._valueTracker;
+    if (tracker && typeof tracker.setValue === "function") {
+      // React ignores input when the tracker already equals the new value.
+      tracker.setValue(previous === next ? previous + " " : previous);
     }
-    el.dispatchEvent(new Event("input", { bubbles: true }));
+    if (desc && desc.set) {
+      desc.set.call(el, next);
+    } else {
+      el.value = next;
+    }
+    // A plain Event is not an InputEvent. Confirm-email and city widgets
+    // that keep their own model ignore it and wipe the box on blur.
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: next,
+      }));
+    } catch (error) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
   }
 
   function finish(el) {
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.dispatchEvent(new Event("blur", { bubbles: true }));
+    try {
+      el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    } catch (error) {
+      /* blur already ran */
+    }
+  }
+
+  function seal(el) {
+    const target = typingTarget(el) || el;
+    if (!target) {
+      return false;
+    }
+    finish(target);
+    return true;
   }
 
   function focusField(el) {
@@ -218,5 +250,5 @@
     nodes.forEach((node) => unpaint(node));
   }
 
-  window.__afUI = { focusField, typeVisible, highlight, clearHighlight };
+  window.__afUI = { focusField, typeVisible, highlight, clearHighlight, seal };
 })();

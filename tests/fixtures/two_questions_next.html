@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Application</title></head>
+<body>
+  <main>
+    <h1>Questions</h1>
+    <label>Favorite color <input id="color" name="color" required></label>
+    <label>Visa <input id="visa" name="visa" required></label>
+    <button id="forward" type="button">Next</button>
+  </main>
+  <script>
+    window.__clicked = [];
+    let moved = false;
+    document.getElementById("forward").addEventListener("click", () => {
+      window.__clicked.push("Next");
+      if (moved) return;
+      moved = true;
+      document.querySelector("main").innerHTML = "<h1>Review</h1><p>Review your application.</p>";
+      const submit = document.createElement("button");
+      submit.type = "submit";
+      submit.id = "submit";
+      submit.textContent = "Submit application";
+      submit.addEventListener("click", (event) => {
+        event.preventDefault();
+        window.__clicked.push("Submit application");
+      });
+      document.querySelector("main").appendChild(submit);
+    });
+  </script>
+</body>
+</html>

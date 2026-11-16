@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Engineer | Example Workday Careers</title></head>
+<body>
+<!-- Synthetic Workday Sign In chooser (shape of a real tenant seen on staging, 2026-10-26):
+     Apple / Google / LinkedIn buttons and "Sign in with email". The email and password boxes
+     only appear after "Sign in with email". No real data. -->
+<header data-automation-id="header">
+  <a href="#home" data-automation-id="logoLink">Example Careers</a>
+  <button type="button" data-automation-id="utilityButtonSignIn">Sign In</button>
+</header>
+<main>
+  <h2 data-automation-id="jobPostingHeader">Example Engineer</h2>
+  <div data-automation-id="signInPage" id="chooser">
+    <h2 data-automation-id="headingText">Sign In</h2>
+    <p>We collect information from candidates who apply for employment.</p>
+    <button type="button" class="sso" data-automation-id="SignInWithAppleButton">Sign in with Apple</button>
+    <button type="button" class="sso" data-automation-id="SignInWithGoogleButton">Sign in with Google</button>
+    <button type="button" class="sso" data-automation-id="SignInWithLinkedInButton">Sign in with LinkedIn</button>
+    <button type="button" data-automation-id="SignInWithEmailButton">Sign in with email</button>
+    <p>Don't have an account yet? <button type="button" data-automation-id="createAccountLink">Create Account</button></p>
+  </div>
+  <div data-automation-id="signInPage" id="emailForm" hidden>
+    <h2 data-automation-id="headingText">Sign In</h2>
+    <form onsubmit="return false" novalidate>
+      <div data-automation-id="formField-email">
+        <label for="input-4">Email Address<abbr title="required">*</abbr></label>
+        <input id="input-4" type="text" data-automation-id="email" aria-required="true" autocomplete="username">
+      </div>
+      <div data-automation-id="formField-password">
+        <label for="input-5">Password<abbr title="required">*</abbr></label>
+        <input id="input-5" type="password" data-automation-id="password" aria-required="true">
+      </div>
+      <button type="button" data-automation-id="forgotPasswordLink">Forgot your password?</button>
+      <div style="position: relative">
+        <div role="button" tabindex="0" data-automation-id="click_filter"
+             style="position:absolute;inset:0;cursor:pointer"></div>
+        <button type="submit" tabindex="-1" aria-hidden="true" data-automation-id="signInSubmitButton">Sign In</button>
+      </div>
+    </form>
+  </div>
+  <div id="app" hidden>
+    <h2>My Information</h2>
+    <label for="first">First Name</label><input id="first" name="firstName" type="text">
+    <label for="last">Last Name</label><input id="last" name="lastName" type="text">
+  </div>
+</main>
+<script>
+window.__sso = 0;
+window.__signedIn = 0;
+for (const el of document.querySelectorAll(".sso")) el.addEventListener("click", () => { window.__sso += 1; });
+document.querySelector("[data-automation-id='SignInWithEmailButton']").addEventListener("click", () => {
+  document.getElementById("chooser").hidden = true;
+  document.getElementById("emailForm").hidden = false;
+});
+document.querySelector("#emailForm [data-automation-id='click_filter']").addEventListener("click", () => {
+  if (!document.getElementById("input-4").value || !document.getElementById("input-5").value) return;
+  window.__signedIn += 1;
+  document.getElementById("emailForm").remove();
+  document.getElementById("app").hidden = false;
+});
+</script>
+</body>
+</html>

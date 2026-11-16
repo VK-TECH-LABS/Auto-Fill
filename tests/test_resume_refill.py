@@ -12,7 +12,6 @@ from playwright.sync_api import sync_playwright
 from autofill.extract import extract_page
 from autofill.fill import bind_confirmed, bind_session_id, reset_confirmed, reset_session_id
 from autofill.resolver import ResolverBinding, ResolverResponse
-from autofill.resume_fetch import ResumePayload
 from autofill.resume_manual import reattach_verified
 from autofill.stepfill import (
     _resume_accepted,
@@ -60,10 +59,6 @@ def test_ashby_parse_refills_cleared_values_and_keeps_a_typed_one(browser, monke
             }
         ),
     )
-    monkeypatch.setattr(
-        "autofill.stepfill.fetch_resume_payload",
-        lambda descriptor: ResumePayload(name="notes.pdf", mime_type="application/pdf", data=PDF),
-    )
     page = browser.new_page()
     try:
         page.goto((FIXTURES / "ashby_resume_rewrite.html").as_uri())
@@ -74,10 +69,11 @@ def test_ashby_parse_refills_cleared_values_and_keeps_a_typed_one(browser, monke
             ats_name="ashby",
             step="application",
         )
-        assert outcome.resume_blocked is False
+        assert outcome.resume_blocked is True
+        assert page.locator("#resume").evaluate("el => el.files.length") == 0
         assert page.locator("#name").input_value() == "River Example"
         assert page.locator("#phone").input_value() == "5550100199"
-        assert page.locator("#email").input_value() == "parsed@example.com"
+        assert page.locator("#email").input_value() == "river.example@example.com"
         assert page.locator("#referral").input_value() == "FRIEND"
     finally:
         page.close()
@@ -328,8 +324,8 @@ def test_split_name_boxes_are_filled_from_a_full_name(browser, monkeypatch):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='first'>First Name</label><input id='first' autocomplete='given-name'>"
-            "<label for='last'>Last Name</label><input id='last' autocomplete='family-name'>"
+            "<label for='first'>First Name</label><input id='first' autocomplete='given-name' required>"
+            "<label for='last'>Last Name</label><input id='last' autocomplete='family-name' required>"
             "</form>"
         )
         fill_resolved_page(
@@ -392,7 +388,7 @@ def test_refill_waits_until_dropped_fields_return(browser, caplog):
     try:
         page.set_content(
             "<h1>Application</h1><div id='slot'>"
-            "<label for='name'>Full name</label><input id='name' name='name'>"
+            "<label for='name'>Full name</label><input id='name' name='name' required>"
             "<label for='phone'>Phone</label><input id='phone' name='phone'>"
             "</div><script>"
             "const html = document.getElementById('slot').innerHTML;"

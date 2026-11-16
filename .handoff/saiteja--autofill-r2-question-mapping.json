@@ -1,0 +1,22 @@
+{
+  "task": "autofill-r2-question-mapping",
+  "developer": "saiteja",
+  "branch": "saiteja/autofill-r2-question-mapping",
+  "latest_commit": "8217a81683a5c0cc383669482e246823805e3475",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/90",
+  "files_touched": [
+    "src/autofill/answers.py",
+    "src/autofill/fill.py",
+    "src/autofill/intents.py",
+    "src/autofill/mapping.py",
+    "src/autofill/profile.py",
+    "src/autofill/service/context.py",
+    "tests/fixtures/question_mapping_r2.html",
+    "tests/test_mapping.py",
+    "tests/test_question_mapping_r2.py"
+  ],
+  "tests": "pytest tests/test_mapping.py tests/test_question_mapping_r2.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-10-29T21:04:45Z"
+}

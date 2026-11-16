@@ -21,6 +21,8 @@ _LOGGERS = (
     "autofill.login",
     "autofill.stepfill",
     "autofill.redact",
+    "autofill.local_helper",
+    "autofill.tilearc_sync",
 )
 
 

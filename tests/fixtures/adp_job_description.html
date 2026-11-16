@@ -17,7 +17,7 @@
     document.getElementById("apply").addEventListener("click", () => {
       window.__clicked.push("Apply");
       document.querySelector("main").innerHTML =
-        "<h1>Application</h1><label>Email <input id='email' type='email' name='email'></label>";
+        "<h1>Application</h1><label>Email <input id='email' type='email' name='email' required></label>";
     });
     document.querySelector("header").addEventListener("click", (event) => {
       const link = event.target.closest("a");

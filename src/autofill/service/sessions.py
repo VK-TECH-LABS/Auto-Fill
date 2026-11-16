@@ -69,6 +69,9 @@ class ServiceSession:
     pause_gate: PauseGate = field(default_factory=PauseGate)
     progress: dict = field(default_factory=empty_progress)
     open_items: list[dict] = field(default_factory=list)
+    # navigation_signature of the page set, and the question ids collected with it.
+    page_signature: tuple | None = None
+    page_set_ids: list[str] = field(default_factory=list)
     held_selectors: set[str] = field(default_factory=set)
     held_answers: list[str] = field(default_factory=list)
     state_version: int = 0
@@ -101,11 +104,15 @@ class ServiceSession:
     next_clicks: int = 0
     pages_advanced: int = 0
     last_navigation: dict | None = None
+    # (selector, name, signature) of a Next already pressed on that signature.
+    nav_block: tuple | None = None
     nav_base_entry: int = 0
     nav_base_next: int = 0
     nav_base_pages: int = 0
     confirmed_values: list[dict] = field(default_factory=list)
     standard_terms_authorized: bool = False
+    # Workday account registered here; no Continue since. See engine._verify_first.
+    verify_pending: bool = False
     created_mono: float = 0.0
     last_activity_mono: float = 0.0
     browser_released: bool = False

@@ -1,0 +1,29 @@
+{
+  "task": "required-only-engine",
+  "developer": "saiteja",
+  "branch": "saiteja/required-only-engine",
+  "latest_commit": "138bfffbdd3d6fd04818d6302205de152805e4f5",
+  "pr": "",
+  "files_touched": [
+    "src/autofill/account_flow.py",
+    "src/autofill/combobox.py",
+    "src/autofill/extract.py",
+    "src/autofill/intents.py",
+    "src/autofill/mapping.py",
+    "src/autofill/stepfill.py",
+    "tests/fixtures/ashby_resume_rewrite.html",
+    "tests/fixtures/checkbox_field_group.html",
+    "tests/test_aaon_workday.py",
+    "tests/test_nav_optional_blockers.py",
+    "tests/test_real_ats.py",
+    "tests/test_required_only_and_workday_shapes.py",
+    "tests/test_t222_data_flow.py",
+    "tests/test_t240_mandatory.py",
+    "tests/test_t315_direct_browser.py",
+    "tests/test_workday_fill_nav.py"
+  ],
+  "tests": "pytest tests/test_aaon_workday.py tests/test_nav_optional_blockers.py tests/test_real_ats.py tests/test_required_only_and_workday_shapes.py tests/test_t222_data_flow.py tests/test_t240_mandatory.py tests/test_t315_direct_browser.py tests/test_workday_fill_nav.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-11-13T17:54:31Z"
+}

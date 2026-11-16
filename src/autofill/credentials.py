@@ -70,6 +70,19 @@ class MemoryCredentialProvider:
         """Drop every record. Callers use this when a session ends."""
         self._records.clear()
 
+    def drop(self, candidate_id: str, scope: str) -> None:
+        """Drop one candidate's secret for one employer. Other scopes stay."""
+        if candidate_id and scope:
+            self._records.pop((candidate_id, scope.lower()), None)
+
+    def drop_candidate(self, candidate_id: str) -> None:
+        """Drop every secret for one candidate. Other candidates stay."""
+        if not candidate_id:
+            return
+        self._records = {
+            key: value for key, value in self._records.items() if key[0] != candidate_id
+        }
+
     def get_credentials(
         self,
         site_context: SiteContext,
@@ -79,3 +92,26 @@ class MemoryCredentialProvider:
         if not cid or not site_context.domain:
             return None
         return self._records.get((cid, site_context.domain.lower()))
+
+
+def credential_scope(url: str, ats: str | None = None) -> str:
+    """Employer key for a stored password. Not the bare hostname when the host is shared.
+
+    Workday's ``tenantKey`` is already ``host/site``. Greenhouse, Lever, Ashby,
+    and SmartRecruiters contribute a company slug, which is stored as
+    ``host/slug`` so two employers on one host do not share a secret. A host
+    with no tenant stays the hostname. The password is not part of this string.
+    """
+    from autofill.ats import detect_ats, site_domain
+    from autofill.login import tenant_identity
+
+    host = site_domain(url)
+    if ats is None:
+        info = detect_ats(url)
+        ats = info.name if info else None
+    tenant = str(tenant_identity(url, ats).get("tenantKey") or "")
+    if not tenant:
+        return host
+    if tenant == host or tenant.startswith(f"{host}/"):
+        return tenant
+    return f"{host}/{tenant}" if host else tenant

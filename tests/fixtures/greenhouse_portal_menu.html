@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Questions</title></head>
+<body>
+  <h1>Questions</h1>
+  <form>
+    <label for="color">Favorite color?</label>
+    <div class="select" id="color-box">
+      <div class="select__control" id="color-control">
+        <input id="color" class="select__input" role="combobox" aria-label="Favorite color?" autocomplete="off">
+      </div>
+      <input type="hidden" id="color-hidden">
+    </div>
+  </form>
+  <script>
+    const input = document.getElementById("color");
+    const hidden = document.getElementById("color-hidden");
+    const rows = [["color-red", "Red"], ["color-blue", "Blue"]];
+    window.__picked = [];
+
+    function openMenu() {
+      if (document.getElementById("color-list")) return;
+      setTimeout(() => {
+        if (document.getElementById("color-list")) return;
+        const list = document.createElement("ul");
+        list.id = "color-list";
+        list.setAttribute("role", "listbox");
+        input.setAttribute("aria-controls", "color-list");
+        input.setAttribute("aria-expanded", "true");
+        for (const [id, label] of rows) {
+          const item = document.createElement("li");
+          item.id = id;
+          item.setAttribute("role", "option");
+          item.textContent = label;
+          item.addEventListener("click", () => {
+            window.__picked.push(id);
+          });
+          list.appendChild(item);
+        }
+        document.body.appendChild(list);
+      }, 300);
+    }
+
+    input.addEventListener("click", openMenu);
+    input.addEventListener("input", () => {
+      const list = document.getElementById("color-list");
+      if (!list) return;
+      const query = input.value.trim().toLowerCase();
+      for (const item of list.querySelectorAll("[role='option']")) {
+        const show = !query || (item.textContent || "").trim().toLowerCase().indexOf(query) !== -1;
+        item.hidden = !show;
+        item.style.display = show ? "" : "none";
+      }
+    });
+    input.addEventListener("keydown", (event) => {
+      const list = document.getElementById("color-list");
+      if (!list) return;
+      if (event.key === "ArrowDown") {
+        const visible = Array.from(list.querySelectorAll("[role='option']")).find((item) => !item.hidden);
+        if (visible) visible.setAttribute("data-active", "1");
+      }
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      const active = list.querySelector("[role='option'][data-active='1']");
+      if (!active || active.hidden) return;
+      hidden.value = (active.textContent || "").trim();
+      input.value = "";
+      list.remove();
+      input.removeAttribute("aria-controls");
+      input.setAttribute("aria-expanded", "false");
+    });
+    document.querySelector("form").addEventListener("submit", (event) => event.preventDefault());
+  </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Tell us about yourself</title></head>
+<body>
+  <h1>Tell us about yourself</h1>
+  <form id="personal" onsubmit="return false">
+    <label for="first">First Name</label>
+    <input id="first" name="firstName" required autocomplete="given-name">
+    <label for="last">Last Name</label>
+    <input id="last" name="lastName" required autocomplete="family-name">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" required autocomplete="email">
+    <label for="mobile">Mobile Number</label>
+    <input id="mobile" name="mobile" type="tel" required autocomplete="tel">
+    <div class="g-recaptcha" style="width:304px;height:78px;display:block">
+      <iframe title="recaptcha" src="/recaptcha/api2/anchor" style="width:304px;height:78px;border:0;display:block"></iframe>
+    </div>
+    <button type="button" id="continue">Continue</button>
+    <button type="submit" id="submit">Submit application</button>
+  </form>
+  <script>
+    window.__continued = false;
+    window.__submitted = false;
+    document.getElementById("continue").addEventListener("click", () => {
+      window.__continued = true;
+    });
+    document.getElementById("submit").addEventListener("click", () => {
+      window.__submitted = true;
+    });
+  </script>
+</body>
+</html>

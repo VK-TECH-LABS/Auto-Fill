@@ -25,6 +25,54 @@ _MONTHS = (
 )
 
 
+def month_number(token: str) -> int | None:
+    """1–12 from ``Jan``, ``Sept``, or ``January``. An unknown token is not a month."""
+    text = token.strip().casefold().rstrip(".")
+    if text == "sept":
+        return 9
+    for index, name in enumerate(_MONTHS, start=1):
+        folded = name.casefold()
+        if text == folded or text == folded[:3]:
+            return index
+    return None
+
+
+def parse_month_year(value: str) -> tuple[int, int] | None:
+    """Month and year from ``DD/MM/YYYY``, ``MM/YYYY``, ``Mon-YYYY``, or an ISO date.
+
+    A three-part numeric date is day/month/year. ``01/10/2023`` is October
+    2023. A two-part date is month/year, including ``03-2019`` and ``Jan-2019``.
+    A year alone is not a month. Nothing is guessed from the day.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    iso = re.fullmatch(r"(\d{4})-(\d{2})(?:-(\d{2}))?", text)
+    if iso:
+        year, month = int(iso.group(1)), int(iso.group(2))
+        if 1 <= month <= 12:
+            return month, year
+        return None
+    three = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", text)
+    if three:
+        day, month, year = int(three.group(1)), int(three.group(2)), int(three.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return month, year
+        return None
+    two = re.fullmatch(r"(\d{1,2})[./-](\d{4})", text)
+    if two:
+        month, year = int(two.group(1)), int(two.group(2))
+        if 1 <= month <= 12:
+            return month, year
+        return None
+    named = re.fullmatch(r"([A-Za-z]+)\s*[-/. ]\s*((?:19|20)\d{2})", text)
+    if named:
+        named_month = month_number(named.group(1))
+        if named_month:
+            return named_month, int(named.group(2))
+    return None
+
+
 def format_for_control(value: str, *, input_type: str = "", placeholder: str = "", label: str = "") -> str | None:
     """Return ``value`` in the control's format, or None when it does not fit."""
     text = value.strip()

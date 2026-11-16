@@ -1,0 +1,20 @@
+{
+  "task": "workday-fill-nav-50d7",
+  "developer": "tharun",
+  "branch": "tharun/workday-fill-nav-50d7",
+  "latest_commit": "b94e1043eacc81f9884588674752d1d2f6f9a24a",
+  "pr": "https://github.com/VK-TECH-LABS/Auto-Fill/pull/76",
+  "files_touched": [
+    "src/autofill/combobox.py",
+    "src/autofill/extract.py",
+    "src/autofill/mapping.py",
+    "src/autofill/models.py",
+    "src/autofill/pagewait.py",
+    "src/autofill/stepfill.py",
+    "tests/test_workday_fill_nav.py"
+  ],
+  "tests": "pytest tests/test_workday_fill_nav.py",
+  "blockers": "",
+  "next_action": "",
+  "updated_at": "2026-10-26T22:36:22Z"
+}

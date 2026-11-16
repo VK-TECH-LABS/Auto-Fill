@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>My Information</title></head>
+<body>
+  <h1>My Information</h1>
+  <form>
+    <div data-automation-id="formField-source">
+      <label>How did you hear about us?</label>
+      <div data-automation-id="multiSelectContainer">
+        <input id="source" aria-label="How did you hear about us?" placeholder="Search" data-automation-id="searchBox">
+        <button type="button" id="prompt" data-automation-id="promptIcon" aria-label="Search" style="width:24px;height:24px"></button>
+        <span id="picked" data-automation-id="selectedItem" hidden></span>
+      </div>
+    </div>
+    <ul id="stray" role="listbox" style="display:block;min-height:24px">
+      <li id="stray-job" role="option" style="height:24px">Job Board</li>
+    </ul>
+  </form>
+  <script>
+    window.__opened = "";
+    const source = document.getElementById("source");
+    source.addEventListener("click", () => {
+      window.__opened = "input";
+    });
+    document.getElementById("prompt").addEventListener("click", () => {
+      window.__opened = "prompt";
+      setTimeout(() => {
+        if (document.getElementById("source-list")) return;
+        const list = document.createElement("ul");
+        list.id = "source-list";
+        list.setAttribute("role", "listbox");
+        for (const [id, label] of [["job-board", "Job Board"], ["referral", "Employee Referral"]]) {
+          const item = document.createElement("li");
+          item.id = id;
+          item.setAttribute("role", "option");
+          item.setAttribute("data-automation-id", "promptOption");
+          item.textContent = label;
+          item.style.height = "24px";
+          item.addEventListener("click", () => {
+            const picked = document.getElementById("picked");
+            picked.hidden = false;
+            picked.textContent = label;
+            source.value = "";
+            list.remove();
+          });
+          list.appendChild(item);
+        }
+        document.body.appendChild(list);
+      }, 400);
+    });
+    document.getElementById("stray-job").addEventListener("click", () => {
+      window.__opened = "stray";
+    });
+  </script>
+</body>
+</html>
