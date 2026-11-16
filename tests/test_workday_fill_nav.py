@@ -179,8 +179,8 @@ _PAGE = """
 <form>
   <h1>My Information</h1>
   <div id="phone-row">
-    <label for="code">Country Phone Code</label>
-    <select id="code">
+    <label for="code">Country Phone Code *</label>
+    <select id="code" required>
       <option value="">Select</option>
       <option value="US">United States of America</option>
       <option value="GB">United Kingdom</option>
@@ -189,8 +189,8 @@ _PAGE = """
     <input id="national" type="tel" data-automation-id="phoneNumber">
   </div>
   <div id="plain">
-    <label for="full">Phone</label>
-    <input id="full" type="tel" autocomplete="tel">
+    <label for="full">Phone *</label>
+    <input id="full" type="tel" autocomplete="tel" required>
   </div>
   <div id="address">
     <label for="territory">Country / Territory</label>

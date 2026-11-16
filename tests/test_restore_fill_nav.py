@@ -186,7 +186,7 @@ def test_create_account_is_not_auto_registered(browser):
         page.set_content(
             """
             <h1>Create Account</h1>
-            <label for="email">Email</label><input id="email" type="email">
+            <label for="email">Email</label><input id="email" type="email" required>
             <label for="password">Password</label><input id="password" type="password">
             <label for="verify">Verify New Password</label><input id="verify" type="password">
             <button type="button" id="create">Create Account</button>

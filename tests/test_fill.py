@@ -93,16 +93,18 @@ def test_sample_form_is_filled_and_not_submitted(browser, tmp_path):
         assert page.locator("#last").input_value() == "Example"
         assert page.locator("#email").input_value() == "casey.example@example.com"
         assert page.locator("#phone").input_value() == "555-010-0199"
-        assert page.locator("#city").input_value() == "Example City"
-        assert page.locator("#auth").input_value() == "Yes"
-        assert page.locator("#sponsor-no").is_checked()
+        # City, cover letter, and GitHub are optional on this form, so they stay blank.
+        assert page.locator("#city").input_value() == ""
+        # The authorization and sponsorship questions are optional on this form.
+        assert page.locator("#auth").input_value() == ""
+        assert page.locator("#sponsor-no").is_checked() is False
         assert page.locator("#sponsor-yes").is_checked() is False
         assert page.locator("#background").is_checked() is False
         assert page.locator("#gender").input_value() == ""
-        assert "fictional" in page.locator("#cover").input_value()
+        assert page.locator("#cover").input_value() == ""
         assert page.locator("#pronouns").input_value() == ""
         assert page.locator("#company-website").input_value() == ""
-        assert page.locator("#github").input_value() == "https://github.com/casey-example"
+        assert page.locator("#github").input_value() == ""
         uploaded = page.evaluate("() => document.querySelector('#resume').files.length")
         assert uploaded == 0
         assert page.locator("#hear").input_value() == ""

@@ -1550,6 +1550,24 @@ def _follow_path(page, selector: str, parts: list[str], found: list[Option]) -> 
     return clicked
 
 
+def _back_to_top(page, selector: str) -> None:
+    """Leave a category that did not hold the answer.
+
+    The search text typed for the leaf is cleared and the menu is closed with
+    as many Escapes as it takes, so the next open starts at the category list
+    instead of staying inside this category.
+    """
+    try:
+        field = page.locator(selector)
+        inner = field.locator("input:not([type='hidden']), textarea")
+        target = inner.first if inner.count() else field
+        if (target.input_value() or "").strip():
+            target.fill("")
+    except Exception:
+        pass
+    _release_menu(page, selector)
+
+
 def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> Option | None:
     """Open a category and choose the leaf, or the only leaf it contains.
 
@@ -1577,6 +1595,14 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
             opened = _open_for_options(page, selector)
         except Exception:
             opened = []
+        if opened and _match_desired(folder.label, opened) is None:
+            # Workday reopens a nested prompt on the level it was left at.
+            # Close it fully and reopen so the next category is on screen.
+            _back_to_top(page, selector)
+            try:
+                opened = _open_for_options(page, selector)
+            except Exception:
+                opened = []
         current = _match_desired(folder.label, opened) or folder
         if not current.selector:
             continue
@@ -1598,10 +1624,7 @@ def _drill_for_leaf(page, selector: str, desired: str, found: list[Option]) -> O
                 children = searched
         if leaf is None or not leaf.selector:
             _note_children(parent_label, children)
-            try:
-                dismiss_combobox(page)
-            except Exception:
-                return None
+            _back_to_top(page, selector)
             continue
         try:
             _choose_listed(page, leaf.selector, leaf.label)

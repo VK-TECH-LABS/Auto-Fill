@@ -57,7 +57,7 @@ SUBMIT_PAGE = """<!DOCTYPE html>
 <html><body>
 <form id="application" onsubmit="window.__submitted = true; return false;">
   <label for="email">Email address</label>
-  <input id="email" type="email">
+  <input id="email" type="email" required>
   <button type="submit" id="submit">Submit application</button>
   <button type="submit" id="apply">Apply now</button>
   <button type="submit" id="send">Send application</button>
@@ -841,7 +841,12 @@ def test_daily_profile_debugging_port_is_ignored(tmp_path, monkeypatch):
     dedicated = probe_debug_port("dedicated", timeout=8, work_dir=tmp_path / "dedicated")
     assert headed["cdp_open"] is False
     assert headed["daily_profile_attach"] is False
-    assert "non-default data directory" in headed["stderr_excerpt"]
+    # Chrome refuses with "non-default data directory", or, when the person's
+    # Chrome is already open, hands the launch to that session without a port.
+    assert (
+        "non-default data directory" in headed["stderr_excerpt"]
+        or "existing browser session" in headed["chrome_version"]
+    ), headed
     assert explicit["cdp_open"] is False
     assert explicit["daily_profile_attach"] is False
     assert headless["daily_profile_attach"] is False

@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from autofill.adapters import adapter_for
@@ -249,11 +249,13 @@ def fill_resolved_page(
     active = flags or FillFlags()
     if resume_uploaded:
         settle_form(page)
-    snapshot = extract_page(page)
+    snapshot = reveal_required(page, extract_page(page))
     from autofill.mapping import note_page_country
 
     note_page_country(page, snapshot)
     outcome = ResolvedPage(snapshot=snapshot)
+    if unmarked_final_page(snapshot):
+        outcome.manual_actions.append(UNMARKED_PAGE_NOTE)
     clusters = _clusters(snapshot)
     requests: list[_Ask] = []
     for kind, controls in clusters:
@@ -425,7 +427,127 @@ def _clusters(snapshot: PageSnapshot) -> list[tuple[str, list[Control]]]:
             ordered.append(("multi", items))
         elif len(items) == 1:
             ordered.append(("one", items))
-    return ordered
+    return required_only(snapshot, ordered)
+
+
+def _is_resume_input(control: Control) -> bool:
+    """The resume file box. It is only reported for a person to attach; never uploaded or filled."""
+    if control.kind != "file" and control.input_type != "file":
+        return False
+    blob = normalize(" ".join(str(x or "") for x in (control.label, control.name, control.aria_label)))
+    return any(word in blob.split() for word in ("resume", "cv")) or "curriculum vitae" in blob
+
+
+_PROBE_KINDS = frozenset({"text", "email", "tel", "textarea", "select", "combobox", "number", "url", "date"})
+_PROBE_LIMIT = 40
+UNMARKED_PAGE_NOTE = (
+    "This page does not say which fields are required. Auto-Fill filled none of its fields; "
+    "fill what the employer needs before you press Submit."
+)
+
+
+def page_marks_required(snapshot: PageSnapshot) -> bool:
+    return any(_marked(c) for c in snapshot.controls if not c.hidden and not c.disabled)
+
+
+def _probe_targets(snapshot: PageSnapshot) -> list[Control]:
+    out: list[Control] = []
+    for control in snapshot.controls:
+        if control.hidden or control.disabled or control.read_only or not control.selector:
+            continue
+        if control.kind not in _PROBE_KINDS and control.input_type not in _PROBE_KINDS:
+            continue
+        if control.input_type == "password":
+            continue
+        out.append(control)
+    return out[:_PROBE_LIMIT]
+
+
+def reveal_required(page, snapshot: PageSnapshot) -> PageSnapshot:
+    """Ask an unmarked page which fields it requires, without typing anything.
+
+    Many forms only show "This field is required" once a field is touched.
+    Each blank field is focused and left; the page's own errors then mark the
+    mandatory ones (read by the extractor). A page that marks fields already
+    is returned unchanged. Nothing is typed, chosen, or submitted.
+    """
+    if page is None or page_marks_required(snapshot):
+        return snapshot
+    targets = _probe_targets(snapshot)
+    if not targets:
+        return snapshot
+    for control in targets:
+        try:
+            box = page.locator(control.selector).first
+            if (box.input_value(timeout=500) or "").strip():
+                continue
+            box.focus(timeout=1000)
+            box.blur(timeout=1000)
+        except Exception:
+            continue
+    try:
+        page.wait_for_timeout(150)
+        return extract_page(page)
+    except Exception:
+        return snapshot
+
+
+def unmarked_final_page(snapshot: PageSnapshot) -> bool:
+    """A last page that names no required field and still has blank fields for a person."""
+    from autofill.pagewait import has_final_submit
+
+    if page_marks_required(snapshot) or not _probe_targets(snapshot):
+        return False
+    try:
+        return has_final_submit(snapshot)
+    except Exception:
+        return False
+
+
+def _marked(control: Control) -> bool:
+    return bool(control.required or account_checkbox_required(control))
+
+
+def mandatory_selectors(snapshot: PageSnapshot) -> set[str]:
+    """Selectors of every mandatory control on this scan. Every fill path uses this one rule.
+
+    A control is mandatory when the page marks it (required, aria-required, an
+    asterisk, or a validation error the page raised on it after Save &
+    Continue, read by the extractor), or when it shares its question with a
+    marked control (a radio group, the month and year parts of one date).
+    Unmarked controls are optional and are never filled, asked, or retried.
+    A page that marks nothing is first asked through :func:`reveal_required`;
+    if it still marks nothing, no field is filled (the resume box is only
+    reported), Save & Continue reveals the rest as errors that the next scan
+    marks, and a final page tells the person. Conditional fields are re-read
+    on every scan.
+    """
+    visible = [c for c in snapshot.controls if not c.hidden and not c.disabled]
+    marked = [c for c in visible if _marked(c)]
+    keys = {key for c in marked for key in (c.group and "g:" + c.group, c.name and "n:" + c.name) if key}
+    keys |= {"f:" + c.form_automation_id for c in marked if c.form_automation_id.startswith("formField")}
+    chosen: set[str] = set()
+    for control in visible:
+        if not control.selector:
+            continue
+        own = {key for key in (control.group and "g:" + control.group, control.name and "n:" + control.name) if key}
+        if control.form_automation_id.startswith("formField"):
+            own.add("f:" + control.form_automation_id)
+        if _marked(control) or own & keys or (not marked and _is_resume_input(control)):
+            chosen.add(control.selector)
+    return chosen
+
+
+def required_view(snapshot: PageSnapshot) -> PageSnapshot:
+    """The same scan with only mandatory controls, for passes that walk ``snapshot.controls``."""
+    keep = mandatory_selectors(snapshot)
+    return replace(snapshot, controls=[c for c in snapshot.controls if c.selector in keep])
+
+
+def required_only(snapshot: PageSnapshot, clusters: list[tuple[str, list[Control]]]) -> list[tuple[str, list[Control]]]:
+    """Keep only clusters that hold a mandatory control. See :func:`mandatory_selectors`."""
+    keep = mandatory_selectors(snapshot)
+    return [(kind, controls) for kind, controls in clusters if any(c.selector in keep for c in controls)]
 
 
 def _describe(kind: str, controls: list[Control], heading: str, hook) -> _Ask | None:
@@ -1211,8 +1333,9 @@ def _open_missing_education(page, response, flags: FillFlags, outcome: ResolvedP
 
 
 def _write_phone_device(page, outcome: ResolvedPage) -> None:
-    """Phone Device Type is Mobile unless the page already shows a choice."""
-    from autofill.mapping import _is_phone_device
+    """Phone Device Type is the mobile option unless the page already shows a choice."""
+    from autofill.combobox import attach_listbox_options
+    from autofill.mapping import _is_phone_device, phone_device_label
 
     if page is None:
         return
@@ -1226,11 +1349,16 @@ def _write_phone_device(page, outcome: ResolvedPage) -> None:
         if control.selector and control_committed(page, control.selector):
             _drop_manual_selector(outcome, control.selector)
             continue
+        try:
+            attach_listbox_options(page, control)
+        except Exception:
+            pass
+        device = phone_device_label(control.options)
         mapped = MappedField(
             key="phone_device",
             action="select",
-            text="Mobile",
-            option_label="Mobile",
+            text=device,
+            option_label=device,
             field_class="PROFILE_FIELD",
             confidence="high",
         )
@@ -5624,7 +5752,7 @@ def unmatched_study_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile
     """A Field of Study the profile names and the prompt did not commit.
 
     Workday leaves the box blank when the search does not pick a row. That is
-    a missing profile value, including when the label is not marked required.
+    a missing profile value. Only a mandatory Field of Study is asked.
     """
     if profile is None or page is None:
         return []
@@ -5645,9 +5773,12 @@ def unmatched_study_gaps(page, snapshot: PageSnapshot, profile: CandidateProfile
     from autofill.combobox import _labels_match, selected_pill_text
 
     gaps: list[dict[str, Any]] = []
+    mandatory = mandatory_selectors(snapshot)
     for control in snapshot.controls:
         if control.hidden or not control.selector or not _is_study_control(control):
             continue
+        if control.selector not in mandatory:
+            continue  # An optional Field of Study is never asked.
         pill = selected_pill_text(page, control.selector)
         if pill and (_labels_match(wanted, pill) or wanted.casefold() in pill.casefold()):
             continue

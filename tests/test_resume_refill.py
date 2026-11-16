@@ -324,8 +324,8 @@ def test_split_name_boxes_are_filled_from_a_full_name(browser, monkeypatch):
     try:
         page.set_content(
             "<h1>Application</h1><form>"
-            "<label for='first'>First Name</label><input id='first' autocomplete='given-name'>"
-            "<label for='last'>Last Name</label><input id='last' autocomplete='family-name'>"
+            "<label for='first'>First Name</label><input id='first' autocomplete='given-name' required>"
+            "<label for='last'>Last Name</label><input id='last' autocomplete='family-name' required>"
             "</form>"
         )
         fill_resolved_page(
@@ -388,7 +388,7 @@ def test_refill_waits_until_dropped_fields_return(browser, caplog):
     try:
         page.set_content(
             "<h1>Application</h1><div id='slot'>"
-            "<label for='name'>Full name</label><input id='name' name='name'>"
+            "<label for='name'>Full name</label><input id='name' name='name' required>"
             "<label for='phone'>Phone</label><input id='phone' name='phone'>"
             "</div><script>"
             "const html = document.getElementById('slot').innerHTML;"

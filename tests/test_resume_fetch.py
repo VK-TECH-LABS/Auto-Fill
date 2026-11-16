@@ -96,7 +96,9 @@ def test_payload_is_the_grant_bytes_under_the_grant_name():
 
 
 def test_fieldset_and_shared_name_checkboxes_are_one_question():
-    english = Control(kind="checkbox", name="en", label="Languages English", group="Languages", selector="#en")
+    english = Control(
+        kind="checkbox", name="en", label="Languages English", group="Languages", selector="#en", required=True
+    )
     spanish = Control(kind="checkbox", name="es", label="Languages Spanish", group="Languages", selector="#es")
     kind, grouped = _clusters(PageSnapshot(controls=[english, spanish], buttons=[]))[0]
     ask = _describe(kind, grouped, "", None)
@@ -109,6 +111,7 @@ def test_fieldset_and_shared_name_checkboxes_are_one_question():
             label=label,
             selector=f"#{label}",
             prompt="Which languages do you speak?",
+            required=label == "English",  # one marked member makes the whole question mandatory
         )
         for label in ("English", "Spanish", "French")
     ]

@@ -232,9 +232,11 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
                 max_pages=12,
             ),
         )
-        assert first.status == Status.MANUAL_ANSWER_REQUIRED, first.messages
+        # Every mandatory question is answered, so the first stop is the human resume upload.
+        # The unmarked "favorite prime number" question is optional: never asked, never filled.
+        assert first.status == Status.RESUME_UPLOAD_REQUIRED, first.messages
         assert first.stopped_before_submit is True
-        assert {"intent": None, "text": "What is your favorite prime number?"} in first.manual_questions
+        assert {"intent": None, "text": "What is your favorite prime number?"} not in first.manual_questions
         assert page.locator("#first").input_value() == "Riverstone"
         assert page.locator("#last").input_value() == "Example"
         assert page.locator("#email").input_value() == "river.example@example.com"
@@ -268,7 +270,8 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
             assert body["jobRef"] == "job-a"
         assert set(by_step["identity"][0]["fields"]) == {"firstName", "fullName", "lastName"}
         assert by_step["identity"][0]["questions"] == []
-        assert set(by_step["contact"][0]["fields"]) == {"email", "phone", "links.website", "links.linkedin"}
+        # Website and LinkedIn are optional, so they are neither filled nor sent to the resolver.
+        assert set(by_step["contact"][0]["fields"]) == {"email", "phone"}
         assert by_step["contact"][0]["questions"] == []
         assert set(by_step["address"][0]["fields"]) == {
             "address.line1",
@@ -276,13 +279,15 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
             "address.postalCode",
             "address.country",
         }
-        assert set(by_step["employment"][0]["fields"]) == {"employment[]", "yearsExperience", "skills", "projects[]"}
+        # Years of experience, skills, and project name are optional here.
+        assert set(by_step["employment"][0]["fields"]) == {"employment[]"}
         assert set(by_step["education"][0]["fields"]) == {"education[]"}
         question_calls = by_step["questions"]
         intents = [item.get("intent") for item in question_calls[0]["questions"]]
-        assert set(intents) == set(ANSWERS) | {None}
+        assert set(intents) == set(ANSWERS)  # the optional prime question is not sent
         assert question_calls[0]["fields"] == []
-        assert "resume" not in by_step
+        # The resume is mandatory, so the resolver is asked only for its file descriptor; nothing is uploaded here.
+        assert [(call["fields"], call["questions"]) for call in by_step["resume"]] == [(["resume.file"], [])]
         for step, calls in by_step.items():
             keys = [tuple(call["fields"]) for call in calls]
             assert len(set(keys)) == 1, step
@@ -303,7 +308,7 @@ def test_eight_page_fills_from_the_resolver_and_never_submits(browser, resolver,
             ),
         )
         assert second.status == Status.RESUME_UPLOAD_REQUIRED, second.messages
-        assert {"intent": None, "text": "What is your favorite prime number?"} in second.manual_questions
+        assert {"intent": None, "text": "What is your favorite prime number?"} not in second.manual_questions
         assert page.locator("#prime").input_value() == ""
         assert page.locator("#resume").input_value() == ""
         page.locator("#resume").set_input_files(
@@ -353,7 +358,7 @@ def test_resolver_401_expired_and_mismatch_stop_clean(browser, resolver):
     server, url = resolver
     page = browser.new_page()
     try:
-        page.set_content("<h1>Contact</h1><label for='email'>Email</label><input id='email' type='email'>")
+        page.set_content("<h1>Contact</h1><label for='email'>Email</label><input id='email' type='email' required>")
         server.mode = "401"
         denied = autofill_application(
             URL,
@@ -391,9 +396,10 @@ def test_resolver_422_stays_on_the_session_with_blanks(browser, resolver, caplog
     try:
         page.set_content(
             "<h1>Contact</h1>"
-            "<label for='email'>Email</label><input id='email' type='email'>"
-            "<label for='relocate'>Are you willing to relocate?</label>"
-            "<select id='relocate'><option value=''>Select...</option><option>Yes</option><option>No</option></select>"
+            "<label for='email'>Email *</label><input id='email' type='email' required>"
+            "<label for='relocate'>Are you willing to relocate? *</label>"
+            "<select id='relocate' required>"
+            "<option value=''>Select...</option><option>Yes</option><option>No</option></select>"
         )
         server.mode = "422"
         result = autofill_application(
@@ -415,10 +421,10 @@ def test_resolver_422_stays_on_the_session_with_blanks(browser, resolver, caplog
 
 _UNKNOWN_FIELDS = """
 <h1>Questions</h1>
-<label for="prime">What is your favorite prime number?</label>
-<input id="prime">
-<label for="color">What is your favorite color?</label>
-<select id="color">
+<label for="prime">What is your favorite prime number? *</label>
+<input id="prime" required>
+<label for="color">What is your favorite color? *</label>
+<select id="color" required>
   <option value="">Select...</option>
   <option>Red</option>
   <option>Blue</option>
@@ -429,8 +435,8 @@ _UNKNOWN_FIELDS = """
 _QUESTIONS = (
     _UNKNOWN_FIELDS.replace(
         "<button",
-        """<label for="gender">Gender</label>
-<select id="gender">
+        """<label for="gender">Gender *</label>
+<select id="gender" required>
   <option value="">Select...</option>
   <option>Decline</option>
 </select>
@@ -524,8 +530,8 @@ _PE_PAGE = """
 <section id="step-questions">
   <h1>Questions</h1>
   <fieldset>
-    <legend>Do you hold a PE license?</legend>
-    <label><input type="radio" name="pe" id="pe-yes" value="Yes"> Yes</label>
+    <legend>Do you hold a PE license? *</legend>
+    <label><input type="radio" name="pe" id="pe-yes" value="Yes" required> Yes</label>
     <label><input type="radio" name="pe" id="pe-no" value="No"> No</label>
   </fieldset>
   <label for="prime">What is your favorite prime number?</label>
@@ -534,8 +540,8 @@ _PE_PAGE = """
 </section>
 <section id="step-resume" hidden>
   <h1>Resume</h1>
-  <label for="resume">Resume</label>
-  <input id="resume" type="file">
+  <label for="resume">Resume *</label>
+  <input id="resume" type="file" required>
 </section>
 <script>
   document.getElementById("next").addEventListener("click", () => {
@@ -604,7 +610,8 @@ def test_continue_stops_again_when_value_does_not_map(browser, resolver):
         assert third.status == Status.RESUME_UPLOAD_REQUIRED, third.messages
         assert page.locator("#pe-yes").is_checked()
         assert page.locator("#resume").input_value() == ""
-        assert {"intent": None, "text": "What is your favorite prime number?"} in third.manual_questions
+        # The optional prime question is never asked, not even as a non-blocking note.
+        assert {"intent": None, "text": "What is your favorite prime number?"} not in third.manual_questions
         assert page.locator("#step-resume").is_hidden() is False
     finally:
         server.custom_answers = None

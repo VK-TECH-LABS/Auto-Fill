@@ -49,7 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_linux_chrome_search_is_unchanged(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
-    paths = [str(path) for path in chrome_search_paths()]
+    paths = [path.as_posix() for path in chrome_search_paths()]
     assert "/usr/bin/google-chrome-stable" in paths
     assert not any(path.endswith("Google Chrome") for path in paths)
 
@@ -197,6 +197,7 @@ def test_login_item_is_only_for_an_applications_copy(tmp_path, monkeypatch):
     executable.parent.mkdir(parents=True)
     executable.write_text("helper", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() on Windows
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(executable))
@@ -208,6 +209,7 @@ def test_login_item_is_only_for_an_applications_copy(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "executable", str(in_dist))
     other_home = tmp_path / "other-home"
     monkeypatch.setenv("HOME", str(other_home))
+    monkeypatch.setenv("USERPROFILE", str(other_home))
     install_macos_login_item()
     assert not (other_home / "Library" / "LaunchAgents" / f"{MACOS_LOGIN_LABEL}.plist").exists()
 
@@ -218,6 +220,7 @@ def test_doctor_does_not_register_the_login_item(monkeypatch, tmp_path):
     executable.parent.mkdir(parents=True)
     executable.write_text("helper", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() on Windows
     monkeypatch.delenv("AUTOFILL_LOCAL_PROFILE_DIR", raising=False)
     monkeypatch.delenv("CHROME_USER_DATA_DIR", raising=False)
     monkeypatch.setenv(ENV_FLAG, "0")

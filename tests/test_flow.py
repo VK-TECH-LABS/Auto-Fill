@@ -298,7 +298,7 @@ def test_full_application_stops_for_a_person(browser, caplog):
         assert page.locator("#intern-org").input_value() == "Sample Studio"
         assert page.locator("#school").input_value() == "Example University"
         assert page.locator("#degree").input_value() == "Bachelor's Degree"
-        assert page.locator("#major").input_value() == "Computer Science"
+        assert page.locator("#major").input_value() == ""  # Field of study is optional here.
         assert page.locator("#auth").input_value() == "Yes"
         assert page.locator("#sponsor-no").is_checked()
         assert page.locator("#hear").input_value() == "Online job board"
@@ -361,7 +361,7 @@ def test_login_variants(browser):
     <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password">
     <button type="button" id="go">Sign in</button>
     <section id="app" hidden><h1>Personal information</h1>
-      <label for="last">Last name</label><input id="last" autocomplete="family-name">
+      <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
       <button type="submit" id="submit">Submit application</button>
     </section>
     <script>
@@ -401,7 +401,7 @@ def test_login_variants(browser):
 
     email_first = """
     <section id="login"><h1>Sign in</h1>
-      <label for="email">Email</label><input id="email" type="email" autocomplete="username">
+      <label for="email">Email</label><input id="email" type="email" autocomplete="username" required>
       <button type="button" id="continue">Continue</button>
       <div id="pwbox" hidden>
         <label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password">
@@ -410,7 +410,7 @@ def test_login_variants(browser):
       <p id="login-error" role="alert" hidden>Invalid credentials</p>
     </section>
     <section id="app" hidden><h1>Personal information</h1>
-      <label for="last">Last name</label><input id="last" autocomplete="family-name">
+      <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
     </section>
     <script>
       document.getElementById("continue").onclick = () => { document.getElementById("pwbox").hidden = false; };
@@ -474,7 +474,7 @@ def test_already_authenticated_skips_login(browser):
         page.set_content(
             """
             <h1>My Information</h1>
-            <label for="last">Last name</label><input id="last" autocomplete="family-name">
+            <label for="last">Last name</label><input id="last" autocomplete="family-name" required>
             <button type="submit" id="submit">Submit application</button>
             <script>window.__n=0; document.getElementById("submit").onclick=()=>{window.__n+=1};</script>
             """
@@ -500,10 +500,10 @@ def test_parallel_results_do_not_share_session_ids(browser):
     try:
         page_a.set_content(
             "<h1>My Information</h1><label for='a'>Last name</label>"
-            "<input id='a' autocomplete='family-name'>"
+            "<input id='a' autocomplete='family-name' required>"
         )
         page_b.set_content(
-            "<h1>My Information</h1><label for='b'>City</label><input id='b' autocomplete='address-level2'>"
+            "<h1>My Information</h1><label for='b'>City *</label><input id='b' autocomplete='address-level2' required>"
         )
         left = autofill_application(
             URL,
@@ -570,7 +570,7 @@ def test_public_api_stops_on_captcha_without_solving(browser):
         page.set_content(
             """
             <h1>Sign in</h1>
-            <label for="email">Email</label><input id="email" type="email">
+            <label for="email">Email</label><input id="email" type="email" required>
             <div class="g-recaptcha" data-sitekey="not-a-real-sitekey">
               <iframe title="recaptcha" src="/recaptcha/api2/anchor" style="width:304px;height:78px;border:0"></iframe>
             </div>

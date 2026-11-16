@@ -1673,6 +1673,28 @@ def _is_county(control: Control) -> bool:
     return bool(re.search(r"\bcounty\b", label))
 
 
+_MOBILE_WORDS = ("mobile", "cell", "cellular")
+_NOT_PERSONAL_PHONE = ("work", "business", "office", "fax", "pager")
+
+
+def phone_device_label(options: list[Option]) -> str:
+    """The option that means a mobile phone: Mobile, Cell, Mobile Phone, Personal Cell.
+
+    Employers name it differently, so an exact "Mobile" would leave a required
+    Phone Device Type on Select One. A work or business mobile is not used.
+    """
+    labels = [(option.label or option.value or "").strip() for option in options or []]
+    labels = [label for label in labels if label]
+    for label in labels:
+        if normalize(label) == "mobile":
+            return label
+    for label in labels:
+        words = normalize(label)
+        if any(word in words for word in _MOBILE_WORDS) and not any(word in words for word in _NOT_PERSONAL_PHONE):
+            return label
+    return "Mobile"
+
+
 def _is_phone_device(control: Control) -> bool:
     """Phone Device Type. It is a listbox, not the phone number."""
     compact = _compact_id(control)
@@ -2002,8 +2024,8 @@ def _skill_answer(control: Control, profile: CandidateProfile) -> MappedField | 
 
 _DEGREE_FAMILIES = (
     ("associate", ("associate",)),
-    ("bachelor", ("bachelor", "b s", "b a")),
-    ("master", ("master", "m s", "m a", "mba")),
+    ("bachelor", ("bachelor", "b s", "b a", "b tech", "btech", "b sc", "bsc", "b eng", "beng")),
+    ("master", ("master", "m s", "m a", "mba", "m tech", "mtech", "m sc", "msc", "m eng", "meng")),
     ("doctor", ("doctor", "ph d", "phd")),
     ("high school", ("high school", "ged")),
 )
@@ -2032,6 +2054,18 @@ def _degree_option(desired: str, options: list[Option]) -> Option | None:
             hits.append(option)
     if len(hits) == 1:
         return hits[0]
+    if len(hits) > 1:
+        # "Bachelor of Technology" with Bachelor of Arts / Science / Bachelor's
+        # Degree on the menu: the option naming the same subject, else the one
+        # generic option for the level. Two equally good options stay a question.
+        words = {word for word in folded.split() if len(word) > 3 and word not in {"bachelor", "master", "degree"}}
+        subject = [o for o in hits if words & set(normalize(o.label or o.value).split())]
+        if len(subject) == 1:
+            return subject[0]
+        plain = {family, family + "s", family + " s", family + " degree", family + "s degree", family + " s degree"}
+        generic = [o for o in hits if normalize(o.label or o.value) in plain]
+        if len(generic) == 1:
+            return generic[0]
     return None
 
 
@@ -2215,7 +2249,8 @@ def map_field(
             )
         return _from_text(control, "middle_name", middle, reason="Middle name from the profile.")
     if _is_phone_device(control):
-        return _from_text(control, "phone_device", "Mobile", reason="Phone device type is Mobile.")
+        device = phone_device_label(control.options)
+        return _from_text(control, "phone_device", device, reason="Phone device type is the mobile option.")
     if is_previous_worker(control):
         companies = [item.company for item in profile.employment]
         companies.extend(item.company for item in profile.internships)

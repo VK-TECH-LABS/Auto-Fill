@@ -160,8 +160,8 @@ def test_profile_email_overwrites_a_stale_value_on_the_form(browser):
         page.set_content(
             """
             <h1>My Information</h1>
-            <label for="email">Email</label>
-            <input id="email" type="email" value="old.person@example.com">
+            <label for="email">Email*</label>
+            <input id="email" type="email" value="old.person@example.com" required>
             <label for="city">City*</label>
             <input id="city" required>
             <button type="button">Save and Continue</button>
